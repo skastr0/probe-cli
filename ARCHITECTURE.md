@@ -1,0 +1,604 @@
+# Probe Architecture
+
+Status: draft
+
+This document captures the current intended architecture for Probe so that future work items, research packs, and delegated implementation all share the same system shape.
+
+Work items remain the SDLC source of truth for lifecycle state and acceptance criteria. This file is the durable architecture reference that explains the whole system, the main design bets, the hard walls, and the expected implementation direction.
+
+## 1. Product Intent
+
+Probe is a lightweight, daemon-first, agent-first iOS runtime controller that gives coding agents reliable, token-efficient access to a running iOS app on Simulator or real devices.
+
+### Core philosophy
+
+- The app is already built and installed.
+- Probe does not own builds, signing, or provisioning of the target app.
+- Prefer public Apple and Xcode surfaces.
+- Be explicit about hard walls rather than pretending unsupported capabilities exist.
+- Optimize for token efficiency through compact JSON, stable refs, diffs, summaries, and artifact offload.
+- Treat the daemon and session model as first-class, not as an afterthought.
+
+## 2. System Summary
+
+Probe has two major halves:
+
+1. **Host side**: a TypeScript + Effect daemon and thin CLI client.
+2. **Target-side / subprocess bridges**: a small XCUITest runner and a persistent LLDB Python bridge.
+
+Probe coordinates Apple utilities such as:
+
+- `simctl`
+- `devicectl`
+- `xcodebuild`
+- `xctrace`
+- `lldb`
+- `log`
+
+These utilities are treated as integration boundaries with explicit contracts, research packs, and typed capability/error reporting.
+
+## 3. Architectural Decisions
+
+### 3.1 Daemon-first
+
+Probe should be daemon-first.
+
+- `probe serve` runs the long-lived kernel.
+- user-facing `probe <command>` invocations should behave mostly like thin clients speaking to the daemon.
+- session state, subprocess lifecycles, artifact paths, and stable refs live in the daemon.
+
+Reason: session continuity, stable references, and long-lived subprocesses are central to the product.
+
+### 3.2 One session = one device + one app
+
+A Probe session represents exactly one app on one device target.
+
+- one Simulator or real device
+- one target bundle id / launched app process
+- one artifact root
+- one session state object
+
+This keeps reasoning simple and avoids hidden cross-device coupling.
+
+### 3.3 Public APIs only
+
+Probe should prefer:
+
+- XCUITest APIs for accessibility tree access and touch injection
+- official Apple CLIs for device control, tracing, and logs
+- LLDB's supported scripting bridge
+
+Probe should not depend on private Accessibility Inspector protocols or undocumented device channels as a primary strategy.
+
+### 3.4 Artifact-first large output model
+
+Large results should not flood stdout.
+
+- small result: inline JSON
+- large result: summary + file path
+- later inspection: `probe drill`
+
+This is a core product feature, not a nice-to-have formatting choice.
+
+### 3.5 Effect-native runtime model
+
+The host should use:
+
+- a single `ManagedRuntime`
+- `Layer.scoped` for long-lived resources
+- typed services and schemas
+- structured fiber lifecycles
+
+Avoid per-command `Effect.provide(...)` trees that recreate stateful services and fragment process-local state.
+
+## 4. Why the Runner Exists
+
+There is no host-side public API for reading an iOS app's accessibility tree or injecting touch events into a running iOS app.
+
+Key constraints:
+
+- macOS accessibility APIs do not introspect guest iOS apps.
+- `simctl` and `devicectl` do not provide general tap/swipe/tree-inspection commands.
+- Accessibility Inspector uses private protocols that are not an acceptable product foundation.
+
+Therefore Probe uses a small XCUITest runner as the on-device bridge.
+
+The runner:
+
+- attaches to the target app using public XCUI APIs
+- walks the UI hierarchy
+- performs actions such as tap, swipe, and type
+- can capture screenshots
+- speaks a small structured protocol back to the host
+
+## 5. System Planes
+
+### 5.1 Control plane
+
+Owns:
+
+- daemon lifecycle
+- session registry
+- RPC server / client contract
+- startup / shutdown / TTL cleanup
+- capability reporting
+
+Expected transport:
+
+- local Unix domain socket
+
+### 5.2 Bridge plane
+
+Owns long-lived structured subprocess bridges:
+
+- XCUITest runner bridge
+- LLDB Python bridge
+
+Preferred protocol shape:
+
+- JSON lines
+- typed request / response envelopes
+- correlation ids for in-flight requests
+
+### 5.3 Tooling plane
+
+Owns integration wrappers over Apple utilities:
+
+- `simctl`
+- `devicectl`
+- `xcodebuild`
+- `xctrace`
+- `log`
+
+Short-lived commands can be wrapped as Effect command services.
+
+Long-lived or streaming subprocesses should be modeled as scoped resources.
+
+### 5.4 Artifact and output plane
+
+Owns:
+
+- artifact store layout
+- output thresholding
+- summary generation
+- `drill` extraction
+- retention / cleanup
+
+## 6. Host Runtime Model
+
+The host runtime should expose a central kernel service, for example:
+
+- `ProbeKernel`
+- `SessionRegistry`
+- `DeviceService`
+- `RunnerService`
+- `SnapshotService`
+- `ActionService`
+- `PerfService`
+- `DebugService`
+- `LogsService`
+- `ArtifactStore`
+- `OutputPolicy`
+- `CapabilityService`
+
+### Effect guidance
+
+- create one top-level `ManagedRuntime`
+- prefer `Effect.Service` / typed tags for services
+- use `Layer.scoped` for process-backed resources
+- use `Effect.acquireRelease` when resource ownership is local
+- use `Deferred` for readiness handshakes
+- use `SubscriptionRef` for observable session state
+- use `FiberMap` or similar keyed coordination for active sessions and background tasks
+
+## 7. Session Model
+
+Each session should own:
+
+- session id
+- target device identity
+- target app identity
+- current capability set
+- artifact root path
+- session state stream
+
+Optional scoped children may include:
+
+- runner process / bridge
+- LLDB bridge
+- log stream collector
+- active `xctrace` recording
+
+### Suggested lifecycle states
+
+- `opening`
+- `ready`
+- `degraded`
+- `closing`
+- `closed`
+- `failed`
+
+### Session invariants
+
+- a session owns exactly one target app on one target device
+- artifact paths are stable for the lifetime of the session
+- session state transitions are explicit
+- subprocess cleanup is owned by the daemon, not by the caller
+
+## 8. Output Strategy
+
+Probe uses a tiered output model.
+
+### 8.1 Inline
+
+Use for small payloads such as:
+
+- action acknowledgements
+- compact snapshots of simple screens
+- short log excerpts
+- small expression evaluation results
+
+### 8.2 Summary + file
+
+Use for large payloads such as:
+
+- large AX trees
+- full backtraces
+- large logs
+- `.trace` exports
+- binary analysis outputs
+
+Return:
+
+- concise structured summary
+- artifact file path
+
+### 8.3 Drill
+
+Use follow-up queries to inspect offloaded artifacts without loading the full file.
+
+Expected drill shapes:
+
+- JSON / XML selection
+- table or row extraction for trace exports
+- line ranges and match context for text logs
+
+### Default threshold
+
+The initial plan assumes roughly:
+
+- ~4 KB or ~100 lines as the default inline threshold
+
+The threshold must remain configurable and overridable per command.
+
+## 9. Capability Areas
+
+### 9.1 Device and session management
+
+Goal:
+
+- list devices
+- boot Simulator targets
+- open sessions
+- manage permissions
+- reconnect where possible
+
+Primary Apple surfaces:
+
+- `simctl`
+- `devicectl`
+
+Probe adds:
+
+- unified device abstraction
+- session ids
+- artifact roots
+- daemon-owned lifecycle management
+
+### 9.2 UI automation and state inspection
+
+Goal:
+
+- compact AX tree snapshots
+- stable refs like `@e1`, `@e2`
+- semantic actions without coordinate dependence
+- screenshots
+- diffing and stale-ref remediation
+
+Primary surface:
+
+- XCUITest runner using `XCUIApplication`, `XCUIElement`, and `XCUIScreen`
+
+### 9.3 Performance profiling and analysis
+
+Goal:
+
+- record and export Instruments traces
+- summarize CPU, GPU, audio, and scheduling behavior
+- surface actionable findings instead of raw dumps only
+
+Primary surfaces:
+
+- `xctrace record`
+- `xctrace export --toc`
+- `xctrace export --xpath`
+
+Important constraint:
+
+- Probe can extract encoder-level and pipeline-level timing from Metal traces, but not true per-shader GPU attribution.
+
+### 9.4 Deep debugging and binary inspection
+
+Goal:
+
+- attach LLDB
+- inspect frames and variables
+- evaluate expressions
+- manage breakpoints
+- inspect symbols and selected disassembly
+
+Primary surfaces:
+
+- LLDB Python bridge
+- `nm`
+- `otool`
+- `codesign`
+
+### 9.5 Logging and artifacts
+
+Goal:
+
+- structured log streaming and filtering
+- screenshots and recordings
+- persistent session artifact bundles
+
+Primary surfaces:
+
+- `log stream`
+- `simctl io`
+- runner screenshots
+
+### 9.6 Recording and replay
+
+Goal:
+
+- capture exploratory sessions as replayable scripts
+- replay via semantic selectors
+- embed assertions and performance checks where useful
+
+This is built on top of the runner and snapshot model rather than a separate Apple tool.
+
+## 10. Artifact Layout
+
+All session outputs should live under:
+
+```text
+~/.probe/sessions/<session-id>/
+```
+
+Suggested subfolders:
+
+- `snapshots/`
+- `traces/`
+- `screenshots/`
+- `recordings/`
+- `logs/`
+- `debug/`
+- `replays/`
+
+Design requirement:
+
+- file formats should stay debuggable on disk
+- offload should optimize token use, not rely on opaque binary compression
+
+## 11. Suggested Source Tree
+
+An initial repository shape could be:
+
+```text
+src/
+  cli/
+    main.ts
+    commands/
+  rpc/
+    protocol.ts
+    server.ts
+    client.ts
+  domain/
+    device.ts
+    session.ts
+    snapshot.ts
+    action.ts
+    artifact.ts
+    output.ts
+    errors.ts
+  services/
+    ProbeKernel.ts
+    SessionRegistry.ts
+    RunnerService.ts
+    PerfService.ts
+    DebugService.ts
+    LogsService.ts
+    ArtifactStore.ts
+    OutputPolicy.ts
+  infra/
+    apple/
+      Simctl.ts
+      Devicectl.ts
+      Xcodebuild.ts
+      Xctrace.ts
+      OsLog.ts
+    bridge/
+      JsonLineProcess.ts
+      RunnerBridge.ts
+      LldbBridge.ts
+    fs/
+      LocalArtifactStore.ts
+  runtime.ts
+
+ios/
+  ProbeRunner/
+```
+
+This is a guideline, not yet a frozen contract.
+
+## 12. Knowledge and Research Workflow
+
+Probe should not integrate with Apple or third-party utilities from memory alone.
+
+Rules:
+
+- check `knowledge/` first
+- reuse or extend an existing research pack when possible
+- create a new pack only when the seam is not already covered
+- prefer official docs and primary sources
+- capture best practices, caveats, and relevant APIs
+- cite the pack used in work item notes and later implementation work
+
+Expected reusable pack areas already identified:
+
+- `effect-cli-daemon`
+- `xcuitest-runner`
+- `xctrace-instruments`
+- `lldb-python`
+- `devicectl-device-signing`
+- `simctl-xcodebuild-session-control`
+- `oslog-simctl-media`
+
+## 13. Open Questions
+
+These remain live and should be answered through spikes and research.
+
+1. **Runner lifecycle model**
+   - Can a single XCUITest test case remain alive as a command server across multiple requests?
+
+2. **XCUIApplication attach semantics**
+   - Can the runner reliably attach to an already-launched app on Simulator and real devices without relaunching it?
+
+3. **`xctrace export` schema shape**
+   - What tables and columns are available per Instruments template?
+
+4. **Real-device runner signing independence**
+   - How independent can the Probe runner be from the target app's signing and team setup?
+
+5. **Runner ↔ host communication transport**
+   - Should the runner use stdout JSONL or a local socket?
+
+6. **`devicectl` reliability on the current macOS/Xcode stack**
+   - Is retry/fallback logic mandatory for production use?
+
+7. **LLDB Python bridge stability over long sessions**
+   - Are there gotchas around crashes, signal handling, and target restarts?
+
+8. **AX tree fidelity for 3D / custom-rendered content**
+   - Will Metal, SceneKit, SpriteKit, or RealityKit apps expose sufficient accessibility structure?
+
+9. **Tool coexistence**
+   - Can runner, `xctrace`, and LLDB operate concurrently without destabilizing the target session?
+
+10. **Large AX tree latency**
+   - Are full snapshots fast enough, or should Probe default to more selective views?
+
+## 14. Known Walls
+
+These are currently known product limits imposed by public Apple tooling.
+
+1. **Per-shader GPU time attribution**
+   - Not available through `xctrace` CLI export.
+   - True per-shader attribution requires Xcode GUI Metal debugging.
+
+2. **Metal GPU frame capture**
+   - There is no equivalent fully supported CLI workflow for the Xcode GPU frame debugger experience.
+
+3. **Some GUI-only Instruments analyses**
+   - Certain higher-level analyses exist only in Xcode GUI views.
+
+4. **Real-device clipboard parity**
+   - Simulator has stronger CLI support than real devices.
+
+5. **Real-device network conditioning parity**
+   - Real-device network throttling lacks a clean CLI path comparable to Simulator workflows.
+
+Probe should state these walls explicitly in command output where relevant.
+
+## 15. Delivery Strategy
+
+Recommended sequence:
+
+### Phase 0: research and feasibility
+
+- research packs for Effect/CLI, XCUITest, `xctrace`, LLDB, device signing, and logs/media
+- runner lifecycle spike
+- XCUI attach spike
+- runner transport spike
+- `xctrace` schema mapping spike
+- LLDB bridge spike
+- device signing and `devicectl` spike
+- coexistence spike
+- large AX tree performance spike
+
+### Phase 1: daemon skeleton
+
+- daemon kernel
+- RPC protocol
+- session registry
+- artifact store base
+- output policy
+
+### Phase 2: Simulator vertical slice
+
+- session open
+- runner handshake
+- basic snapshot
+- session health
+
+### Phase 3: core interaction surface
+
+- snapshot diffing
+- stable refs
+- actions
+- screenshots
+- logs
+
+### Phase 4: replay and validation
+
+- recording
+- replay
+- fixture app / harness
+- regression contracts
+
+### Phase 5: performance and debugging
+
+- `xctrace` record / export / summaries
+- LLDB attach / eval / vars / backtrace
+
+### Phase 6: real-device support and operability
+
+- device sessions
+- reconnect / cleanup / diagnostics
+- capability reporting
+
+## 16. Delegation Guidance
+
+Work items alone are not enough for larger delegated implementation.
+
+For meaningful delegation, a subagent should usually have:
+
+1. the active work item
+2. this architecture document
+3. the relevant `knowledge/<topic>/` pack
+4. explicit instruction to load the `effect` skill for CLI/daemon work
+
+Why this matters:
+
+- work items capture acceptance and sequence
+- research packs capture external evidence and best practices
+- this file captures the whole-system shape and design intent
+
+Together they provide a much better handoff surface than any one of them alone.
+
+## 17. Current Recommendation
+
+The current architecture can be summarized as:
+
+> Probe is a daemon-hosted Effect kernel supervising scoped device/app sessions, with typed JSONL bridges to runner and debugger subprocesses, explicit capability and error reporting, and a first-class artifact/output subsystem designed for agent token efficiency.
