@@ -307,8 +307,8 @@ const resolveSelectedDevice = (args: {
 
 const extractConfiguredDevelopmentTeams = (content: string): ReadonlyArray<string> =>
   dedupeStrings(
-    [...content.matchAll(/DEVELOPMENT_TEAM = "([^"]*)";/g)]
-      .map((match) => match[1]?.trim() ?? "")
+    [...content.matchAll(/DEVELOPMENT_TEAM = (?:(?:"([^"]*)")|([A-Za-z0-9]+));/g)]
+      .map((match) => match[1]?.trim() ?? match[2]?.trim() ?? "")
       .filter((value) => value.length > 0),
   )
 
