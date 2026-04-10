@@ -30,7 +30,7 @@
 		661F3EAC5080A5207E98132A /* AttachControlSpikeUITests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = AttachControlSpikeUITests.swift; path = ../ProbeRunner/AttachControlSpikeUITests.swift; sourceTree = "<group>"; };
 		6FB7049F7168A3A8FE7824FE /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; name = Info.plist; path = ProbeFixture/Info.plist; sourceTree = "<group>"; };
 		9647B2561CAF81012D2BEC7C /* FixtureViewController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = FixtureViewController.swift; path = ProbeFixture/FixtureViewController.swift; sourceTree = "<group>"; };
-		A1EB8BFAFFA9F1C02F7F5006 /* ProbeFixture.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = ProbeFixture.app; path = ProbeFixture.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1EB8BFAFFA9F1C02F7F5006 /* ProbeFixture.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProbeFixture.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CF72ACD14B4FCA6478E2340E /* ProbeRunnerUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ProbeRunnerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -154,8 +154,14 @@
 				LastSwiftUpdateCheck = 2600;
 				LastUpgradeCheck = 2600;
 				TargetAttributes = {
+					AE6AE876E19BFF4030967AAA = {
+						DevelopmentTeam = 4452968868;
+						ProvisioningStyle = Automatic;
+					};
 					C6BEF88323EE551A9FF34BA9 = {
 						CreatedOnToolsVersion = 26.3;
+						DevelopmentTeam = 4452968868;
+						ProvisioningStyle = Automatic;
 						TestTargetID = AE6AE876E19BFF4030967AAA;
 					};
 				};
@@ -169,8 +175,6 @@
 				Base,
 			);
 			mainGroup = E88D1E0608525669D2BF403C;
-			minimizedProjectReferenceProxies = 0;
-			preferredProjectObjectVersion = 77;
 			productRefGroup = 90644A048DC79966A70C0FA8 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -236,7 +240,7 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 4452968868;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ProbeFixture/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -257,7 +261,7 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 4452968868;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ../ProbeRunner/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -320,8 +324,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_COMPILATION_MODE = wholemodule;
-				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_OPTIMIZATION_LEVEL = "-Owholemodule";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
@@ -394,7 +397,7 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 4452968868;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ../ProbeRunner/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -417,7 +420,7 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 4452968868;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ProbeFixture/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
