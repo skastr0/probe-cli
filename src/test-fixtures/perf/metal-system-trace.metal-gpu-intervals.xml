@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[100]'>
+    <schema name="metal-gpu-intervals">
+      <col><mnemonic>start</mnemonic><name>Creation</name><engineering-type>start-time</engineering-type></col>
+      <col><mnemonic>duration</mnemonic><name>Duration</name><engineering-type>duration</engineering-type></col>
+      <col><mnemonic>channel-name</mnemonic><name>Channel Name</name><engineering-type>gpu-channel-name</engineering-type></col>
+      <col><mnemonic>frame-number</mnemonic><name>Frame</name><engineering-type>gpu-frame-number</engineering-type></col>
+      <col><mnemonic>start-latency</mnemonic><name>CPU to GPU Latency</name><engineering-type>duration</engineering-type></col>
+      <col><mnemonic>event-depth</mnemonic><name>Depth</name><engineering-type>metal-nesting-level</engineering-type></col>
+      <col><mnemonic>event-label</mnemonic><name>Label</name><engineering-type>formatted-label</engineering-type></col>
+      <col><mnemonic>state</mnemonic><name>State</name><engineering-type>gpu-state</engineering-type></col>
+      <col><mnemonic>connection-UUID</mnemonic><name>Connection UUID</name><engineering-type>connection-uuid64</engineering-type></col>
+      <col><mnemonic>color</mnemonic><name>Color</name><engineering-type>render-buffer-depth</engineering-type></col>
+      <col><mnemonic>process</mnemonic><name>Process</name><engineering-type>process</engineering-type></col>
+      <col><mnemonic>gpu</mnemonic><name>Metal Device</name><engineering-type>metal-device-name</engineering-type></col>
+      <col><mnemonic>channel-subtitle</mnemonic><name>Channel Subtitle</name><engineering-type>metal-object-label</engineering-type></col>
+      <col><mnemonic>iosurface-accesses</mnemonic><name>IOSurface Accesses</name><engineering-type>formatted-label</engineering-type></col>
+      <col><mnemonic>bytes</mnemonic><name>Bytes</name><engineering-type>size-in-bytes</engineering-type></col>
+      <col><mnemonic>cmdbuffer-id</mnemonic><name>Commmand Buffer Id</name><engineering-type>metal-command-buffer-id</engineering-type></col>
+      <col><mnemonic>encoder-id</mnemonic><name>Encoder Id</name><engineering-type>metal-command-buffer-id</engineering-type></col>
+      <col><mnemonic>gpu-submission-id</mnemonic><name>GPU Submission Id</name><engineering-type>uint64</engineering-type></col>
+    </schema>
+    <row><start-time fmt="00:00.358.223">358223833</start-time><duration fmt="6.08 µs">6083</duration><gpu-channel-name fmt="Blit">Blit</gpu-channel-name><sentinel/><duration fmt="1.12 ms">1117250</duration><metal-nesting-level fmt="0">0</metal-nesting-level><formatted-label fmt="GPU Execution      ( WindowServer (181) )  0x47e7a1bb">GPU Execution      ( WindowServer (181) )  0x47e7a1bb</formatted-label><gpu-state fmt="Active">Active</gpu-state><connection-uuid64 fmt="1">1</connection-uuid64><render-buffer-depth fmt="0">0</render-buffer-depth><process fmt="WindowServer (181)"><pid fmt="181">181</pid></process><metal-device-name fmt="Apple M-series GPU">Apple M-series GPU</metal-device-name><metal-object-label fmt="n/a">n/a</metal-object-label><formatted-label fmt="n/a">n/a</formatted-label><size-in-bytes fmt="0 B">0</size-in-bytes><metal-command-buffer-id fmt="0xa79439f">175719327</metal-command-buffer-id><metal-command-buffer-id fmt="0xa7943b4">175719348</metal-command-buffer-id><uint64 fmt="1.206.362.555">1206362555</uint64></row>
+    <row><start-time fmt="00:00.360.280">360280208</start-time><duration fmt="18.92 µs">18917</duration><gpu-channel-name fmt="Compute">Compute</gpu-channel-name><sentinel/><duration fmt="3.13 ms">3129458</duration><metal-nesting-level fmt="0">0</metal-nesting-level><formatted-label fmt="GPU Execution      ( WindowServer (181) )  0x47e7a1c6">GPU Execution      ( WindowServer (181) )  0x47e7a1c6</formatted-label><gpu-state fmt="Active">Active</gpu-state><connection-uuid64 fmt="13">13</connection-uuid64><render-buffer-depth fmt="0">0</render-buffer-depth><process fmt="WindowServer (181)"><pid fmt="181">181</pid></process><metal-device-name fmt="Apple M-series GPU">Apple M-series GPU</metal-device-name><metal-object-label fmt="n/a">n/a</metal-object-label><formatted-label fmt="n/a">n/a</formatted-label><size-in-bytes fmt="0 B">0</size-in-bytes><metal-command-buffer-id fmt="0xa7943b8">175719352</metal-command-buffer-id><metal-command-buffer-id fmt="0xa7943b8">175719352</metal-command-buffer-id><uint64 fmt="1.206.362.566">1206362566</uint64></row>
+  </node>
+</trace-query-result>

@@ -1,0 +1,13 @@
+{
+  "kind": "response",
+  "sequence": 2,
+  "ok": true,
+  "action": "snapshot",
+  "payload": "snapshot-captured",
+  "snapshotPayloadPath": "/tmp/probe/contracts/runner/runtime-control/snapshot-002.json",
+  "handledMs": 137,
+  "statusLabel": "Ready for attach/control validation",
+  "snapshotNodeCount": 94,
+  "recordedAt": "2026-04-10T17:27:51.503Z",
+  "hostObservedAt": "2026-04-10T17:27:51.550792Z"
+}

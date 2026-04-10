@@ -1,0 +1,143 @@
+{
+  "capturedAt": "2026-04-10T05:53:59.167Z",
+  "statusLabel": "Detail view active",
+  "metrics": {
+    "rawNodeCount": 11,
+    "prunedNodeCount": 11,
+    "interactiveNodeCount": 2
+  },
+  "root": {
+    "type": "application",
+    "label": "ProbeFixture",
+    "interactive": false,
+    "children": [
+      {
+        "type": "window",
+        "frame": {
+          "x": 0,
+          "y": 0,
+          "width": 402,
+          "height": 874
+        },
+        "interactive": false,
+        "children": [
+          {
+            "type": "other",
+            "frame": {
+              "x": 0,
+              "y": 0,
+              "width": 402,
+              "height": 874
+            },
+            "interactive": false,
+            "children": [
+              {
+                "type": "navigationBar",
+                "identifier": "Detail",
+                "frame": {
+                  "x": 0,
+                  "y": 62,
+                  "width": 402,
+                  "height": 54
+                },
+                "interactive": false,
+                "children": [
+                  {
+                    "type": "button",
+                    "identifier": "BackButton",
+                    "label": "Probe Fixture",
+                    "frame": {
+                      "x": 16,
+                      "y": 62,
+                      "width": 44,
+                      "height": 44
+                    },
+                    "interactive": true,
+                    "children": []
+                  },
+                  {
+                    "type": "staticText",
+                    "label": "Detail",
+                    "frame": {
+                      "x": 178,
+                      "y": 74,
+                      "width": 46,
+                      "height": 21
+                    },
+                    "interactive": false,
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "other",
+                "identifier": "fixture.detail.view",
+                "frame": {
+                  "x": 0,
+                  "y": 0,
+                  "width": 402,
+                  "height": 874
+                },
+                "interactive": false,
+                "children": [
+                  {
+                    "type": "staticText",
+                    "identifier": "fixture.detail.label",
+                    "label": "Detail view active",
+                    "frame": {
+                      "x": 20,
+                      "y": 148,
+                      "width": 362,
+                      "height": 26
+                    },
+                    "interactive": false,
+                    "children": []
+                  },
+                  {
+                    "type": "staticText",
+                    "identifier": "fixture.detail.summaryLabel",
+                    "label": "Ready for attach/control validation",
+                    "frame": {
+                      "x": 20,
+                      "y": 190,
+                      "width": 362,
+                      "height": 20
+                    },
+                    "interactive": false,
+                    "children": []
+                  },
+                  {
+                    "type": "button",
+                    "identifier": "fixture.detail.popButton",
+                    "label": "Pop Detail",
+                    "frame": {
+                      "x": 20,
+                      "y": 235,
+                      "width": 102,
+                      "height": 34
+                    },
+                    "interactive": true,
+                    "children": [
+                      {
+                        "type": "staticText",
+                        "label": "Pop Detail",
+                        "frame": {
+                          "x": 32,
+                          "y": 242,
+                          "width": 78,
+                          "height": 20
+                        },
+                        "interactive": false,
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

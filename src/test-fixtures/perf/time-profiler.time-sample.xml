@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[3]'>
+    <schema name="time-sample">
+      <col><mnemonic>time</mnemonic><name>Timestamp</name><engineering-type>sample-time</engineering-type></col>
+      <col><mnemonic>thread</mnemonic><name>Thread</name><engineering-type>thread</engineering-type></col>
+      <col><mnemonic>core-index</mnemonic><name>Core Index</name><engineering-type>core</engineering-type></col>
+      <col><mnemonic>thread-state</mnemonic><name>Thread State</name><engineering-type>thread-state</engineering-type></col>
+      <col><mnemonic>cp-kernel-callstack</mnemonic><name>Kernel Callstack ID</name><engineering-type>kperf-bt</engineering-type></col>
+      <col><mnemonic>cp-user-callstack</mnemonic><name>User Callstack ID</name><engineering-type>kperf-bt</engineering-type></col>
+      <col><mnemonic>sample-type</mnemonic><name>Sample type</name><engineering-type>time-sample-kind</engineering-type></col>
+    </schema>
+    <row><sample-time id="1" fmt="00:00.359.163">359163375</sample-time><thread id="2" fmt="Main Thread 0x1aa38f3 (ProbeFixture, pid: 45472)"><tid id="3" fmt="0x1aa38f3">27932915</tid><process id="4" fmt="ProbeFixture (45472)"><pid id="5" fmt="45472">45472</pid><device-session id="6" fmt="TODO">TODO</device-session></process></thread><sentinel/><thread-state id="7" fmt="Blocked">Blocked</thread-state><sentinel/><kperf-bt id="8" fmt="PC:0x1010fcb70, 14 frames, 1 regs, pid: 45472"><text-addresses id="9" fmt="frag 2">4312812560 4312780516 6446996692 6446993036 6446972348 6756501948 6547350020 6547366956 6532888248 4310260344 4310260204 4310260564 4310651856 4313582932</text-addresses><text-address id="10" fmt="0x1010fcb70">4312779632</text-address><process ref="4"/><register-content id="11" fmt="0x0">0</register-content></kperf-bt><time-sample-kind id="12" fmt="Stackshot">3</time-sample-kind></row>
+    <row><sample-time ref="1"/><thread id="13" fmt="com.apple.uikit.eventfetch-thread 0x1aa3925 (ProbeFixture, pid: 45472)"><tid id="14" fmt="0x1aa3925">27932965</tid><process ref="4"/></thread><sentinel/><thread-state ref="7"/><sentinel/><kperf-bt id="15" fmt="PC:0x1010fcb70, 10 frames, 1 regs, pid: 45472"><text-addresses id="16" fmt="frag 5">4312812560 4312780516 6446996692 6446993036 6446972348 6460325712 6460326256 6544562328 6460485148 4311967148</text-addresses><text-address ref="10"/><process ref="4"/><register-content id="17" fmt="0x101031998">4311947672</register-content></kperf-bt><time-sample-kind ref="12"/></row>
+    <row><sample-time ref="1"/><thread id="18" fmt="ProbeFixture 0x1aa3927 (ProbeFixture, pid: 45472)"><tid id="19" fmt="0x1aa3927">27932967</tid><process ref="4"/></thread><sentinel/><thread-state ref="7"/><sentinel/><kperf-bt id="20" fmt="PC:0x1010fe68c, 1 frames, 0 regs, pid: 45472"><text-addresses id="21" fmt="frag 8">4312786572</text-addresses><text-address id="22" fmt="0x1010fe68c">4312786572</text-address><process ref="4"/></kperf-bt><time-sample-kind ref="12"/></row>
+    <row><sample-time ref="1"/><thread id="23" fmt="ProbeFixture 0x1aa3c7a (ProbeFixture, pid: 45472)"><tid id="24" fmt="0x1aa3c7a">27933818</tid><process ref="4"/></thread><sentinel/><thread-state ref="7"/><sentinel/><kperf-bt ref="20"/><time-sample-kind ref="12"/></row>
+    <row><sample-time ref="1"/><thread ref="23"/><sentinel/><thread-state ref="7"/><sentinel/><kperf-bt ref="20"/><time-sample-kind ref="12"/></row>
+  </node>
+</trace-query-result>

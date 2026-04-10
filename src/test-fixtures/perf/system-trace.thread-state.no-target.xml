@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[4]'>
+    <schema name="thread-state">
+      <col><mnemonic>start</mnemonic><name>Start Time</name><engineering-type>start-time</engineering-type></col>
+      <col><mnemonic>thread</mnemonic><name>Thread</name><engineering-type>thread</engineering-type></col>
+      <col><mnemonic>state</mnemonic><name>State</name><engineering-type>thread-state</engineering-type></col>
+      <col><mnemonic>duration</mnemonic><name>Duration</name><engineering-type>duration</engineering-type></col>
+      <col><mnemonic>process</mnemonic><name>Process</name><engineering-type>process</engineering-type></col>
+      <col><mnemonic>core</mnemonic><name>Core</name><engineering-type>core</engineering-type></col>
+      <col><mnemonic>cputime</mnemonic><name>Running Time</name><engineering-type>duration-on-core</engineering-type></col>
+      <col><mnemonic>waittime</mnemonic><name>Wait Time</name><engineering-type>duration-waiting</engineering-type></col>
+      <col><mnemonic>priority</mnemonic><name>Priority</name><engineering-type>sched-priority</engineering-type></col>
+      <col><mnemonic>note</mnemonic><name>Note</name><engineering-type>narrative</engineering-type></col>
+      <col><mnemonic>summary</mnemonic><name>Summary</name><engineering-type>narrative</engineering-type></col>
+    </schema>
+    <row><start-time id="1" fmt="00:00.000.000">0</start-time><thread id="2" fmt="VM_compressor 0x65f (kernel.release.t8103, pid: 0)"><tid id="3" fmt="0x65f">1631</tid><process id="4" fmt="kernel.release.t8103 (0)"><pid id="5" fmt="0">0</pid><device-session id="6" fmt="TODO">TODO</device-session></process></thread><thread-state id="7" fmt="Running">Running</thread-state><duration id="8" fmt="4.25 ms">4254041</duration><process ref="4"/><sentinel/><sentinel/><sentinel/><sched-priority id="9" fmt="91">91</sched-priority><sentinel/><narrative id="10" fmt="Running  at priority  91"><thread-state ref="7"/><narrative-text id="11" fmt=" at priority "> at priority </narrative-text><sched-priority ref="9"/></narrative></row>
+    <row><start-time ref="1"/><thread id="12" fmt="Main Thread 0x1577 (Google Chrome Helper, pid: 565)"><tid id="13" fmt="0x1577">5495</tid><process id="14" fmt="Google Chrome Helper (565)"><pid id="15" fmt="565">565</pid><device-session ref="6"/></process></thread><thread-state ref="7"/><duration id="16" fmt="9.19 ms">9193333</duration><process ref="14"/><sentinel/><sentinel/><sentinel/><sched-priority id="17" fmt="47">47</sched-priority><sentinel/><narrative id="18" fmt="Running  at priority  47"><thread-state ref="7"/><narrative-text ref="11"/><sched-priority ref="17"/></narrative></row>
+    <row><start-time ref="1"/><thread id="19" fmt="0x1aa468c (&lt;Unknown&gt;, pid: 46259)"><tid id="20" fmt="0x1aa468c">27936396</tid><process id="21" fmt="Process (46259)"><pid id="22" fmt="46259">46259</pid><device-session ref="6"/></process></thread><thread-state id="23" fmt="Unknown">Unknown</thread-state><duration id="24" fmt="2.05 s">2046771526</duration><process ref="21"/><sentinel/><sentinel/><sentinel/><sched-priority id="25" fmt="0">0</sched-priority><sentinel/><narrative id="26" fmt="Unknown"><thread-state ref="23"/></narrative></row>
+  </node>
+</trace-query-result>

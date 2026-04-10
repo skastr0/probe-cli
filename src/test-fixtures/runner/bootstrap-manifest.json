@@ -1,0 +1,9 @@
+{
+  "contractVersion": "probe.runner.transport/hybrid-v1",
+  "controlDirectoryPath": "/tmp/probe/contracts/runner/runtime-control",
+  "egressTransport": "stdout-jsonl-mixed-log",
+  "generatedAt": "2026-04-10T17:27:44.000Z",
+  "ingressTransport": "file-mailbox",
+  "sessionIdentifier": "fixture-session",
+  "simulatorUdid": "SIM-UDID-1234"
+}

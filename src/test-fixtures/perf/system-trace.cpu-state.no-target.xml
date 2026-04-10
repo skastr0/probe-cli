@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[8]'>
+    <schema name="cpu-state">
+      <col><mnemonic>start</mnemonic><name>Start Time</name><engineering-type>start-time</engineering-type></col>
+      <col><mnemonic>cpu</mnemonic><name>CPU</name><engineering-type>core</engineering-type></col>
+      <col><mnemonic>state</mnemonic><name>State</name><engineering-type>core-state</engineering-type></col>
+      <col><mnemonic>duration</mnemonic><name>Duration</name><engineering-type>duration</engineering-type></col>
+      <col><mnemonic>process</mnemonic><name>Process</name><engineering-type>process</engineering-type></col>
+      <col><mnemonic>thread</mnemonic><name>Thread</name><engineering-type>thread</engineering-type></col>
+      <col><mnemonic>priority</mnemonic><name>Priority</name><engineering-type>sched-priority</engineering-type></col>
+    </schema>
+    <row><start-time id="1" fmt="00:00.004.191">4191750</start-time><core id="2" fmt="CPU 4">4</core><core-state id="3" fmt="Running">Running</core-state><duration id="4" fmt="17.12 µs">17125</duration><process id="5" fmt="kernel.release.t8103 (0)"><pid id="6" fmt="0">0</pid><device-session id="7" fmt="TODO">TODO</device-session></process><thread id="8" fmt="VM_pageout_scan 0x65 (kernel.release.t8103, pid: 0)"><tid id="9" fmt="0x65">101</tid><process ref="5"/></thread><sched-priority id="10" fmt="91">91</sched-priority></row>
+    <row><start-time id="11" fmt="00:00.004.195">4195583</start-time><core id="12" fmt="CPU 6">6</core><core-state ref="3"/><duration id="13" fmt="875 ns">875</duration><process ref="5"/><thread id="14" fmt="idle #6 0x1e3 (kernel.release.t8103, pid: 0)"><tid id="15" fmt="0x1e3">483</tid><process ref="5"/></thread><sched-priority id="16" fmt="0">0</sched-priority></row>
+    <row><start-time id="17" fmt="00:00.004.210">4210291</start-time><core ref="2"/><core-state ref="3"/><duration id="18" fmt="10.92 µs">10917</duration><process id="19" fmt="launchd_sim (30590)"><pid id="20" fmt="30590">30590</pid><device-session ref="7"/></process><thread id="21" fmt="launchd_sim 0x1aa3a69 (launchd_sim, pid: 30590)"><tid id="22" fmt="0x1aa3a69">27933289</tid><process ref="19"/></thread><sched-priority id="23" fmt="46">46</sched-priority></row>
+  </node>
+</trace-query-result>
