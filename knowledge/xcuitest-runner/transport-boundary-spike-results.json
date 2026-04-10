@@ -1,0 +1,243 @@
+{
+  "generatedAt": "2026-04-10T03:11:56.380462Z",
+  "simulatorUdid": "4015AB8A-185C-4334-8019-EBDE113852E5",
+  "derivedDataPath": "/tmp/probe-runner-transport-derived-data.ljtMv8",
+  "resultBundlePath": "/tmp/probe-runner-transport-derived-data.ljtMv8/ProbeRunnerTransportBoundary.xcresult",
+  "stdoutArtifactControlDir": "/tmp/probe-runner-transport-boundary.MUrGCI",
+  "runnerFileControlDir": "/tmp/probe-runner-runtime-control.TEWA7c",
+  "logPath": "/tmp/probe-runner-transport-derived-data.ljtMv8/probe-runner-transport-boundary.log",
+  "stdoutEventsPath": "/tmp/probe-runner-transport-boundary.MUrGCI/stdout-events.ndjson",
+  "selectedTransport": {
+    "contract": "probe.runner.transport/hybrid-v1",
+    "bootstrapSource": "simulator-bootstrap-manifest",
+    "bootstrapPath": "/tmp/probe-runner-bootstrap/4015AB8A-185C-4334-8019-EBDE113852E5.json",
+    "ingress": "file-mailbox",
+    "egress": "stdout-jsonl-mixed-log",
+    "sessionIdentifier": "probe-runner-runtime-control.TEWA7c"
+  },
+  "ready": {
+    "fileReadySeenMs": 1775790716673,
+    "stdoutReadySeenMs": 1775790716478,
+    "stdoutMinusFileMs": -195,
+    "fileReady": {
+      "bootstrapPath": "/tmp/probe-runner-bootstrap/4015AB8A-185C-4334-8019-EBDE113852E5.json",
+      "processIdentifier": 64521,
+      "controlDirectoryPath": "/tmp/probe-runner-runtime-control.TEWA7c",
+      "kind": "ready",
+      "currentDirectoryPath": "/",
+      "bootstrapSource": "simulator-bootstrap-manifest",
+      "simulatorUdid": "4015AB8A-185C-4334-8019-EBDE113852E5",
+      "egressTransport": "stdout-jsonl-mixed-log",
+      "attachLatencyMs": 1103,
+      "ingressTransport": "file-mailbox",
+      "runnerTransportContract": "probe.runner.transport/hybrid-v1",
+      "sessionIdentifier": "probe-runner-runtime-control.TEWA7c",
+      "recordedAt": "2026-04-10T03:11:56.374Z",
+      "initialStatusLabel": "Ready for attach/control validation",
+      "homeDirectoryPath": "/Users/guilhermecastro/Library/Developer/CoreSimulator/Devices/4015AB8A-185C-4334-8019-EBDE113852E5/data/Containers/Data/Application/D453534F-0E8F-4ECD-87E1-B4F8FBA8DE7E"
+    },
+    "stdoutReadyEvent": {
+      "homeDirectoryPath": "/Users/guilhermecastro/Library/Developer/CoreSimulator/Devices/4015AB8A-185C-4334-8019-EBDE113852E5/data/Containers/Data/Application/D453534F-0E8F-4ECD-87E1-B4F8FBA8DE7E",
+      "egressTransport": "stdout-jsonl-mixed-log",
+      "initialStatusLabel": "Ready for attach/control validation",
+      "bootstrapSource": "simulator-bootstrap-manifest",
+      "kind": "ready",
+      "ingressTransport": "file-mailbox",
+      "recordedAt": "2026-04-10T03:11:56.374Z",
+      "processIdentifier": 64521,
+      "bootstrapPath": "/tmp/probe-runner-bootstrap/4015AB8A-185C-4334-8019-EBDE113852E5.json",
+      "runnerTransportContract": "probe.runner.transport/hybrid-v1",
+      "controlDirectoryPath": "/tmp/probe-runner-runtime-control.TEWA7c",
+      "currentDirectoryPath": "/",
+      "attachLatencyMs": 1103,
+      "simulatorUdid": "4015AB8A-185C-4334-8019-EBDE113852E5",
+      "sessionIdentifier": "probe-runner-runtime-control.TEWA7c",
+      "hostObservedAt": "2026-04-10T03:11:56.380462Z"
+    }
+  },
+  "stdinProbe": {
+    "kind": "stdin-probe-result",
+    "recordedAt": "2026-04-10T03:12:01.380Z",
+    "status": "timeout",
+    "hostObservedAt": "2026-04-10T03:12:01.383513Z"
+  },
+  "commands": [
+    {
+      "sequence": 1,
+      "action": "ping",
+      "idleGapBeforeMs": 0,
+      "fileHostRttMs": 1292,
+      "stdoutHostRttMs": 1418,
+      "stdoutMinusFileMs": 126,
+      "fileResponse": {
+        "kind": "response",
+        "recordedAt": "2026-04-10T03:12:02.655Z",
+        "action": "ping",
+        "statusLabel": "Ready for attach/control validation",
+        "payload": "pong:boundary-probe-1",
+        "ok": true,
+        "handledMs": 1094,
+        "sequence": 1
+      },
+      "stdoutResponseEvent": {
+        "payload": "pong:boundary-probe-1",
+        "sequence": 1,
+        "statusLabel": "Ready for attach/control validation",
+        "ok": true,
+        "recordedAt": "2026-04-10T03:12:02.655Z",
+        "action": "ping",
+        "kind": "response",
+        "handledMs": 1094,
+        "hostObservedAt": "2026-04-10T03:12:02.682736Z"
+      }
+    },
+    {
+      "sequence": 2,
+      "action": "ping",
+      "idleGapBeforeMs": 1000,
+      "fileHostRttMs": 1303,
+      "stdoutHostRttMs": 1425,
+      "stdoutMinusFileMs": 122,
+      "fileResponse": {
+        "handledMs": 1095,
+        "payload": "pong:boundary-probe-2",
+        "statusLabel": "Ready for attach/control validation",
+        "recordedAt": "2026-04-10T03:12:05.202Z",
+        "action": "ping",
+        "ok": true,
+        "sequence": 2,
+        "kind": "response"
+      },
+      "stdoutResponseEvent": {
+        "ok": true,
+        "payload": "pong:boundary-probe-2",
+        "kind": "response",
+        "action": "ping",
+        "sequence": 2,
+        "statusLabel": "Ready for attach/control validation",
+        "recordedAt": "2026-04-10T03:12:05.202Z",
+        "handledMs": 1095,
+        "hostObservedAt": "2026-04-10T03:12:05.226079Z"
+      }
+    },
+    {
+      "sequence": 3,
+      "action": "snapshot",
+      "idleGapBeforeMs": 1000,
+      "fileHostRttMs": 226,
+      "stdoutHostRttMs": 360,
+      "stdoutMinusFileMs": 134,
+      "fileResponse": {
+        "kind": "response",
+        "sequence": 3,
+        "payload": "snapshot-captured",
+        "recordedAt": "2026-04-10T03:12:06.705Z",
+        "action": "snapshot",
+        "snapshotNodeCount": 172,
+        "statusLabel": "Ready for attach/control validation",
+        "handledMs": 65,
+        "ok": true
+      },
+      "stdoutResponseEvent": {
+        "kind": "response",
+        "sequence": 3,
+        "payload": "snapshot-captured",
+        "recordedAt": "2026-04-10T03:12:06.705Z",
+        "action": "snapshot",
+        "snapshotNodeCount": 172,
+        "statusLabel": "Ready for attach/control validation",
+        "handledMs": 65,
+        "ok": true,
+        "hostObservedAt": "2026-04-10T03:12:06.730596Z"
+      }
+    },
+    {
+      "sequence": 4,
+      "action": "ping",
+      "idleGapBeforeMs": 1000,
+      "fileHostRttMs": 1278,
+      "stdoutHostRttMs": 1404,
+      "stdoutMinusFileMs": 126,
+      "fileResponse": {
+        "action": "ping",
+        "ok": true,
+        "statusLabel": "Ready for attach/control validation",
+        "kind": "response",
+        "handledMs": 1089,
+        "payload": "pong:boundary-probe-3",
+        "recordedAt": "2026-04-10T03:12:09.253Z",
+        "sequence": 4
+      },
+      "stdoutResponseEvent": {
+        "action": "ping",
+        "statusLabel": "Ready for attach/control validation",
+        "ok": true,
+        "handledMs": 1089,
+        "payload": "pong:boundary-probe-3",
+        "sequence": 4,
+        "recordedAt": "2026-04-10T03:12:09.253Z",
+        "kind": "response",
+        "hostObservedAt": "2026-04-10T03:12:09.277826Z"
+      }
+    },
+    {
+      "sequence": 5,
+      "action": "shutdown",
+      "idleGapBeforeMs": 0,
+      "fileHostRttMs": 184,
+      "stdoutHostRttMs": 308,
+      "stdoutMinusFileMs": 124,
+      "fileResponse": {
+        "kind": "response",
+        "handledMs": 0,
+        "sequence": 5,
+        "statusLabel": "Ready for attach/control validation",
+        "payload": "shutdown-ack",
+        "recordedAt": "2026-04-10T03:12:09.610Z",
+        "ok": true,
+        "action": "shutdown"
+      },
+      "stdoutResponseEvent": {
+        "action": "shutdown",
+        "statusLabel": "Ready for attach/control validation",
+        "ok": true,
+        "handledMs": 0,
+        "payload": "shutdown-ack",
+        "sequence": 5,
+        "recordedAt": "2026-04-10T03:12:09.610Z",
+        "kind": "response",
+        "hostObservedAt": "2026-04-10T03:12:09.639866Z"
+      }
+    }
+  ],
+  "fileBoundary": {
+    "count": 5,
+    "minMs": 184,
+    "maxMs": 1303,
+    "avgMs": 856.6
+  },
+  "stdoutBoundary": {
+    "count": 5,
+    "minMs": 308,
+    "maxMs": 1425,
+    "avgMs": 983.0
+  },
+  "stdoutMinusFile": {
+    "count": 5,
+    "minMs": 122,
+    "maxMs": 134,
+    "avgMs": 126.4
+  },
+  "conclusion": {
+    "validated": [
+      "Structured runner frames survive the xcodebuild-launched XCUITest runner boundary as mixed stdout log lines.",
+      "The host can demultiplex ready and response frames from the xcodebuild/XCTest log stream.",
+      "A simulator bootstrap manifest can carry a per-session file-mailbox control directory into the runner without relying on ad hoc shell environment injection."
+    ],
+    "notValidated": [
+      "A pure dedicated JSONL stdout channel with no surrounding log noise.",
+      "Host-to-runner stdin delivery through xcodebuild.",
+      "A clean real-device equivalent for the shared file ingress path."
+    ]
+  }
+}

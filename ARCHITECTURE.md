@@ -82,12 +82,13 @@ This is a core product feature, not a nice-to-have formatting choice.
 
 ### 3.5 Effect-native runtime model
 
-The host should use:
+The host should use one root Effect runtime per daemon process, but it should not treat `ManagedRuntime` as the daemon's internal orchestration primitive.
 
-- a single `ManagedRuntime`
-- `Layer.scoped` for long-lived resources
-- typed services and schemas
-- structured fiber lifecycles
+- `probe serve` should ultimately launch a layer-shaped daemon with `NodeRuntime.runMain(Layer.launch(ProbeDaemonLive))`.
+- daemon-owned services should live in shared layers.
+- session-owned resources should live in child scoped services opened by the session registry.
+- request-local resources should use `Effect.acquireRelease` or other local scoped effects.
+- `ManagedRuntime` is reserved for boundary use such as tests, adapter callbacks, or embedding Effect into non-Effect code.
 
 Avoid per-command `Effect.provide(...)` trees that recreate stateful services and fragment process-local state.
 
@@ -113,6 +114,17 @@ The runner:
 
 ## 5. System Planes
 
+The planes are distinct, but they are not peers from an ownership perspective. The control plane owns daemon lifecycle and session scopes. Bridge resources are session children. Tool wrappers are infrastructure services. Artifact and output services are shared daemon services used by every other plane.
+
+The canonical top-level service map is:
+
+| Plane | Canonical services | Lifetime | Ownership rule |
+| --- | --- | --- | --- |
+| Control | `ProbeDaemon`, `RpcServer`, `ProbeKernel`, `SessionRegistry`, `CapabilityService` | daemon | Owns socket lifecycle, session creation, shutdown, and health reporting. |
+| Bridge | `RunnerBridgeFactory`, `LldbBridgeFactory`, session `RunnerBridge`, session `LldbBridge` | shared factories + session instances | Factories are daemon services; live bridge processes belong to a session scope. |
+| Tooling | `Simctl`, `Devicectl`, `Xcodebuild`, `Xctrace`, `OsLog` wrappers | daemon services with request/session operations | Wrappers expose typed operations; they do not own session policy by themselves. |
+| Artifact / output | `ArtifactStore`, `OutputPolicy`, `DrillService`, retention worker | daemon | Owns stable artifact paths, offload policy, drill reads, and cleanup policy. |
+
 ### 5.1 Control plane
 
 Owns:
@@ -122,6 +134,13 @@ Owns:
 - RPC server / client contract
 - startup / shutdown / TTL cleanup
 - capability reporting
+
+Expected internal shape:
+
+- `ProbeDaemon` is the root launched service for `probe serve`.
+- `RpcServer` only terminates transport concerns; it should not contain business logic.
+- `ProbeKernel` is the domain facade used by CLI / RPC handlers.
+- `SessionRegistry` is the only service allowed to open and close session scopes.
 
 Expected transport:
 
@@ -134,11 +153,23 @@ Owns long-lived structured subprocess bridges:
 - XCUITest runner bridge
 - LLDB Python bridge
 
-Preferred protocol shape:
+Ownership rule:
 
-- JSON lines
-- typed request / response envelopes
-- correlation ids for in-flight requests
+- bridge factories are daemon-scoped
+- live bridge instances are session-scoped
+- requests may use a bridge, but callers do not own the underlying process handle or cleanup
+
+Current validated runner boundary contract on Simulator:
+
+- simulator-scoped bootstrap manifest under `/tmp/probe-runner-bootstrap/<SIMULATOR_UDID>.json`
+- file-backed command ingress into a per-session control directory
+- JSON line response/event egress parsed from the mixed `xcodebuild` / XCTest stdout stream
+- host runtime treats stdout ready/response frames as canonical egress; `ready.json` and `response-*.json` remain validation-only mirrors for spike scripts
+- typed request / response envelopes with correlation ids or sequence ids for in-flight work
+
+Design requirement:
+
+- keep the runner transport behind a swappable seam so a future real-device or cleaner egress path can replace the current boundary mechanics without rewriting runner semantics
 
 ### 5.3 Tooling plane
 
@@ -154,6 +185,8 @@ Short-lived commands can be wrapped as Effect command services.
 
 Long-lived or streaming subprocesses should be modeled as scoped resources.
 
+Tool wrappers should stay policy-light: they expose typed capabilities and structured errors, while session policy stays in control-plane or session services.
+
 ### 5.4 Artifact and output plane
 
 Owns:
@@ -164,32 +197,55 @@ Owns:
 - `drill` extraction
 - retention / cleanup
 
+This plane decides when to offload, where artifacts live, and how later follow-up reads stay token-efficient. It should not depend on command-specific formatting hidden in callers.
+
 ## 6. Host Runtime Model
 
-The host runtime should expose a central kernel service, for example:
+The host runtime should be organized by ownership boundary rather than by command names.
 
+### 6.1 Daemon-scoped services
+
+- `ProbeDaemon`
+- `RpcServer`
 - `ProbeKernel`
 - `SessionRegistry`
-- `DeviceService`
-- `RunnerService`
-- `SnapshotService`
-- `ActionService`
-- `PerfService`
-- `DebugService`
-- `LogsService`
+- `CapabilityService`
 - `ArtifactStore`
 - `OutputPolicy`
-- `CapabilityService`
+- Apple tool wrapper services (`Simctl`, `Devicectl`, `Xcodebuild`, `Xctrace`, `OsLog`)
+
+These services live for the lifetime of the daemon process.
+
+### 6.2 Session-scoped services
+
+- `SessionHandle` / `SessionContext`
+- `RunnerBridge`
+- `LldbBridge`
+- `LogsStream`
+- `TraceRecorder`
+
+These services are created and finalized by `SessionRegistry`. They are never process-global singletons.
+
+### 6.3 Request-scoped operations
+
+- one-off Apple CLI invocations
+- artifact drill reads
+- snapshot transforms / diffing
+- export and summary work that does not need to outlive the request
+
+These stay local to one effect and must not leak child-process ownership out of their scope.
 
 ### Effect guidance
 
-- create one top-level `ManagedRuntime`
+- launch the daemon with `NodeRuntime.runMain(Layer.launch(...))`
 - prefer `Effect.Service` / typed tags for services
 - use `Layer.scoped` for process-backed resources
 - use `Effect.acquireRelease` when resource ownership is local
+- use `SessionRegistry` to open child scopes instead of storing raw process handles in ad hoc global maps
 - use `Deferred` for readiness handshakes
 - use `SubscriptionRef` for observable session state
 - use `FiberMap` or similar keyed coordination for active sessions and background tasks
+- treat the current `src/runtime.ts` scaffold as a bootstrap placeholder, not as the final `probe serve` architecture
 
 ## 7. Session Model
 
@@ -201,6 +257,7 @@ Each session should own:
 - current capability set
 - artifact root path
 - session state stream
+- optional child resource states for runner, debugger, logs, and trace
 
 Optional scoped children may include:
 
@@ -209,14 +266,39 @@ Optional scoped children may include:
 - log stream collector
 - active `xctrace` recording
 
-### Suggested lifecycle states
+### Session phase contract
 
-- `opening`
+| Phase | Meaning | Notes |
+| --- | --- | --- |
+| `opening` | The registry is creating the session scope and allocating the artifact root. | Requests other than status / open polling should be rejected. |
+| `ready` | The session can accept work. Optional child resources may still be inactive. | This is the healthy steady state. |
+| `degraded` | The session remains open but one or more optional resources are unavailable or unhealthy. | Commands that need the broken resource must fail explicitly. |
+| `closing` | The daemon has started cleanup and no new mutating work should be accepted. | Existing child resources are draining or being interrupted. |
+| `closed` | Cleanup completed and the live scope is gone. | Registry may retain tombstone metadata briefly, but not live handles. |
+| `failed` | The session can no longer satisfy its contract. | The daemon must transition toward cleanup and surface a failure summary. |
+
+### Resource state contract
+
+Each optional child resource should expose a state in this family:
+
+- `not-requested`
+- `starting`
 - `ready`
 - `degraded`
-- `closing`
-- `closed`
+- `stopping`
+- `stopped`
 - `failed`
+
+The session phase and resource states are related but not identical. For example, a session may be `ready` while its LLDB bridge is `not-requested`, or a session may be `degraded` because logs or tracing failed while the runner still works.
+
+### Resource ownership rules
+
+| Resource | Start trigger | Lifetime owner | Cleanup owner | Notes |
+| --- | --- | --- | --- | --- |
+| Runner bridge | Session open or first automation request, depending on later implementation choice | session scope | `SessionRegistry` | At most one live runner bridge per session. |
+| LLDB bridge | Explicit debug attach request | session scope after attach succeeds | `SessionRegistry` with `DebugService` helpers | Optional; failure should degrade the session rather than corrupt unrelated features. |
+| Log collector | Explicit stream/start request or future default-capture policy | session scope once started | `SessionRegistry` with `LogsService` helpers | Callers subscribe to data; they do not own the collector process. |
+| `xctrace` recorder | Explicit recording request | session scope while the recording is active | `SessionRegistry` with `PerfService` helpers | Initial architecture assumes at most one active trace recording per session. |
 
 ### Session invariants
 
@@ -224,6 +306,14 @@ Optional scoped children may include:
 - artifact paths are stable for the lifetime of the session
 - session state transitions are explicit
 - subprocess cleanup is owned by the daemon, not by the caller
+- request handlers may trigger child resources, but they never become the lifecycle owner of those resources
+- child-resource failures degrade the session explicitly; they do not silently disappear
+
+### Current session contract freeze boundary
+
+`src/domain/session.ts` freezes the generic session lifecycle/state surface with `SessionPhase`, `SessionResourceState`, `SessionTarget`, and `ProbeSessionState`.
+
+The current `session.open` / `session.health` payload is intentionally narrower: it extends that base with runner-backed simulator transport and liveness details (`RunnerTransportContract`, `RunnerSessionDetails`, `SessionHealthCheck`) because the current vertical slice only has the runner bridge implemented. Future LLDB, log, or trace-specific health payloads should extend `ProbeSessionState` as sibling details rather than pushing runner-only fields into the generic session state.
 
 ## 8. Output Strategy
 
@@ -440,7 +530,9 @@ ios/
   ProbeRunner/
 ```
 
-This is a guideline, not yet a frozen contract.
+The exact file list is still a guideline, not yet a frozen contract.
+
+The directory names and ownership boundaries above are now the canonical host seam map for phase-1 and phase-2 work. Individual files may split or merge, but new work should not invent parallel directories or alternate service boundaries without first updating this document.
 
 ## 12. Knowledge and Research Workflow
 
@@ -482,7 +574,8 @@ These remain live and should be answered through spikes and research.
    - How independent can the Probe runner be from the target app's signing and team setup?
 
 5. **Runner ↔ host communication transport**
-   - Should the runner use stdout JSONL or a local socket?
+   - **Closed for Simulator:** use a bootstrap manifest plus file-backed ingress and stdout JSONL mixed-log egress.
+   - **Still open:** what replaces the shared-file ingress seam on real devices, and whether mixed-log stdout can later be replaced by a cleaner public-tooling egress path.
 
 6. **`devicectl` reliability on the current macOS/Xcode stack**
    - Is retry/fallback logic mandatory for production use?
@@ -518,6 +611,10 @@ These are currently known product limits imposed by public Apple tooling.
 
 5. **Real-device network conditioning parity**
    - Real-device network throttling lacks a clean CLI path comparable to Simulator workflows.
+
+6. **Real-device runner transport parity**
+   - The current runner transport contract depends on a Simulator-shared filesystem seam under `/tmp`.
+   - A clean real-device equivalent is not proven yet.
 
 Probe should state these walls explicitly in command output where relevant.
 
@@ -601,4 +698,4 @@ Together they provide a much better handoff surface than any one of them alone.
 
 The current architecture can be summarized as:
 
-> Probe is a daemon-hosted Effect kernel supervising scoped device/app sessions, with typed JSONL bridges to runner and debugger subprocesses, explicit capability and error reporting, and a first-class artifact/output subsystem designed for agent token efficiency.
+> Probe is a daemon-hosted Effect kernel supervising scoped device/app sessions, with structured runner and debugger bridges, explicit capability and error reporting, and a first-class artifact/output subsystem designed for agent token efficiency. Today the validated XCUITest runner seam is simulator-scoped file ingress plus stdout JSONL egress, kept behind a swappable transport boundary.

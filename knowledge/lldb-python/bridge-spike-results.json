@@ -1,0 +1,1108 @@
+{
+  "capturedAt": "2026-04-10T17:33:29.753Z",
+  "host": {
+    "cwd": "/Users/guilhermecastro/Projects/probe-cli",
+    "platform": "darwin",
+    "arch": "arm64"
+  },
+  "tooling": {
+    "bridgeReady": {
+      "kind": "ready",
+      "bridgePid": 66318,
+      "pythonExecutable": "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+      "lldbPythonPath": "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Resources/Python",
+      "lldbVersion": "lldb-1703.0.236.103\nApple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)",
+      "initFilesSkipped": true,
+      "asyncMode": false
+    },
+    "compileCommand": "xcrun clang -g -O0 -fno-omit-frame-pointer /Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c -o /var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-lldb-bridge-MXwrQQ/probe-lldb-target",
+    "compileStdout": "",
+    "compileStderr": "",
+    "codesignCommand": "codesign --force --sign - --entitlements /Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/debuggee-entitlements.plist /var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-lldb-bridge-MXwrQQ/probe-lldb-target",
+    "codesignStdout": "",
+    "codesignStderr": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-lldb-bridge-MXwrQQ/probe-lldb-target: replacing existing signature\n",
+    "debuggeeEntitlements": "Executable=/private/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-lldb-bridge-MXwrQQ/probe-lldb-target\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n",
+    "targetBinaryPath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-lldb-bridge-MXwrQQ/probe-lldb-target"
+  },
+  "commands": {
+    "handshake": {
+      "request": {
+        "id": "bridge-1",
+        "command": "handshake"
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-1",
+        "command": "handshake",
+        "ok": true,
+        "bridgePid": 66318,
+        "pythonExecutable": "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        "lldbPythonPath": "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Resources/Python",
+        "lldbVersion": "lldb-1703.0.236.103\nApple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)"
+      }
+    },
+    "attach": {
+      "request": {
+        "id": "bridge-2",
+        "command": "attach",
+        "pid": 66321
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-2",
+        "command": "attach",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 1,
+          "numThreads": 1,
+          "selectedThread": {
+            "threadId": 28842950,
+            "indexId": 1,
+            "stopReason": "signal"
+          },
+          "threads": [
+            {
+              "threadId": 28842950,
+              "indexId": 1,
+              "name": null,
+              "queue": "com.apple.main-thread",
+              "stopReason": "signal",
+              "stopDescription": "signal SIGSTOP",
+              "frames": [
+                {
+                  "frameId": 0,
+                  "pc": 6923938712,
+                  "function": "__sigsuspend",
+                  "displayFunction": "__sigsuspend",
+                  "module": "libsystem_kernel.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 1,
+                  "pc": 6923117340,
+                  "function": "pause",
+                  "displayFunction": "pause",
+                  "module": "libsystem_c.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 2,
+                  "pc": 4337682052,
+                  "function": "probe_bridge_leaf_wait",
+                  "displayFunction": "probe_bridge_leaf_wait",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 20,
+                    "column": 5
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 3,
+                  "pc": 4337681956,
+                  "function": "probe_bridge_middle_frame",
+                  "displayFunction": "probe_bridge_middle_frame",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 30,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 4,
+                  "pc": 4337681844,
+                  "function": "main",
+                  "displayFunction": "main",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 43,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 5,
+                  "pc": 6920183124,
+                  "function": "start",
+                  "displayFunction": "start",
+                  "module": "dyld",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "backtrace": {
+      "request": {
+        "id": "bridge-3",
+        "command": "backtrace",
+        "frameLimit": 8,
+        "threadIndexId": 1
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-3",
+        "command": "backtrace",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 1
+        },
+        "thread": {
+          "threadId": 28842950,
+          "indexId": 1,
+          "name": null,
+          "queue": "com.apple.main-thread",
+          "stopReason": "signal",
+          "stopDescription": "signal SIGSTOP",
+          "frames": [
+            {
+              "frameId": 0,
+              "pc": 6923938712,
+              "function": "__sigsuspend",
+              "displayFunction": "__sigsuspend",
+              "module": "libsystem_kernel.dylib",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 1,
+              "pc": 6923117340,
+              "function": "pause",
+              "displayFunction": "pause",
+              "module": "libsystem_c.dylib",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 2,
+              "pc": 4337682052,
+              "function": "probe_bridge_leaf_wait",
+              "displayFunction": "probe_bridge_leaf_wait",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 20,
+                "column": 5
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 3,
+              "pc": 4337681956,
+              "function": "probe_bridge_middle_frame",
+              "displayFunction": "probe_bridge_middle_frame",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 30,
+                "column": 10
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 4,
+              "pc": 4337681844,
+              "function": "main",
+              "displayFunction": "main",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 43,
+                "column": 10
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 5,
+              "pc": 6920183124,
+              "function": "start",
+              "displayFunction": "start",
+              "module": "dyld",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            }
+          ]
+        }
+      }
+    },
+    "vars": {
+      "request": {
+        "id": "bridge-4",
+        "command": "vars",
+        "threadIndexId": 1,
+        "frameIndex": 2
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-4",
+        "command": "vars",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 1
+        },
+        "frame": {
+          "frameId": 2,
+          "pc": 4337682052,
+          "function": "probe_bridge_leaf_wait",
+          "displayFunction": "probe_bridge_leaf_wait",
+          "module": "probe-lldb-target",
+          "lineEntry": {
+            "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+            "line": 20,
+            "column": 5
+          },
+          "isArtificial": false,
+          "isHidden": false,
+          "isInlined": false
+        },
+        "variables": [
+          {
+            "name": "seed",
+            "type": "int",
+            "value": "7",
+            "summary": null,
+            "numChildren": 0,
+            "valueText": "7"
+          },
+          {
+            "name": "label",
+            "type": "const char *",
+            "value": "0x00000001028bc6e4",
+            "summary": "\"probe-lldb-target\"",
+            "numChildren": 1,
+            "valueText": "\"probe-lldb-target\"",
+            "children": [
+              {
+                "name": "*label",
+                "type": "const char",
+                "value": "'p'",
+                "summary": null,
+                "numChildren": 0,
+                "valueText": "'p'"
+              }
+            ]
+          },
+          {
+            "name": "counter",
+            "type": "int",
+            "value": "7",
+            "summary": null,
+            "numChildren": 0,
+            "valueText": "7"
+          },
+          {
+            "name": "derived",
+            "type": "int",
+            "value": "21",
+            "summary": null,
+            "numChildren": 0,
+            "valueText": "21"
+          },
+          {
+            "name": "local_label",
+            "type": "const char *",
+            "value": "0x00000001028bc6e4",
+            "summary": "\"probe-lldb-target\"",
+            "numChildren": 1,
+            "valueText": "\"probe-lldb-target\"",
+            "children": [
+              {
+                "name": "*local_label",
+                "type": "const char",
+                "value": "'p'",
+                "summary": null,
+                "numChildren": 0,
+                "valueText": "'p'"
+              }
+            ]
+          },
+          {
+            "name": "probe_last_signal",
+            "type": "sig_atomic_t",
+            "value": "0",
+            "summary": null,
+            "numChildren": 0,
+            "valueText": "0"
+          },
+          {
+            "name": "probe_keep_running",
+            "type": "sig_atomic_t",
+            "value": "1",
+            "summary": null,
+            "numChildren": 0,
+            "valueText": "1"
+          }
+        ]
+      }
+    },
+    "evalExpression": {
+      "request": {
+        "id": "bridge-5",
+        "command": "eval",
+        "threadIndexId": 1,
+        "frameIndex": 2,
+        "expression": "counter + derived",
+        "timeoutMs": 500
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-5",
+        "command": "eval",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 1
+        },
+        "frame": {
+          "frameId": 2,
+          "pc": 4337682052,
+          "function": "probe_bridge_leaf_wait",
+          "displayFunction": "probe_bridge_leaf_wait",
+          "module": "probe-lldb-target",
+          "lineEntry": {
+            "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+            "line": 20,
+            "column": 5
+          },
+          "isArtificial": false,
+          "isHidden": false,
+          "isInlined": false
+        },
+        "expression": "counter + derived",
+        "result": {
+          "name": "$0",
+          "type": "int",
+          "value": "28",
+          "summary": null,
+          "numChildren": 0,
+          "valueText": "28"
+        },
+        "options": {
+          "timeoutMs": 500,
+          "tryAllThreads": false,
+          "trapExceptions": true,
+          "unwindOnError": true,
+          "ignoreBreakpoints": false,
+          "stopOthers": true,
+          "suppressPersistentResult": true
+        }
+      }
+    },
+    "repeatBacktrace": {
+      "request": {
+        "id": "bridge-6",
+        "command": "backtrace",
+        "frameLimit": 8
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-6",
+        "command": "backtrace",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 1
+        },
+        "thread": {
+          "threadId": 28842950,
+          "indexId": 1,
+          "name": null,
+          "queue": "com.apple.main-thread",
+          "stopReason": "signal",
+          "stopDescription": "signal SIGSTOP",
+          "frames": [
+            {
+              "frameId": 0,
+              "pc": 6923938712,
+              "function": "__sigsuspend",
+              "displayFunction": "__sigsuspend",
+              "module": "libsystem_kernel.dylib",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 1,
+              "pc": 6923117340,
+              "function": "pause",
+              "displayFunction": "pause",
+              "module": "libsystem_c.dylib",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 2,
+              "pc": 4337682052,
+              "function": "probe_bridge_leaf_wait",
+              "displayFunction": "probe_bridge_leaf_wait",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 20,
+                "column": 5
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 3,
+              "pc": 4337681956,
+              "function": "probe_bridge_middle_frame",
+              "displayFunction": "probe_bridge_middle_frame",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 30,
+                "column": 10
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 4,
+              "pc": 4337681844,
+              "function": "main",
+              "displayFunction": "main",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 43,
+                "column": 10
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 5,
+              "pc": 6920183124,
+              "function": "start",
+              "displayFunction": "start",
+              "module": "dyld",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            }
+          ]
+        }
+      }
+    },
+    "signalStop": {
+      "request": {
+        "id": "bridge-7",
+        "command": "continue"
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-7",
+        "command": "continue",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 2,
+          "numThreads": 1,
+          "selectedThread": {
+            "threadId": 28842950,
+            "indexId": 1,
+            "stopReason": "signal"
+          },
+          "threads": [
+            {
+              "threadId": 28842950,
+              "indexId": 1,
+              "name": null,
+              "queue": "com.apple.main-thread",
+              "stopReason": "signal",
+              "stopDescription": "signal SIGUSR1",
+              "frames": [
+                {
+                  "frameId": 0,
+                  "pc": 6923938712,
+                  "function": "__sigsuspend",
+                  "displayFunction": "__sigsuspend",
+                  "module": "libsystem_kernel.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 1,
+                  "pc": 6923117340,
+                  "function": "pause",
+                  "displayFunction": "pause",
+                  "module": "libsystem_c.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 2,
+                  "pc": 4337682052,
+                  "function": "probe_bridge_leaf_wait",
+                  "displayFunction": "probe_bridge_leaf_wait",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 20,
+                    "column": 5
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 3,
+                  "pc": 4337681956,
+                  "function": "probe_bridge_middle_frame",
+                  "displayFunction": "probe_bridge_middle_frame",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 30,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 4,
+                  "pc": 4337681844,
+                  "function": "main",
+                  "displayFunction": "main",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 43,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 5,
+                  "pc": 6920183124,
+                  "function": "start",
+                  "displayFunction": "start",
+                  "module": "dyld",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "crashStop": {
+      "request": {
+        "id": "bridge-8",
+        "command": "continue"
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-8",
+        "command": "continue",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "stopped",
+          "stopId": 3,
+          "numThreads": 1,
+          "selectedThread": {
+            "threadId": 28842950,
+            "indexId": 1,
+            "stopReason": "signal"
+          },
+          "threads": [
+            {
+              "threadId": 28842950,
+              "indexId": 1,
+              "name": null,
+              "queue": "com.apple.main-thread",
+              "stopReason": "signal",
+              "stopDescription": "signal SIGABRT",
+              "frames": [
+                {
+                  "frameId": 0,
+                  "pc": 6923938712,
+                  "function": "__sigsuspend",
+                  "displayFunction": "__sigsuspend",
+                  "module": "libsystem_kernel.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 1,
+                  "pc": 6923117340,
+                  "function": "pause",
+                  "displayFunction": "pause",
+                  "module": "libsystem_c.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 2,
+                  "pc": 4337682052,
+                  "function": "probe_bridge_leaf_wait",
+                  "displayFunction": "probe_bridge_leaf_wait",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 20,
+                    "column": 5
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 3,
+                  "pc": 4337681956,
+                  "function": "probe_bridge_middle_frame",
+                  "displayFunction": "probe_bridge_middle_frame",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 30,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 4,
+                  "pc": 4337681844,
+                  "function": "main",
+                  "displayFunction": "main",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 43,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 5,
+                  "pc": 6920183124,
+                  "function": "start",
+                  "displayFunction": "start",
+                  "module": "dyld",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "exitAfterCrash": {
+      "request": {
+        "id": "bridge-9",
+        "command": "continue"
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-9",
+        "command": "continue",
+        "ok": true,
+        "process": {
+          "pid": 66321,
+          "state": "exited",
+          "stopId": 4,
+          "numThreads": 1,
+          "selectedThread": {
+            "threadId": 28842950,
+            "indexId": 1,
+            "stopReason": "none"
+          },
+          "threads": [
+            {
+              "threadId": 28842950,
+              "indexId": 1,
+              "name": null,
+              "queue": "com.apple.main-thread",
+              "stopReason": "none",
+              "stopDescription": "",
+              "frames": [
+                {
+                  "frameId": 4294967295,
+                  "pc": 18446744073709552000,
+                  "function": null,
+                  "displayFunction": null,
+                  "module": null,
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "reattach": {
+      "request": {
+        "id": "bridge-10",
+        "command": "attach",
+        "pid": 66333
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-10",
+        "command": "attach",
+        "ok": true,
+        "process": {
+          "pid": 66333,
+          "state": "stopped",
+          "stopId": 1,
+          "numThreads": 1,
+          "selectedThread": {
+            "threadId": 28843059,
+            "indexId": 1,
+            "stopReason": "signal"
+          },
+          "threads": [
+            {
+              "threadId": 28843059,
+              "indexId": 1,
+              "name": null,
+              "queue": "com.apple.main-thread",
+              "stopReason": "signal",
+              "stopDescription": "signal SIGSTOP",
+              "frames": [
+                {
+                  "frameId": 0,
+                  "pc": 6923938712,
+                  "function": "__sigsuspend",
+                  "displayFunction": "__sigsuspend",
+                  "module": "libsystem_kernel.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 1,
+                  "pc": 6923117340,
+                  "function": "pause",
+                  "displayFunction": "pause",
+                  "module": "libsystem_c.dylib",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 2,
+                  "pc": 4377396868,
+                  "function": "probe_bridge_leaf_wait",
+                  "displayFunction": "probe_bridge_leaf_wait",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 20,
+                    "column": 5
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 3,
+                  "pc": 4377396772,
+                  "function": "probe_bridge_middle_frame",
+                  "displayFunction": "probe_bridge_middle_frame",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 30,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 4,
+                  "pc": 4377396660,
+                  "function": "main",
+                  "displayFunction": "main",
+                  "module": "probe-lldb-target",
+                  "lineEntry": {
+                    "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                    "line": 43,
+                    "column": 10
+                  },
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                },
+                {
+                  "frameId": 5,
+                  "pc": 6920183124,
+                  "function": "start",
+                  "displayFunction": "start",
+                  "module": "dyld",
+                  "lineEntry": null,
+                  "isArtificial": false,
+                  "isHidden": false,
+                  "isInlined": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "reattachBacktrace": {
+      "request": {
+        "id": "bridge-11",
+        "command": "backtrace",
+        "frameLimit": 8
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-11",
+        "command": "backtrace",
+        "ok": true,
+        "process": {
+          "pid": 66333,
+          "state": "stopped",
+          "stopId": 1
+        },
+        "thread": {
+          "threadId": 28843059,
+          "indexId": 1,
+          "name": null,
+          "queue": "com.apple.main-thread",
+          "stopReason": "signal",
+          "stopDescription": "signal SIGSTOP",
+          "frames": [
+            {
+              "frameId": 0,
+              "pc": 6923938712,
+              "function": "__sigsuspend",
+              "displayFunction": "__sigsuspend",
+              "module": "libsystem_kernel.dylib",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 1,
+              "pc": 6923117340,
+              "function": "pause",
+              "displayFunction": "pause",
+              "module": "libsystem_c.dylib",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 2,
+              "pc": 4377396868,
+              "function": "probe_bridge_leaf_wait",
+              "displayFunction": "probe_bridge_leaf_wait",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 20,
+                "column": 5
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 3,
+              "pc": 4377396772,
+              "function": "probe_bridge_middle_frame",
+              "displayFunction": "probe_bridge_middle_frame",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 30,
+                "column": 10
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 4,
+              "pc": 4377396660,
+              "function": "main",
+              "displayFunction": "main",
+              "module": "probe-lldb-target",
+              "lineEntry": {
+                "file": "/Users/guilhermecastro/Projects/probe-cli/src/spikes/lldb-python-bridge/target.c",
+                "line": 43,
+                "column": 10
+              },
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            },
+            {
+              "frameId": 5,
+              "pc": 6920183124,
+              "function": "start",
+              "displayFunction": "start",
+              "module": "dyld",
+              "lineEntry": null,
+              "isArtificial": false,
+              "isHidden": false,
+              "isInlined": false
+            }
+          ]
+        }
+      }
+    },
+    "detach": {
+      "request": {
+        "id": "bridge-12",
+        "command": "detach"
+      },
+      "response": {
+        "kind": "response",
+        "id": "bridge-12",
+        "command": "detach",
+        "ok": true,
+        "pid": 66333,
+        "state": "detached"
+      }
+    }
+  },
+  "derivedEvidence": {
+    "attachedPid": 66321,
+    "attachedState": "stopped",
+    "backtraceFunctions": [
+      "__sigsuspend",
+      "pause",
+      "probe_bridge_leaf_wait",
+      "probe_bridge_middle_frame",
+      "main",
+      "start"
+    ],
+    "vars": [
+      {
+        "name": "seed",
+        "type": "int",
+        "value": "7",
+        "summary": null
+      },
+      {
+        "name": "label",
+        "type": "const char *",
+        "value": "0x00000001028bc6e4",
+        "summary": "\"probe-lldb-target\""
+      },
+      {
+        "name": "counter",
+        "type": "int",
+        "value": "7",
+        "summary": null
+      },
+      {
+        "name": "derived",
+        "type": "int",
+        "value": "21",
+        "summary": null
+      },
+      {
+        "name": "local_label",
+        "type": "const char *",
+        "value": "0x00000001028bc6e4",
+        "summary": "\"probe-lldb-target\""
+      },
+      {
+        "name": "probe_last_signal",
+        "type": "sig_atomic_t",
+        "value": "0",
+        "summary": null
+      },
+      {
+        "name": "probe_keep_running",
+        "type": "sig_atomic_t",
+        "value": "1",
+        "summary": null
+      }
+    ],
+    "evalValue": "28",
+    "signalState": "stopped",
+    "signalStopReason": "signal",
+    "crashState": "stopped",
+    "crashStopReason": "signal",
+    "exitState": "exited",
+    "reattachedPid": 66333
+  },
+  "bridgeStderr": ""
+}

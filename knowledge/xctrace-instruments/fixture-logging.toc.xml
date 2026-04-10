@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+
+<trace-toc>
+    <run number="1">
+        <info>
+            <target>
+                <device uuid="4015AB8A-185C-4334-8019-EBDE113852E5" model="Simulated iPhone 17 Pro" name="iPhone 17 Pro" os-version="26.3.1 (23D8133)" platform="iOS Simulator"/>
+                <host-device uuid="4220D4B9-5546-54BE-998B-C12B4DF9905D" model="Mac mini" name="Guilherme’s Mac mini" os-version="26.3.1 (25D2128)" platform="macOS"/>
+                <process type="attached" return-exit-status="0" name="ProbeFixture" pid="27364" termination-reason="exit(0)"/>
+            </target>
+            <summary>
+                <start-date>2026-04-09T23:31:11.270-03:00</start-date>
+                <end-date>2026-04-09T23:31:16.854-03:00</end-date>
+                <duration>5.584840</duration>
+                <end-reason>Time limit reached</end-reason>
+                <instruments-version>26.0 (17C529)</instruments-version>
+                <template-name>Logging</template-name>
+                <recording-mode>Deferred</recording-mode>
+                <time-limit>5 seconds</time-limit>
+            </summary>
+        </info>
+        <processes>
+            <process name="ProbeFixture" pid="27364" path="/Users/guilhermecastro/Library/Developer/CoreSimulator/Devices/4015AB8A-185C-4334-8019-EBDE113852E5/data/Containers/Bundle/Application/0B6170B0-BB7E-4F62-8FB9-8D55CBD6C472/ProbeFixture.app/ProbeFixture"/>
+            <process name="kernel.release.t8103" pid="0" path="/System/Library/Kernels/kernel.release.t8103"/>
+        </processes>
+        <data>
+            <table schema="os-log" target-pid="SINGLE"/>
+            <table layout-scope="name" schema="os-signpost-interval" target-pid="SINGLE"/>
+            <table schema="os-signpost-arg" target-pid="SINGLE"/>
+            <table schema="thread-info"/>
+            <table schema="os-signpost" target-pid="SINGLE"/>
+            <table schema="process-info"/>
+            <table schema="os-log-arg" target-pid="SINGLE"/>
+        </data>
+        <tracks/>
+    </run>
+</trace-toc>

@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+
+<trace-toc>
+    <run number="1">
+        <info>
+            <target>
+                <device uuid="4015AB8A-185C-4334-8019-EBDE113852E5" model="Simulated iPhone 17 Pro" name="iPhone 17 Pro" os-version="26.3.1 (23D8133)" platform="iOS Simulator"/>
+                <host-device uuid="4220D4B9-5546-54BE-998B-C12B4DF9905D" model="Mac mini" name="Guilherme’s Mac mini" os-version="26.3.1 (25D2128)" platform="macOS"/>
+                <process type="attached" return-exit-status="0" name="ProbeFixture" pid="27364" termination-reason="exit(0)"/>
+            </target>
+            <summary>
+                <start-date>2026-04-09T23:30:51.788-03:00</start-date>
+                <end-date>2026-04-09T23:30:57.689-03:00</end-date>
+                <duration>5.900422</duration>
+                <end-reason>Time limit reached</end-reason>
+                <instruments-version>26.0 (17C529)</instruments-version>
+                <template-name>Swift Concurrency</template-name>
+                <recording-mode>Deferred</recording-mode>
+                <time-limit>5 seconds</time-limit>
+                <intruments-recording-settings>
+                    <instrument name="Hangs">
+                        <array>
+                            <dictionary>
+                                <key name="Reporting Threshold">Include Microhangs (&gt;250ms)</key>
+                            </dictionary>
+                        </array>
+                    </instrument>
+                </intruments-recording-settings>
+            </summary>
+        </info>
+        <processes>
+            <process name="ProbeFixture" pid="27364" path="/Users/guilhermecastro/Library/Developer/CoreSimulator/Devices/4015AB8A-185C-4334-8019-EBDE113852E5/data/Containers/Bundle/Application/0B6170B0-BB7E-4F62-8FB9-8D55CBD6C472/ProbeFixture.app/ProbeFixture"/>
+            <process name="kernel.release.t8103" pid="0" path="/System/Library/Kernels/kernel.release.t8103"/>
+        </processes>
+        <data>
+            <table schema="swift-actor-lifetime" target-pid="SINGLE"/>
+            <table hangs-threshold="250" schema="potential-hangs" target-pid="SINGLE"/>
+            <table callstack="user" target="SINGLE" schema="time-sample" sample-rate-micro-seconds="1000" all-thread-states="NO"/>
+            <table enable-priority-inversion-detection="0" target-pid="SINGLE" message-type="Fault" schema="os-log" category="&quot;Hang Risk&quot; &quot;Severe Hang Risk&quot; CFNetwork Contacts CoreML" subsystem="&quot;com.apple.runtime-issues&quot;"/>
+            <table schema="swift-total-task-count" target-pid="SINGLE"/>
+            <table schema="swift-alive-task-count" target-pid="SINGLE"/>
+            <table target-pid="SINGLE" schema="os-signpost" category="Actor" subsystem="&quot;com.apple.swift.concurrency&quot;"/>
+            <table target-pid="SINGLE" schema="os-signpost" category="Task" subsystem="&quot;com.apple.swift.concurrency&quot;"/>
+            <table schema="swift-running-task-count" target-pid="SINGLE"/>
+            <table schema="runloop-events" target-pid="SINGLE"/>
+            <table schema="process-info"/>
+            <table schema="life-cycle-period" target-pid="SINGLE"/>
+            <table codes="&quot;0x1f,0x7&quot;" schema="kdebug" target="SINGLE"/>
+            <table codes="&quot;0x2b,0xd8&quot;" schema="kdebug" target="SINGLE"/>
+            <table codes="&quot;0x31,0xca&quot;" schema="kdebug" target="SINGLE"/>
+            <table codes="&quot;33,0x11&quot;" schema="kdebug" target="SINGLE"/>
+            <table codes="&quot;0x2b,0x87&quot;" schema="kdebug" target="SINGLE"/>
+            <table schema="swift-actor-queue-size" target-pid="SINGLE"/>
+            <table schema="thread-info"/>
+            <table schema="swift-task-creation-event" target-pid="SINGLE"/>
+            <table schema="swift-task-lifetime" target-pid="SINGLE"/>
+            <table target-pid="SINGLE" schema="hang-risks" detect-priority-inversions="0"/>
+            <table schema="swift-task-state" target-pid="SINGLE"/>
+            <table schema="swift-actor-count" target-pid="SINGLE"/>
+            <table codes="&quot;33,0x11&quot;" schema="kdebug-strings" target="SINGLE"/>
+            <table schema="swift-task-cancellation-event" target-pid="SINGLE"/>
+            <table schema="swift-task-relationship" target-pid="SINGLE"/>
+            <table target-pid="SINGLE" context-switch-sampling="0" high-frequency-sampling="0" schema="time-profile" record-waiting-threads="0" needs-kernel-callstack="0"/>
+            <table schema="tick" frequency="1"/>
+            <table schema="swift-actor-execution" target-pid="SINGLE"/>
+        </data>
+        <tracks/>
+    </run>
+</trace-toc>

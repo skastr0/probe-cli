@@ -1,0 +1,271 @@
+{
+  "generatedAt": "2026-04-10T02:25:17.998757Z",
+  "overallOutcome": "partial",
+  "summary": "Host-side real-device prerequisites are partially validated: devicectl is present, iOS DDI metadata is usable, and the Probe runner compiles for iPhoneOS without signing, but deployment remains blocked by missing signing configuration and the lack of a connected physical device.",
+  "host": {
+    "workspaceRoot": "/Users/guilhermecastro/Projects/probe-cli",
+    "spikeRoot": "/tmp/probe-real-device-spike.xmweKz",
+    "developerDir": "/Applications/Xcode.app/Contents/Developer",
+    "xcodeVersionLines": [
+      "Xcode 26.3",
+      "Build version 17C529"
+    ]
+  },
+  "signing": {
+    "signedBuild": {
+      "exitCode": 65,
+      "status": "blocked",
+      "xctestrunPath": null,
+      "evidence": [
+        "Command line invocation:",
+        "    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -project /Users/guilhermecastro/Projects/probe-cli/ios/ProbeFixture/ProbeFixture.xcodeproj -scheme ProbeRunner -destination generic/platform=iOS -derivedDataPath /tmp/probe-real-device-spike.xmweKz/derived-data-device-signed build-for-testing",
+        "ComputePackagePrebuildTargetDependencyGraph",
+        "Prepare packages",
+        "CreateBuildRequest",
+        "SendProjectDescription",
+        "CreateBuildOperation",
+        "ComputeTargetDependencyGraph",
+        "note: Building targets in dependency order",
+        "note: Target dependency graph (2 targets)",
+        "    Target 'ProbeRunnerUITests' in project 'ProbeFixture'",
+        "        \u279c Explicit dependency on target 'ProbeFixture' in project 'ProbeFixture'"
+      ],
+      "keyFailure": "/Users/guilhermecastro/Projects/probe-cli/ios/ProbeFixture/ProbeFixture.xcodeproj: error: Signing for \"ProbeRunnerUITests\" requires a development team. Select a development team in the Signing & Capabilities editor. (in target 'ProbeRunnerUITests' from project 'ProbeFixture')",
+      "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/build-for-testing-device-signed.log"
+    },
+    "unsignedBuild": {
+      "exitCode": 0,
+      "status": "validated",
+      "successMarker": "** TEST BUILD SUCCEEDED **",
+      "artifacts": {
+        "appPath": "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/Debug-iphoneos/ProbeFixture.app",
+        "runnerAppPath": "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/Debug-iphoneos/ProbeRunnerUITests-Runner.app",
+        "xctestPath": "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/Debug-iphoneos/ProbeRunnerUITests-Runner.app/PlugIns/ProbeRunnerUITests.xctest",
+        "xctestrunPath": "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/ProbeRunner_iphoneos26.2-arm64.xctestrun",
+        "appExists": true,
+        "runnerAppExists": true,
+        "xctestExists": true,
+        "xctestrunExists": true
+      },
+      "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/build-for-testing-device-unsigned.log"
+    },
+    "codeSignVerification": [
+      {
+        "artifact": "ProbeFixture.app",
+        "exitCode": 1,
+        "evidence": [
+          "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/Debug-iphoneos/ProbeFixture.app: code object is not signed at all",
+          "In architecture: arm64"
+        ],
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/codesign-verify-unsigned-app.log"
+      },
+      {
+        "artifact": "ProbeRunnerUITests-Runner.app",
+        "exitCode": 1,
+        "evidence": [
+          "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/Debug-iphoneos/ProbeRunnerUITests-Runner.app: code has no resources but signature indicates they must be present"
+        ],
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/codesign-verify-unsigned-runner-app.log"
+      },
+      {
+        "artifact": "ProbeRunnerUITests.xctest",
+        "exitCode": 1,
+        "evidence": [
+          "/tmp/probe-real-device-spike.xmweKz/derived-data-device-unsigned/Build/Products/Debug-iphoneos/ProbeRunnerUITests-Runner.app/PlugIns/ProbeRunnerUITests.xctest: code object is not signed at all",
+          "In architecture: arm64"
+        ],
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/codesign-verify-unsigned-xctest.log"
+      }
+    ],
+    "setupRequirements": [
+      "Configure a non-empty DEVELOPMENT_TEAM (or equivalent signing settings) for both ProbeFixture and ProbeRunnerUITests before attempting a real-device build.",
+      "Provide development signing artifacts that can sign both the target app host and the UI-test runner path.",
+      "Treat build-for-testing output as the canonical runner artifact contract for now: ProbeFixture.app, ProbeRunnerUITests-Runner.app, ProbeRunnerUITests.xctest, and the generated .xctestrun file."
+    ]
+  },
+  "devicectl": {
+    "coreDeviceVersion": "506.7",
+    "jsonVersion": 3,
+    "deviceCount": 0,
+    "commands": [
+      {
+        "name": "devicectl list preferredDDI",
+        "mode": "validated",
+        "exitCode": 0,
+        "summary": "Validated on this host; CoreDevice reports a usable iOS DDI.",
+        "evidence": [
+          "jsonVersion=3",
+          "hostCoreDeviceVersion=506.7",
+          "iOS hostDDI=file:///Library/Developer/DeveloperDiskImages/iOS_DDI/",
+          "iOS isUsable=True",
+          "iOS contentIsCompatible=True"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-list-preferredDDI.log"
+      },
+      {
+        "name": "devicectl list devices",
+        "mode": "validated",
+        "exitCode": 0,
+        "summary": "Validated on this host; CoreDevice discovered 0 connected device(s).",
+        "evidence": [
+          "jsonVersion=3",
+          "outcome=success",
+          "deviceCount=0"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-list-devices.log"
+      },
+      {
+        "name": "devicectl manage pair --help",
+        "mode": "surface-only",
+        "exitCode": 0,
+        "summary": "Validated the command surface locally via help output.",
+        "evidence": [
+          "OVERVIEW: Pair with a given device.",
+          "This command attempts to pair with a device discovered by CoreDevice.",
+          "USAGE: devicectl manage pair --device <uuid|ecid|serial_number|udid|name|dns_name> [--columns <columns> ...] [--hide-default-columns] [--hide-headers] [--verbose] [--quiet] [--timeout <seconds>] [--json-output <path>] [--log-output <path>]",
+          "DEVICE OPTIONS:",
+          "  -d, --device <uuid|ecid|serial_number|udid|name|dns_name>"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-help-manage-pair.log"
+      },
+      {
+        "name": "devicectl device info ddiServices --help",
+        "mode": "surface-only",
+        "exitCode": 0,
+        "summary": "Validated the command surface locally via help output.",
+        "evidence": [
+          "OVERVIEW: Get information on the developer disk image services on the device.",
+          "This command gets information about the developer disk image services on the",
+          "device (if they are currently enabled).",
+          "USAGE: devicectl device info ddiServices --device <uuid|ecid|serial_number|udid|name|dns_name> [--auto-mount-ddis] [--no-auto-mount-ddis] [--verbose] [--quiet] [--timeout <seconds>] [--json-output <path>] [--log-output <path>]",
+          "DEVICE OPTIONS:",
+          "  -d, --device <uuid|ecid|serial_number|udid|name|dns_name>"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-help-device-info-ddiServices.log"
+      },
+      {
+        "name": "devicectl device info apps --help",
+        "mode": "surface-only",
+        "exitCode": 0,
+        "summary": "Validated the command surface locally via help output.",
+        "evidence": [
+          "OVERVIEW: List apps installed on the device.",
+          "This command prints the list of apps that are installed on the device.",
+          "USAGE: devicectl device info apps [<options>] --device <uuid|ecid|serial_number|udid|name|dns_name>",
+          "DEVICE OPTIONS:",
+          "  -d, --device <uuid|ecid|serial_number|udid|name|dns_name>",
+          "                          The identifier, ECID, serial number, UDID,"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-help-device-info-apps.log"
+      },
+      {
+        "name": "devicectl device install app --help",
+        "mode": "surface-only",
+        "exitCode": 0,
+        "summary": "Validated the install command surface locally via help output.",
+        "evidence": [
+          "OVERVIEW: Installs an app.",
+          "This command installs an app bundle (with a .app extension) on the device.",
+          "USAGE: devicectl device install app --device <uuid|ecid|serial_number|udid|name|dns_name> <path> [--filter <filter>] [--sort-by <sort-by>] [--columns <columns> ...] [--hide-default-columns] [--hide-headers] [--verbose] [--quiet] [--timeout <seconds>] [--json-output <path>] [--log-output <path>]",
+          "DEVICE OPTIONS:",
+          "  -d, --device <uuid|ecid|serial_number|udid|name|dns_name>",
+          "                          The identifier, ECID, serial number, UDID,"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-help-device-install-app.log"
+      },
+      {
+        "name": "devicectl device process launch --help",
+        "mode": "surface-only",
+        "exitCode": 0,
+        "summary": "Validated the launch command surface locally via help output.",
+        "evidence": [
+          "OVERVIEW: Launch a remote application.",
+          "This command launches an application on a device and passes it specific",
+          "arguments.",
+          "If you want to set environment variables in the resulting environment, set them",
+          "in the calling environment with a DEVICECTL_CHILD_ prefix.",
+          "Once the application has launched, you can attach to it using LLDB. For",
+          "example, if you have an iPhone named 'iPhone' connected to your Mac, and your",
+          "application running on the iPhone has the process identifier of 10684, you can"
+        ],
+        "blockedReason": null,
+        "logPath": "/tmp/probe-real-device-spike.xmweKz/logs/devicectl-help-device-process-launch.log"
+      },
+      {
+        "name": "devicectl device info ddiServices",
+        "mode": "blocked",
+        "exitCode": null,
+        "summary": "Skipped because the host has no concrete physical device target.",
+        "evidence": [
+          "deviceCount=0"
+        ],
+        "blockedReason": "No physical device identifier was provided, and CoreDevice discovered no connected devices on this host.",
+        "logPath": null
+      },
+      {
+        "name": "devicectl device info apps",
+        "mode": "blocked",
+        "exitCode": null,
+        "summary": "Skipped because the host has no concrete physical device target.",
+        "evidence": [
+          "deviceCount=0"
+        ],
+        "blockedReason": "No physical device identifier was provided, and CoreDevice discovered no connected devices on this host.",
+        "logPath": null
+      },
+      {
+        "name": "devicectl device install app",
+        "mode": "blocked",
+        "exitCode": null,
+        "summary": "Skipped because the host has no connected real device and no signed app artifact to install.",
+        "evidence": [
+          "signedBuildExit=65",
+          "deviceCount=0"
+        ],
+        "blockedReason": "No physical device identifier was provided, and CoreDevice discovered no connected devices on this host.",
+        "logPath": null
+      },
+      {
+        "name": "devicectl device process launch",
+        "mode": "blocked",
+        "exitCode": null,
+        "summary": "Skipped because install/launch validation needs a paired real device and a signed app on that device.",
+        "evidence": [
+          "signedBuildExit=65",
+          "deviceCount=0"
+        ],
+        "blockedReason": "No physical device identifier was provided, and CoreDevice discovered no connected devices on this host.",
+        "logPath": null
+      }
+    ]
+  },
+  "requirements": {
+    "userSetup": [
+      "Use the active Xcode selected by xcode-select and confirm xcodebuild -version matches the intended toolchain.",
+      "Pair and trust the iPhone/iPad with Xcode before relying on devicectl-managed real-device flows.",
+      "Enable Developer Mode on the device before trying to run development-signed software.",
+      "Use an iOS 17+ physical device for the devicectl path.",
+      "Confirm xcrun devicectl list preferredDDI reports a usable iOS DDI before trying device info, install, or launch operations."
+    ],
+    "retry": [
+      "After pairing, trust, or Developer Mode changes, rerun devicectl list devices and device info ddiServices instead of assuming the host state refreshed itself.",
+      "If DDI compatibility is broken, run xcodebuild -runFirstLaunch -checkForNewerComponents and xcrun devicectl manage ddis update before retrying install or launch.",
+      "Retry devicectl install/launch only after the signed build succeeds; Probe should not mask missing-team or unsigned-artifact failures with opaque retries."
+    ],
+    "fallback": [
+      "If no physical device is connected, stop at host-side validation and surface explicit setup requirements instead of claiming real-device support works.",
+      "If the device is older than the devicectl support window, keep the session on Simulator or use an explicitly different Xcode-managed path; do not pretend devicectl covers it.",
+      "If signed runner artifacts are unavailable, require externally built and signed artifacts rather than teaching Probe to provision teams, certificates, or devices itself."
+    ]
+  },
+  "hardWalls": [
+    "No physical device is connected to this host, so pair/DDI-service/install/launch behavior could not be exercised end-to-end.",
+    "The ProbeFixture project cannot currently produce a deployable iPhoneOS runner build because the project has no development team configured for signing."
+  ]
+}

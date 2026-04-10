@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+
+<trace-toc>
+    <run number="1">
+        <info>
+            <target>
+                <device uuid="4220D4B9-5546-54BE-998B-C12B4DF9905D" model="Mac mini" name="Guilherme’s Mac mini" os-version="26.3.1 (25D2128)" platform="macOS"/>
+                <all-processes/>
+            </target>
+            <summary>
+                <start-date/>
+                <end-date/>
+                <duration>0.000000</duration>
+                <instruments-version/>
+                <recording-mode/>
+            </summary>
+        </info>
+        <processes/>
+        <data>
+            <table schema="com-apple-cfnetwork-transaction-intervals-full-info"/>
+            <table schema="com-apple-cfnetwork-transaction-drawables"/>
+            <table schema="os-log" category="PointsOfInterest"/>
+            <table subsystem="&quot;com.apple.CFNetwork&quot;" schema="os-log" category="HAR"/>
+            <table category="PointsOfInterest" schema="os-signpost" dynamic-tracing-enabled-subsystems="&quot;com.apple.neappprivacy&quot;"/>
+            <table subsystem="&quot;com.apple.CFNetwork.Instruments&quot;" schema="os-signpost" category="&quot;HTTP Transactions&quot;"/>
+            <table subsystem="&quot;com.apple.CFNetwork.Instruments&quot;" schema="os-signpost" category="DynamicStackTracing"/>
+            <table schema="com-apple-cfnetwork-transaction-states"/>
+            <table schema="com-apple-cfnetwork-task-ends"/>
+            <table exclude-os-logs="0" schema="global-poi-layout" target-pid="SINGLE"/>
+            <table schema="kdebug-signpost" target-pid="SINGLE"/>
+            <table schema="com-apple-cfnetwork-transaction-intervals"/>
+            <table schema="network-interface-detection"/>
+            <table schema="process-info"/>
+            <table codes="&quot;46,2&quot;" schema="kdebug" callstack="user" target="SINGLE"/>
+            <table codes="&quot;0x1,0xa&quot;" schema="kdebug" callstack="user" target="SINGLE"/>
+            <table exclude-os-logs="0" schema="region-of-interest" target-pid="SINGLE"/>
+            <table codes="&quot;0x21,0xa&quot;" schema="kdebug" callstack="user" target="SINGLE"/>
+            <table schema="global-roi-layout" target-pid="SINGLE"/>
+            <table schema="com-apple-cfnetwork-task-intervals"/>
+            <table schema="os-log-arg" category="PointsOfInterest"/>
+            <table schema="com-apple-cfnetwork-aggregation-drawables"/>
+            <table schema="com-apple-cfnetwork-task-drawables"/>
+            <table schema="network-connection-update"/>
+            <table schema="network-connection-detected" target-pid="SINGLE"/>
+            <table schema="gcd-perf-event" target-pid="SINGLE"/>
+            <table schema="thread-info"/>
+            <table schema="configured-network-interface"/>
+            <table schema="com-apple-cfnetwork-harlogging-schema"/>
+            <table schema="com-apple-cfnetwork-task-starts"/>
+            <table schema="network-connection-stat" target-pid="SINGLE"/>
+            <table exclude-os-logs="0" schema="roi-metadata" target-pid="SINGLE"/>
+            <table schema="os-signpost-arg" category="PointsOfInterest"/>
+            <external-format format="har" source-schema="com-apple-cfnetwork-harlogging-schema"/>
+        </data>
+        <tracks/>
+    </run>
+</trace-toc>

@@ -1,0 +1,149 @@
+{
+  "bootstrapPath": "/tmp/probe-runner-bootstrap/4015AB8A-185C-4334-8019-EBDE113852E5.json",
+  "controlDirectoryPath": "/tmp/probe-runner-ax-tree-control.QYvucQ",
+  "generatedAt": "2026-04-10T03:49:56.944Z",
+  "evidenceScope": {
+    "environment": "simulator",
+    "fixture": "ios/ProbeFixture generated Medium/Large profiles",
+    "caveat": "This is simulator-only, fixture-based evidence from one generated UIKit fixture app. Treat numeric caps as heuristics until broader app/device coverage exists."
+  },
+  "metricDefinitions": {
+    "rawSnapshot.nodeCount": "Counts recursive objects in XCUIElementSnapshot.dictionaryRepresentation, not a canonical count of unique accessibility elements.",
+    "views[].nodeCount": "Counts serialized objects/entries in each derived representation being measured."
+  },
+  "heuristicInlineCaps": {
+    "budget": {
+      "maxInlineBytes": 24576,
+      "maxInlineLines": 700
+    },
+    "interactiveOnly": {
+      "approxMaxEntries": 50,
+      "basis": "Both fixture profiles land at about 13.9 pretty-printed lines per serialized interactive entry, which projects to about 50 entries inside a 700-line budget."
+    },
+    "collapsed": {
+      "approxMaxEntries": 55,
+      "basis": "Both fixture profiles land at about 12.1-12.6 pretty-printed lines per serialized collapsed entry, which projects to about 55 entries inside a 700-line budget. A looser ~80 cap is not supported once the 700-line budget is treated as binding."
+    }
+  },
+  "profiles": [
+    {
+      "attachLatencyMs": 1126,
+      "profile": "medium",
+      "profileStatusLabel": "Snapshot profile ready: medium (12 generated cards)",
+      "rawSnapshot": {
+        "compactBytes": 112665,
+        "dictionaryEncodeMs": 16,
+        "nodeCount": 726,
+        "prettyBytes": 533200,
+        "prettyLines": 7266,
+        "snapshotMs": 157
+      },
+      "views": [
+        {
+          "compactBytes": 81799,
+          "encodeMs": 31,
+          "interactiveNodeCount": 117,
+          "kind": "full",
+          "nodeCount": 363,
+          "prettyBytes": 459743,
+          "prettyLines": 6517,
+          "reductionVsRawPrettyBytesPct": 13.8,
+          "transformMs": 3
+        },
+        {
+          "compactBytes": 55725,
+          "encodeMs": 24,
+          "interactiveNodeCount": 117,
+          "kind": "pruned",
+          "nodeCount": 363,
+          "prettyBytes": 331147,
+          "prettyLines": 4765,
+          "reductionVsRawPrettyBytesPct": 37.9,
+          "transformMs": 0
+        },
+        {
+          "compactBytes": 56077,
+          "encodeMs": 14,
+          "interactiveNodeCount": 117,
+          "kind": "collapsed",
+          "nodeCount": 353,
+          "prettyBytes": 93239,
+          "prettyLines": 4257,
+          "reductionVsRawPrettyBytesPct": 82.5,
+          "transformMs": 0
+        },
+        {
+          "compactBytes": 24819,
+          "encodeMs": 12,
+          "interactiveNodeCount": 117,
+          "kind": "interactive-only",
+          "nodeCount": 117,
+          "prettyBytes": 39188,
+          "prettyLines": 1626,
+          "reductionVsRawPrettyBytesPct": 92.7,
+          "transformMs": 0
+        }
+      ]
+    },
+    {
+      "attachLatencyMs": 1126,
+      "profile": "large",
+      "profileStatusLabel": "Snapshot profile ready: large (48 generated cards)",
+      "rawSnapshot": {
+        "compactBytes": 367727,
+        "dictionaryEncodeMs": 19,
+        "nodeCount": 2322,
+        "prettyBytes": 1788816,
+        "prettyLines": 23226,
+        "snapshotMs": 447
+      },
+      "views": [
+        {
+          "compactBytes": 271167,
+          "encodeMs": 57,
+          "interactiveNodeCount": 405,
+          "kind": "full",
+          "nodeCount": 1161,
+          "prettyBytes": 1555381,
+          "prettyLines": 21025,
+          "reductionVsRawPrettyBytesPct": 13,
+          "transformMs": 9
+        },
+        {
+          "compactBytes": 192589,
+          "encodeMs": 42,
+          "interactiveNodeCount": 405,
+          "kind": "pruned",
+          "nodeCount": 1161,
+          "prettyBytes": 1159961,
+          "prettyLines": 16009,
+          "reductionVsRawPrettyBytesPct": 35.2,
+          "transformMs": 0
+        },
+        {
+          "compactBytes": 194832,
+          "encodeMs": 18,
+          "interactiveNodeCount": 405,
+          "kind": "collapsed",
+          "nodeCount": 1151,
+          "prettyBytes": 322036,
+          "prettyLines": 14487,
+          "reductionVsRawPrettyBytesPct": 82,
+          "transformMs": 0
+        },
+        {
+          "compactBytes": 88091,
+          "encodeMs": 8,
+          "interactiveNodeCount": 405,
+          "kind": "interactive-only",
+          "nodeCount": 405,
+          "prettyBytes": 137848,
+          "prettyLines": 5622,
+          "reductionVsRawPrettyBytesPct": 92.3,
+          "transformMs": 0
+        }
+      ]
+    }
+  ],
+  "simulatorUdid": "4015AB8A-185C-4334-8019-EBDE113852E5"
+}

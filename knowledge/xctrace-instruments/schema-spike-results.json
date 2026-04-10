@@ -1,0 +1,2436 @@
+{
+  "generatedAt": "2026-04-10T02:29:44.187897Z",
+  "xcodeVersion": "Xcode 26.3\nBuild version 17C529",
+  "xctraceVersion": "xctrace version 26.0 (17C529)",
+  "simulatorUdid": "4015AB8A-185C-4334-8019-EBDE113852E5",
+  "fixtureBundleId": "dev.probe.fixture",
+  "fixturePid": 27364,
+  "fixtureLaunchOutput": "dev.probe.fixture: 27364",
+  "fixtureSetup": {
+    "derivedDataPath": "/tmp/probe-fixture-derived-data.FOVAth",
+    "appPath": "/tmp/probe-fixture-derived-data.FOVAth/Build/Products/Debug-iphonesimulator/ProbeFixture.app",
+    "launchResult": "dev.probe.fixture: 27356"
+  },
+  "traceRoot": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13",
+  "templates": [
+    {
+      "templateName": "Time Profiler",
+      "slug": "time-profiler",
+      "expectedStatus": "success",
+      "tracePath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13/time-profiler.trace",
+      "tocPath": "knowledge/xctrace-instruments/fixture-time-profiler.toc.xml",
+      "recordExitCode": 0,
+      "recordStdout": "Starting recording with the Time Profiler template. Attaching to: ProbeFixture (27364). Time limit: 5.0 s\nCtrl-C to stop the recording\nReached specified time limit, ending recording...\nRecording completed. Saving output file...\nOutput file saved as: time-profiler.trace",
+      "recordStderr": "",
+      "tableCount": 32,
+      "tables": [
+        {
+          "schema": "time-profile",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "context-switch-sampling": "0",
+            "high-frequency-sampling": "0",
+            "record-waiting-threads": "0",
+            "needs-kernel-callstack": "0"
+          }
+        },
+        {
+          "schema": "potential-hangs",
+          "attributes": {
+            "hangs-threshold": "250",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "time-sample",
+          "attributes": {
+            "callstack": "user",
+            "target": "SINGLE",
+            "sample-rate-micro-seconds": "1000",
+            "all-thread-states": "NO"
+          }
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "enable-priority-inversion-detection": "0",
+            "target-pid": "SINGLE",
+            "message-type": "Fault",
+            "category": "\"Hang Risk\" \"Severe Hang Risk\" CFNetwork Contacts CoreML",
+            "subsystem": "\"com.apple.runtime-issues\""
+          }
+        },
+        {
+          "schema": "region-of-interest",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "exclude-os-logs": "0"
+          }
+        },
+        {
+          "schema": "runloop-events",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.ConditionInducer.LowSeverity\"",
+            "category": "InduceCondition"
+          }
+        },
+        {
+          "schema": "roi-metadata",
+          "attributes": {
+            "exclude-os-logs": "0",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "dynamic-tracing-enabled-subsystems": "\"com.apple.neappprivacy\"",
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"46,2\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x65\""
+          }
+        },
+        {
+          "schema": "life-cycle-period",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0xa\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x21,0xa\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x87\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1f,0x7\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0xd8\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x31,0xca\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "process-info"
+        },
+        {
+          "schema": "gcd-perf-event",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost-arg",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "global-poi-layout",
+          "attributes": {
+            "exclude-os-logs": "0",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "thread-info"
+        },
+        {
+          "schema": "hang-risks",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "detect-priority-inversions": "0"
+          }
+        },
+        {
+          "schema": "global-roi-layout",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug-strings",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-log-arg",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "device-thermal-state-intervals"
+        },
+        {
+          "schema": "tick",
+          "attributes": {
+            "frequency": "1"
+          }
+        },
+        {
+          "schema": "kdebug-signpost",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        }
+      ],
+      "schemaExcerpts": [
+        {
+          "schema": "time-profile",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-profile\"]",
+          "columns": [
+            {
+              "mnemonic": "time",
+              "name": "Sample Time",
+              "engineering_type": "sample-time"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "core",
+              "name": "Core",
+              "engineering_type": "core"
+            },
+            {
+              "mnemonic": "thread-state",
+              "name": "State",
+              "engineering_type": "thread-state"
+            },
+            {
+              "mnemonic": "weight",
+              "name": "Weight",
+              "engineering_type": "weight"
+            },
+            {
+              "mnemonic": "stack",
+              "name": "Backtrace",
+              "engineering_type": "backtrace"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        },
+        {
+          "schema": "time-sample",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-sample\"]",
+          "columns": [
+            {
+              "mnemonic": "time",
+              "name": "Timestamp",
+              "engineering_type": "sample-time"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "core-index",
+              "name": "Core Index",
+              "engineering_type": "core"
+            },
+            {
+              "mnemonic": "thread-state",
+              "name": "Thread State",
+              "engineering_type": "thread-state"
+            },
+            {
+              "mnemonic": "cp-kernel-callstack",
+              "name": "Kernel Callstack ID",
+              "engineering_type": "kperf-bt"
+            },
+            {
+              "mnemonic": "cp-user-callstack",
+              "name": "User Callstack ID",
+              "engineering_type": "kperf-bt"
+            },
+            {
+              "mnemonic": "sample-type",
+              "name": "Sample type",
+              "engineering_type": "time-sample-kind"
+            }
+          ],
+          "has_rows": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "templateName": "Metal System Trace",
+      "slug": "metal-system-trace",
+      "expectedStatus": "success",
+      "tracePath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13/metal-system-trace.trace",
+      "tocPath": "knowledge/xctrace-instruments/fixture-metal-system-trace.toc.xml",
+      "recordExitCode": 0,
+      "recordStdout": "Starting recording with the Metal System Trace template. Attaching to: ProbeFixture (27364). Time limit: 5.0 s\nCtrl-C to stop the recording\nReached specified time limit, ending recording...\nRecording completed. Saving output file...\nOutput file saved as: metal-system-trace.trace",
+      "recordStderr": "",
+      "tableCount": 106,
+      "tables": [
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0xd8\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug-strings",
+          "attributes": {
+            "codes": "\"0x85,0x1\" \"0x85,0x2\" \"0x85,0x8\" \"0x85,0x30\" \"0x85,0xc0\" \"0x85,0xc1\" \"0x31,0xca\""
+          }
+        },
+        {
+          "schema": "kdebug-strings",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x31,0xca\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x65\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x20\" \"0x31,0x80\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0xAF\" \"0x34,0x11\" \"0x34,0x0f\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x92\" \"0x85,0x93\" \"0x85,0xae\" \"0x06,0x1b\" \"0x2b,0x24\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x2b\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x80\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x12\""
+          }
+        },
+        {
+          "schema": "ca-client-present-request"
+        },
+        {
+          "schema": "metal-shader-profiler-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-residency-set-usage-event"
+        },
+        {
+          "schema": "display-compositor-events-interval"
+        },
+        {
+          "schema": "displayed-surfaces-interval",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-object-dependency-chain-display",
+          "attributes": {
+            "track-id-base": "2000"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x31,0xb0\" \"0x31,0xd0\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-application-encoders-list",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x34,0x11\" \"0x34,0x0f\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0xc2\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x2\"",
+            "callstack": "user"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x30\"",
+            "callstack": "user"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0xc0\" \"0x85,0xc1\" \"0x31,0xca\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x1\" \"0x85,0x8\"",
+            "callstack": "user"
+          }
+        },
+        {
+          "schema": "display-surface-queue"
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x9\" \"0x85,0x18\"",
+            "callstack": "user"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x92\" \"0x85,0x93\" \"0x85,0xae\""
+          }
+        },
+        {
+          "schema": "metal-driver-event-per-thread-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-object-label"
+        },
+        {
+          "schema": "time-sample",
+          "attributes": {
+            "callstack": "user",
+            "target": "SINGLE",
+            "sample-rate-micro-seconds": "1000",
+            "all-thread-states": "NO"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x85,0x3\" \"0x85,0x90\" \"0x85,0xA9\""
+          }
+        },
+        {
+          "schema": "metal-gpu-execution-points"
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x87\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-gpu-info"
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "enable-priority-inversion-detection": "0",
+            "target-pid": "SINGLE",
+            "message-type": "Fault",
+            "category": "\"Hang Risk\" \"Severe Hang Risk\" CFNetwork Contacts CoreML",
+            "subsystem": "\"com.apple.runtime-issues\""
+          }
+        },
+        {
+          "schema": "metal-object-dependency-chain-gpu",
+          "attributes": {
+            "track-id-base": "2000"
+          }
+        },
+        {
+          "schema": "metal-visual-highlight-chain-gpu"
+        },
+        {
+          "schema": "process-info"
+        },
+        {
+          "schema": "ca-client-presented-handler"
+        },
+        {
+          "schema": "runloop-events",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-residency-set-interval"
+        },
+        {
+          "schema": "metal-driver-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "time-info"
+        },
+        {
+          "schema": "graphics-compiler-activity-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-application-command-buffer-submissions",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "gpu-counter-info",
+          "attributes": {
+            "shader-profiler": "0",
+            "counter-profile": "0",
+            "counter-device": "0"
+          }
+        },
+        {
+          "schema": "gpu-shader-profiler-sample"
+        },
+        {
+          "schema": "gpu-performance-state-info",
+          "attributes": {
+            "requested-consistent-state": "0"
+          }
+        },
+        {
+          "schema": "device-display-info"
+        },
+        {
+          "schema": "metal-command-buffer-completed"
+        },
+        {
+          "schema": "hang-risks",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "detect-priority-inversions": "0"
+          }
+        },
+        {
+          "schema": "metal-wired-sysmem-level-interval"
+        },
+        {
+          "schema": "os-signpost-arg",
+          "attributes": {
+            "subsystem": "\"com.apple.Metal.AGXSignposts\"",
+            "category": "ShaderTimeline"
+          }
+        },
+        {
+          "schema": "metal-current-allocated-size",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-ar-events"
+        },
+        {
+          "schema": "metal-application-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "visual-chain",
+          "attributes": {
+            "content": "metal-connection-chains",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "gpu-performance-state-intervals",
+          "attributes": {
+            "requested-consistent-state": "0"
+          }
+        },
+        {
+          "schema": "gpu-aps-stream"
+        },
+        {
+          "schema": "display-vsyncs-interval"
+        },
+        {
+          "schema": "device-thermal-state-intervals"
+        },
+        {
+          "schema": "metal-driver-event-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-visual-highlight-chain-app"
+        },
+        {
+          "schema": "potential-hangs",
+          "attributes": {
+            "hangs-threshold": "100",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-shader-profiler-shader-list",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "visual-connection",
+          "attributes": {
+            "content": "metal-connections",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "display-events-interval"
+        },
+        {
+          "schema": "gpu-shader-profiler-interval"
+        },
+        {
+          "schema": "thread-info"
+        },
+        {
+          "schema": "metal-visual-highlight-chain-display"
+        },
+        {
+          "schema": "display-compositor-interval",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "tick"
+        },
+        {
+          "schema": "tick",
+          "attributes": {
+            "frequency": "1"
+          }
+        },
+        {
+          "schema": "life-cycle-period",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "time-profile",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "context-switch-sampling": "0",
+            "high-frequency-sampling": "0",
+            "record-waiting-threads": "0",
+            "needs-kernel-callstack": "0"
+          }
+        },
+        {
+          "schema": "metal-object-dependency-chain-app",
+          "attributes": {
+            "track-id-base": "1000"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.coreanimation\"",
+            "category": "CAMetalLayer"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.ConditionInducer.LowSeverity\"",
+            "category": "InduceCondition"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.Metal.AGXSignposts\"",
+            "category": "ShaderTimeline"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.coreanimation\"",
+            "category": "\"CAMetalLayer.Stalls\""
+          }
+        },
+        {
+          "schema": "device-gpu-info"
+        },
+        {
+          "schema": "gpu-performance-device-state-intervals",
+          "attributes": {
+            "requested-consistent-state": "0"
+          }
+        },
+        {
+          "schema": "mps-hw-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-gpu-state-intervals"
+        },
+        {
+          "schema": "ca-client-buffer-wait-interval"
+        },
+        {
+          "schema": "gpu-counter-value"
+        },
+        {
+          "schema": "metal-gpu-counter-profile",
+          "attributes": {
+            "shader-profiler": "0",
+            "counter-profile": "0",
+            "counter-device": "0"
+          }
+        },
+        {
+          "schema": "metal-object-dependency-chain-driver",
+          "attributes": {
+            "track-id-base": "2000"
+          }
+        },
+        {
+          "schema": "metal-io-surface-access"
+        },
+        {
+          "schema": "metal-command-buffer-error"
+        },
+        {
+          "schema": "metal-residency-set-resource-event"
+        },
+        {
+          "schema": "metal-application-event-interval",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-gpu-counter-intervals"
+        },
+        {
+          "schema": "displayed-surfaces-per-second"
+        },
+        {
+          "schema": "display-surface-swap"
+        },
+        {
+          "schema": "metal-gpu-submission-to-command-buffer-id"
+        },
+        {
+          "schema": "metal-known-compositor-process"
+        },
+        {
+          "schema": "metal-gpu-intervals",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-command-buffer-frame-assignment"
+        },
+        {
+          "schema": "metal-visual-highlight-chain-driver"
+        },
+        {
+          "schema": "metal-command-buffer-to-accelerator-id"
+        },
+        {
+          "schema": "metal-resource-allocations",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "metal-kernel-resource-allocations",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1f,0x7\"",
+            "target": "SINGLE"
+          }
+        }
+      ],
+      "schemaExcerpts": [
+        {
+          "schema": "metal-driver-event-intervals",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"metal-driver-event-intervals\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Creation",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "gpu-driver-name",
+              "name": "GPU Driver Name",
+              "engineering_type": "gpu-driver-name"
+            },
+            {
+              "mnemonic": "event-type",
+              "name": "Event Type",
+              "engineering_type": "gpu-driver-name"
+            },
+            {
+              "mnemonic": "event-depth",
+              "name": "Depth",
+              "engineering_type": "metal-nesting-level"
+            },
+            {
+              "mnemonic": "event-label",
+              "name": "Event",
+              "engineering_type": "formatted-label"
+            },
+            {
+              "mnemonic": "event-priority",
+              "name": "Priority",
+              "engineering_type": "metal-workload-priority"
+            },
+            {
+              "mnemonic": "connection-UUID",
+              "name": "Connection UUID",
+              "engineering_type": "connection-uuid64"
+            },
+            {
+              "mnemonic": "color",
+              "name": "Color",
+              "engineering_type": "render-buffer-depth"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "gpu",
+              "name": "Metal Device",
+              "engineering_type": "metal-device-name"
+            },
+            {
+              "mnemonic": "resource-id",
+              "name": "Resource ID",
+              "engineering_type": "metal-command-buffer-id"
+            },
+            {
+              "mnemonic": "show-per-thread",
+              "name": "Show per Thread",
+              "engineering_type": "boolean"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        },
+        {
+          "schema": "metal-gpu-intervals",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"metal-gpu-intervals\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Creation",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "channel-name",
+              "name": "Channel Name",
+              "engineering_type": "gpu-channel-name"
+            },
+            {
+              "mnemonic": "frame-number",
+              "name": "Frame",
+              "engineering_type": "gpu-frame-number"
+            },
+            {
+              "mnemonic": "start-latency",
+              "name": "CPU to GPU Latency",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "event-depth",
+              "name": "Depth",
+              "engineering_type": "metal-nesting-level"
+            },
+            {
+              "mnemonic": "event-label",
+              "name": "Label",
+              "engineering_type": "formatted-label"
+            },
+            {
+              "mnemonic": "state",
+              "name": "State",
+              "engineering_type": "gpu-state"
+            },
+            {
+              "mnemonic": "connection-UUID",
+              "name": "Connection UUID",
+              "engineering_type": "connection-uuid64"
+            },
+            {
+              "mnemonic": "color",
+              "name": "Color",
+              "engineering_type": "render-buffer-depth"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "gpu",
+              "name": "Metal Device",
+              "engineering_type": "metal-device-name"
+            },
+            {
+              "mnemonic": "channel-subtitle",
+              "name": "Channel Subtitle",
+              "engineering_type": "metal-object-label"
+            },
+            {
+              "mnemonic": "iosurface-accesses",
+              "name": "IOSurface Accesses",
+              "engineering_type": "formatted-label"
+            },
+            {
+              "mnemonic": "bytes",
+              "name": "Bytes",
+              "engineering_type": "size-in-bytes"
+            },
+            {
+              "mnemonic": "cmdbuffer-id",
+              "name": "Commmand Buffer Id",
+              "engineering_type": "metal-command-buffer-id"
+            },
+            {
+              "mnemonic": "encoder-id",
+              "name": "Encoder Id",
+              "engineering_type": "metal-command-buffer-id"
+            },
+            {
+              "mnemonic": "gpu-submission-id",
+              "name": "GPU Submission Id",
+              "engineering_type": "uint64"
+            }
+          ],
+          "has_rows": true,
+          "error": null
+        },
+        {
+          "schema": "metal-application-encoders-list",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"metal-application-encoders-list\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Creation",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "gpu",
+              "name": "Metal Device",
+              "engineering_type": "metal-device-name"
+            },
+            {
+              "mnemonic": "frame-number",
+              "name": "Frame",
+              "engineering_type": "gpu-frame-number"
+            },
+            {
+              "mnemonic": "cmdbuffer-label",
+              "name": "Command Buffer",
+              "engineering_type": "metal-object-label"
+            },
+            {
+              "mnemonic": "cmdbuffer-label-indexed",
+              "name": "Command Buffer (Indexed)",
+              "engineering_type": "metal-object-label"
+            },
+            {
+              "mnemonic": "encoder-label",
+              "name": "Encoder",
+              "engineering_type": "metal-object-label"
+            },
+            {
+              "mnemonic": "encoder-label-indexed",
+              "name": "Encoder (Indexed)",
+              "engineering_type": "metal-object-label"
+            },
+            {
+              "mnemonic": "event-type",
+              "name": "Event Type",
+              "engineering_type": "metal-event-name"
+            },
+            {
+              "mnemonic": "cmdbuffer-id",
+              "name": "Commmand Buffer Id",
+              "engineering_type": "metal-command-buffer-id"
+            },
+            {
+              "mnemonic": "encoder-id",
+              "name": "Encoder Id",
+              "engineering_type": "metal-command-buffer-id"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        }
+      ]
+    },
+    {
+      "templateName": "Swift Concurrency",
+      "slug": "swift-concurrency",
+      "expectedStatus": "success",
+      "tracePath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13/swift-concurrency.trace",
+      "tocPath": "knowledge/xctrace-instruments/fixture-swift-concurrency.toc.xml",
+      "recordExitCode": 0,
+      "recordStdout": "Starting recording with the Swift Concurrency template. Attaching to: ProbeFixture (27364). Time limit: 5.0 s\nCtrl-C to stop the recording\nReached specified time limit, ending recording...\nRecording completed. Saving output file...\nOutput file saved as: swift-concurrency.trace",
+      "recordStderr": "",
+      "tableCount": 30,
+      "tables": [
+        {
+          "schema": "swift-actor-lifetime",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "potential-hangs",
+          "attributes": {
+            "hangs-threshold": "250",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "time-sample",
+          "attributes": {
+            "callstack": "user",
+            "target": "SINGLE",
+            "sample-rate-micro-seconds": "1000",
+            "all-thread-states": "NO"
+          }
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "enable-priority-inversion-detection": "0",
+            "target-pid": "SINGLE",
+            "message-type": "Fault",
+            "category": "\"Hang Risk\" \"Severe Hang Risk\" CFNetwork Contacts CoreML",
+            "subsystem": "\"com.apple.runtime-issues\""
+          }
+        },
+        {
+          "schema": "swift-total-task-count",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "swift-alive-task-count",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "category": "Actor",
+            "subsystem": "\"com.apple.swift.concurrency\""
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "category": "Task",
+            "subsystem": "\"com.apple.swift.concurrency\""
+          }
+        },
+        {
+          "schema": "swift-running-task-count",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "runloop-events",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "process-info"
+        },
+        {
+          "schema": "life-cycle-period",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1f,0x7\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0xd8\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x31,0xca\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x87\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "swift-actor-queue-size",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "thread-info"
+        },
+        {
+          "schema": "swift-task-creation-event",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "swift-task-lifetime",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "hang-risks",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "detect-priority-inversions": "0"
+          }
+        },
+        {
+          "schema": "swift-task-state",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "swift-actor-count",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug-strings",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "swift-task-cancellation-event",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "swift-task-relationship",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "time-profile",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "context-switch-sampling": "0",
+            "high-frequency-sampling": "0",
+            "record-waiting-threads": "0",
+            "needs-kernel-callstack": "0"
+          }
+        },
+        {
+          "schema": "tick",
+          "attributes": {
+            "frequency": "1"
+          }
+        },
+        {
+          "schema": "swift-actor-execution",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        }
+      ],
+      "schemaExcerpts": [
+        {
+          "schema": "swift-task-lifetime",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"swift-task-lifetime\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Start",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "task",
+              "name": "Swift Task",
+              "engineering_type": "swift-task"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        },
+        {
+          "schema": "swift-task-state",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"swift-task-state\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Start",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "task",
+              "name": "Swift Task",
+              "engineering_type": "swift-task"
+            },
+            {
+              "mnemonic": "state",
+              "name": "Task State",
+              "engineering_type": "swift-task-state"
+            },
+            {
+              "mnemonic": "backtrace",
+              "name": "Creation Backtrace",
+              "engineering_type": "text-backtrace"
+            },
+            {
+              "mnemonic": "resume-backtrace",
+              "name": "Resume Backtrace",
+              "engineering_type": "text-backtrace"
+            },
+            {
+              "mnemonic": "suspend-backtrace",
+              "name": "Suspend Backtrace",
+              "engineering_type": "text-backtrace"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "narrative",
+              "name": "Narrative",
+              "engineering_type": "narrative"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        },
+        {
+          "schema": "swift-actor-execution",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"swift-actor-execution\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Start",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "actor",
+              "name": "Swift Actor",
+              "engineering_type": "swift-actor"
+            },
+            {
+              "mnemonic": "task",
+              "name": "Swift Task",
+              "engineering_type": "swift-task"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        }
+      ]
+    },
+    {
+      "templateName": "Logging",
+      "slug": "logging",
+      "expectedStatus": "success",
+      "tracePath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13/logging.trace",
+      "tocPath": "knowledge/xctrace-instruments/fixture-logging.toc.xml",
+      "recordExitCode": 0,
+      "recordStdout": "Starting recording with the Logging template. Attaching to: ProbeFixture (27364). Time limit: 5.0 s\nCtrl-C to stop the recording\nReached specified time limit, ending recording...\nRecording completed. Saving output file...\nOutput file saved as: logging.trace",
+      "recordStderr": "",
+      "tableCount": 7,
+      "tables": [
+        {
+          "schema": "os-log",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost-interval",
+          "attributes": {
+            "layout-scope": "name",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost-arg",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "thread-info"
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "process-info"
+        },
+        {
+          "schema": "os-log-arg",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        }
+      ],
+      "schemaExcerpts": [
+        {
+          "schema": "os-log",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"os-log\"]",
+          "columns": [
+            {
+              "mnemonic": "time",
+              "name": "Timestamp",
+              "engineering_type": "event-time"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "message-type",
+              "name": "Type",
+              "engineering_type": "event-type"
+            },
+            {
+              "mnemonic": "format-string",
+              "name": "Format String",
+              "engineering_type": "format-string"
+            },
+            {
+              "mnemonic": "backtrace",
+              "name": "Backtrace",
+              "engineering_type": "text-backtrace"
+            },
+            {
+              "mnemonic": "subsystem",
+              "name": "Subsystem",
+              "engineering_type": "subsystem"
+            },
+            {
+              "mnemonic": "category",
+              "name": "Category",
+              "engineering_type": "category"
+            },
+            {
+              "mnemonic": "message",
+              "name": "Message",
+              "engineering_type": "os-log-metadata"
+            },
+            {
+              "mnemonic": "emit-location",
+              "name": "Emit Location",
+              "engineering_type": "return-location"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        },
+        {
+          "schema": "os-signpost",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"os-signpost\"]",
+          "columns": [
+            {
+              "mnemonic": "time",
+              "name": "Timestamp",
+              "engineering_type": "event-time"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "event-type",
+              "name": "Event Type",
+              "engineering_type": "event-type"
+            },
+            {
+              "mnemonic": "scope",
+              "name": "Scope",
+              "engineering_type": "string"
+            },
+            {
+              "mnemonic": "identifier",
+              "name": "Signpost identifier",
+              "engineering_type": "os-signpost-identifier"
+            },
+            {
+              "mnemonic": "name",
+              "name": "Name",
+              "engineering_type": "signpost-name"
+            },
+            {
+              "mnemonic": "format-string",
+              "name": "Format String",
+              "engineering_type": "format-string"
+            },
+            {
+              "mnemonic": "backtrace",
+              "name": "Backtrace",
+              "engineering_type": "text-backtrace"
+            },
+            {
+              "mnemonic": "subsystem",
+              "name": "Subsystem",
+              "engineering_type": "subsystem"
+            },
+            {
+              "mnemonic": "category",
+              "name": "Category",
+              "engineering_type": "category"
+            },
+            {
+              "mnemonic": "message",
+              "name": "Message",
+              "engineering_type": "os-log-metadata"
+            },
+            {
+              "mnemonic": "emit-location",
+              "name": "Emit Location",
+              "engineering_type": "return-location"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        }
+      ]
+    },
+    {
+      "templateName": "System Trace",
+      "slug": "system-trace",
+      "expectedStatus": "success",
+      "tracePath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13/system-trace.trace",
+      "tocPath": "knowledge/xctrace-instruments/fixture-system-trace.toc.xml",
+      "recordExitCode": 0,
+      "recordStdout": "Starting recording with the System Trace template. Attaching to: ProbeFixture (27364). Time limit: 5.0 s\nCtrl-C to stop the recording\nReached specified time limit, ending recording...\nRecording completed. Saving output file...\nOutput file saved as: system-trace.trace",
+      "recordStderr": "",
+      "tableCount": 49,
+      "tables": [
+        {
+          "schema": "tick",
+          "attributes": {
+            "frequency": "1"
+          }
+        },
+        {
+          "schema": "life-cycle-period",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "tick",
+          "attributes": {
+            "frequency": "100"
+          }
+        },
+        {
+          "schema": "thread-state",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "device-thermal-state-intervals"
+        },
+        {
+          "schema": "syscall-name-map"
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "enable-priority-inversion-detection": "0",
+            "target-pid": "SINGLE",
+            "message-type": "Fault",
+            "category": "\"Hang Risk\" \"Severe Hang Risk\" CFNetwork Contacts CoreML",
+            "subsystem": "\"com.apple.runtime-issues\""
+          }
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "cpu-state",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.ConditionInducer.LowSeverity\"",
+            "category": "InduceCondition"
+          }
+        },
+        {
+          "schema": "cpu-narrative"
+        },
+        {
+          "schema": "hang-risks",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "detect-priority-inversions": "0"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "category": "PointsOfInterest",
+            "dynamic-tracing-enabled-subsystems": "\"com.apple.neappprivacy\""
+          }
+        },
+        {
+          "schema": "potential-hangs",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "hangs-threshold": "250"
+          }
+        },
+        {
+          "schema": "global-poi-layout",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "exclude-os-logs": "0"
+          }
+        },
+        {
+          "schema": "context-switch",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "target-capability"
+        },
+        {
+          "schema": "time-profile",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "context-switch-sampling": "0",
+            "high-frequency-sampling": "0",
+            "needs-kernel-callstack": "0",
+            "record-waiting-threads": "0"
+          }
+        },
+        {
+          "schema": "kdebug-signpost",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug-strings",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "process-info"
+        },
+        {
+          "schema": "os-log-arg",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "global-roi-layout",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "syscall",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "region-of-interest",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "exclude-os-logs": "0"
+          }
+        },
+        {
+          "schema": "thread-snapshot"
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x65\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"33,0x11\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "thread-narrative"
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0x87\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1f,0x7\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x2b,0xd8\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x31,0xca\"",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0x30\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x7,0x0\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0xc\" \"0x4,0xc\"",
+            "target": "SINGLE",
+            "callstack": "user"
+          }
+        },
+        {
+          "schema": "virtual-memory",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0x40\""
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0xa\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x21,0xa\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"46,2\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0x9\" \"0x1,0x5\""
+          }
+        },
+        {
+          "schema": "gcd-perf-event",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "thread-info"
+        },
+        {
+          "schema": "runloop-events",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "system-load",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "roi-metadata",
+          "attributes": {
+            "target-pid": "SINGLE",
+            "exclude-os-logs": "0"
+          }
+        },
+        {
+          "schema": "time-sample",
+          "attributes": {
+            "callstack": "user",
+            "target": "SINGLE",
+            "sample-rate-micro-seconds": "1000",
+            "all-thread-states": "NO"
+          }
+        },
+        {
+          "schema": "os-signpost-arg",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        }
+      ],
+      "schemaExcerpts": [
+        {
+          "schema": "thread-state",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"thread-state\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Start Time",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "state",
+              "name": "State",
+              "engineering_type": "thread-state"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "core",
+              "name": "Core",
+              "engineering_type": "core"
+            },
+            {
+              "mnemonic": "cputime",
+              "name": "Running Time",
+              "engineering_type": "duration-on-core"
+            },
+            {
+              "mnemonic": "waittime",
+              "name": "Wait Time",
+              "engineering_type": "duration-waiting"
+            },
+            {
+              "mnemonic": "priority",
+              "name": "Priority",
+              "engineering_type": "sched-priority"
+            },
+            {
+              "mnemonic": "note",
+              "name": "Note",
+              "engineering_type": "narrative"
+            },
+            {
+              "mnemonic": "summary",
+              "name": "Summary",
+              "engineering_type": "narrative"
+            }
+          ],
+          "has_rows": true,
+          "error": null
+        },
+        {
+          "schema": "cpu-state",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"cpu-state\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Start Time",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "cpu",
+              "name": "CPU",
+              "engineering_type": "core"
+            },
+            {
+              "mnemonic": "state",
+              "name": "State",
+              "engineering_type": "core-state"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "priority",
+              "name": "Priority",
+              "engineering_type": "sched-priority"
+            }
+          ],
+          "has_rows": true,
+          "error": null
+        },
+        {
+          "schema": "runloop-events",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"runloop-events\"]",
+          "columns": [
+            {
+              "mnemonic": "timestamp",
+              "name": "Timestamp",
+              "engineering_type": "event-time"
+            },
+            {
+              "mnemonic": "timestamp-accuracy",
+              "name": "Timestamp Accuracy",
+              "engineering_type": "string"
+            },
+            {
+              "mnemonic": "interval-type",
+              "name": "Runloop Interval",
+              "engineering_type": "short-string"
+            },
+            {
+              "mnemonic": "event-type",
+              "name": "Event Type",
+              "engineering_type": "kdebug-func"
+            },
+            {
+              "mnemonic": "interval-identifier",
+              "name": "Interval Identifier",
+              "engineering_type": "short-string"
+            },
+            {
+              "mnemonic": "nesting-level",
+              "name": "Nesting Level",
+              "engineering_type": "uint64"
+            },
+            {
+              "mnemonic": "mode",
+              "name": "RunLoop Mode",
+              "engineering_type": "medium-length-string"
+            },
+            {
+              "mnemonic": "is-main",
+              "name": "Main RunLoop",
+              "engineering_type": "boolean"
+            },
+            {
+              "mnemonic": "thread",
+              "name": "Thread",
+              "engineering_type": "thread"
+            },
+            {
+              "mnemonic": "runloop-pointer",
+              "name": "Runloop",
+              "engineering_type": "address"
+            },
+            {
+              "mnemonic": "timeout",
+              "name": "Timeout",
+              "engineering_type": "uint64"
+            },
+            {
+              "mnemonic": "other-arg",
+              "name": "Other Argument",
+              "engineering_type": "uint64"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        }
+      ]
+    },
+    {
+      "templateName": "Network",
+      "slug": "network",
+      "expectedStatus": "expected-simulator-failure",
+      "tracePath": "/var/folders/n8/cfckz4jx07j7yx95w091vtnr0000gn/T/probe-xctrace-schema-spike.rfbxii13/network.trace",
+      "tocPath": "knowledge/xctrace-instruments/fixture-network.toc.xml",
+      "recordExitCode": 2,
+      "recordStdout": "Starting recording with the Network template. Attaching to: ProbeFixture (27364). Time limit: 5.0 s\nCtrl-C to stop the recording\nRecording failed with errors. Saving output file...\nOutput file saved as: network.trace",
+      "recordStderr": "Run issues were detected (trace is still ready to be viewed):\n* [Error] Recording of 'Network Connections' is not supported in the Simulator.\n\n\t* [Error] Recovery Suggestion: Remove the `Network Connections` instrument and try again.\n\n* [Error] Recording of 'Network Connections' is not supported in the Simulator.\n\n\t* [Error] Recovery Suggestion: Remove the `Network Connections` instrument and try again.\n\n* [Error] Recording of 'Network Connections' is not supported in the Simulator.\n\n\t* [Error] Recovery Suggestion: Remove the `Network Connections` instrument and try again.",
+      "tableCount": 33,
+      "tables": [
+        {
+          "schema": "com-apple-cfnetwork-transaction-intervals-full-info"
+        },
+        {
+          "schema": "com-apple-cfnetwork-transaction-drawables"
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "os-log",
+          "attributes": {
+            "subsystem": "\"com.apple.CFNetwork\"",
+            "category": "HAR"
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "category": "PointsOfInterest",
+            "dynamic-tracing-enabled-subsystems": "\"com.apple.neappprivacy\""
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.CFNetwork.Instruments\"",
+            "category": "\"HTTP Transactions\""
+          }
+        },
+        {
+          "schema": "os-signpost",
+          "attributes": {
+            "subsystem": "\"com.apple.CFNetwork.Instruments\"",
+            "category": "DynamicStackTracing"
+          }
+        },
+        {
+          "schema": "com-apple-cfnetwork-transaction-states"
+        },
+        {
+          "schema": "com-apple-cfnetwork-task-ends"
+        },
+        {
+          "schema": "global-poi-layout",
+          "attributes": {
+            "exclude-os-logs": "0",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug-signpost",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "com-apple-cfnetwork-transaction-intervals"
+        },
+        {
+          "schema": "network-interface-detection"
+        },
+        {
+          "schema": "process-info"
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"46,2\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x1,0xa\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "region-of-interest",
+          "attributes": {
+            "exclude-os-logs": "0",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "kdebug",
+          "attributes": {
+            "codes": "\"0x21,0xa\"",
+            "callstack": "user",
+            "target": "SINGLE"
+          }
+        },
+        {
+          "schema": "global-roi-layout",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "com-apple-cfnetwork-task-intervals"
+        },
+        {
+          "schema": "os-log-arg",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        },
+        {
+          "schema": "com-apple-cfnetwork-aggregation-drawables"
+        },
+        {
+          "schema": "com-apple-cfnetwork-task-drawables"
+        },
+        {
+          "schema": "network-connection-update"
+        },
+        {
+          "schema": "network-connection-detected",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "gcd-perf-event",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "thread-info"
+        },
+        {
+          "schema": "configured-network-interface"
+        },
+        {
+          "schema": "com-apple-cfnetwork-harlogging-schema"
+        },
+        {
+          "schema": "com-apple-cfnetwork-task-starts"
+        },
+        {
+          "schema": "network-connection-stat",
+          "attributes": {
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "roi-metadata",
+          "attributes": {
+            "exclude-os-logs": "0",
+            "target-pid": "SINGLE"
+          }
+        },
+        {
+          "schema": "os-signpost-arg",
+          "attributes": {
+            "category": "PointsOfInterest"
+          }
+        }
+      ],
+      "schemaExcerpts": [
+        {
+          "schema": "com-apple-cfnetwork-transaction-intervals",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"com-apple-cfnetwork-transaction-intervals\"]",
+          "columns": [
+            {
+              "mnemonic": "start",
+              "name": "Start",
+              "engineering_type": "start-time"
+            },
+            {
+              "mnemonic": "duration",
+              "name": "Duration",
+              "engineering_type": "duration"
+            },
+            {
+              "mnemonic": "layout-qualifier",
+              "name": "Layout ID",
+              "engineering_type": "layout-id"
+            },
+            {
+              "mnemonic": "process",
+              "name": "Process",
+              "engineering_type": "process"
+            },
+            {
+              "mnemonic": "transaction-id",
+              "name": "Transaction ID",
+              "engineering_type": "uuid"
+            },
+            {
+              "mnemonic": "unique-task-id",
+              "name": "Unique Task ID",
+              "engineering_type": "uuid"
+            },
+            {
+              "mnemonic": "additional-info-json",
+              "name": "Additional Info",
+              "engineering_type": "data"
+            },
+            {
+              "mnemonic": "end-reason",
+              "name": "End Reason",
+              "engineering_type": "uint32"
+            },
+            {
+              "mnemonic": "http-status-code",
+              "name": "Status Code",
+              "engineering_type": "http-status"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        },
+        {
+          "schema": "network-connection-detected",
+          "xpath": "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"network-connection-detected\"]",
+          "columns": [
+            {
+              "mnemonic": "time",
+              "name": "Detection Time",
+              "engineering_type": "event-time"
+            },
+            {
+              "mnemonic": "pid",
+              "name": "Process ID",
+              "engineering_type": "pid"
+            },
+            {
+              "mnemonic": "local-address",
+              "name": "Local Address",
+              "engineering_type": "sockaddr"
+            },
+            {
+              "mnemonic": "remote-address",
+              "name": "Remote Address",
+              "engineering_type": "sockaddr"
+            },
+            {
+              "mnemonic": "interface-index",
+              "name": "Interface Index",
+              "engineering_type": "uint32"
+            },
+            {
+              "mnemonic": "recv-buffer-size",
+              "name": "Receive Buffer",
+              "engineering_type": "size-in-bytes"
+            },
+            {
+              "mnemonic": "recv-buffer-used",
+              "name": "Receive Used",
+              "engineering_type": "size-in-bytes"
+            },
+            {
+              "mnemonic": "serial-number",
+              "name": "Serial Number",
+              "engineering_type": "uint32"
+            },
+            {
+              "mnemonic": "kind",
+              "name": "Kind",
+              "engineering_type": "network-protocol"
+            }
+          ],
+          "has_rows": false,
+          "error": null
+        }
+      ]
+    }
+  ],
+  "fixtureTerminate": {
+    "exitCode": 0,
+    "stdout": "",
+    "stderr": ""
+  }
+}

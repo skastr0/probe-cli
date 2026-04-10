@@ -1,0 +1,94 @@
+{
+  "generatedAt": "2026-04-10T00:20:48.518Z",
+  "config": {
+    "startupRuns": 12,
+    "latencyWarmup": 50,
+    "latencySamples": 500,
+    "restartRuns": 15,
+    "timeoutMs": 2000
+  },
+  "results": [
+    {
+      "transport": "stdout-jsonl",
+      "startup": {
+        "count": 12,
+        "minMs": 18.08,
+        "maxMs": 33.168,
+        "avgMs": 25.615,
+        "medianMs": 27.82,
+        "p95Ms": 33.168
+      },
+      "latency": {
+        "count": 500,
+        "minMs": 0.015,
+        "maxMs": 0.85,
+        "avgMs": 0.038,
+        "medianMs": 0.02,
+        "p95Ms": 0.089
+      },
+      "recovery": {
+        "count": 15,
+        "minMs": 18.598,
+        "maxMs": 21.628,
+        "avgMs": 19.6,
+        "medianMs": 19.478,
+        "p95Ms": 21.628
+      },
+      "reliability": {
+        "steadyStateAttempts": 500,
+        "steadyStateSuccesses": 500,
+        "steadyStateFailures": 0,
+        "restartAttempts": 15,
+        "restartSuccesses": 15,
+        "restartFailures": 0
+      },
+      "startupComplexity": {
+        "measuredReadyPath": "wait for runner's stdout ready frame",
+        "coordinationSteps": 2,
+        "notes": "Host only needs spawn + first parsed JSONL frame before steady-state commands can flow over existing stdin/stdout pipes."
+      },
+      "restartBehavior": "Host kills the child, respawns it, waits for a new ready line, and resumes using the new stdio pipes."
+    },
+    {
+      "transport": "unix-socket",
+      "startup": {
+        "count": 12,
+        "minMs": 20.939,
+        "maxMs": 25.272,
+        "avgMs": 24.088,
+        "medianMs": 24.464,
+        "p95Ms": 25.272
+      },
+      "latency": {
+        "count": 500,
+        "minMs": 0.011,
+        "maxMs": 0.838,
+        "avgMs": 0.032,
+        "medianMs": 0.021,
+        "p95Ms": 0.075
+      },
+      "recovery": {
+        "count": 15,
+        "minMs": 22.915,
+        "maxMs": 31.325,
+        "avgMs": 25.643,
+        "medianMs": 25.383,
+        "p95Ms": 31.325
+      },
+      "reliability": {
+        "steadyStateAttempts": 500,
+        "steadyStateSuccesses": 500,
+        "steadyStateFailures": 0,
+        "restartAttempts": 15,
+        "restartSuccesses": 15,
+        "restartFailures": 0
+      },
+      "startupComplexity": {
+        "measuredReadyPath": "spawn runner, retry connect until socket accepts, then establish line reader",
+        "coordinationSteps": 4,
+        "notes": "Host must choose a socket path, wait for bind/listen, connect, and recreate the connection after every restart."
+      },
+      "restartBehavior": "Host destroys the old connection, kills the child, respawns it with a fresh socket path, reconnects, and recreates the line reader."
+    }
+  ]
+}
