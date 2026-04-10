@@ -5,12 +5,16 @@
   "type": "module",
   "scripts": {
     "probe": "bun run src/cli/main.ts",
-    "transport-spike": "bun run src/spikes/runner-transport/benchmark.ts",
-    "lldb-bridge-spike": "bun run src/spikes/lldb-python-bridge/validate.ts",
-    "coexistence-spike": "bun run src/spikes/concurrent-attachment-coexistence/validate.ts",
+    "serve": "bun run src/cli/main.ts serve",
+    "doctor": "bun run src/cli/main.ts doctor",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "check": "bun run typecheck"
+    "check": "bun run typecheck",
+    "build": "bun scripts/build.ts",
+    "install:local": "bun scripts/install.ts",
+    "transport-spike": "bun run src/spikes/runner-transport/benchmark.ts",
+    "lldb-bridge-spike": "bun run src/spikes/lldb-python-bridge/validate.ts",
+    "coexistence-spike": "bun run src/spikes/concurrent-attachment-coexistence/validate.ts"
   },
   "dependencies": {
     "effect": "^3.21.0"
