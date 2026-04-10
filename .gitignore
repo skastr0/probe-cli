@@ -4,7 +4,5 @@ dist/
 coverage/
 *.tsbuildinfo
 .probe/
-.agents/messages/*
-!.agents/messages/.gitkeep
 **/__pycache__/
 *.pyc
