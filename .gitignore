@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+dist/
+coverage/
+*.tsbuildinfo
+.probe/
+.agents/messages/*
+!.agents/messages/.gitkeep
+**/__pycache__/
+*.pyc

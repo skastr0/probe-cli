@@ -1,0 +1,22 @@
+{
+  "name": "probe-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "probe": "bun run src/cli/main.ts",
+    "transport-spike": "bun run src/spikes/runner-transport/benchmark.ts",
+    "lldb-bridge-spike": "bun run src/spikes/lldb-python-bridge/validate.ts",
+    "coexistence-spike": "bun run src/spikes/concurrent-attachment-coexistence/validate.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck"
+  },
+  "dependencies": {
+    "effect": "^3.21.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.11",
+    "typescript": "^6.0.2"
+  }
+}
