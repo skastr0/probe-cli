@@ -5,5 +5,6 @@
   "generatedAt": "2026-04-10T17:27:44.000Z",
   "ingressTransport": "file-mailbox",
   "sessionIdentifier": "fixture-session",
-  "simulatorUdid": "SIM-UDID-1234"
+  "simulatorUdid": "SIM-UDID-1234",
+  "targetBundleId": "dev.probe.fixture"
 }

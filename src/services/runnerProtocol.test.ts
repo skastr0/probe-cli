@@ -30,6 +30,14 @@ describe("runner protocol", () => {
     expect(manifest.contractVersion).toBe(RUNNER_TRANSPORT_CONTRACT)
     expect(manifest.ingressTransport).toBe("file-mailbox")
     expect(manifest.egressTransport).toBe("stdout-jsonl-mixed-log")
+    expect(manifest.targetBundleId).toBe("dev.probe.fixture")
+  })
+
+  test("fails with a focused error when a bootstrap manifest loses target bundle identity", () => {
+    const broken = structuredClone(loadFixture<Record<string, unknown>>("runner", "bootstrap-manifest.json"))
+    delete broken.targetBundleId
+
+    expect(() => decodeRunnerBootstrapManifest(broken)).toThrow(/Invalid runner bootstrap manifest:.*targetBundleId/)
   })
 
   test("decodes a real ready frame from the validated transport-boundary artifact", () => {
