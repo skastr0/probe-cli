@@ -12,7 +12,7 @@ Probe is a lightweight, daemon-first, agent-first iOS runtime controller that gi
 
 ### Core philosophy
 
-- The app is already built and installed.
+- The general case assumes the app is already built and installed; Probe's fixture app is the explicit simulator self-test exception for `build-and-install` mode.
 - Probe does not own builds, signing, or provisioning of the target app.
 - Prefer public Apple and Xcode surfaces.
 - Be explicit about hard walls rather than pretending unsupported capabilities exist.
@@ -159,9 +159,10 @@ Ownership rule:
 - live bridge instances are session-scoped
 - requests may use a bridge, but callers do not own the underlying process handle or cleanup
 
-Current validated runner boundary contract on Simulator:
+Current validated runner boundary contract:
 
 - simulator-scoped bootstrap manifest under `/tmp/probe-runner-bootstrap/<SIMULATOR_UDID>.json`
+- real-device bootstrap manifest under `/tmp/probe-runner-bootstrap/device-<DEVICE_UDID>.json`
 - file-backed command ingress into a per-session control directory
 - JSON line response/event egress parsed from the mixed `xcodebuild` / XCTest stdout stream
 - host runtime treats stdout ready/response frames as canonical egress; `ready.json` and `response-*.json` remain validation-only mirrors for spike scripts
@@ -169,7 +170,7 @@ Current validated runner boundary contract on Simulator:
 
 Design requirement:
 
-- keep the runner transport behind a swappable seam so a future real-device or cleaner egress path can replace the current boundary mechanics without rewriting runner semantics
+- keep the runner transport behind a swappable seam so a cleaner future egress path can replace the current boundary mechanics without rewriting runner semantics
 
 ### 5.3 Tooling plane
 
@@ -259,6 +260,16 @@ Each session should own:
 - session state stream
 - optional child resource states for runner, debugger, logs, and trace
 
+### Session open modes
+
+Probe currently exposes these open shapes:
+
+| Target | Mode | Meaning |
+| --- | --- | --- |
+| Simulator | `build-and-install` | Build, install, and launch the Probe fixture app before attaching the runner. This is the default self-test path when `--bundle-id` is omitted or resolves to the fixture bundle id. |
+| Simulator | `attach-to-running` | Attach the runner to an already-running installed app identified by bundle id. |
+| Device | attach-to-running | Verify the requested app is installed, launch it with public device tooling, and attach the runner. Probe does not own arbitrary target-app signing or provisioning. |
+
 Optional scoped children may include:
 
 - runner process / bridge
@@ -313,7 +324,7 @@ The session phase and resource states are related but not identical. For example
 
 `src/domain/session.ts` freezes the generic session lifecycle/state surface with `SessionPhase`, `SessionResourceState`, `SessionTarget`, and `ProbeSessionState`.
 
-The current `session.open` / `session.health` payload is intentionally narrower: it extends that base with runner-backed simulator transport and liveness details (`RunnerTransportContract`, `RunnerSessionDetails`, `SessionHealthCheck`) because the current vertical slice only has the runner bridge implemented. Future LLDB, log, or trace-specific health payloads should extend `ProbeSessionState` as sibling details rather than pushing runner-only fields into the generic session state.
+The current `session.open` / `session.health` payload is intentionally narrower: it extends that base with runner-backed simulator and live real-device transport/liveness details (`RunnerTransportContract`, `RunnerSessionDetails`, `SessionHealthCheck`) because the current vertical slice only has the runner bridge implemented. Future LLDB, log, or trace-specific health payloads should extend `ProbeSessionState` as sibling details rather than pushing runner-only fields into the generic session state.
 
 ## 8. Output Strategy
 
@@ -392,7 +403,7 @@ Goal:
 - compact AX tree snapshots
 - stable refs like `@e1`, `@e2`
 - semantic actions without coordinate dependence
-- screenshots
+- runner-backed screenshots and short videos on simulator and device
 - diffing and stale-ref remediation
 
 Primary surface:
@@ -406,6 +417,14 @@ Goal:
 - record and export Instruments traces
 - summarize CPU, GPU, audio, and scheduling behavior
 - surface actionable findings instead of raw dumps only
+
+Current bounded template set:
+
+- `time-profiler`
+- `system-trace`
+- `metal-system-trace` with extended driver / encoder exports when present and within budget
+- `hangs`
+- `swift-concurrency`
 
 Primary surfaces:
 
@@ -446,7 +465,7 @@ Primary surfaces:
 
 - `log stream`
 - `simctl io`
-- runner screenshots
+- runner screenshots and videos
 
 ### 9.6 Recording and replay
 
@@ -471,7 +490,7 @@ Suggested subfolders:
 - `snapshots/`
 - `traces/`
 - `screenshots/`
-- `recordings/`
+- `video/`
 - `logs/`
 - `debug/`
 - `replays/`
@@ -613,8 +632,8 @@ These are currently known product limits imposed by public Apple tooling.
    - Real-device network throttling lacks a clean CLI path comparable to Simulator workflows.
 
 6. **Real-device runner transport parity**
-   - The current runner transport contract depends on a Simulator-shared filesystem seam under `/tmp`.
-   - A clean real-device equivalent is not proven yet.
+   - The current live device path reuses the same bootstrap-manifest + file-mailbox + mixed-stdout seam as Simulator.
+   - That path is validated, but it is still not the final cleaner transport end state.
 
 Probe should state these walls explicitly in command output where relevant.
 
@@ -698,4 +717,4 @@ Together they provide a much better handoff surface than any one of them alone.
 
 The current architecture can be summarized as:
 
-> Probe is a daemon-hosted Effect kernel supervising scoped device/app sessions, with structured runner and debugger bridges, explicit capability and error reporting, and a first-class artifact/output subsystem designed for agent token efficiency. Today the validated XCUITest runner seam is simulator-scoped file ingress plus stdout JSONL egress, kept behind a swappable transport boundary.
+> Probe is a daemon-hosted Effect kernel supervising scoped device/app sessions, with structured runner and debugger bridges, explicit capability and error reporting, and a first-class artifact/output subsystem designed for agent token efficiency. Today the validated XCUITest runner seam is bootstrap-manifest file ingress plus stdout JSONL egress on simulator and current live real-device sessions, kept behind a swappable transport boundary.

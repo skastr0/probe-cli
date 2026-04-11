@@ -1,12 +1,14 @@
 # XCUITest runner transport contract
 
-Updated: 2026-04-10
+Updated: 2026-04-11
 
 ## Chosen contract Probe can ship now
 
-Scope: **Simulator-only** `xcodebuild test-without-building` sessions.
+Scope: `xcodebuild test-without-building` sessions on **Simulator and real device**.
 
-- **Bootstrap/config seam:** a simulator-scoped manifest at `/tmp/probe-runner-bootstrap/<SIMULATOR_UDID>.json`
+- **Bootstrap/config seam:** a host-local manifest under `/tmp/probe-runner-bootstrap/`
+  - simulator: `/tmp/probe-runner-bootstrap/<SIMULATOR_UDID>.json`
+  - device: `/tmp/probe-runner-bootstrap/device-<UDID>.json`
 - **Host → runner ingress:** atomic JSON command files in a per-session control directory
 - **Runner → host egress:** structured JSON frames parsed out of the mixed `xcodebuild` / XCTest stdout stream
 - **Canonical host response path in the local runtime:** stdout `ready` / `response` frames
@@ -18,7 +20,7 @@ This is the cheapest honest contract because it uses only seams that are now pro
 
 1. The real-boundary stdin probe still times out, so Probe cannot honestly claim a clean bidirectional stdio bridge through `xcodebuild`.
 2. Structured stdout frames do survive the real boundary and are practical to demultiplex from surrounding log noise.
-3. File-backed command ingress is already stable on Simulator and no longer needs ad hoc shell env injection once the bootstrap manifest carries the per-session control directory.
+3. File-backed command ingress is already stable at the XCUITest boundary and no longer needs ad hoc shell env injection once the bootstrap manifest carries the per-session control directory.
 4. The extra stdout observation cost is small relative to UI automation costs.
 
 ## Evidence summary
@@ -61,8 +63,7 @@ This keeps Unix socket in the “possible later alternative” bucket, but not t
 ## Caveats
 
 - Stdout is still a **mixed log stream**, not a dedicated pipe.
-- The bootstrap manifest depends on Simulator-shared host filesystem access under `/tmp`.
-- No clean real-device equivalent for the shared file-ingress seam is proven yet.
+- The bootstrap manifest depends on host-local filesystem access under `/tmp`; the runner resolves it differently on Simulator vs device.
 - The spike still writes file mirrors for measurement and debugging because the lifecycle and boundary validation scripts compare them against stdout; `SimulatorHarness` / `SessionRegistry` treat stdout as canonical egress.
 
 ## Swappability requirement

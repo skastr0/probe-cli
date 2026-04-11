@@ -1,6 +1,6 @@
 # Probe xctrace schema inventory
 
-Updated: 2026-04-10
+Updated: 2026-04-11
 
 ## Scope
 
@@ -66,6 +66,7 @@ All of these worked against the recorded `.trace` artifacts:
 
 | Desired metric family | Schema evidence | Why it stayed empty here |
 | --- | --- | --- |
+| Hang detection / hang-risk hints | `potential-hangs`, `hang-risks` | The idle fixture run did not trigger a long enough stall to emit hang rows, but the schemas are present in the validated TOCs for Time Profiler, System Trace, Metal System Trace, and Swift Concurrency. |
 | Swift task lifetime / task state / actor execution | `swift-task-lifetime`, `swift-task-state`, `swift-actor-execution` | The fixture does not use `async` / `await` workloads. |
 | App `os_log` / signpost streams | `os-log`, `os-signpost` | The fixture does not emit custom logs or signposts in the sampled interval. |
 | Runloop event rows | `runloop-events` | Schema exported, but the sampled interval did not return rows for this idle fixture run. |
@@ -86,5 +87,5 @@ All of these worked against the recorded `.trace` artifacts:
 
 - Prefer TOC-first discovery and schema-name-based XPath selection.
 - Treat `time-sample`, `thread-state`, `cpu-state`, and `metal-gpu-intervals` as the first honest Probe extractor targets on the current Simulator workflow.
-- Treat `Swift Concurrency`, `Logging`, and several richer Metal views as schema-known but workload-dependent: Probe should report them as available schemas, not guaranteed populated metrics.
+- Treat `Swift Concurrency`, `Hangs`, `Logging`, and several richer Metal views as schema-known but workload-dependent: Probe should report them as available schemas, not guaranteed populated metrics.
 - Treat `Network` as a simulator hard wall and require a real-device or alternate validation path before promising HTTP metrics.
