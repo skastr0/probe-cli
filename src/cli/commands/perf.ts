@@ -1,21 +1,24 @@
 import { Effect } from "effect"
-import type { PerfRecordResult, PerfTemplate } from "../../domain/perf"
+import {
+  defaultPerfTimeLimitForTemplate,
+  perfTemplateChoiceText,
+  perfTemplateChoices,
+  type PerfRecordResult,
+  type PerfTemplate,
+} from "../../domain/perf"
 import { DaemonClient } from "../../services/DaemonClient"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
 const parseTemplate = (value: string) => {
-  switch (value) {
-    case "time-profiler":
-    case "system-trace":
-    case "metal-system-trace":
-      return Effect.succeed(value satisfies PerfTemplate)
-    default:
-      return invalidOption(
-        "--template",
-        `invalid value ${value}; expected time-profiler, system-trace, or metal-system-trace.`,
-        "Provide --template time-profiler|system-trace|metal-system-trace and retry the command.",
-      )
+  if (perfTemplateChoices.includes(value as PerfTemplate)) {
+    return Effect.succeed(value as PerfTemplate)
   }
+
+  return invalidOption(
+    "--template",
+    `invalid value ${value}; expected ${perfTemplateChoiceText}.`,
+    `Provide --template ${perfTemplateChoiceText} and retry the command.`,
+  )
 }
 
 const formatPerfResult = (result: PerfRecordResult): string => {
@@ -61,7 +64,7 @@ export const runPerfCommand = (args: ReadonlyArray<string>) =>
         const sessionId = yield* requireOption(rest, "--session-id")
         const templateOption = yield* requireOption(rest, "--template")
         const template = yield* parseTemplate(templateOption)
-        const timeLimit = (yield* optionalOption(rest, "--time-limit")) ?? "3s"
+        const timeLimit = (yield* optionalOption(rest, "--time-limit")) ?? defaultPerfTimeLimitForTemplate(template)
         const client = yield* DaemonClient
         const result = yield* client.recordPerf({
           sessionId,

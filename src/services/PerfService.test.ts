@@ -29,6 +29,123 @@ const timeProfilerXml = `<?xml version="1.0"?>
   </node>
 </trace-query-result>`
 
+const potentialHangsXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="potential-hangs">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>hang-type</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.100.000">100000000</start-time><duration fmt="450.00 ms">450000000</duration><hang-type fmt="Main Run Loop Unresponsive">Main Run Loop Unresponsive</hang-type><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process></row>
+    <row><start-time fmt="00:00.900.000">900000000</start-time><duration fmt="300.00 ms">300000000</duration><hang-type fmt="Main Run Loop Unresponsive">Main Run Loop Unresponsive</hang-type><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process></row>
+  </node>
+</trace-query-result>`
+
+const hangRisksXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="hang-risks">
+      <col><mnemonic>time</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>message</mnemonic></col>
+      <col><mnemonic>severity</mnemonic></col>
+      <col><mnemonic>event-type</mnemonic></col>
+      <col><mnemonic>backtrace</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+    </schema>
+    <row><event-time fmt="00:00.120.000">120000000</event-time><process fmt="ProbeFixture (123)"><pid>123</pid></process><message fmt="Main thread blocked in expensive layout pass">Main thread blocked in expensive layout pass</message><severity fmt="Severe">Severe</severity><event-type fmt="Hang Risk">Hang Risk</event-type><backtrace fmt="MainActor.run → LayoutPass.render → ExpensiveView.body">MainActor.run → LayoutPass.render → ExpensiveView.body</backtrace><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread></row>
+  </node>
+</trace-query-result>`
+
+const swiftTaskStateXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="swift-task-state">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>task</mnemonic></col>
+      <col><mnemonic>state</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.000.000">0</start-time><duration fmt="1.00 ms">1000000</duration><swift-task fmt="Task 1">Task 1</swift-task><task-state fmt="Created">Created</task-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread></row>
+    <row><start-time fmt="00:00.005.000">5000000</start-time><duration fmt="10.00 ms">10000000</duration><swift-task fmt="Task 1">Task 1</swift-task><task-state fmt="Running">Running</task-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread></row>
+    <row><start-time fmt="00:00.160.000">160000000</start-time><duration fmt="1.00 ms">1000000</duration><swift-task fmt="Task 1">Task 1</swift-task><task-state fmt="Completed">Completed</task-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread></row>
+    <row><start-time fmt="00:00.010.000">10000000</start-time><duration fmt="1.00 ms">1000000</duration><swift-task fmt="Task 2">Task 2</swift-task><task-state fmt="Created">Created</task-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Worker Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread></row>
+    <row><start-time fmt="00:00.020.000">20000000</start-time><duration fmt="10.00 ms">10000000</duration><swift-task fmt="Task 2">Task 2</swift-task><task-state fmt="Running">Running</task-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Worker Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread></row>
+    <row><start-time fmt="00:00.040.000">40000000</start-time><duration fmt="1.00 ms">1000000</duration><swift-task fmt="Task 2">Task 2</swift-task><task-state fmt="Cancelled">Cancelled</task-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Worker Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread></row>
+  </node>
+</trace-query-result>`
+
+const swiftTaskLifetimeXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="swift-task-lifetime">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>task</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.000.000">0</start-time><duration fmt="250.00 ms">250000000</duration><swift-task fmt="Task 1">Task 1</swift-task></row>
+    <row><start-time fmt="00:00.010.000">10000000</start-time><duration fmt="50.00 ms">50000000</duration><swift-task fmt="Task 2">Task 2</swift-task></row>
+  </node>
+</trace-query-result>`
+
+const swiftActorExecutionXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[3]'>
+    <schema name="swift-actor-execution">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>actor</mnemonic></col>
+      <col><mnemonic>task</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.006.000">6000000</start-time><duration fmt="4.00 ms">4000000</duration><swift-actor fmt="MainActor">MainActor</swift-actor><swift-task fmt="Task 1">Task 1</swift-task><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread></row>
+    <row><start-time fmt="00:00.025.000">25000000</start-time><duration fmt="30.00 ms">30000000</duration><swift-actor fmt="ImagePipelineActor">ImagePipelineActor</swift-actor><swift-task fmt="Task 2">Task 2</swift-task><thread fmt="Worker Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread></row>
+  </node>
+</trace-query-result>`
+
+const metalDriverIntervalsXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="metal-driver-event-intervals">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>event-type</mnemonic></col>
+      <col><mnemonic>event-label</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.001.000">1000000</start-time><duration fmt="1.50 ms">1500000</duration><driver-event-type fmt="Submit">Submit</driver-event-type><event-label fmt="Submit Command Buffer">Submit Command Buffer</event-label></row>
+    <row><start-time fmt="00:00.024.000">24000000</start-time><duration fmt="2.00 ms">2000000</duration><driver-event-type fmt="Complete">Complete</driver-event-type><event-label fmt="GPU Completion">GPU Completion</event-label></row>
+  </node>
+</trace-query-result>`
+
+const metalEncoderListXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[3]'>
+    <schema name="metal-application-encoders-list">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>gpu</mnemonic></col>
+      <col><mnemonic>frame-number</mnemonic></col>
+      <col><mnemonic>cmdbuffer-label</mnemonic></col>
+      <col><mnemonic>cmdbuffer-label-indexed</mnemonic></col>
+      <col><mnemonic>encoder-label</mnemonic></col>
+      <col><mnemonic>encoder-label-indexed</mnemonic></col>
+      <col><mnemonic>event-type</mnemonic></col>
+      <col><mnemonic>cmdbuffer-id</mnemonic></col>
+      <col><mnemonic>encoder-id</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.000.000">0</start-time><duration fmt="6.00 ms">6000000</duration><thread fmt="Render Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><gpu-device fmt="Apple GPU">Apple GPU</gpu-device><gpu-frame-number fmt="Frame 1">1</gpu-frame-number><cmdbuffer-label fmt="Frame 1 Buffer">Frame 1 Buffer</cmdbuffer-label><cmdbuffer-label-indexed fmt="Frame 1 Buffer [1]">Frame 1 Buffer [1]</cmdbuffer-label-indexed><encoder-label fmt="Vertex Pass">Vertex Pass</encoder-label><encoder-label-indexed fmt="Vertex Pass [1]">Vertex Pass [1]</encoder-label-indexed><event-type fmt="Render">Render</event-type><cmdbuffer-id fmt="100">100</cmdbuffer-id><encoder-id fmt="10">10</encoder-id></row>
+    <row><start-time fmt="00:00.005.000">5000000</start-time><duration fmt="11.00 ms">11000000</duration><thread fmt="Render Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><gpu-device fmt="Apple GPU">Apple GPU</gpu-device><gpu-frame-number fmt="Frame 1">1</gpu-frame-number><cmdbuffer-label fmt="Frame 1 Buffer">Frame 1 Buffer</cmdbuffer-label><cmdbuffer-label-indexed fmt="Frame 1 Buffer [1]">Frame 1 Buffer [1]</cmdbuffer-label-indexed><encoder-label fmt="Fragment Pass">Fragment Pass</encoder-label><encoder-label-indexed fmt="Fragment Pass [1]">Fragment Pass [1]</encoder-label-indexed><event-type fmt="Render">Render</event-type><cmdbuffer-id fmt="100">100</cmdbuffer-id><encoder-id fmt="11">11</encoder-id></row>
+    <row><start-time fmt="00:00.020.000">20000000</start-time><duration fmt="12.00 ms">12000000</duration><thread fmt="Render Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><gpu-device fmt="Apple GPU">Apple GPU</gpu-device><gpu-frame-number fmt="Frame 2">2</gpu-frame-number><cmdbuffer-label fmt="Frame 2 Buffer">Frame 2 Buffer</cmdbuffer-label><cmdbuffer-label-indexed fmt="Frame 2 Buffer [2]">Frame 2 Buffer [2]</cmdbuffer-label-indexed><encoder-label fmt="Fragment Pass">Fragment Pass</encoder-label><encoder-label-indexed fmt="Fragment Pass [2]">Fragment Pass [2]</encoder-label-indexed><event-type fmt="Render">Render</event-type><cmdbuffer-id fmt="101">101</cmdbuffer-id><encoder-id fmt="12">12</encoder-id></row>
+  </node>
+</trace-query-result>`
+
 const loadPerfFixture = (name: string) =>
   readFileSync(join(import.meta.dir, "..", "test-fixtures", "perf", name), "utf8")
 
@@ -107,7 +224,7 @@ const createSessionHealth = (
     kind: "simulator-runner",
     wrapperProcessId: 456,
     testProcessId: 789,
-    fixtureProcessId: 123,
+    targetProcessId: 123,
     attachLatencyMs: 10,
     runtimeControlDirectory: "/tmp/runtime-control",
     observerControlDirectory: "/tmp/observer-control",
@@ -184,7 +301,7 @@ const createCommandRunner = (options: {
 
         if (args.commandArgs[0] === "xctrace" && args.commandArgs[1] === "list") {
           return {
-            stdout: "Time Profiler\nSystem Trace\nMetal System Trace\n",
+            stdout: "Time Profiler\nSystem Trace\nMetal System Trace\nSwift Concurrency\nHangs\n",
             stderr: "",
             exitCode: 0,
           }
@@ -528,6 +645,160 @@ describe("PerfService", () => {
       ])
       expect(result.template).toBe("system-trace")
       expect(result.artifacts.exports).toHaveLength(2)
+    })
+  })
+
+  test("metal system trace exports gpu, driver, and encoder tables with the extended budgets", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+      }
+      const commandRunner = createCommandRunner({
+        exports: {
+          "metal-gpu-intervals": loadPerfFixture("metal-system-trace.metal-gpu-intervals.xml"),
+          "metal-driver-event-intervals": metalDriverIntervalsXml,
+          "metal-application-encoders-list": metalEncoderListXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          template: "metal-system-trace",
+          timeLimit: "90s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.budgets).toEqual([
+        { schema: "metal-gpu-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
+        { schema: "metal-driver-event-intervals", maxBytes: 4 * mib, maxRows: 12_000 },
+        { schema: "metal-application-encoders-list", maxBytes: 4 * mib, maxRows: 12_000 },
+      ])
+      expect(result.template).toBe("metal-system-trace")
+      expect(result.timeLimit).toBe("90s")
+      expect(result.artifacts.exports).toHaveLength(3)
+      expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
+      expect(result.summary.metrics.find((metric) => metric.label === "Per-encoder summary")?.value).toContain("command buffer")
+    })
+  })
+
+  test("records hangs traces and returns structured hang diagnostics", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+      }
+      const commandRunner = createCommandRunner({
+        exports: {
+          "potential-hangs": potentialHangsXml,
+          "hang-risks": hangRisksXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          template: "hangs",
+          timeLimit: "10s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.template).toBe("hangs")
+      expect(result.templateName).toBe("Hangs")
+      expect(result.artifacts.exports).toHaveLength(2)
+      expect(result.summary.headline).toContain("Detected 2 hang events")
+      expect(result.summary.metrics.find((metric) => metric.label === "Call stack hints")?.value).toBe("available")
+      expect(result.diagnoses.find((diagnosis) => diagnosis.code === "hangs-longest-event")?.details.join(" ")).toContain("LayoutPass.render")
+    })
+  })
+
+  test("records swift concurrency traces and returns task and actor diagnostics", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+      }
+      const commandRunner = createCommandRunner({
+        exports: {
+          "swift-task-state": swiftTaskStateXml,
+          "swift-task-lifetime": swiftTaskLifetimeXml,
+          "swift-actor-execution": swiftActorExecutionXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          template: "swift-concurrency",
+          timeLimit: "10s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.template).toBe("swift-concurrency")
+      expect(result.templateName).toBe("Swift Concurrency")
+      expect(result.artifacts.exports).toHaveLength(3)
+      expect(result.summary.headline).toContain("Observed 2 Swift tasks")
+      expect(result.summary.metrics.find((metric) => metric.label === "Task creations")?.value).toBe("2")
+      expect(result.summary.metrics.find((metric) => metric.label === "Actor executions")?.value).toBe("2")
+      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "swift-concurrency-long-running-tasks")).toBe(true)
+    })
+  })
+
+  test("rejects metal trace windows above the 120 second cap before xctrace runs", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+      }
+      const commandRunner = createCommandRunner({ exports: {} })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.record({
+            sessionId: "session-1",
+            template: "metal-system-trace",
+            timeLimit: "121s",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(commandRunner.stats.captureCalls).toBe(0)
+      expect(commandRunner.stats.exportCalls).toBe(0)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-template-time-limit-too-large")
+          expect(result.left.reason).toContain("2m")
+        }
+      }
     })
   })
 

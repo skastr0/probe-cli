@@ -8,8 +8,10 @@ import { Context, Effect, Layer } from "effect"
 import {
   PerfRecordResult,
   PerfTemplate,
-  analyzeMetalSystemTraceTable,
+  analyzeHangsTables,
+  analyzeMetalSystemTraceTables,
   analyzeSystemTraceTables,
+  analyzeSwiftConcurrencyTables,
   analyzeTimeProfilerTable,
   parsePerfTableExport,
   type PerfDiagnosis,
@@ -31,7 +33,6 @@ const nowIso = (): string => new Date().toISOString()
 
 const timestampForFile = (): string => nowIso().replace(/[:.]/g, "-")
 
-const defaultPerfTimeLimit = "3s"
 const defaultCommandOverheadMs = 120_000
 const maxPerfTimeLimitMs = 5 * 60_000
 const mib = 1024 * 1024
@@ -84,6 +85,12 @@ interface CommandResult {
 interface ExportBudget {
   readonly maxBytes: number
   readonly maxRows: number
+}
+
+interface TemplateExportSpec {
+  readonly schema: string
+  readonly budget: ExportBudget
+  readonly required?: boolean
 }
 
 interface StreamedCommandResult extends CommandResult {
@@ -162,9 +169,9 @@ class ExportBudgetTransform extends Transform {
 
 interface TemplateSpec {
   readonly slug: PerfTemplate
-  readonly templateName: string
-  readonly exportSchemas: ReadonlyArray<string>
-  readonly exportBudgets: Readonly<Record<string, ExportBudget>>
+  readonly displayName: string
+  readonly xctraceTemplateName: string
+  readonly exportSchemas: ReadonlyArray<TemplateExportSpec>
   readonly maxRecordingTimeLimitMs?: number
   readonly analyze: (tables: Record<string, ParsedPerfTable>, targetPid: number) => {
     readonly summary: PerfSummary
@@ -175,30 +182,37 @@ interface TemplateSpec {
 const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
   "time-profiler": {
     slug: "time-profiler",
-    templateName: "Time Profiler",
-    exportSchemas: ["time-sample"],
-    exportBudgets: {
-      "time-sample": {
+    displayName: "Time Profiler",
+    xctraceTemplateName: "Time Profiler",
+    exportSchemas: [{
+      schema: "time-sample",
+      required: true,
+      budget: {
         maxBytes: 4 * mib,
         maxRows: 20_000,
       },
-    },
+    }],
     analyze: (tables) => analyzeTimeProfilerTable(tables["time-sample"]),
   },
   "system-trace": {
     slug: "system-trace",
-    templateName: "System Trace",
-    exportSchemas: ["thread-state", "cpu-state"],
-    exportBudgets: {
-      "thread-state": {
+    displayName: "System Trace",
+    xctraceTemplateName: "System Trace",
+    exportSchemas: [{
+      schema: "thread-state",
+      required: true,
+      budget: {
         maxBytes: 2 * mib,
         maxRows: 8_000,
       },
-      "cpu-state": {
+    }, {
+      schema: "cpu-state",
+      required: true,
+      budget: {
         maxBytes: 2 * mib,
         maxRows: 8_000,
       },
-    },
+    }],
     maxRecordingTimeLimitMs: 10_000,
     analyze: (tables, targetPid) =>
       analyzeSystemTraceTables({
@@ -209,15 +223,88 @@ const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
   },
   "metal-system-trace": {
     slug: "metal-system-trace",
-    templateName: "Metal System Trace",
-    exportSchemas: ["metal-gpu-intervals"],
-    exportBudgets: {
-      "metal-gpu-intervals": {
+    displayName: "Metal System Trace",
+    xctraceTemplateName: "Metal System Trace",
+    exportSchemas: [{
+      schema: "metal-gpu-intervals",
+      required: true,
+      budget: {
         maxBytes: 8 * mib,
         maxRows: 25_000,
       },
-    },
-    analyze: (tables) => analyzeMetalSystemTraceTable(tables["metal-gpu-intervals"]),
+    }, {
+      schema: "metal-driver-event-intervals",
+      budget: {
+        maxBytes: 4 * mib,
+        maxRows: 12_000,
+      },
+    }, {
+      schema: "metal-application-encoders-list",
+      budget: {
+        maxBytes: 4 * mib,
+        maxRows: 12_000,
+      },
+    }],
+    maxRecordingTimeLimitMs: 120_000,
+    analyze: (tables) => analyzeMetalSystemTraceTables({
+      gpuIntervalsTable: tables["metal-gpu-intervals"],
+      driverEventTable: tables["metal-driver-event-intervals"],
+      encoderListTable: tables["metal-application-encoders-list"],
+    }),
+  },
+  hangs: {
+    slug: "hangs",
+    displayName: "Hangs",
+    xctraceTemplateName: "Hangs",
+    exportSchemas: [{
+      schema: "potential-hangs",
+      required: true,
+      budget: {
+        maxBytes: 2 * mib,
+        maxRows: 4_000,
+      },
+    }, {
+      schema: "hang-risks",
+      budget: {
+        maxBytes: 2 * mib,
+        maxRows: 4_000,
+      },
+    }],
+    analyze: (tables) => analyzeHangsTables({
+      hangTable: tables["potential-hangs"],
+      hangRiskTable: tables["hang-risks"],
+    }),
+  },
+  "swift-concurrency": {
+    slug: "swift-concurrency",
+    displayName: "Swift Concurrency",
+    xctraceTemplateName: "Swift Concurrency",
+    exportSchemas: [{
+      schema: "swift-task-state",
+      required: true,
+      budget: {
+        maxBytes: 4 * mib,
+        maxRows: 25_000,
+      },
+    }, {
+      schema: "swift-task-lifetime",
+      required: true,
+      budget: {
+        maxBytes: 3 * mib,
+        maxRows: 20_000,
+      },
+    }, {
+      schema: "swift-actor-execution",
+      budget: {
+        maxBytes: 2 * mib,
+        maxRows: 10_000,
+      },
+    }],
+    analyze: (tables) => analyzeSwiftConcurrencyTables({
+      taskStateTable: tables["swift-task-state"],
+      taskLifetimeTable: tables["swift-task-lifetime"],
+      actorExecutionTable: tables["swift-actor-execution"],
+    }),
   },
 }
 
@@ -266,6 +353,13 @@ const parseFirstRunNumber = (tocXml: string): string | null => {
   const match = tocXml.match(/<run[^>]*number="([^"]+)"/)
   return match?.[1] ?? null
 }
+
+const parseAvailableSchemaNames = (tocXml: string): ReadonlySet<string> =>
+  new Set(
+    [...tocXml.matchAll(/<(?:table|schema)\b[^>]*(?:schema|name)="([^"]+)"/g)]
+      .map((match) => match[1]?.trim() ?? "")
+      .filter((schema) => schema.length > 0),
+  )
 
 const runCommand = (args: {
   readonly command: string
@@ -658,9 +752,9 @@ export const createPerfService = (dependencies: {
       if (timeLimitMs > templateTimeLimitMs) {
         return yield* new EnvironmentError({
           code: spec.maxRecordingTimeLimitMs ? "perf-template-time-limit-too-large" : "perf-time-limit-too-large",
-          reason: `Requested time limit ${timeLimit} exceeds the current ${spec.templateName} cap of ${formatTimeLimitMs(templateTimeLimitMs)}.`,
+          reason: `Requested time limit ${timeLimit} exceeds the current ${spec.displayName} cap of ${formatTimeLimitMs(templateTimeLimitMs)}.`,
           nextStep: spec.maxRecordingTimeLimitMs
-            ? `Use --time-limit ${formatTimeLimitMs(templateTimeLimitMs)} or less for ${spec.templateName}; larger exports are outside the current supported summary contract.`
+            ? `Use --time-limit ${formatTimeLimitMs(templateTimeLimitMs)} or less for ${spec.displayName}; larger exports are outside the current supported summary contract.`
             : "Keep perf recordings at 5m or less in this slice so RPC/session timeouts stay honest.",
           details: [],
         })
@@ -693,7 +787,7 @@ export const createPerfService = (dependencies: {
         })
       }
 
-      emitProgress("perf.record", `Checking xctrace template availability for ${spec.templateName}.`)
+      emitProgress("perf.record", `Checking xctrace template availability for ${spec.displayName}.`)
 
       const templateList = yield* Effect.tryPromise({
         try: () =>
@@ -715,11 +809,11 @@ export const createPerfService = (dependencies: {
 
       const availableTemplates = new Set(parseTemplateNames(templateList.stdout))
 
-      if (!availableTemplates.has(spec.templateName)) {
+      if (!availableTemplates.has(spec.xctraceTemplateName)) {
         return yield* new UnsupportedCapabilityError({
           code: "perf-template-unavailable",
           capability: `perf.record.template.${template}`,
-          reason: `The local xctrace installation does not expose the ${spec.templateName} template.`,
+          reason: `The local xctrace installation does not expose the ${spec.xctraceTemplateName} template required for ${spec.displayName}.`,
           nextStep: "Run `xcrun xctrace list templates`, then choose a supported template or update Xcode.",
           details: [],
           wall: false,
@@ -762,7 +856,7 @@ export const createPerfService = (dependencies: {
 
       emitProgress(
         "perf.record",
-        `Recording ${spec.templateName} for pid ${runnerDetails.fixtureProcessId} on device ${sessionBeforeRecord.target.deviceId}.`,
+        `Recording ${spec.displayName} for pid ${runnerDetails.targetProcessId} on device ${sessionBeforeRecord.target.deviceId}.`,
       )
 
       yield* Effect.tryPromise({
@@ -773,11 +867,11 @@ export const createPerfService = (dependencies: {
               "xctrace",
               "record",
               "--template",
-              spec.templateName,
+              spec.xctraceTemplateName,
               "--device",
               sessionBeforeRecord.target.deviceId,
               "--attach",
-              String(runnerDetails.fixtureProcessId),
+              String(runnerDetails.targetProcessId),
               "--time-limit",
               timeLimit,
               "--output",
@@ -827,11 +921,11 @@ export const createPerfService = (dependencies: {
           label: `${spec.slug}-trace`,
           kind: "directory",
           absolutePath: tracePath,
-          summary: `${spec.templateName} raw .trace bundle.`,
+          summary: `${spec.displayName} raw .trace bundle.`,
         }),
       )
 
-      emitProgress("perf.record", `Refreshing session health after recording ${spec.templateName}.`)
+      emitProgress("perf.record", `Refreshing session health after recording ${spec.displayName}.`)
       const sessionAfterRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
 
       emitProgress("perf.export", `Exporting TOC for ${basename(tracePath)}.`)
@@ -873,7 +967,7 @@ export const createPerfService = (dependencies: {
           label: `${spec.slug}-toc`,
           kind: "xml",
           absolutePath: tocPath,
-          summary: `${spec.templateName} TOC export.`,
+          summary: `${spec.displayName} TOC export.`,
         }),
       )
 
@@ -890,13 +984,28 @@ export const createPerfService = (dependencies: {
 
       const exportArtifacts: Array<ArtifactRecord> = []
       const parsedTables: Record<string, ParsedPerfTable> = {}
+      const availableSchemas = parseAvailableSchemaNames(tocResult.stdout)
+      const tocAdvertisesSchemas = availableSchemas.size > 0
 
-      for (const schema of spec.exportSchemas) {
+      for (const exportSpec of spec.exportSchemas) {
+        if (tocAdvertisesSchemas && !availableSchemas.has(exportSpec.schema)) {
+          if (exportSpec.required) {
+            return yield* new EnvironmentError({
+              code: "perf-export-schema-missing",
+              reason: `${spec.displayName} TOC did not expose the expected ${exportSpec.schema} schema.`,
+              nextStep: "Inspect the saved TOC export and align Probe's supported schema contract before retrying.",
+              details: [...availableSchemas].sort(),
+            })
+          }
+
+          continue
+        }
+
+        const { schema, budget } = exportSpec
         const exportPath = join(tracesDirectory, `${baseName}.${schema}.xml`)
-        const budget = spec.exportBudgets[schema]
         emitProgress(
           "perf.export",
-          `Exporting ${schema} rows for ${spec.templateName} (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
+          `Exporting ${schema} rows for ${spec.displayName} (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
         )
 
         const exportResult = yield* Effect.tryPromise({
@@ -919,7 +1028,7 @@ export const createPerfService = (dependencies: {
             error instanceof ChildProcessError
               ? error
               : error instanceof ExportBudgetExceededError
-                ? buildExportBudgetError({ templateName: spec.templateName, schema, error })
+                ? buildExportBudgetError({ templateName: spec.displayName, schema, error })
                 : new EnvironmentError({
                     code: "perf-export-schema",
                     reason: error instanceof Error ? error.message : String(error),
@@ -936,7 +1045,7 @@ export const createPerfService = (dependencies: {
             label: `${spec.slug}-${schema}`,
             kind: "xml",
             absolutePath: exportPath,
-            summary: `${schema} export for ${spec.templateName} (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
+            summary: `${schema} export for ${spec.displayName} (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
           }),
         )
 
@@ -950,7 +1059,7 @@ export const createPerfService = (dependencies: {
           if (s.size > maxExportFileSizeBytes) {
             maybeOversized = new EnvironmentError({
               code: "perf-export-file-too-large",
-              reason: `${spec.templateName} ${schema} export file (${formatBytes(s.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
+              reason: `${spec.displayName} ${schema} export file (${formatBytes(s.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
               nextStep: "Reduce --time-limit or use a narrower recording window; inspect the saved .trace directly for full data.",
               details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${s.size}`],
             })
@@ -987,20 +1096,20 @@ export const createPerfService = (dependencies: {
       }
 
       const analysis = yield* Effect.try({
-        try: () => spec.analyze(parsedTables, runnerDetails.fixtureProcessId),
+        try: () => spec.analyze(parsedTables, runnerDetails.targetProcessId),
         catch: (error) =>
           new EnvironmentError({
             code: "perf-analyze-export-contract",
             reason: error instanceof Error ? error.message : String(error),
             nextStep: "Inspect the saved schema exports and align Probe's supported xctrace contract before retrying.",
-            details: spec.exportSchemas,
+            details: spec.exportSchemas.map((exportSpec) => exportSpec.schema),
           }),
       })
 
       return {
         sessionId,
         template,
-        templateName: spec.templateName,
+        templateName: spec.displayName,
         timeLimit,
         recordedAt: nowIso(),
         xctraceVersion: xctraceVersionResult.stdout.trim(),

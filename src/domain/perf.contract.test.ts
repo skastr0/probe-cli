@@ -72,7 +72,8 @@ describe("perf export contract fixtures", () => {
     expect(table.rows[0]?.["start-latency"]?.raw).toBe("1117250")
     expect(table.rows[1]?.["channel-name"]?.display).toBe("Compute")
     expect(analysis.summary.headline).toContain("Observed 2 Metal GPU intervals")
-    expect(analysis.diagnoses.some((diagnosis) => diagnosis.code === "metal-per-shader-wall")).toBe(true)
+    expect(analysis.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
+    expect(analysis.diagnoses.some((diagnosis) => diagnosis.code === "metal-gpu-counters-required")).toBe(true)
   })
 
   test("throws a focused contract error when a consumed metal column disappears", () => {

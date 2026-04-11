@@ -2,8 +2,29 @@ import { Schema } from "effect"
 import { ArtifactRecord } from "./output"
 import { SessionHealthCheck, SessionPhase } from "./session"
 
-export const PerfTemplate = Schema.Literal("time-profiler", "system-trace", "metal-system-trace")
+const perfTemplateValues = [
+  "time-profiler",
+  "system-trace",
+  "metal-system-trace",
+  "hangs",
+  "swift-concurrency",
+] as const
+
+export const PerfTemplate = Schema.Literal(...perfTemplateValues)
 export type PerfTemplate = typeof PerfTemplate.Type
+
+export const perfTemplateChoices = [...perfTemplateValues]
+export const perfTemplateChoiceText = perfTemplateChoices.join("|")
+
+const defaultPerfTimeLimits: Record<PerfTemplate, string> = {
+  "time-profiler": "3s",
+  "system-trace": "3s",
+  "metal-system-trace": "60s",
+  "hangs": "3s",
+  "swift-concurrency": "3s",
+}
+
+export const defaultPerfTimeLimitForTemplate = (template: PerfTemplate): string => defaultPerfTimeLimits[template]
 
 export const PerfDiagnosisSeverity = Schema.Literal("info", "warning")
 export type PerfDiagnosisSeverity = typeof PerfDiagnosisSeverity.Type
@@ -66,6 +87,8 @@ export interface ParsedPerfTable {
   readonly mnemonics: ReadonlyArray<string>
   readonly rows: ReadonlyArray<Record<string, ParsedPerfCell | null>>
 }
+
+type PerfRow = Record<string, ParsedPerfCell | null>
 
 const childElementPattern = /<([a-zA-Z0-9-]+)([^>]*)>([\s\S]*?)<\/\1>|<([a-zA-Z0-9-]+)([^>]*)\/>/g
 const attributePattern = /([a-zA-Z0-9-]+)="([^"]*)"/g
@@ -144,13 +167,14 @@ const buildCell = (
 }
 
 export const parsePerfTableExport = (xml: string): ParsedPerfTable => {
-  const schemaMatch = xml.match(/<schema name="([^"]+)">([\s\S]*?)<\/schema>/)
+  const schemaMatch = xml.match(/<schema\b([^>]*)>([\s\S]*?)<\/schema>/)
 
   if (!schemaMatch) {
     throw new Error("Missing schema block in xctrace export output.")
   }
 
-  const schema = schemaMatch[1]?.trim()
+  const schemaAttributes = schemaMatch[1] ?? ""
+  const schema = parseAttributes(schemaAttributes).name?.trim()
   const schemaBody = schemaMatch[2] ?? ""
 
   if (!schema) {
@@ -159,7 +183,7 @@ export const parsePerfTableExport = (xml: string): ParsedPerfTable => {
 
   const mnemonics = parseSchemaMnemonics(schemaBody)
   const refs = new Map<string, ParsedPerfCell>()
-  const rows: Array<Record<string, ParsedPerfCell | null>> = []
+  const rows: Array<PerfRow> = []
 
   for (const rowMatch of xml.matchAll(/<row>([\s\S]*?)<\/row>/g)) {
     const rowBody = rowMatch[1] ?? ""
@@ -170,7 +194,7 @@ export const parsePerfTableExport = (xml: string): ParsedPerfTable => {
       return buildCell(tagName, attributes, inner, refs)
     })
 
-    const row: Record<string, ParsedPerfCell | null> = {}
+    const row: PerfRow = {}
 
     mnemonics.forEach((mnemonic, index) => {
       row[mnemonic] = values[index] ?? null
@@ -186,13 +210,12 @@ export const parsePerfTableExport = (xml: string): ParsedPerfTable => {
   }
 }
 
-const readRaw = (row: Record<string, ParsedPerfCell | null>, mnemonic: string): string | null =>
-  row[mnemonic]?.raw ?? null
+const readRaw = (row: PerfRow, mnemonic: string): string | null => row[mnemonic]?.raw ?? null
 
-const readDisplay = (row: Record<string, ParsedPerfCell | null>, mnemonic: string): string | null =>
+const readDisplay = (row: PerfRow, mnemonic: string): string | null =>
   row[mnemonic]?.display ?? row[mnemonic]?.raw ?? null
 
-const readNumber = (row: Record<string, ParsedPerfCell | null>, mnemonic: string): number | null => {
+const readNumber = (row: PerfRow, mnemonic: string): number | null => {
   const raw = readRaw(row, mnemonic)
 
   if (!raw) {
@@ -202,6 +225,21 @@ const readNumber = (row: Record<string, ParsedPerfCell | null>, mnemonic: string
   const value = Number(raw)
   return Number.isFinite(value) ? value : null
 }
+
+const readLabel = (row: PerfRow, mnemonics: ReadonlyArray<string>): string | null => {
+  for (const mnemonic of mnemonics) {
+    const value = readDisplay(row, mnemonic) ?? readRaw(row, mnemonic)
+
+    if (value && value.trim().length > 0) {
+      return value.trim()
+    }
+  }
+
+  return null
+}
+
+const averageOf = (values: ReadonlyArray<number>): number | null =>
+  values.length === 0 ? null : values.reduce((total, value) => total + value, 0) / values.length
 
 const countBy = (values: ReadonlyArray<string>): ReadonlyArray<readonly [string, number]> =>
   [...values.reduce((counts, value) => counts.set(value, (counts.get(value) ?? 0) + 1), new Map<string, number>()).entries()].sort(
@@ -265,9 +303,43 @@ export const formatNanoseconds = (value: number | null): string => {
 
 const formatRatio = (value: number): string => `${(value * 100).toFixed(1)}%`
 
+const formatFramesPerSecond = (value: number | null): string => {
+  if (value === null || !Number.isFinite(value) || value <= 0) {
+    return "n/a"
+  }
+
+  return `${value.toFixed(1)} fps`
+}
+
+const formatCount = (value: number, singular: string, plural = `${singular}s`): string => `${value} ${value === 1 ? singular : plural}`
+
+const compactText = (value: string | null, maxLength = 160): string | null => {
+  if (!value) {
+    return null
+  }
+
+  const compact = value.replace(/\s+/g, " ").trim()
+
+  if (compact.length === 0) {
+    return null
+  }
+
+  return compact.length > maxLength
+    ? `${compact.slice(0, maxLength - 1).trimEnd()}…`
+    : compact
+}
+
 const warningDiagnosis = (code: string, summary: string, details: ReadonlyArray<string>): PerfDiagnosis => ({
   code,
   severity: "warning",
+  summary,
+  details: [...details],
+  wall: false,
+})
+
+const infoDiagnosis = (code: string, summary: string, details: ReadonlyArray<string>): PerfDiagnosis => ({
+  code,
+  severity: "info",
   summary,
   details: [...details],
   wall: false,
@@ -340,9 +412,7 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
     wallDiagnosis(
       "time-profiler-callstack-wall",
       "Probe keeps the raw sample exports, but full reconstructed call stacks are not yet a stable supported contract.",
-      [
-        "Use the saved .trace bundle and exported sample XML for deeper inspection when stack fidelity matters.",
-      ],
+      ["Inspect the saved .trace bundle when you need richer stack reconstruction than the current XML contract provides."],
     ),
   )
 
@@ -356,7 +426,7 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
         { label: "Samples", value: String(sampleCount) },
         { label: "Threads", value: String(uniqueCount(threads)) },
         { label: "Observed cores", value: cores.length === 0 ? "none" : String(uniqueCount(cores)) },
-        { label: "Thread states", value: summarizeCounts(states) },
+        { label: "States", value: summarizeCounts(states) },
         { label: "Sample kinds", value: summarizeCounts(sampleKinds) },
         { label: "Sample window", value: formatNanoseconds(windowNs) },
       ],
@@ -366,7 +436,7 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
 }
 
 const matchesTargetProcess = (
-  row: Record<string, ParsedPerfCell | null>,
+  row: PerfRow,
   targetPid: number,
 ): boolean => {
   const pid = String(targetPid)
@@ -421,6 +491,7 @@ export const analyzeSystemTraceTables = (args: {
         "System Trace did not export any thread-state rows tied back to the target pid.",
         [
           `Probe filtered thread intervals to pid ${args.targetPid} so unrelated system activity does not masquerade as app behavior.`,
+          "Inspect the saved .trace bundle if you need the broader system-wide view.",
         ],
       ),
     )
@@ -455,9 +526,7 @@ export const analyzeSystemTraceTables = (args: {
     wallDiagnosis(
       "system-trace-attribution-wall",
       "Probe's first System Trace summary only uses rows that still carry the target pid; unattributed system-wide intervals remain outside the supported summary contract.",
-      [
-        "Keep the raw .trace and exported XML around when you need to inspect broader kernel or simulator scheduling behavior.",
-      ],
+      ["Inspect the saved .trace bundle when you need system-wide scheduler attribution beyond the filtered target rows."],
     ),
   )
 
@@ -481,27 +550,186 @@ export const analyzeSystemTraceTables = (args: {
 }
 
 const sixtyFpsFrameBudgetNs = 16_667_000
+const longRunningSwiftTaskThresholdNs = 100_000_000
 
-export const analyzeMetalSystemTraceTable = (table: ParsedPerfTable): {
+interface MetalFrameEstimate {
+  readonly frameId: string
+  readonly duration: number
+}
+
+interface MetalEncoderAggregate {
+  readonly label: string
+  readonly encoderCount: number
+  readonly commandBufferCount: number
+  readonly totalDuration: number
+  readonly averageDuration: number
+}
+
+const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): ReadonlyArray<MetalFrameEstimate> => {
+  const frames = new Map<string, { minStart: number; maxEnd: number }>()
+
+  for (const row of rows) {
+    const frameId = readDisplay(row, "frame-number") ?? readRaw(row, "frame-number")
+    const start = readNumber(row, "start")
+    const duration = readNumber(row, "duration")
+
+    if (frameId === null || start === null || duration === null) {
+      continue
+    }
+
+    const existing = frames.get(frameId)
+    const end = start + duration
+
+    if (existing) {
+      existing.minStart = Math.min(existing.minStart, start)
+      existing.maxEnd = Math.max(existing.maxEnd, end)
+      continue
+    }
+
+    frames.set(frameId, { minStart: start, maxEnd: end })
+  }
+
+  return [...frames.entries()]
+    .map(([frameId, bounds]) => ({
+      frameId,
+      duration: bounds.maxEnd - bounds.minStart,
+    }))
+    .sort((left, right) => left.frameId.localeCompare(right.frameId, undefined, { numeric: true }))
+}
+
+const buildMetalEncoderAggregates = (table: ParsedPerfTable | undefined): ReadonlyArray<MetalEncoderAggregate> => {
+  if (!table) {
+    return []
+  }
+
+  assertSchemaContract({
+    table,
+    schema: "metal-application-encoders-list",
+    requiredMnemonics: ["duration", "encoder-label", "cmdbuffer-id", "encoder-id"],
+  })
+
+  const aggregates = new Map<string, { duration: number; encoderCount: number; commandBuffers: Set<string> }>()
+
+  for (const row of table.rows) {
+    const label = readLabel(row, [
+      "encoder-label",
+      "encoder-label-indexed",
+      "cmdbuffer-label",
+      "cmdbuffer-label-indexed",
+      "event-type",
+    ]) ?? (readRaw(row, "encoder-id") ? `Encoder ${readRaw(row, "encoder-id")}` : null)
+    const duration = readNumber(row, "duration")
+
+    if (!label || duration === null) {
+      continue
+    }
+
+    const commandBufferId = readRaw(row, "cmdbuffer-id") ?? readDisplay(row, "cmdbuffer-id") ?? "unknown"
+    const existing = aggregates.get(label)
+
+    if (existing) {
+      existing.duration += duration
+      existing.encoderCount += 1
+      existing.commandBuffers.add(commandBufferId)
+      continue
+    }
+
+    aggregates.set(label, {
+      duration,
+      encoderCount: 1,
+      commandBuffers: new Set([commandBufferId]),
+    })
+  }
+
+  return [...aggregates.entries()]
+    .map(([label, aggregate]) => ({
+      label,
+      encoderCount: aggregate.encoderCount,
+      commandBufferCount: aggregate.commandBuffers.size,
+      totalDuration: aggregate.duration,
+      averageDuration: aggregate.duration / aggregate.encoderCount,
+    }))
+    .sort((left, right) => right.totalDuration - left.totalDuration || left.label.localeCompare(right.label))
+}
+
+const summarizeEncoderAggregates = (aggregates: ReadonlyArray<MetalEncoderAggregate>, limit = 3): string => {
+  if (aggregates.length === 0) {
+    return "none"
+  }
+
+  return aggregates
+    .slice(0, limit)
+    .map((aggregate) => `${aggregate.label} (${formatCount(aggregate.commandBufferCount, "command buffer")}, ${formatNanoseconds(aggregate.totalDuration)} total, ${formatNanoseconds(aggregate.averageDuration)} avg)`)
+    .join(", ")
+}
+
+const buildMetalDriverSummary = (table: ParsedPerfTable | undefined) => {
+  if (!table) {
+    return {
+      eventCount: 0,
+      averageDuration: null as number | null,
+      maxDuration: null as number | null,
+      eventTypes: [] as ReadonlyArray<string>,
+    }
+  }
+
+  assertSchemaContract({
+    table,
+    schema: "metal-driver-event-intervals",
+    requiredMnemonics: ["duration", "event-type", "event-label"],
+  })
+
+  const durations = table.rows.map((row) => readNumber(row, "duration")).filter((value): value is number => value !== null)
+  const eventTypes = table.rows
+    .map((row) => readLabel(row, ["event-label", "event-type"]))
+    .filter((value): value is string => value !== null)
+
+  return {
+    eventCount: table.rows.length,
+    averageDuration: averageOf(durations),
+    maxDuration: durations.length === 0 ? null : Math.max(...durations),
+    eventTypes,
+  }
+}
+
+export const analyzeMetalSystemTraceTables = (args: {
+  readonly gpuIntervalsTable: ParsedPerfTable
+  readonly driverEventTable?: ParsedPerfTable
+  readonly encoderListTable?: ParsedPerfTable
+}): {
   readonly summary: PerfSummary
   readonly diagnoses: ReadonlyArray<PerfDiagnosis>
 } => {
   assertSchemaContract({
-    table,
+    table: args.gpuIntervalsTable,
     schema: "metal-gpu-intervals",
-    requiredMnemonics: ["duration", "channel-name", "start-latency", "state"],
+    requiredMnemonics: ["start", "duration", "channel-name", "frame-number", "start-latency", "state"],
   })
 
-  const rows = table.rows
+  const rows = args.gpuIntervalsTable.rows
   const durations = rows.map((row) => readNumber(row, "duration")).filter((value): value is number => value !== null)
   const latencies = rows.map((row) => readNumber(row, "start-latency")).filter((value): value is number => value !== null)
   const states = rows.map((row) => readDisplay(row, "state")).filter((value): value is string => value !== null)
   const channels = rows.map((row) => readDisplay(row, "channel-name")).filter((value): value is string => value !== null)
   const maxDuration = durations.length === 0 ? null : Math.max(...durations)
   const maxLatency = latencies.length === 0 ? null : Math.max(...latencies)
-  const averageDuration = durations.length === 0 ? null : durations.reduce((total, value) => total + value, 0) / durations.length
-  const averageLatency = latencies.length === 0 ? null : latencies.reduce((total, value) => total + value, 0) / latencies.length
+  const averageDuration = averageOf(durations)
+  const averageLatency = averageOf(latencies)
+  const frameEstimates = buildMetalFrameEstimates(rows)
+  const frameDurations = frameEstimates.map((frame) => frame.duration)
+  const averageFrameDuration = averageOf(frameDurations)
+  const maxFrameDuration = frameDurations.length === 0 ? null : Math.max(...frameDurations)
+  const estimatedFrameDuration = averageFrameDuration ?? averageDuration
+  const averageFps = estimatedFrameDuration === null || estimatedFrameDuration <= 0 ? null : 1_000_000_000 / estimatedFrameDuration
+  const framesOverBudget = frameDurations.filter((duration) => duration > sixtyFpsFrameBudgetNs).length
+  const encoderAggregates = buildMetalEncoderAggregates(args.encoderListTable)
+  const topEncoder = encoderAggregates[0] ?? null
+  const driverSummary = buildMetalDriverSummary(args.driverEventTable)
   const diagnoses: Array<PerfDiagnosis> = []
+  const estimatedFpsText = formatFramesPerSecond(averageFps)
+  const frameBudgetSummary = frameEstimates.length === 0
+    ? null
+    : `${estimatedFpsText} average; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}`
 
   if (rows.length === 0) {
     diagnoses.push(
@@ -533,11 +761,39 @@ export const analyzeMetalSystemTraceTable = (table: ParsedPerfTable): {
     )
   }
 
+  if (frameEstimates.length > 0 && framesOverBudget > 0) {
+    diagnoses.push(
+      warningDiagnosis(
+        "metal-frame-budget-fps",
+        "Estimated GPU frame spans missed a 60 FPS budget.",
+        [
+          `${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}.`,
+          `Estimated average frame rate: ${estimatedFpsText}.`,
+        ],
+      ),
+    )
+  }
+
+  if (topEncoder) {
+    diagnoses.push(
+      infoDiagnosis(
+        "metal-encoder-breakdown",
+        `${topEncoder.label} dominated the exported encoder timing.`,
+        [
+          `Average encoder duration: ${formatNanoseconds(topEncoder.averageDuration)}.`,
+          `Total encoder duration: ${formatNanoseconds(topEncoder.totalDuration)} across ${topEncoder.encoderCount} encoders and ${topEncoder.commandBufferCount} command buffers.`,
+        ],
+      ),
+    )
+  }
+
   diagnoses.push(
     wallDiagnosis(
-      "metal-per-shader-wall",
-      "Probe can summarize encoder and command-buffer timing from Metal traces, but true per-shader GPU attribution is still outside the supported contract.",
-      ["Use the saved .trace bundle for deeper Instruments inspection when shader attribution matters."],
+      "metal-gpu-counters-required",
+      "Probe can summarize GPU intervals, driver events, and encoder timing from Metal traces, but per-shader GPU cycle attribution still requires GPU Counters with a pre-configured custom template.",
+      topEncoder
+        ? [`Top encoder in this export: ${topEncoder.label} (${formatNanoseconds(topEncoder.averageDuration)} avg).`]
+        : ["This recording did not export encoder rows, so Probe cannot isolate individual encoder hotspots from the current trace alone."],
     ),
   )
 
@@ -546,7 +802,13 @@ export const analyzeMetalSystemTraceTable = (table: ParsedPerfTable): {
       headline:
         rows.length === 0
           ? "No Metal GPU intervals were exported."
-          : `Observed ${rows.length} Metal GPU intervals across ${uniqueCount(channels)} channels.`,
+          : topEncoder && frameBudgetSummary
+            ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}; ${topEncoder.label} dominated the encoder timing.`
+            : topEncoder
+              ? `Observed ${rows.length} Metal GPU intervals; ${topEncoder.label} dominated the encoder timing.`
+              : frameBudgetSummary
+                ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}.`
+                : `Observed ${rows.length} Metal GPU intervals across ${uniqueCount(channels)} channels.`,
       metrics: [
         { label: "GPU intervals", value: String(rows.length) },
         { label: "Channels", value: summarizeCounts(channels) },
@@ -555,6 +817,314 @@ export const analyzeMetalSystemTraceTable = (table: ParsedPerfTable): {
         { label: "Max duration", value: formatNanoseconds(maxDuration) },
         { label: "Avg CPU→GPU latency", value: formatNanoseconds(averageLatency) },
         { label: "Max CPU→GPU latency", value: formatNanoseconds(maxLatency) },
+        { label: "Estimated FPS", value: estimatedFpsText },
+        { label: "Frames over 60 FPS budget", value: frameEstimates.length === 0 ? "n/a" : `${framesOverBudget}/${frameEstimates.length}` },
+        { label: "Avg frame span", value: formatNanoseconds(averageFrameDuration) },
+        { label: "Max frame span", value: formatNanoseconds(maxFrameDuration) },
+        { label: "Driver events", value: String(driverSummary.eventCount) },
+        { label: "Driver event types", value: summarizeCounts(driverSummary.eventTypes) },
+        { label: "Avg driver event duration", value: formatNanoseconds(driverSummary.averageDuration) },
+        { label: "Per-encoder summary", value: summarizeEncoderAggregates(encoderAggregates) },
+      ],
+    },
+    diagnoses,
+  }
+}
+
+export const analyzeMetalSystemTraceTable = (table: ParsedPerfTable): {
+  readonly summary: PerfSummary
+  readonly diagnoses: ReadonlyArray<PerfDiagnosis>
+} => analyzeMetalSystemTraceTables({ gpuIntervalsTable: table })
+
+const readThreadKeys = (row: PerfRow): ReadonlySet<string> =>
+  new Set(
+    [
+      readDisplay(row, "thread"),
+      readRaw(row, "thread"),
+    ].filter((value): value is string => value !== null && value.trim().length > 0),
+  )
+
+const findThreadMatchedHangRisk = (args: {
+  readonly hangRow?: PerfRow | null
+  readonly hangRiskTable?: ParsedPerfTable
+}): PerfRow | null => {
+  if (!args.hangRiskTable || !args.hangRow) {
+    return null
+  }
+
+  assertSchemaContract({
+    table: args.hangRiskTable,
+    schema: "hang-risks",
+    requiredMnemonics: ["time", "process", "message", "severity", "event-type", "backtrace", "thread"],
+  })
+
+  const hangThreadKeys = readThreadKeys(args.hangRow)
+
+  if (hangThreadKeys.size === 0) {
+    return null
+  }
+
+  return args.hangRiskTable.rows.find((row) => {
+    const riskThreadKeys = readThreadKeys(row)
+    return [...riskThreadKeys].some((key) => hangThreadKeys.has(key))
+  }) ?? null
+}
+
+export const analyzeHangsTables = (args: {
+  readonly hangTable: ParsedPerfTable
+  readonly hangRiskTable?: ParsedPerfTable
+}): {
+  readonly summary: PerfSummary
+  readonly diagnoses: ReadonlyArray<PerfDiagnosis>
+} => {
+  assertSchemaContract({
+    table: args.hangTable,
+    schema: "potential-hangs",
+    requiredMnemonics: ["start", "duration", "hang-type", "thread", "process"],
+  })
+
+  if (args.hangRiskTable) {
+    assertSchemaContract({
+      table: args.hangRiskTable,
+      schema: "hang-risks",
+      requiredMnemonics: ["time", "process", "message", "severity", "event-type", "backtrace", "thread"],
+    })
+  }
+
+  const hangRows = args.hangTable.rows
+  const hangDurations = hangRows.map((row) => readNumber(row, "duration")).filter((value): value is number => value !== null)
+  const hangTypes = hangRows.map((row) => readDisplay(row, "hang-type")).filter((value): value is string => value !== null)
+  const threads = hangRows.map((row) => readDisplay(row, "thread")).filter((value): value is string => value !== null)
+  const averageDuration = averageOf(hangDurations)
+  const maxDuration = hangDurations.length === 0 ? null : Math.max(...hangDurations)
+  const longestHangRow = hangRows.reduce<PerfRow | null>((longest, row) => {
+    const longestDuration = longest ? readNumber(longest, "duration") ?? -1 : -1
+    const currentDuration = readNumber(row, "duration") ?? -1
+    return currentDuration > longestDuration ? row : longest
+  }, null)
+  const matchedRiskRow = findThreadMatchedHangRisk({
+    hangRow: longestHangRow,
+    hangRiskTable: args.hangRiskTable,
+  })
+  const longestHangThread = longestHangRow ? readDisplay(longestHangRow, "thread") ?? readRaw(longestHangRow, "thread") : null
+  const matchedBacktrace = compactText(matchedRiskRow ? readDisplay(matchedRiskRow, "backtrace") ?? readRaw(matchedRiskRow, "backtrace") : null)
+  const matchedRiskMessage = compactText(matchedRiskRow ? readDisplay(matchedRiskRow, "message") ?? readRaw(matchedRiskRow, "message") : null)
+  const hangRiskSeverities = args.hangRiskTable
+    ? args.hangRiskTable.rows.map((row) => readDisplay(row, "severity")).filter((value): value is string => value !== null)
+    : []
+  const diagnoses: Array<PerfDiagnosis> = []
+
+  if (hangRows.length === 0) {
+    diagnoses.push(
+      warningDiagnosis(
+        "hangs-no-events",
+        "The recording did not export any potential hang rows.",
+        ["This interval may have been too short or too idle to trigger the current hang threshold."],
+      ),
+    )
+  }
+
+  if (longestHangRow && maxDuration !== null) {
+    const details = [
+      `Hang type: ${readDisplay(longestHangRow, "hang-type") ?? "unknown"}.`,
+      `Thread: ${longestHangThread ?? "unknown"}.`,
+    ]
+
+    if (matchedRiskMessage) {
+      details.push(`Risk message: ${matchedRiskMessage}.`)
+    }
+
+    if (matchedBacktrace) {
+      details.push(`Call stack hint: ${matchedBacktrace}.`)
+    }
+
+    diagnoses.push(
+      warningDiagnosis(
+        "hangs-longest-event",
+        `Longest exported hang lasted ${formatNanoseconds(maxDuration)}.`,
+        details,
+      ),
+    )
+  }
+
+  return {
+    summary: {
+      headline:
+        hangRows.length === 0
+          ? "No hang events were exported."
+          : `Detected ${hangRows.length} hang events across ${uniqueCount(threads)} threads.`,
+      metrics: [
+        { label: "Hang events", value: String(hangRows.length) },
+        { label: "Hang types", value: summarizeCounts(hangTypes) },
+        { label: "Affected threads", value: threads.length === 0 ? "none" : String(uniqueCount(threads)) },
+        { label: "Avg duration", value: formatNanoseconds(averageDuration) },
+        { label: "Max duration", value: formatNanoseconds(maxDuration) },
+        { label: "Hang-risk severities", value: summarizeCounts(hangRiskSeverities) },
+        { label: "Call stack hints", value: matchedBacktrace ? "available" : "none" },
+      ],
+    },
+    diagnoses,
+  }
+}
+
+interface SwiftTaskStateRow {
+  readonly task: string
+  readonly start: number | null
+  readonly state: string
+  readonly thread: string | null
+}
+
+const buildSwiftTaskStateRows = (table: ParsedPerfTable): ReadonlyArray<SwiftTaskStateRow> => {
+  assertSchemaContract({
+    table,
+    schema: "swift-task-state",
+    requiredMnemonics: ["start", "duration", "task", "state", "process", "thread"],
+  })
+
+  return table.rows
+    .map((row) => {
+      const task = readDisplay(row, "task") ?? readRaw(row, "task")
+      const state = readDisplay(row, "state") ?? readRaw(row, "state")
+
+      if (!task || !state) {
+        return null
+      }
+
+      return {
+        task,
+        start: readNumber(row, "start"),
+        state,
+        thread: readDisplay(row, "thread") ?? readRaw(row, "thread"),
+      } satisfies SwiftTaskStateRow
+    })
+    .filter((row): row is SwiftTaskStateRow => row !== null)
+}
+
+export const analyzeSwiftConcurrencyTables = (args: {
+  readonly taskStateTable: ParsedPerfTable
+  readonly taskLifetimeTable: ParsedPerfTable
+  readonly actorExecutionTable?: ParsedPerfTable
+}): {
+  readonly summary: PerfSummary
+  readonly diagnoses: ReadonlyArray<PerfDiagnosis>
+} => {
+  assertSchemaContract({
+    table: args.taskLifetimeTable,
+    schema: "swift-task-lifetime",
+    requiredMnemonics: ["start", "duration", "task"],
+  })
+
+  const stateRows = buildSwiftTaskStateRows(args.taskStateTable)
+  const lifetimeRows = args.taskLifetimeTable.rows
+  const lifetimeDurations = lifetimeRows.map((row) => readNumber(row, "duration")).filter((value): value is number => value !== null)
+  const lifetimeTaskIds = lifetimeRows
+    .map((row) => readDisplay(row, "task") ?? readRaw(row, "task"))
+    .filter((value): value is string => value !== null)
+  const allTaskIds = new Set<string>([
+    ...lifetimeTaskIds,
+    ...stateRows.map((row) => row.task),
+  ])
+  const states = stateRows.map((row) => row.state)
+  const taskTransitions: Array<string> = []
+  const createdTasks = new Set<string>()
+  const terminatedTasks = new Set<string>()
+
+  for (const stateRow of stateRows) {
+    if (/create/i.test(stateRow.state)) {
+      createdTasks.add(stateRow.task)
+    }
+
+    if (/(complete|cancel|finish|terminate|destroy)/i.test(stateRow.state)) {
+      terminatedTasks.add(stateRow.task)
+    }
+  }
+
+  const stateRowsByTask = new Map<string, Array<SwiftTaskStateRow>>()
+
+  for (const row of stateRows) {
+    const rows = stateRowsByTask.get(row.task) ?? []
+    rows.push(row)
+    stateRowsByTask.set(row.task, rows)
+  }
+
+  for (const rows of stateRowsByTask.values()) {
+    rows.sort((left, right) => (left.start ?? 0) - (right.start ?? 0))
+
+    for (let index = 1; index < rows.length; index += 1) {
+      const previous = rows[index - 1]
+      const current = rows[index]
+
+      if (previous && current && previous.state !== current.state) {
+        taskTransitions.push(`${previous.state} → ${current.state}`)
+      }
+    }
+  }
+
+  const createdCount = createdTasks.size > 0 ? createdTasks.size : allTaskIds.size
+  const terminatedCount = terminatedTasks.size > 0 ? terminatedTasks.size : uniqueCount(lifetimeTaskIds)
+  const averageLifetime = averageOf(lifetimeDurations)
+  const maxLifetime = lifetimeDurations.length === 0 ? null : Math.max(...lifetimeDurations)
+  const longRunningTasks = lifetimeRows
+    .map((row) => ({
+      task: readDisplay(row, "task") ?? readRaw(row, "task") ?? "unknown",
+      duration: readNumber(row, "duration"),
+    }))
+    .filter((row): row is { readonly task: string; readonly duration: number } => row.duration !== null && row.duration > longRunningSwiftTaskThresholdNs)
+    .sort((left, right) => right.duration - left.duration)
+
+  const actorRows = args.actorExecutionTable?.rows ?? []
+  const actorDurations = actorRows.map((row) => readNumber(row, "duration")).filter((value): value is number => value !== null)
+  const actorNames = actorRows
+    .map((row) => readDisplay(row, "actor") ?? readRaw(row, "actor"))
+    .filter((value): value is string => value !== null)
+
+  if (args.actorExecutionTable) {
+    assertSchemaContract({
+      table: args.actorExecutionTable,
+      schema: "swift-actor-execution",
+      requiredMnemonics: ["start", "duration", "actor", "task", "thread"],
+    })
+  }
+
+  const diagnoses: Array<PerfDiagnosis> = []
+
+  if (stateRows.length === 0 && lifetimeRows.length === 0) {
+    diagnoses.push(
+      warningDiagnosis(
+        "swift-concurrency-no-rows",
+        "Swift Concurrency exported no task lifetime or task state rows for the requested interval.",
+        ["Drive async or actor-backed workload before trusting concurrency conclusions."],
+      ),
+    )
+  }
+
+  if (longRunningTasks.length > 0) {
+    diagnoses.push(
+      warningDiagnosis(
+        "swift-concurrency-long-running-tasks",
+        `Some Swift tasks stayed alive longer than ${formatNanoseconds(longRunningSwiftTaskThresholdNs)}.`,
+        longRunningTasks.slice(0, 3).map((task) => `${task.task}: ${formatNanoseconds(task.duration)}`),
+      ),
+    )
+  }
+
+  return {
+    summary: {
+      headline:
+        allTaskIds.size === 0
+          ? "No Swift Concurrency task rows were exported."
+          : `Observed ${allTaskIds.size} Swift tasks with ${stateRows.length} task-state intervals.`,
+      metrics: [
+        { label: "Task creations", value: String(createdCount) },
+        { label: "Task terminations", value: String(terminatedCount) },
+        { label: "Task states", value: summarizeCounts(states) },
+        { label: "State transitions", value: summarizeCounts(taskTransitions, 4) },
+        { label: "Avg task lifetime", value: formatNanoseconds(averageLifetime) },
+        { label: "Max task lifetime", value: formatNanoseconds(maxLifetime) },
+        { label: "Long-running tasks (>100 ms)", value: String(longRunningTasks.length) },
+        { label: "Actor executions", value: String(actorRows.length) },
+        { label: "Actors", value: summarizeCounts(actorNames) },
+        { label: "Avg actor execution", value: formatNanoseconds(averageOf(actorDurations)) },
       ],
     },
     diagnoses,

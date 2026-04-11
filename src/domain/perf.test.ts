@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  defaultPerfTimeLimitForTemplate,
   analyzeMetalSystemTraceTable,
   analyzeSystemTraceTables,
   analyzeTimeProfilerTable,
@@ -91,6 +92,10 @@ describe("perf export parsing", () => {
 })
 
 describe("perf analysis", () => {
+  test("uses the longer default time limit for metal traces", () => {
+    expect(defaultPerfTimeLimitForTemplate("metal-system-trace")).toBe("60s")
+  })
+
   test("time profiler analysis flags blocked-heavy traces and preserves walls", () => {
     const result = analyzeTimeProfilerTable(parsePerfTableExport(timeProfilerXml))
 
@@ -119,8 +124,9 @@ describe("perf analysis", () => {
     const result = analyzeMetalSystemTraceTable(parsePerfTableExport(metalXml))
 
     expect(result.summary.headline).toContain("Observed 1 Metal GPU intervals")
+    expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toBe("50.0 fps")
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-frame-budget-duration")).toBe(true)
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-frame-budget-latency")).toBe(true)
-    expect(result.diagnoses.some((diagnosis) => diagnosis.wall)).toBe(true)
+    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-gpu-counters-required")).toBe(true)
   })
 })
