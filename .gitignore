@@ -6,3 +6,4 @@ coverage/
 .probe/
 **/__pycache__/
 *.pyc
+.env
