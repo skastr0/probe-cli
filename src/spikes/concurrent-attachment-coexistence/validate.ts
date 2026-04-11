@@ -29,7 +29,7 @@ const hostDebugTargetShutdownTimeoutMs = 3_000
 
 const sameTargetDebuggerWall = [
   "The current Probe LLDB session surface only exposes external-host-process attach.",
-  "The validated LLDB proof in knowledge/lldb-python/ is a signed local macOS process, not the simulator fixture app.",
+  "The validated LLDB proof in knowledge/lldb-python/ is a signed local macOS process, not the simulator default test app.",
   "Runner + LLDB same-target coexistence therefore remains an explicit hard wall for this spike.",
 ].join(" ")
 
@@ -129,7 +129,7 @@ const summarizeHealth = (health: SessionHealth) => ({
   pingRttMs: health.healthCheck.pingRttMs,
   lastCommand: health.healthCheck.lastCommand,
   lastOk: health.healthCheck.lastOk,
-  runnerProcessId: isLiveRunnerDetails(health.runner) ? health.runner.fixtureProcessId : null,
+  runnerProcessId: isLiveRunnerDetails(health.runner) ? health.runner.targetProcessId : null,
   coordination: health.coordination,
   debugger: {
     attachState: health.debugger.attachState,
@@ -149,7 +149,7 @@ const requireRunnerPid = (health: SessionHealth): number => {
     throw new Error("Expected a simulator runner-backed session for this spike.")
   }
 
-  return health.runner.fixtureProcessId
+  return health.runner.targetProcessId
 }
 
 const summarizeSnapshot = (snapshot: SessionSnapshotResult) => ({
@@ -697,7 +697,7 @@ const main = async () => {
   const coordinationPolicy = {
     runnerAndXctrace: runnerAndXctraceViable
       ? "Allow runner-backed snapshot/action work while Time Profiler records on the same simulator session target. Keep this as the current supported coexistence mode for runner + xctrace."
-      : "Do not claim runner + xctrace coexistence until the failing overlap step is resolved on the simulator fixture path.",
+      : "Do not claim runner + xctrace coexistence until the failing overlap step is resolved on the simulator default-test-app path.",
     pausedSessionApp: pausedSnapshotBlocked && pausedHealthBlocked
       ? "When the session app is paused, runner-backed snapshot and health ping requests time out at the runner command boundary. Probe should fail closed for runner-backed snapshot/action/health work whenever it knows the session app is stopped, suspended, or crashed, instead of probing and waiting for the full timeout budget."
       : "Pause behavior did not show the expected runner timeout wall; inspect the recorded evidence before changing the current coordination assumptions.",
@@ -726,7 +726,7 @@ const main = async () => {
     hardWalls: {
       sameTargetDebuggerWall,
       pauseMeasurementNote:
-        "The current LLDB surface cannot yet pause the session app itself, so pause behavior was measured by sending SIGSTOP/SIGCONT directly to the simulator fixture process.",
+        "The current LLDB surface cannot yet pause the session app itself, so pause behavior was measured by sending SIGSTOP/SIGCONT directly to the simulator default-test-app process.",
     },
     scenarios: {
       runnerAndXctrace,

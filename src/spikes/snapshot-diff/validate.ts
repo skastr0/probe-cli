@@ -8,7 +8,7 @@ import {
   decodeRunnerSnapshotPayload,
   type StoredSnapshotNode,
 } from "../../domain/snapshot"
-import { SimulatorHarness, SimulatorHarnessLive, type OpenedFixtureSession } from "../../services/SimulatorHarness"
+import { SimulatorHarness, SimulatorHarnessLive, type OpenedSimulatorSession } from "../../services/SimulatorHarness"
 
 const findNodeByIdentifier = (
   node: StoredSnapshotNode,
@@ -33,7 +33,7 @@ const main = async () => {
   const runtime = ManagedRuntime.make(SimulatorHarnessLive)
   const rootDir = process.cwd()
   const tempRoot = await mkdtemp(join(tmpdir(), "probe-snapshot-diff-"))
-  let opened: OpenedFixtureSession | null = null
+  let opened: OpenedSimulatorSession | null = null
 
   try {
     const harness = await runtime.runPromise(Effect.gen(function* () {
@@ -41,7 +41,7 @@ const main = async () => {
     }))
 
     opened = await runtime.runPromise(
-      harness.openFixtureSession({
+      harness.openSession({
         rootDir,
         sessionId: "snapshot-diff-validate",
         artifactRoot: tempRoot,

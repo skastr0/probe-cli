@@ -139,6 +139,10 @@ describe("action domain", () => {
       resolved,
     )
 
+    if (recorded.kind !== "type") {
+      throw new Error(`Expected a recorded type action, received ${recorded.kind}.`)
+    }
+
     expect(recorded.target.preferredRef).toBe("@e7")
     expect(recorded.target.fallback?.identifier).toBe("fixture.form.input")
     expect(recorded.target.fallback?.label).toBeNull()
