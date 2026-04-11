@@ -10,7 +10,7 @@ import { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import { ProbeFailurePayload, ProtocolMismatchError } from "../domain/errors"
 import { DrillQuery, DrillResult, OutputMode, SessionLogSource, SessionLogsResult, SummaryArtifactResult } from "../domain/output"
 import { PerfRecordResult, PerfTemplate } from "../domain/perf"
-import { SessionHealth } from "../domain/session"
+import { SessionHealth, SimulatorSessionMode } from "../domain/session"
 import { SessionSnapshotResultSchema } from "../domain/snapshot"
 
 export const PROBE_PROTOCOL_VERSION = "probe-rpc/v1"
@@ -25,6 +25,7 @@ export const RpcMethod = Schema.Literal(
   "session.debug",
   "session.snapshot",
   "session.screenshot",
+  "session.video",
   "session.action",
   "session.recording.export",
   "session.replay",
@@ -51,6 +52,7 @@ export const SessionOpenRequest = Schema.Struct({
   params: Schema.Struct({
     target: Schema.Literal("simulator", "device"),
     bundleId: Schema.String,
+    sessionMode: Schema.Union(SimulatorSessionMode, Schema.Null),
     simulatorUdid: NullableString,
     deviceId: NullableString,
   }),
@@ -124,6 +126,18 @@ export const SessionScreenshotRequest = Schema.Struct({
   }),
 })
 export type SessionScreenshotRequest = typeof SessionScreenshotRequest.Type
+
+export const SessionVideoRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.video"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    duration: Schema.String,
+  }),
+})
+export type SessionVideoRequest = typeof SessionVideoRequest.Type
 
 export const SessionActionRequest = Schema.Struct({
   kind: Schema.Literal("request"),
@@ -209,6 +223,7 @@ export const RpcRequest = Schema.Union(
   SessionDebugRequest,
   SessionSnapshotRequest,
   SessionScreenshotRequest,
+  SessionVideoRequest,
   SessionActionRequest,
   SessionRecordingExportRequest,
   SessionReplayRequest,
@@ -293,6 +308,15 @@ export const SessionScreenshotResponse = Schema.Struct({
 })
 export type SessionScreenshotResponse = typeof SessionScreenshotResponse.Type
 
+export const SessionVideoResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.video"),
+  result: SummaryArtifactResult,
+})
+export type SessionVideoResponse = typeof SessionVideoResponse.Type
+
 export const SessionActionResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -356,6 +380,7 @@ export const RpcResponse = Schema.Union(
   SessionDebugResponse,
   SessionSnapshotResponse,
   SessionScreenshotResponse,
+  SessionVideoResponse,
   SessionActionResponse,
   SessionRecordingExportResponse,
   SessionReplayResponse,
@@ -414,6 +439,7 @@ const coerceRpcMethod = (value: unknown): RpcMethod => {
     case "session.debug":
     case "session.snapshot":
     case "session.screenshot":
+    case "session.video":
     case "session.action":
     case "session.recording.export":
     case "session.replay":

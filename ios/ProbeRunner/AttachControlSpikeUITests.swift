@@ -3,10 +3,12 @@ import Foundation
 import XCTest
 
 final class AttachControlSpikeUITests: XCTestCase {
-  private let fixtureBundleIdentifier = "dev.probe.fixture"
   private let attachTimeout: TimeInterval = 10
   private let interactionTimeout: TimeInterval = 5
   private let lifecycleCommandTimeout: TimeInterval = 20
+  private let defaultVideoDurationMs = 10_000
+  private let maxVideoDurationMs = 120_000
+  private let videoFrameInterval: TimeInterval = 0.1
   private let stdinProbeTimeout: TimeInterval = 5
   private let runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
   private let runnerTransportContract = "probe.runner.transport/hybrid-v1"
@@ -55,6 +57,13 @@ final class AttachControlSpikeUITests: XCTestCase {
     let snapshotNodeCount: Int?
   }
 
+  private struct LifecycleVideoCaptureManifest: Codable {
+    let durationMs: Int
+    let fps: Int
+    let frameCount: Int
+    let framesDirectoryPath: String
+  }
+
   private struct RunnerUIActionLocator: Codable {
     let identifier: String?
     let label: String?
@@ -96,6 +105,7 @@ final class AttachControlSpikeUITests: XCTestCase {
 
   private enum LifecycleBootstrapSource: String {
     case simulatorBootstrapManifest = "simulator-bootstrap-manifest"
+    case deviceBootstrapManifest = "device-bootstrap-manifest"
   }
 
   private struct LifecycleBootstrapConfig: Codable {
@@ -106,6 +116,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     let ingressTransport: String
     let sessionIdentifier: String
     let simulatorUdid: String
+    let targetBundleId: String
   }
 
   private struct ResolvedLifecycleControlDirectory {
@@ -307,7 +318,8 @@ final class AttachControlSpikeUITests: XCTestCase {
 
   @MainActor
   func testAttachSnapshotAndControlWithoutRelaunch() throws {
-    let app = XCUIApplication(bundleIdentifier: fixtureBundleIdentifier)
+    let defaultTestBundleIdentifier = "dev.probe.fixture"
+    let app = XCUIApplication(bundleIdentifier: defaultTestBundleIdentifier)
 
     let attachStartedAt = Date()
     XCTAssertTrue(
@@ -512,7 +524,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     foregroundFailureMessage: String,
     statusLabelFailureMessage: String,
   ) throws -> LifecycleLoopState {
-    let app = XCUIApplication(bundleIdentifier: fixtureBundleIdentifier)
+    let app = XCUIApplication(bundleIdentifier: resolvedControlDirectory.config.targetBundleId)
 
     let attachStartedAt = Date()
     XCTAssertTrue(
@@ -552,41 +564,85 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private func resolveLifecycleControlDirectory() throws -> ResolvedLifecycleControlDirectory {
-    guard let simulatorUdid = ProcessInfo.processInfo.environment["SIMULATOR_UDID"],
+    if let simulatorUdid = ProcessInfo.processInfo.environment["SIMULATOR_UDID"],
       !simulatorUdid.isEmpty
+    {
+      let bootstrapPath = "\(runnerBootstrapRootPath)/\(simulatorUdid).json"
+      let bootstrapConfig = try loadLifecycleBootstrapConfig(at: bootstrapPath)
+
+      try validateLifecycleBootstrapConfig(
+        bootstrapConfig,
+        expectedBootstrapPath: bootstrapPath,
+        expectedBootstrapIdentifier: simulatorUdid
+      )
+
+      return ResolvedLifecycleControlDirectory(
+        bootstrapPath: bootstrapPath,
+        bootstrapSource: .simulatorBootstrapManifest,
+        config: bootstrapConfig,
+        controlDirectoryPath: bootstrapConfig.controlDirectoryPath
+      )
+    }
+
+    let bootstrapRootURL = URL(fileURLWithPath: runnerBootstrapRootPath, isDirectory: true)
+    let bootstrapEntries: [String]
+    do {
+      bootstrapEntries = try FileManager.default.contentsOfDirectory(atPath: bootstrapRootURL.path)
+    } catch {
+      throw lifecycleBootstrapError(
+        "Neither SIMULATOR_UDID nor a device bootstrap manifest was available under \(runnerBootstrapRootPath): \(error.localizedDescription)"
+      )
+    }
+
+    guard let deviceBootstrapFile = bootstrapEntries
+      .filter({ $0.hasPrefix("device-") && $0.hasSuffix(".json") })
+      .sorted()
+      .last
     else {
       throw lifecycleBootstrapError(
-        "SIMULATOR_UDID was not present. ProbeRunner now requires the simulator bootstrap manifest contract."
+        "SIMULATOR_UDID was not present, and no device bootstrap manifest matching device-*.json was found under \(runnerBootstrapRootPath)."
       )
     }
 
-    let bootstrapPath = "\(runnerBootstrapRootPath)/\(simulatorUdid).json"
-    guard FileManager.default.fileExists(atPath: bootstrapPath) else {
-      throw lifecycleBootstrapError(
-        "Expected simulator bootstrap manifest at \(bootstrapPath), but it was missing."
-      )
-    }
+    let bootstrapPath = bootstrapRootURL.appendingPathComponent(deviceBootstrapFile).path
+    let bootstrapConfig = try loadLifecycleBootstrapConfig(at: bootstrapPath)
+    let expectedDeviceIdentifier = String(deviceBootstrapFile.dropFirst("device-".count).dropLast(".json".count))
 
-    let bootstrapData = try Data(contentsOf: URL(fileURLWithPath: bootstrapPath))
-    let bootstrapConfig = try JSONDecoder().decode(LifecycleBootstrapConfig.self, from: bootstrapData)
     try validateLifecycleBootstrapConfig(
       bootstrapConfig,
       expectedBootstrapPath: bootstrapPath,
-      expectedSimulatorUdid: simulatorUdid
+      expectedBootstrapIdentifier: expectedDeviceIdentifier
     )
 
     return ResolvedLifecycleControlDirectory(
       bootstrapPath: bootstrapPath,
-      bootstrapSource: .simulatorBootstrapManifest,
+      bootstrapSource: .deviceBootstrapManifest,
       config: bootstrapConfig,
       controlDirectoryPath: bootstrapConfig.controlDirectoryPath
     )
   }
 
+  private func loadLifecycleBootstrapConfig(at bootstrapPath: String) throws -> LifecycleBootstrapConfig {
+    guard FileManager.default.fileExists(atPath: bootstrapPath) else {
+      throw lifecycleBootstrapError(
+        "Expected bootstrap manifest at \(bootstrapPath), but it was missing."
+      )
+    }
+
+    let bootstrapData = try Data(contentsOf: URL(fileURLWithPath: bootstrapPath))
+    do {
+      return try JSONDecoder().decode(LifecycleBootstrapConfig.self, from: bootstrapData)
+    } catch {
+      throw lifecycleBootstrapError(
+        "Bootstrap manifest \(bootstrapPath) could not be decoded: \(error.localizedDescription)"
+      )
+    }
+  }
+
   private func validateLifecycleBootstrapConfig(
     _ bootstrapConfig: LifecycleBootstrapConfig,
     expectedBootstrapPath: String,
-    expectedSimulatorUdid: String,
+    expectedBootstrapIdentifier: String,
   ) throws {
     guard bootstrapConfig.contractVersion == runnerTransportContract else {
       throw lifecycleBootstrapError(
@@ -594,15 +650,21 @@ final class AttachControlSpikeUITests: XCTestCase {
       )
     }
 
-    guard bootstrapConfig.simulatorUdid == expectedSimulatorUdid else {
+    guard bootstrapConfig.simulatorUdid == expectedBootstrapIdentifier else {
       throw lifecycleBootstrapError(
-        "Bootstrap manifest \(expectedBootstrapPath) declared simulator \(bootstrapConfig.simulatorUdid), expected \(expectedSimulatorUdid)."
+        "Bootstrap manifest \(expectedBootstrapPath) declared bootstrap identifier \(bootstrapConfig.simulatorUdid), expected \(expectedBootstrapIdentifier)."
       )
     }
 
     guard !bootstrapConfig.controlDirectoryPath.isEmpty else {
       throw lifecycleBootstrapError(
         "Bootstrap manifest \(expectedBootstrapPath) did not declare a control directory path."
+      )
+    }
+
+    guard !bootstrapConfig.targetBundleId.isEmpty else {
+      throw lifecycleBootstrapError(
+        "Bootstrap manifest \(expectedBootstrapPath) did not declare a target bundle ID."
       )
     }
 
@@ -900,7 +962,8 @@ final class AttachControlSpikeUITests: XCTestCase {
     foregroundFailureMessage: String,
     statusLabelFailureMessage: String,
   ) throws -> AttachedFixtureState {
-    let app = XCUIApplication(bundleIdentifier: fixtureBundleIdentifier)
+    let defaultTestBundleIdentifier = "dev.probe.fixture"
+    let app = XCUIApplication(bundleIdentifier: defaultTestBundleIdentifier)
 
     let attachStartedAt = Date()
     XCTAssertTrue(
@@ -1823,6 +1886,60 @@ final class AttachControlSpikeUITests: XCTestCase {
         snapshotNodeCount: compactNodeCount
       )
 
+    case "screenshot":
+      let screenshot = XCUIScreen.main.screenshot()
+      let payloadURL = lifecycleScreenshotPayloadURL(in: controlDirectoryURL, sequence: command.sequence)
+      try screenshot.pngRepresentation.write(to: payloadURL, options: .atomic)
+      return LifecycleCommandResult(
+        payload: "screenshot-captured",
+        snapshotPayloadPath: payloadURL.path,
+        snapshotNodeCount: nil
+      )
+
+    case "recordVideo":
+      let requestedDurationMs = Int(command.payload ?? "") ?? defaultVideoDurationMs
+      let durationMs = min(max(requestedDurationMs, 1), maxVideoDurationMs)
+      let fps = Int((1 / videoFrameInterval).rounded())
+      let framesDirectoryURL = lifecycleVideoFramesDirectoryURL(
+        in: controlDirectoryURL,
+        sequence: command.sequence
+      )
+
+      try FileManager.default.createDirectory(
+        at: framesDirectoryURL,
+        withIntermediateDirectories: true
+      )
+
+      let captureDeadline = Date().addingTimeInterval(TimeInterval(durationMs) / 1000)
+      var frameIndex = 0
+
+      while frameIndex == 0 || Date() < captureDeadline {
+        let screenshot = XCUIScreen.main.screenshot()
+        let frameURL = framesDirectoryURL.appendingPathComponent(
+          String(format: "frame-%05d.png", frameIndex)
+        )
+        try screenshot.pngRepresentation.write(to: frameURL, options: .atomic)
+        frameIndex += 1
+
+        if Date() < captureDeadline {
+          RunLoop.current.run(until: Date().addingTimeInterval(videoFrameInterval))
+        }
+      }
+
+      let manifest = LifecycleVideoCaptureManifest(
+        durationMs: durationMs,
+        fps: fps,
+        frameCount: frameIndex,
+        framesDirectoryPath: framesDirectoryURL.path
+      )
+      try writeJSON(manifest, to: framesDirectoryURL.appendingPathComponent("manifest.json"))
+
+      return LifecycleCommandResult(
+        payload: "video-captured",
+        snapshotPayloadPath: framesDirectoryURL.path,
+        snapshotNodeCount: nil
+      )
+
     case "uiAction":
       let payloadData = Data((command.payload ?? "{}").utf8)
       let actionPayload = try JSONDecoder().decode(RunnerUIActionPayload.self, from: payloadData)
@@ -1879,6 +1996,14 @@ final class AttachControlSpikeUITests: XCTestCase {
 
   private func lifecycleSnapshotPayloadURL(in controlDirectoryURL: URL, sequence: Int) -> URL {
     controlDirectoryURL.appendingPathComponent(String(format: "snapshot-%03d.json", sequence))
+  }
+
+  private func lifecycleScreenshotPayloadURL(in controlDirectoryURL: URL, sequence: Int) -> URL {
+    controlDirectoryURL.appendingPathComponent(String(format: "screenshot-%03d.png", sequence))
+  }
+
+  private func lifecycleVideoFramesDirectoryURL(in controlDirectoryURL: URL, sequence: Int) -> URL {
+    controlDirectoryURL.appendingPathComponent(String(format: "video-frames-%03d", sequence))
   }
 
   private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {

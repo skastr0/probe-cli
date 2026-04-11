@@ -47,6 +47,8 @@ import type {
   SessionSnapshotResponse,
   SessionScreenshotRequest,
   SessionScreenshotResponse,
+  SessionVideoRequest,
+  SessionVideoResponse,
 } from "./protocol"
 
 export interface RpcClientOptions {
@@ -316,6 +318,9 @@ export const sendSessionDebug = (options: RpcClientOptions, request: SessionDebu
 
 export const sendSessionScreenshot = (options: RpcClientOptions, request: SessionScreenshotRequest) =>
   sendRequest<SessionScreenshotResponse>(options, request)
+
+export const sendSessionVideo = (options: RpcClientOptions, request: SessionVideoRequest) =>
+  sendRequest<SessionVideoResponse>(options, request)
 
 export const sendSessionAction = (options: RpcClientOptions, request: SessionActionRequest) =>
   sendRequest<SessionActionResponse>(options, request)

@@ -19,6 +19,7 @@ describe("rpc protocol", () => {
       params: {
         target: "simulator",
         bundleId: "dev.probe.fixture",
+        sessionMode: "attach-to-running",
         simulatorUdid: null,
         deviceId: null,
       },
@@ -92,6 +93,21 @@ describe("rpc protocol", () => {
     expect(request.method).toBe("session.action")
   })
 
+  test("decodes a session video request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-video",
+      method: "session.video",
+      params: {
+        sessionId: "session-1",
+        duration: "30s",
+      },
+    })
+
+    expect(request.method).toBe("session.video")
+  })
+
   test("decodes a perf record request", () => {
     const request = decodeRpcRequest({
       kind: "request",
@@ -132,6 +148,7 @@ describe("rpc protocol", () => {
         params: {
           target: "simulator",
           bundleId: "dev.probe.fixture",
+          sessionMode: "build-and-install",
           simulatorUdid: null,
           deviceId: null,
         },

@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { access, mkdir, readFile, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
 import { join, relative } from "node:path"
 import { Context, Effect, Layer, Ref } from "effect"
 import {
@@ -46,13 +47,14 @@ import {
   type SessionHealthCheck,
   type SessionResourceState,
   type SessionResourceStates,
+  type SimulatorSessionMode,
 } from "../domain/session"
 import { buildSessionSnapshotResult, buildSnapshotArtifact, decodeRunnerSnapshotPayload, type SessionSnapshotResult, type StoredSnapshotArtifact } from "../domain/snapshot"
 import { ArtifactStore, type DaemonSessionMetadata } from "./ArtifactStore"
 import { type LldbBridgeHandle, type LldbBridgeResponseFrame, LldbBridgeFactory } from "./LldbBridge"
 import { OutputPolicy } from "./OutputPolicy"
 import { type OpenedRealDeviceSession, RealDeviceHarness } from "./RealDeviceHarness"
-import { SimulatorHarness, type OpenedFixtureSession, type RunnerCommandResult } from "./SimulatorHarness"
+import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
 const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
@@ -61,12 +63,184 @@ const defaultDebugCommandTimeoutMs = Number(process.env.PROBE_LLDB_COMMAND_TIMEO
 const maxDebugFrameLimit = 200
 const maxDebugEvalTimeoutMs = 30_000
 const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
+const maxVideoDurationMs = 120_000
+const defaultVideoDurationMs = 10_000
+const videoCaptureFps = 10
+const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
 const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
 const nonRecoverableSessionWarning =
   "Probe fails closed when the runner exits, the daemon restarts, or runner transport is lost. Close and reopen the session instead of expecting transparent recovery."
 const daemonOwnedCleanupWarning =
   "Session cleanup is daemon-owned; close/session shutdown tears down the runner wrapper process group and removes the bootstrap manifest."
+
+interface HostCommandResult {
+  readonly stdout: string
+  readonly stderr: string
+  readonly exitCode: number | null
+  readonly signal: string | null
+  readonly timedOut: boolean
+}
+
+interface RunnerVideoCaptureManifest {
+  readonly durationMs: number
+  readonly fps: number
+  readonly frameCount: number
+  readonly framesDirectoryPath: string
+}
+
+const parseDurationStringMs = (value: string): number | null => {
+  const match = value.match(/^(\d+)(ms|s|m|h)$/)
+
+  if (!match) {
+    return null
+  }
+
+  const amount = Number(match[1])
+  const unit = match[2]
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return null
+  }
+
+  switch (unit) {
+    case "ms":
+      return amount
+    case "s":
+      return amount * 1_000
+    case "m":
+      return amount * 60_000
+    case "h":
+      return amount * 60 * 60_000
+    default:
+      return null
+  }
+}
+
+const normalizeVideoDurationMs = (durationMs: number): number =>
+  Math.min(Math.max(Math.round(durationMs), 1), maxVideoDurationMs)
+
+const resolveFfmpegExecutable = (): string => process.env.PROBE_FFMPEG_PATH ?? "ffmpeg"
+
+const runHostCommand = (args: {
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly cwd?: string
+  readonly timeoutMs?: number
+}): Promise<HostCommandResult> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(args.command, [...args.commandArgs], {
+      cwd: args.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+
+    let stdout = ""
+    let stderr = ""
+    let timedOut = false
+    const timeoutMs = args.timeoutMs ?? 30_000
+    const timeout = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGTERM")
+      setTimeout(() => {
+        if (child.exitCode === null) {
+          child.kill("SIGKILL")
+        }
+      }, 2_000)
+    }, timeoutMs)
+
+    child.stdout?.setEncoding("utf8")
+    child.stderr?.setEncoding("utf8")
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk
+    })
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk
+    })
+
+    child.once("error", (error) => {
+      clearTimeout(timeout)
+      reject(error)
+    })
+    child.once("close", (exitCode, signal) => {
+      clearTimeout(timeout)
+      resolve({ stdout, stderr, exitCode, signal, timedOut })
+    })
+  })
+
+const formatHostCommandFailure = (command: string, result: HostCommandResult): string => {
+  if (result.timedOut) {
+    return `${command} timed out.`
+  }
+
+  const excerpt = `${result.stdout}${result.stderr}`.trim().split(/\r?\n/).slice(-3).join(" | ")
+  return excerpt.length > 0
+    ? `${command} exited with ${result.exitCode ?? result.signal ?? "unknown"}: ${excerpt}`
+    : `${command} exited with ${result.exitCode ?? result.signal ?? "unknown"}.`
+}
+
+const fileExists = async (path: string): Promise<boolean> => {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const isFfmpegAvailable = async (): Promise<boolean> => {
+  const ffmpegExecutable = resolveFfmpegExecutable()
+
+  try {
+    const result = await runHostCommand({
+      command: ffmpegExecutable,
+      commandArgs: ["-version"],
+      timeoutMs: 5_000,
+    })
+    return result.exitCode === 0
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return false
+    }
+
+    throw error
+  }
+}
+
+const decodeRunnerVideoCaptureManifest = (
+  value: unknown,
+  framesDirectoryPath: string,
+): RunnerVideoCaptureManifest => {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("runner video manifest must be an object")
+  }
+
+  const record = value as Record<string, unknown>
+  const durationMs = typeof record.durationMs === "number" ? record.durationMs : null
+  const fps = typeof record.fps === "number" ? record.fps : null
+  const frameCount = typeof record.frameCount === "number" ? record.frameCount : null
+
+  if (
+    durationMs === null
+    || fps === null
+    || frameCount === null
+    || !Number.isFinite(durationMs)
+    || !Number.isFinite(fps)
+    || !Number.isFinite(frameCount)
+    || durationMs <= 0
+    || fps <= 0
+    || frameCount <= 0
+  ) {
+    throw new Error("runner video manifest is missing one or more required fields")
+  }
+
+  return {
+    durationMs,
+    fps,
+    frameCount,
+    framesDirectoryPath,
+  }
+}
 
 const timestampForFile = (): string => new Date().toISOString().replace(/[:.]/g, "-")
 
@@ -132,7 +306,7 @@ interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
   nextSequence: number
   readonly sendRunnerCommand: (
     sequence: number,
-    action: "ping" | "applyInput" | "snapshot" | "shutdown" | "uiAction",
+    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
     payload?: string,
   ) => Promise<RunnerCommandResult>
   readonly closeResources: () => Promise<void>
@@ -142,13 +316,24 @@ interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
 
 interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "device"
-  nextSequence: 0
+  integrationPoints: ReadonlyArray<string>
+  nextSequence: number
+  readonly sendRunnerCommand: ((
+    sequence: number,
+    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+    payload?: string,
+  ) => Promise<RunnerCommandResult>) | null
   readonly refreshConnection: () => Promise<SessionConnectionDetails>
   readonly closeResources: () => Promise<void>
-  readonly isRunnerRunning: () => false
+  readonly isRunnerRunning: () => boolean
+  readonly waitForExit: Promise<{ readonly code: number | null; readonly signal: string | null }> | null
 }
 
 type ActiveSessionRecord = SimulatorActiveSessionRecord | RealDeviceActiveSessionRecord
+type RunnerBackedActiveSessionRecord = SimulatorActiveSessionRecord | (RealDeviceActiveSessionRecord & {
+  readonly sendRunnerCommand: NonNullable<RealDeviceActiveSessionRecord["sendRunnerCommand"]>
+  readonly waitForExit: NonNullable<RealDeviceActiveSessionRecord["waitForExit"]>
+})
 
 interface OpeningSessionReservation {
   readonly sessionId: string
@@ -419,11 +604,13 @@ const buildSimulatorCapabilities = (): ReadonlyArray<CapabilityReport> => [
   {
     area: "simulator",
     status: "supported",
-    summary: "The daemon can resolve a concrete simulator UDID, boot it, install the fixture app, launch it before runner attach, and capture screenshots into the session artifact root.",
+    summary:
+      "The daemon can resolve a concrete simulator UDID, boot it, either build/install Probe's fixture app or attach to an already-running installed app, and capture runner-backed screenshots and videos into the session artifact root.",
     details: [
       "Uses simctl list --json plus bootstatus -b for deterministic simulator selection.",
-      "Uses simctl install and simctl launch --terminate-running-process for the fixture app.",
-      "Uses simctl io screenshot with artifact-backed PNG outputs under screenshots/.",
+      "Fixture sessions use simctl install and simctl launch --terminate-running-process before runner attach.",
+      "Arbitrary-app sessions verify installation/running state with simctl launch plus simctl listapps before runner attach.",
+      "Runner-backed screenshots land under screenshots/, and runner-backed video artifacts land under video/.",
     ],
   },
   {
@@ -439,16 +626,17 @@ const buildSimulatorCapabilities = (): ReadonlyArray<CapabilityReport> => [
       "Runner control works, but the contract is still the honest transport-boundary seam: simulator bootstrap manifest plus file-backed command ingress plus stdout-framed mixed-log egress.",
     details: [
       "xcodebuild stdin is not treated as a usable host-to-runner transport in this slice.",
-      "The current runner target is fixture-only and attaches to dev.probe.fixture.",
+      "The same runner transport is used for both Probe's built-in fixture app and attach-to-running simulator sessions.",
     ],
   },
   {
     area: "perf",
     status: "degraded",
     summary:
-      "The daemon can record/export Time Profiler, System Trace, and Metal System Trace for the fixture-backed simulator path, but wider Instruments coverage still remains explicit follow-up work.",
+      "The daemon can record/export Time Profiler, System Trace, Metal System Trace, Hangs, and Swift Concurrency for simulator sessions anchored to the active target-app pid, but wider Instruments coverage still remains explicit follow-up work.",
     details: [
       "Current summaries intentionally stop at row-proven exports instead of implying support for every schema visible in a TOC.",
+      "Metal driver/encoder exports plus hangs and swift-task summaries are available only when the bounded exports are populated for the current workload.",
       "System Trace stays on an explicitly bounded contract: smaller recording windows plus per-export size/row budgets that fail honest when XML cost outruns the supported summary.",
       "Network-on-Simulator, full reconstructed call stacks, and per-shader GPU attribution remain honest walls.",
     ],
@@ -478,18 +666,25 @@ const buildSimulatorCapabilities = (): ReadonlyArray<CapabilityReport> => [
 const buildRealDeviceCapabilities = (args: {
   readonly connection: SessionConnectionDetails
   readonly integrationPoints: ReadonlyArray<string>
+  readonly liveRunner: boolean
 }): ReadonlyArray<CapabilityReport> => [
   {
     area: "simulator",
     status: "unsupported",
-    summary: "This session targets a real device, so simulator-only boot/install/media helpers are not part of its contract.",
-    details: ["Retry on a simulator target if you need simctl-backed screenshots or simulator log capture."],
+    summary: "This session targets a real device, so simulator-only boot/install helpers are not part of its contract.",
+    details: ["Retry on a simulator target if you need simulator log capture or fixture build/install helpers."],
   },
   {
     area: "real-device",
-    status: args.connection.status === "connected" ? "degraded" : "unsupported",
+    status: args.connection.status !== "connected"
+      ? "unsupported"
+      : args.liveRunner
+        ? "supported"
+        : "degraded",
     summary: args.connection.status === "connected"
-      ? "Probe opened a real-device session through explicit devicectl + signing preflight, but the on-device runner transport remains an honest follow-up seam."
+      ? args.liveRunner
+        ? "Probe opened a live real-device runner session through explicit devicectl, signing, and XCUITest transport validation."
+        : "Probe opened a real-device session through explicit devicectl + signing preflight, but the on-device runner transport remains an honest follow-up seam."
       : "The selected real device is no longer reachable, so the device session stays open only as degraded metadata until the device reconnects.",
     details: [
       ...args.connection.details,
@@ -498,27 +693,45 @@ const buildRealDeviceCapabilities = (args: {
   },
   {
     area: "runner",
-    status: "degraded",
-    summary: "The real-device runner transport is not established in this slice; Probe only keeps preflight state and explicit integration points alive.",
-    details: [
-      "The Simulator bootstrap-manifest transport is not claimed for real devices.",
-      "Use session health plus the saved preflight artifacts to inspect device connectivity and prerequisites.",
-    ],
+    status: args.liveRunner ? "supported" : "degraded",
+    summary: args.liveRunner
+      ? "The real-device runner is live over the same bootstrap-manifest + file-mailbox + stdout-JSONL transport used on simulator."
+      : "The real-device runner transport is not established in this slice; Probe only keeps preflight state and explicit integration points alive.",
+    details: args.liveRunner
+      ? [
+          "Command ingress uses the host-side file mailbox shared with the XCUITest boundary.",
+          "Runner events are parsed from stdout JSONL frames embedded in the mixed xcodebuild/XCTest log stream.",
+        ]
+      : [
+          "The Simulator bootstrap-manifest transport is not claimed for real devices.",
+          "Use session health plus the saved preflight artifacts to inspect device connectivity and prerequisites.",
+        ],
   },
   {
     area: "perf",
-    status: "unsupported",
-    summary: "Perf recording still depends on the simulator fixture runner pid path in this slice.",
-    details: ["Real-device xctrace anchoring remains a follow-up seam after on-device runner/session validation."],
+    status: args.liveRunner ? "supported" : "unsupported",
+    summary: args.liveRunner
+      ? "Perf recording can attach xctrace to the live real-device target pid exposed by the runner session."
+      : "Perf recording still depends on the simulator runner pid path in this slice.",
+    details: args.liveRunner
+      ? ["Real-device xctrace recording still depends on the live runner pid and connected-device availability."]
+      : ["Real-device xctrace anchoring remains a follow-up seam after on-device runner/session validation."],
   },
   {
     area: "logs",
     status: "degraded",
-    summary: "Real-device sessions currently expose only preflight/build artifacts; there is no long-lived device log collector yet.",
-    details: [
-      "You can inspect the saved build/preflight artifacts through session logs or artifact drill when present.",
-      "Real-device live unified logging remains an explicit later seam.",
-    ],
+    summary: args.liveRunner
+      ? "Real-device sessions expose build + runner boundary artifacts, but there is no long-lived device unified-log collector yet."
+      : "Real-device sessions currently expose only preflight/build artifacts; there is no long-lived device log collector yet.",
+    details: args.liveRunner
+      ? [
+          "You can inspect the saved xcodebuild-session, wrapper stderr, stdout-event, and preflight artifacts through session logs or artifact drill.",
+          "Real-device live unified logging remains an explicit later seam.",
+        ]
+      : [
+          "You can inspect the saved build/preflight artifacts through session logs or artifact drill when present.",
+          "Real-device live unified logging remains an explicit later seam.",
+        ],
   },
   {
     area: "debug",
@@ -528,10 +741,9 @@ const buildRealDeviceCapabilities = (args: {
   },
 ]
 
-const buildSimulatorWarnings = (opened: OpenedFixtureSession): ReadonlyArray<string> => {
+const buildSimulatorWarnings = (opened: OpenedSimulatorSession): ReadonlyArray<string> => {
   const warnings = [
     "Runner command ingress currently uses the validated file-backed mailbox rather than xcodebuild stdin.",
-    "The current runner vertical slice is fixture-only and does not yet support arbitrary target bundle ids.",
     daemonOwnedCleanupWarning,
     nonRecoverableSessionWarning,
     selectorDriftContractWarning,
@@ -547,11 +759,20 @@ const buildSimulatorWarnings = (opened: OpenedFixtureSession): ReadonlyArray<str
   return warnings
 }
 
-const buildRealDeviceWarnings = (opened: OpenedRealDeviceSession): ReadonlyArray<string> => [
-  ...opened.warnings,
-  "Device reconnects are surfaced explicitly in session health; Probe does not claim transparent recovery of real-device runner state.",
-  daemonOwnedCleanupWarning,
-]
+const buildRealDeviceWarnings = (opened: OpenedRealDeviceSession): ReadonlyArray<string> => {
+  const warnings = [
+    ...opened.warnings,
+    daemonOwnedCleanupWarning,
+  ]
+
+  if (opened.mode === "live" && opened.stdinProbeStatus !== "received") {
+    warnings.push(
+      `Runner stdin probe reported ${opened.stdinProbeStatus}; the daemon continues on the proven file-mailbox contract instead of pretending stdin works.`,
+    )
+  }
+
+  return dedupeStrings(warnings)
+}
 
 const composeWarnings = (
   record: Pick<ActiveSessionRecord, "baseWarnings">,
@@ -563,6 +784,9 @@ const isSimulatorRecord = (record: ActiveSessionRecord): record is SimulatorActi
 
 const isRealDeviceRecord = (record: ActiveSessionRecord): record is RealDeviceActiveSessionRecord =>
   record.kind === "device"
+
+const isRunnerBackedRecord = (record: ActiveSessionRecord): record is RunnerBackedActiveSessionRecord =>
+  isSimulatorRecord(record) || record.sendRunnerCommand !== null
 
 export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
   SessionRegistry,
@@ -580,6 +804,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
     >
     readonly openSimulatorSession: (params: {
       readonly bundleId: string
+      readonly sessionMode?: SimulatorSessionMode
       readonly simulatorUdid: string | null
       readonly rootDir: string
       readonly emitProgress: (stage: string, message: string) => void
@@ -615,6 +840,13 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
     }) => Effect.Effect<
       SummaryArtifactResult,
       SessionNotFoundError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+    >
+    readonly recordVideo: (params: {
+      readonly sessionId: string
+      readonly duration: string
+    }) => Effect.Effect<
+      SummaryArtifactResult,
+      SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
     >
     readonly captureSnapshot: (params: {
       readonly sessionId: string
@@ -755,12 +987,21 @@ export const SessionRegistryLive = Layer.scoped(
           return
         }
 
+        const capabilities = isRealDeviceRecord(args.record)
+          ? [...buildRealDeviceCapabilities({
+              connection: args.record.health.connection,
+              integrationPoints: args.record.integrationPoints,
+              liveRunner: false,
+            })]
+          : args.record.health.capabilities
+
         args.record.health = {
           ...args.record.health,
           state: "failed",
           updatedAt: nowIso(),
           expiresAt: expiresAtIso(),
           resources: setRunnerResourceState(args.record.health.resources, "failed"),
+          capabilities,
           healthCheck: {
             ...args.record.health.healthCheck,
             checkedAt: nowIso(),
@@ -782,8 +1023,8 @@ export const SessionRegistryLive = Layer.scoped(
 
     const sendRunnerCommand = (
       sessionId: string,
-      record: SimulatorActiveSessionRecord,
-      action: "ping" | "snapshot" | "shutdown" | "uiAction",
+      record: RunnerBackedActiveSessionRecord,
+      action: "ping" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
       payload?: string,
     ) =>
       Effect.tryPromise({
@@ -1013,6 +1254,343 @@ export const SessionRegistryLive = Layer.scoped(
         content: args.report,
       })
     }
+
+    const captureRunnerScreenshotArtifact = (args: {
+      readonly sessionId: string
+      readonly record: RunnerBackedActiveSessionRecord
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+      readonly summary: string
+    }) =>
+      Effect.gen(function* () {
+        const response = yield* sendRunnerCommand(args.sessionId, args.record, "screenshot")
+        args.record.nextSequence += 1
+
+        if (!response.ok) {
+          return yield* new EnvironmentError({
+            code: "session-screenshot-failed",
+            reason: response.error ?? response.payload ?? `Runner screenshot failed with status ${response.statusLabel}.`,
+            nextStep: "Inspect the latest runner artifacts, then retry the screenshot request.",
+            details: [],
+          })
+        }
+
+        if (!response.snapshotPayloadPath) {
+          return yield* new EnvironmentError({
+            code: "session-screenshot-payload-missing",
+            reason: "Runner screenshot completed without reporting a PNG payload path.",
+            nextStep: "Inspect the runner response artifact and align the screenshot transport contract before retrying.",
+            details: [],
+          })
+        }
+
+        const screenshotsDirectory = join(args.record.health.artifactRoot, "screenshots")
+        const absolutePath = join(screenshotsDirectory, `${args.fileStem}.png`)
+
+        yield* Effect.tryPromise({
+          try: async () => {
+            await mkdir(screenshotsDirectory, { recursive: true })
+            await rename(response.snapshotPayloadPath!, absolutePath)
+          },
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-screenshot-artifact-write",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Check write access to the session screenshots directory and retry the screenshot request.",
+              details: [],
+            }),
+        })
+
+        const artifact = createArtifactRecord({
+          artifactRoot: args.record.health.artifactRoot,
+          key: args.artifactKey,
+          label: args.artifactLabel,
+          kind: "png",
+          absolutePath,
+          summary: args.summary,
+        })
+
+        yield* artifactStore.registerArtifact(args.sessionId, artifact)
+
+        return {
+          artifact,
+          statusLabel: response.statusLabel,
+        }
+      })
+
+    const materializeFrameSequenceArtifact = (args: {
+      readonly sessionId: string
+      readonly artifactRoot: string
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+      readonly manifest: RunnerVideoCaptureManifest
+    }) =>
+      Effect.gen(function* () {
+        const frameFiles = yield* Effect.tryPromise({
+          try: async () => {
+            const entries = await readdir(args.manifest.framesDirectoryPath)
+            return entries.filter((entry) => entry.endsWith(".png")).sort()
+          },
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-frames-read",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect the runner video frames directory and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (frameFiles.length === 0) {
+          return yield* new EnvironmentError({
+            code: "session-video-frames-empty",
+            reason: "Runner video capture completed without producing any frame PNGs.",
+            nextStep: "Inspect the runner video manifest and frames directory, then retry the video request.",
+            details: [],
+          })
+        }
+
+        const bundlePath = join(args.artifactRoot, "video", `${args.fileStem}.frame-sequence`)
+        const manifestPath = join(bundlePath, "frames.json")
+        const archivePath = join(bundlePath, "frames.tar.gz")
+
+        yield* Effect.tryPromise({
+          try: async () => {
+            await mkdir(bundlePath, { recursive: true })
+            await writeFile(
+              manifestPath,
+              `${JSON.stringify({
+                ...args.manifest,
+                archivedAt: nowIso(),
+                archiveFile: "frames.tar.gz",
+              }, null, 2)}\n`,
+              "utf8",
+            )
+          },
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-manifest-write",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Check write access to the session video directory and retry the video request.",
+              details: [],
+            }),
+        })
+
+        const tarResult = yield* Effect.tryPromise({
+          try: () =>
+            runHostCommand({
+              command: tarExecutable,
+              commandArgs: ["-czf", archivePath, ...frameFiles],
+              cwd: args.manifest.framesDirectoryPath,
+              timeoutMs: 60_000,
+            }),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-frames-archive",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect tar availability and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (tarResult.exitCode !== 0) {
+          return yield* new EnvironmentError({
+            code: "session-video-frames-archive",
+            reason: formatHostCommandFailure(`${tarExecutable} -czf`, tarResult),
+            nextStep: "Inspect tar availability and retry the video request.",
+            details: [],
+          })
+        }
+
+        const artifact = createArtifactRecord({
+          artifactRoot: args.artifactRoot,
+          key: args.artifactKey,
+          label: args.artifactLabel,
+          kind: "directory",
+          absolutePath: bundlePath,
+          summary:
+            `Frame-sequence bundle with ${args.manifest.frameCount} frame(s) at ${args.manifest.fps} fps because ffmpeg was not available for MP4 stitching.`,
+        })
+
+        yield* artifactStore.registerArtifact(args.sessionId, artifact)
+        return artifact
+      })
+
+    const captureRunnerVideoArtifact = (args: {
+      readonly sessionId: string
+      readonly record: RunnerBackedActiveSessionRecord
+      readonly durationMs: number
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+    }) =>
+      Effect.gen(function* () {
+        const response = yield* sendRunnerCommand(args.sessionId, args.record, "recordVideo", String(args.durationMs))
+        args.record.nextSequence += 1
+
+        if (!response.ok) {
+          return yield* new EnvironmentError({
+            code: "session-video-failed",
+            reason: response.error ?? response.payload ?? `Runner video capture failed with status ${response.statusLabel}.`,
+            nextStep: "Inspect the latest runner artifacts, then retry the video request.",
+            details: [],
+          })
+        }
+
+        if (!response.snapshotPayloadPath) {
+          return yield* new EnvironmentError({
+            code: "session-video-manifest-missing",
+            reason: "Runner video capture completed without reporting a frames directory payload path.",
+            nextStep: "Inspect the runner response artifact and align the video transport contract before retrying.",
+            details: [],
+          })
+        }
+
+        const framesDirectoryPath = response.snapshotPayloadPath
+        const manifestPath = join(framesDirectoryPath, "manifest.json")
+
+        const manifestContent = yield* Effect.tryPromise({
+          try: () => readFile(manifestPath, "utf8"),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-manifest-read",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect the runner video manifest artifact and retry the video request.",
+              details: [],
+            }),
+        })
+
+        const manifest = yield* Effect.try({
+          try: () => decodeRunnerVideoCaptureManifest(JSON.parse(manifestContent) as unknown, framesDirectoryPath),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-manifest-parse",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect the runner video manifest artifact and align the host/runner video contract before retrying.",
+              details: [],
+            }),
+        })
+
+        const framesExist = yield* Effect.tryPromise({
+          try: () => fileExists(manifest.framesDirectoryPath),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-frames-check",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect the runner video frames directory and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (!framesExist) {
+          return yield* new EnvironmentError({
+            code: "session-video-frames-missing",
+            reason: `Runner video manifest referenced missing frames directory ${manifest.framesDirectoryPath}.`,
+            nextStep: "Inspect the runner video manifest artifact and retry the video request.",
+            details: [],
+          })
+        }
+
+        const ffmpegAvailable = yield* Effect.tryPromise({
+          try: isFfmpegAvailable,
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-ffmpeg-check",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect ffmpeg availability and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (!ffmpegAvailable) {
+          const artifact = yield* materializeFrameSequenceArtifact({
+            sessionId: args.sessionId,
+            artifactRoot: args.record.health.artifactRoot,
+            fileStem: args.fileStem,
+            artifactKey: args.artifactKey,
+            artifactLabel: args.artifactLabel,
+            manifest,
+          })
+
+          return {
+            artifact,
+            statusLabel: response.statusLabel,
+            mode: "frame-sequence" as const,
+          }
+        }
+
+        const ffmpegExecutable = resolveFfmpegExecutable()
+        const videoDirectory = join(args.record.health.artifactRoot, "video")
+        const absolutePath = join(videoDirectory, `${args.fileStem}.mp4`)
+
+        yield* Effect.tryPromise({
+          try: async () => {
+            await mkdir(videoDirectory, { recursive: true })
+          },
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-directory-create",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Check write access to the session video directory and retry the video request.",
+              details: [],
+            }),
+        })
+
+        const ffmpegResult = yield* Effect.tryPromise({
+          try: () =>
+            runHostCommand({
+              command: ffmpegExecutable,
+              commandArgs: [
+                "-y",
+                "-framerate",
+                String(manifest.fps || videoCaptureFps),
+                "-i",
+                "frame-%05d.png",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                absolutePath,
+              ],
+              cwd: manifest.framesDirectoryPath,
+              timeoutMs: manifest.durationMs + 60_000,
+            }),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-ffmpeg-run",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect ffmpeg availability and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (ffmpegResult.exitCode !== 0) {
+          return yield* new EnvironmentError({
+            code: "session-video-ffmpeg-run",
+            reason: formatHostCommandFailure(`${ffmpegExecutable} -framerate`, ffmpegResult),
+            nextStep: "Inspect ffmpeg availability and retry the video request.",
+            details: [],
+          })
+        }
+
+        const artifact = createArtifactRecord({
+          artifactRoot: args.record.health.artifactRoot,
+          key: args.artifactKey,
+          label: args.artifactLabel,
+          kind: "mp4",
+          absolutePath,
+          summary: `MP4 video with ${manifest.frameCount} frame(s) at ${manifest.fps} fps stitched from runner screenshots via ffmpeg.`,
+        })
+
+        yield* artifactStore.registerArtifact(args.sessionId, artifact)
+
+        return {
+          artifact,
+          statusLabel: response.statusLabel,
+          mode: "mp4" as const,
+        }
+      })
 
     const persistRecordHealth = (sessionId: string, record: ActiveSessionRecord) =>
       persistHealth(sessionId, record.health).pipe(Effect.zipRight(syncDaemonMetadata))
@@ -1515,12 +2093,12 @@ export const SessionRegistryLive = Layer.scoped(
       Effect.gen(function* () {
         yield* assertRunnerActionsAvailable(record)
 
-        if (!isSimulatorRecord(record)) {
+        if (!isRunnerBackedRecord(record)) {
           return yield* new UnsupportedCapabilityError({
             code: "session-snapshot-real-device-runner",
             capability: "session.snapshot",
-            reason: "The current real-device session slice does not have a validated on-device runner transport for snapshots.",
-            nextStep: "Inspect session health/preflight artifacts, or retry on a simulator session until the real-device runner seam is validated.",
+            reason: "This session does not currently expose a live runner transport for snapshots.",
+            nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
             details: [],
             wall: false,
           })
@@ -1770,7 +2348,7 @@ export const SessionRegistryLive = Layer.scoped(
 
         yield* closeDebuggerBridgeInternal(sessionId, record)
 
-        if (reason !== "runner-exit" && isSimulatorRecord(record) && record.isRunnerRunning()) {
+        if (reason !== "runner-exit" && isRunnerBackedRecord(record) && record.isRunnerRunning()) {
           yield* Effect.tryPromise({
             try: async () => {
               await record.sendRunnerCommand(record.nextSequence, "shutdown")
@@ -1904,7 +2482,7 @@ export const SessionRegistryLive = Layer.scoped(
 
                 emitProgress("device.resolve", "Resolving a concrete real-device target through CoreDevice.")
 
-                const opened = yield* realDeviceHarness.openPreflightSession({
+                const opened = yield* realDeviceHarness.openLiveSession({
                   rootDir,
                   sessionId: opening.sessionId,
                   artifactRoot: layout.root,
@@ -1914,10 +2492,7 @@ export const SessionRegistryLive = Layer.scoped(
                   requestedDeviceId: deviceId,
                 })
 
-                emitProgress(
-                  "device.preflight",
-                  "Real-device prerequisites passed; Probe is opening a degraded device session with an explicit runner-transport wall.",
-                )
+                emitProgress("runner.ready", "Real-device runner attached and acknowledged the initial ping.")
 
                 return yield* Effect.gen(function* () {
                   const discoveredArtifacts = yield* Effect.tryPromise({
@@ -1944,6 +2519,20 @@ export const SessionRegistryLive = Layer.scoped(
                           absolutePath: opened.devicesJsonPath,
                           summary: "Raw devicectl device-list JSON captured during real-device preflight.",
                         },
+                        {
+                          key: "installed-apps",
+                          label: "installed-apps",
+                          kind: "json",
+                          absolutePath: opened.installedAppsJsonPath,
+                          summary: "Raw devicectl installed-apps JSON filtered to the requested target bundle id.",
+                        },
+                        {
+                          key: "device-process-launch",
+                          label: "device-process-launch",
+                          kind: "json",
+                          absolutePath: opened.launchJsonPath,
+                          summary: "Raw devicectl process-launch JSON for the target app Probe attached to on device.",
+                        },
                         ...(opened.ddiServicesJsonPath
                           ? [{
                               key: "ddi-services",
@@ -1962,6 +2551,34 @@ export const SessionRegistryLive = Layer.scoped(
                               summary: "Signed iPhoneOS build-for-testing output for the real-device preflight.",
                             }]
                           : []),
+                        {
+                          key: "xcodebuild-session-log",
+                          label: "xcodebuild-session-log",
+                          kind: "text",
+                          absolutePath: opened.logPath,
+                          summary: "Mixed xcodebuild and XCTest output from the active real-device runner session.",
+                        },
+                        {
+                          key: "stdout-events",
+                          label: "stdout-events",
+                          kind: "ndjson",
+                          absolutePath: opened.stdoutEventsPath,
+                          summary: "Structured stdout-framed runner events captured by the observer wrapper for the real-device session.",
+                        },
+                        {
+                          key: "result-bundle",
+                          label: "result-bundle",
+                          kind: "directory",
+                          absolutePath: opened.resultBundlePath,
+                          summary: "xcodebuild result bundle for the active real-device runner session.",
+                        },
+                        {
+                          key: "wrapper-stderr",
+                          label: "wrapper-stderr",
+                          kind: "text",
+                          absolutePath: opened.wrapperStderrPath,
+                          summary: "stderr from the Python wrapper that supervises the real-device xcodebuild boundary.",
+                        },
                         ...(opened.xctestrunPath
                           ? [{
                               key: "xctestrun",
@@ -1971,13 +2588,13 @@ export const SessionRegistryLive = Layer.scoped(
                               summary: "Generated xctestrun metadata emitted by the signed real-device preflight build.",
                             }]
                           : []),
-                        ...(opened.fixtureAppPath
+                        ...(opened.targetAppPath
                           ? [{
-                              key: "fixture-app",
-                              label: "fixture-app",
+                              key: "target-app",
+                              label: "target-app",
                               kind: "directory" as const,
-                              absolutePath: opened.fixtureAppPath,
-                              summary: "Signed ProbeFixture.app emitted by the real-device preflight build.",
+                              absolutePath: opened.targetAppPath,
+                              summary: "Signed target app bundle emitted by the real-device preflight build for the requested bundle id.",
                             }]
                           : []),
                         ...(opened.runnerAppPath
@@ -2016,15 +2633,15 @@ export const SessionRegistryLive = Layer.scoped(
                   const debuggerState = makeDefaultDebuggerState()
                   const healthCheck: SessionHealthCheck = {
                     checkedAt: nowIso(),
-                    wrapperRunning: false,
-                    pingRttMs: null,
-                    lastCommand: "device-preflight",
+                    wrapperRunning: opened.isWrapperRunning(),
+                    pingRttMs: opened.initialPingRttMs,
+                    lastCommand: "ping",
                     lastOk: true,
                   }
 
                   const health: SessionHealth = {
                     sessionId: opening.sessionId,
-                    state: "degraded",
+                    state: "ready",
                     openedAt: opening.openedAt,
                     updatedAt: nowIso(),
                     expiresAt: expiresAtIso(),
@@ -2034,45 +2651,45 @@ export const SessionRegistryLive = Layer.scoped(
                       bundleId: opened.bundleId,
                       deviceId: opened.device.identifier,
                       deviceName: opened.device.name,
-                      runtime: opened.device.runtime,
+                        runtime: opened.device.runtime,
                     },
                     connection: opened.connection,
-                    resources: makeSessionResources("degraded"),
+                    resources: makeSessionResources("ready"),
                     transport: {
-                      kind: "real-device-preflight",
-                      contract: "probe.runner.transport/unvalidated-device-v1",
-                      bootstrapSource: "not-established",
-                      bootstrapPath: null,
-                      sessionIdentifier: opening.sessionId,
-                      commandIngress: "not-established",
-                      eventEgress: "not-established",
-                      stdinProbeStatus: "not-run",
+                      kind: "real-device-live",
+                      contract: opened.runnerTransportContract,
+                      bootstrapSource: opened.bootstrapSource,
+                      bootstrapPath: opened.bootstrapPath,
+                      sessionIdentifier: opened.sessionIdentifier,
+                      commandIngress: opened.commandIngress,
+                      eventEgress: opened.eventEgress,
+                      stdinProbeStatus: opened.stdinProbeStatus,
                       note:
-                        "The real-device session currently stops at explicit devicectl + signing preflight. Probe does not claim a validated on-device runner transport yet.",
-                      integrationPoints: [...opened.integrationPoints],
+                        "The current real-device slice reuses the validated XCUITest boundary seam: device bootstrap manifest plus file-backed command ingress plus stdout-framed event egress.",
                     },
                     capabilities: [...buildRealDeviceCapabilities({
                       connection: opened.connection,
                       integrationPoints: opened.integrationPoints,
+                      liveRunner: true,
                     })],
                     runner: {
-                      kind: "real-device-preflight",
-                      wrapperProcessId: null,
-                      testProcessId: null,
-                      fixtureProcessId: null,
-                      attachLatencyMs: null,
-                      runtimeControlDirectory: null,
-                      observerControlDirectory: null,
-                      logPath: null,
+                      kind: "real-device-live",
+                      wrapperProcessId: opened.wrapperProcessId,
+                      testProcessId: opened.testProcessId,
+                      targetProcessId: opened.targetProcessId,
+                      attachLatencyMs: opened.attachLatencyMs,
+                      runtimeControlDirectory: opened.runtimeControlDirectory,
+                      observerControlDirectory: opened.observerControlDirectory,
+                      logPath: opened.logPath,
                       buildLogPath: opened.buildLogPath,
-                      stdoutEventsPath: null,
-                      resultBundlePath: null,
-                      wrapperStderrPath: null,
-                      stdinProbeStatus: "not-run",
+                      stdoutEventsPath: opened.stdoutEventsPath,
+                      resultBundlePath: opened.resultBundlePath,
+                      wrapperStderrPath: opened.wrapperStderrPath,
+                      stdinProbeStatus: opened.stdinProbeStatus,
                       connectionStatus: opened.connection.status,
                       lastCheckedAt: opened.connection.checkedAt,
                       note:
-                        "No on-device runner bridge is live for this session. Health reflects preflight/device connectivity only until the real-device runner seam is validated on hardware.",
+                        "The real-device runner is live over the same file-mailbox + stdout-JSONL mixed-log transport validated on simulator.",
                     },
                     healthCheck,
                     debugger: debuggerState,
@@ -2085,7 +2702,8 @@ export const SessionRegistryLive = Layer.scoped(
                     kind: "device",
                     health,
                     baseWarnings: warnings,
-                    nextSequence: 0,
+                    integrationPoints: opened.integrationPoints,
+                    nextSequence: opened.nextSequence,
                     debuggerBridge: null,
                     snapshotState: {
                       latest: null,
@@ -2095,13 +2713,33 @@ export const SessionRegistryLive = Layer.scoped(
                     recording: {
                       steps: [],
                     },
+                    sendRunnerCommand: opened.sendCommand,
                     refreshConnection: opened.refreshConnection,
                     closeResources: opened.close,
-                    isRunnerRunning: () => false,
+                    isRunnerRunning: opened.isWrapperRunning,
+                    waitForExit: opened.waitForExit,
                   }
 
                   yield* persistHealth(opening.sessionId, health)
                   yield* Ref.update(sessionsRef, (current) => new Map(current).set(opening.sessionId, record))
+
+                  record.waitForExit?.then(() => {
+                    if (record.health.state === "closing" || record.health.state === "closed") {
+                      return
+                    }
+
+                    void Effect.runPromise(
+                      markSessionRunnerFailed({
+                        sessionId: opening.sessionId,
+                        record,
+                        lastCommand: "runner-exit",
+                        reason: "The real-device runner wrapper exited unexpectedly.",
+                        wrapperRunning: false,
+                      }).pipe(
+                        Effect.catchAll(() => Effect.void),
+                      ),
+                    )
+                  })
 
                   return health
                 }).pipe(
@@ -2111,7 +2749,7 @@ export const SessionRegistryLive = Layer.scoped(
             (opening, exit) => finalizeOpeningSession(opening.sessionId, exit._tag === "Failure"),
           )
         }),
-      openSimulatorSession: ({ bundleId, simulatorUdid, rootDir, emitProgress }) =>
+      openSimulatorSession: ({ bundleId, sessionMode, simulatorUdid, rootDir, emitProgress }) =>
         Effect.gen(function* () {
           const reservation = yield* reserveOpeningSession({
             platform: "simulator",
@@ -2150,13 +2788,14 @@ export const SessionRegistryLive = Layer.scoped(
 
                 emitProgress("simulator.resolve", "Resolving a concrete Simulator target.")
 
-                const opened = yield* simulatorHarness.openFixtureSession({
+                const opened = yield* simulatorHarness.openSession({
                   rootDir,
                   sessionId: opening.sessionId,
                   artifactRoot: layout.root,
                   runnerDirectory: layout.runnerDirectory,
                   logsDirectory: layout.logsDirectory,
                   bundleId,
+                  sessionMode,
                   simulatorUdid,
                 })
 
@@ -2264,7 +2903,7 @@ export const SessionRegistryLive = Layer.scoped(
                       kind: "simulator-runner",
                       wrapperProcessId: opened.wrapperProcessId,
                       testProcessId: opened.testProcessId,
-                      fixtureProcessId: opened.fixtureProcessId,
+                      targetProcessId: opened.targetProcessId,
                       attachLatencyMs: opened.attachLatencyMs,
                       runtimeControlDirectory: opened.runtimeControlDirectory,
                       observerControlDirectory: opened.observerControlDirectory,
@@ -2356,7 +2995,55 @@ export const SessionRegistryLive = Layer.scoped(
                 }),
             })
 
-            const runnerDetails = record.health.runner.kind === "real-device-preflight"
+            if (!isRunnerBackedRecord(record)) {
+              const runnerDetails = record.health.runner.kind === "real-device-preflight"
+                ? {
+                    ...record.health.runner,
+                    connectionStatus: connection.status,
+                    lastCheckedAt: connection.checkedAt,
+                  }
+                : record.health.runner
+
+              const nextHealth: SessionHealth = {
+                ...record.health,
+                updatedAt: nowIso(),
+                expiresAt: expiresAtIso(),
+                connection,
+                resources: setRunnerResourceState(record.health.resources, "degraded"),
+                capabilities: [...buildRealDeviceCapabilities({
+                  connection,
+                  integrationPoints: record.integrationPoints,
+                  liveRunner: false,
+                })],
+                runner: runnerDetails,
+                healthCheck: {
+                  checkedAt: nowIso(),
+                  wrapperRunning: false,
+                  pingRttMs: null,
+                  lastCommand: "device-health",
+                  lastOk: connection.status === "connected",
+                },
+                warnings: connection.status === "connected"
+                  ? [...record.baseWarnings]
+                  : composeWarnings(record, [
+                      `Selected device ${record.health.target.deviceName} (${record.health.target.deviceId}) is currently disconnected. Probe keeps the session degraded instead of claiming transparent recovery.`,
+                    ]),
+                artifacts: [...(yield* refreshArtifacts(sessionId))],
+              }
+
+              record.health = {
+                ...nextHealth,
+                state: deriveSessionPhase(nextHealth),
+              }
+
+              yield* persistHealth(sessionId, record.health)
+              yield* syncDaemonMetadata
+              return record.health
+            }
+
+            const deviceDisconnectedWarning =
+              `Selected device ${record.health.target.deviceName} (${record.health.target.deviceId}) is currently disconnected. Probe keeps the session degraded instead of claiming transparent recovery.`
+            const runnerDetails = record.health.runner.kind === "real-device-live"
               ? {
                   ...record.health.runner,
                   connectionStatus: connection.status,
@@ -2364,31 +3051,82 @@ export const SessionRegistryLive = Layer.scoped(
                 }
               : record.health.runner
 
+            if (!record.isRunnerRunning()) {
+              const nextHealth: SessionHealth = {
+                ...record.health,
+                updatedAt: nowIso(),
+                expiresAt: expiresAtIso(),
+                connection,
+                resources: setRunnerResourceState(record.health.resources, "failed"),
+                capabilities: [...buildRealDeviceCapabilities({
+                  connection,
+                  integrationPoints: record.integrationPoints,
+                  liveRunner: false,
+                })],
+                runner: runnerDetails,
+                healthCheck: {
+                  checkedAt: nowIso(),
+                  wrapperRunning: false,
+                  pingRttMs: null,
+                  lastCommand: "ping",
+                  lastOk: false,
+                },
+                warnings: composeWarnings(record, [
+                  "The real-device runner wrapper process is no longer running. Probe fails closed instead of pretending the device runner recovered.",
+                  ...(connection.status === "connected" ? [] : [deviceDisconnectedWarning]),
+                ]),
+                artifacts: [...(yield* refreshArtifacts(sessionId))],
+              }
+
+              record.health = {
+                ...nextHealth,
+                state: deriveSessionPhase(nextHealth),
+              }
+
+              yield* persistHealth(sessionId, record.health)
+              yield* syncDaemonMetadata
+              return record.health
+            }
+
+            yield* assertRunnerActionsAvailable(
+              record,
+              "Continue or detach the debugger before retrying session health, then retry.",
+            )
+
+            const response = yield* sendRunnerCommand(sessionId, record, "ping", "health-check")
+            record.nextSequence += 1
+
+            const warnings = response.ok
+              ? connection.status === "connected"
+                ? [...record.baseWarnings]
+                : composeWarnings(record, [deviceDisconnectedWarning])
+              : composeWarnings(record, [
+                  `Runner ping reported ${response.statusLabel}. ${nonRecoverableSessionWarning}`,
+                  ...(connection.status === "connected" ? [] : [deviceDisconnectedWarning]),
+                ])
+
             const nextHealth: SessionHealth = {
               ...record.health,
               updatedAt: nowIso(),
               expiresAt: expiresAtIso(),
               connection,
-              resources: setRunnerResourceState(record.health.resources, "degraded"),
+              resources: response.ok
+                ? record.health.resources
+                : setRunnerResourceState(record.health.resources, "failed"),
               capabilities: [...buildRealDeviceCapabilities({
                 connection,
-                integrationPoints: record.health.transport.kind === "real-device-preflight"
-                  ? record.health.transport.integrationPoints
-                  : [],
+                integrationPoints: record.integrationPoints,
+                liveRunner: response.ok && connection.status === "connected",
               })],
               runner: runnerDetails,
               healthCheck: {
                 checkedAt: nowIso(),
-                wrapperRunning: false,
-                pingRttMs: null,
-                lastCommand: "device-health",
-                lastOk: connection.status === "connected",
+                wrapperRunning: record.isRunnerRunning(),
+                pingRttMs: response.hostRttMs,
+                lastCommand: response.action,
+                lastOk: response.ok,
               },
-              warnings: connection.status === "connected"
-                ? [...record.baseWarnings]
-                : composeWarnings(record, [
-                    `Selected device ${record.health.target.deviceName} (${record.health.target.deviceId}) is currently disconnected. Probe keeps the session degraded instead of claiming transparent recovery.`,
-                  ]),
+              warnings,
               artifacts: [...(yield* refreshArtifacts(sessionId))],
             }
 
@@ -2473,12 +3211,23 @@ export const SessionRegistryLive = Layer.scoped(
 
           const record = yield* requireSessionRecord(sessionId)
 
-          if (isRealDeviceRecord(record) && source !== "build") {
+          if (isRealDeviceRecord(record) && !isRunnerBackedRecord(record) && source !== "build") {
             return yield* new UnsupportedCapabilityError({
               code: "session-logs-real-device-source",
               capability: `session.logs.${source}`,
               reason: `The current real-device session slice only keeps build/preflight artifacts available for log-style inspection; ${source} is not a supported device log source yet.`,
               nextStep: "Retry with --source build to inspect the signed-build/preflight output, or wait for the real-device logging seam to be implemented.",
+              details: [],
+              wall: false,
+            })
+          }
+
+          if (isRealDeviceRecord(record) && isRunnerBackedRecord(record) && source === "simulator") {
+            return yield* new UnsupportedCapabilityError({
+              code: "session-logs-real-device",
+              capability: "session.logs.simulator-source",
+              reason: "The current bounded log capture path only supports simulator sessions.",
+              nextStep: "Retry against a simulator session, or inspect the saved device runner artifacts for this session.",
               details: [],
               wall: false,
             })
@@ -2571,12 +3320,12 @@ export const SessionRegistryLive = Layer.scoped(
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
 
-          if (!isSimulatorRecord(record)) {
+          if (!isRunnerBackedRecord(record)) {
             return yield* new UnsupportedCapabilityError({
               code: "session-action-real-device-runner",
               capability: "session.action",
-              reason: "The current real-device session slice does not yet expose a validated on-device runner for UI actions.",
-              nextStep: "Inspect session health/preflight artifacts, or retry the action on a simulator session until the real-device runner seam is validated.",
+              reason: "This session does not currently expose a live runner for UI actions.",
+              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
               details: [],
               wall: false,
             })
@@ -2591,6 +3340,90 @@ export const SessionRegistryLive = Layer.scoped(
               nextStep: "Fix the action payload and retry the session action request.",
               details: [],
             })
+          }
+
+          const persistActionFailure = (kind: SessionAction["kind"]) =>
+            Effect.gen(function* () {
+              updateHealthCheck(record, kind, false)
+              yield* persistHealth(sessionId, record.health)
+              yield* syncDaemonMetadata
+            })
+
+          if (action.kind === "screenshot") {
+            const fileStem = `${timestampForFile()}-screenshot`
+            const captureResult = yield* Effect.either(captureRunnerScreenshotArtifact({
+              sessionId,
+              record,
+              fileStem,
+              artifactKey: `screenshot-${fileStem}`,
+              artifactLabel: "screenshot",
+              summary: `Runner screenshot captured for session ${sessionId}.`,
+            }))
+
+            if (captureResult._tag === "Left") {
+              yield* persistActionFailure(action.kind)
+              return yield* captureResult.left
+            }
+
+            appendRecordedAction(record, buildRecordedSessionAction(action, null))
+            updateHealthCheck(record, action.kind, true)
+            yield* refreshSessionArtifacts(sessionId, record)
+            yield* persistHealth(sessionId, record.health)
+            yield* syncDaemonMetadata
+
+            return {
+              summary: `Captured screenshot artifact ${captureResult.right.artifact.absolutePath}.`,
+              action: action.kind,
+              matchedRef: null,
+              resolvedBy: "none",
+              statusLabel: captureResult.right.statusLabel,
+              latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+              artifact: captureResult.right.artifact,
+              recordingLength: record.recording.steps.length,
+            } satisfies SessionActionResult
+          }
+
+          if (action.kind === "video") {
+            const durationMs = normalizeVideoDurationMs(action.durationMs)
+            const normalizedAction: SessionAction = { kind: "video", durationMs }
+            const fileStem = `${timestampForFile()}-video`
+            const captureResult = yield* Effect.either(captureRunnerVideoArtifact({
+              sessionId,
+              record,
+              durationMs,
+              fileStem,
+              artifactKey: `video-${fileStem}`,
+              artifactLabel: "video",
+            }))
+
+            if (captureResult._tag === "Left") {
+              yield* persistActionFailure(action.kind)
+              return yield* captureResult.left
+            }
+
+            appendRecordedAction(record, buildRecordedSessionAction(normalizedAction, null))
+            updateHealthCheck(record, action.kind, true)
+            yield* refreshSessionArtifacts(sessionId, record)
+            yield* persistHealth(sessionId, record.health)
+            yield* syncDaemonMetadata
+
+            const modeSummary = captureResult.right.mode === "mp4"
+              ? "MP4 video artifact"
+              : "frame-sequence video artifact"
+            const clampNote = durationMs !== action.durationMs
+              ? ` Requested duration ${action.durationMs}ms was clamped to ${durationMs}ms.`
+              : ""
+
+            return {
+              summary: `Captured ${modeSummary} at ${captureResult.right.artifact.absolutePath}.${clampNote}`,
+              action: action.kind,
+              matchedRef: null,
+              resolvedBy: "none",
+              statusLabel: captureResult.right.statusLabel,
+              latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+              artifact: captureResult.right.artifact,
+              recordingLength: record.recording.steps.length,
+            } satisfies SessionActionResult
           }
 
           const preSnapshot = yield* captureSnapshotArtifactInternal(sessionId, record)
@@ -2627,6 +3460,7 @@ export const SessionRegistryLive = Layer.scoped(
               resolvedBy: evaluation.resolvedBy,
               statusLabel: preSnapshot.artifact.statusLabel,
               latestSnapshotId: preSnapshot.artifact.snapshotId,
+              artifact: null,
               recordingLength: record.recording.steps.length,
             } satisfies SessionActionResult
           }
@@ -2691,6 +3525,7 @@ export const SessionRegistryLive = Layer.scoped(
             resolvedBy: resolvedTarget.resolvedBy,
             statusLabel: postSnapshot.artifact.statusLabel,
             latestSnapshotId: postSnapshot.artifact.snapshotId,
+            artifact: null,
             recordingLength: record.recording.steps.length,
           } satisfies SessionActionResult
         }),
@@ -2698,12 +3533,12 @@ export const SessionRegistryLive = Layer.scoped(
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
 
-          if (!isSimulatorRecord(record)) {
+          if (!isRunnerBackedRecord(record)) {
             return yield* new UnsupportedCapabilityError({
               code: "session-recording-real-device-runner",
               capability: "session.recording.export",
-              reason: "This real-device session has no runner-backed action recording to export.",
-              nextStep: "Retry on a simulator session, or wait for the real-device runner path to be validated before exporting recordings.",
+              reason: "This session has no runner-backed action recording to export.",
+              nextStep: "Execute one or more runner-backed actions before exporting a recording.",
               details: [],
               wall: false,
             })
@@ -2750,12 +3585,12 @@ export const SessionRegistryLive = Layer.scoped(
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
 
-          if (!isSimulatorRecord(record)) {
+          if (!isRunnerBackedRecord(record)) {
             return yield* new UnsupportedCapabilityError({
               code: "session-replay-real-device-runner",
               capability: "session.replay",
-              reason: "The current real-device session slice does not yet support replaying actions against an on-device runner.",
-              nextStep: "Retry on a simulator session, or wait for the real-device runner seam to be validated before replaying recordings.",
+              reason: "This session does not currently support replaying actions because no live runner is available.",
+              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
               details: [],
               wall: false,
             })
@@ -2782,6 +3617,81 @@ export const SessionRegistryLive = Layer.scoped(
 
             while (attempt < defaultReplayAttemptLimit && !succeeded) {
               attempt += 1
+
+              if (step.kind === "screenshot") {
+                const fileStem = `step-${String(index + 1).padStart(3, "0")}-screenshot`
+                const capture = yield* Effect.either(captureRunnerScreenshotArtifact({
+                  sessionId,
+                  record,
+                  fileStem,
+                  artifactKey: `screenshot-${fileStem}`,
+                  artifactLabel: `replay-screenshot-${index + 1}`,
+                  summary: `Replay step ${index + 1} screenshot captured for session ${sessionId}.`,
+                }))
+
+                if (capture._tag === "Left") {
+                  lastFailure = capture.left.reason
+                  continue
+                }
+
+                if (attempt > 1) {
+                  retriedStepCount += 1
+                }
+
+                reports.push({
+                  index: index + 1,
+                  kind: step.kind,
+                  attempts: attempt,
+                  resolvedBy: "none",
+                  matchedRef: null,
+                  artifact: capture.right.artifact,
+                  summary: `Captured replay screenshot artifact ${capture.right.artifact.absolutePath}.`,
+                })
+                succeeded = true
+                continue
+              }
+
+              if (step.kind === "video") {
+                const durationMs = normalizeVideoDurationMs(step.durationMs)
+                const fileStem = `step-${String(index + 1).padStart(3, "0")}-video`
+                const capture = yield* Effect.either(captureRunnerVideoArtifact({
+                  sessionId,
+                  record,
+                  durationMs,
+                  fileStem,
+                  artifactKey: `video-${fileStem}`,
+                  artifactLabel: `replay-video-${index + 1}`,
+                }))
+
+                if (capture._tag === "Left") {
+                  lastFailure = capture.left.reason
+                  continue
+                }
+
+                if (attempt > 1) {
+                  retriedStepCount += 1
+                }
+
+                const modeSummary = capture.right.mode === "mp4"
+                  ? "MP4 video"
+                  : "frame-sequence video"
+                const clampNote = durationMs !== step.durationMs
+                  ? ` Requested duration ${step.durationMs}ms was clamped to ${durationMs}ms.`
+                  : ""
+
+                reports.push({
+                  index: index + 1,
+                  kind: step.kind,
+                  attempts: attempt,
+                  resolvedBy: "none",
+                  matchedRef: null,
+                  artifact: capture.right.artifact,
+                  summary: `Captured replay ${modeSummary} artifact ${capture.right.artifact.absolutePath}.${clampNote}`,
+                })
+                succeeded = true
+                continue
+              }
+
               const preSnapshot = yield* captureSnapshotArtifactInternal(sessionId, record)
               finalSnapshotId = preSnapshot.artifact.snapshotId
               const resolution = resolveRecordedActionTargetInSnapshot(preSnapshot.artifact, step.target)
@@ -2812,6 +3722,7 @@ export const SessionRegistryLive = Layer.scoped(
                   attempts: attempt,
                   resolvedBy: evaluation.resolvedBy,
                   matchedRef: evaluation.matchedRef,
+                  artifact: null,
                   summary,
                 })
                 succeeded = true
@@ -2831,7 +3742,7 @@ export const SessionRegistryLive = Layer.scoped(
                 "uiAction",
                 JSON.stringify(
                   buildRunnerUiActionPayload(
-                    step as unknown as Exclude<SessionAction, AssertAction>,
+                    step,
                     resolvedTarget,
                     preSnapshot.artifact,
                   ),
@@ -2859,15 +3770,16 @@ export const SessionRegistryLive = Layer.scoped(
                 ? `Executed ${step.kind} on ${describeRecordedActionTarget(step.target)} after semantic selector-drift recovery; captured ${postSnapshot.artifact.snapshotId}.`
                 : `Executed ${step.kind} on ${describeRecordedActionTarget(step.target)}; captured ${postSnapshot.artifact.snapshotId}.`
 
-              reports.push({
-                index: index + 1,
-                kind: step.kind,
-                attempts: attempt,
-                resolvedBy: resolvedTarget.resolvedBy,
-                matchedRef: resolvedTarget.ref,
-                summary,
-              })
-              succeeded = true
+                reports.push({
+                  index: index + 1,
+                  kind: step.kind,
+                  attempts: attempt,
+                  resolvedBy: resolvedTarget.resolvedBy,
+                  matchedRef: resolvedTarget.ref,
+                  artifact: null,
+                  summary,
+                })
+                succeeded = true
             }
 
             if (!succeeded) {
@@ -2966,43 +3878,110 @@ export const SessionRegistryLive = Layer.scoped(
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
 
-          if (record.health.target.platform !== "simulator") {
+          yield* assertRunnerActionsAvailable(record)
+
+          if (!isRunnerBackedRecord(record)) {
             return yield* new UnsupportedCapabilityError({
               code: "session-screenshot-real-device",
               capability: "session.screenshot",
-              reason: "The current screenshot surface only supports simulator sessions via simctl io.",
-              nextStep: "Retry against a simulator session, or extend the real-device media seam before requesting screenshots.",
+              reason: "This session does not currently expose a live runner transport for screenshots.",
+              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
               details: [],
               wall: false,
             })
           }
 
-          const capture = yield* simulatorHarness.captureScreenshot({
-            simulatorUdid: record.health.target.deviceId,
-            screenshotsDirectory: join(record.health.artifactRoot, "screenshots"),
-            label,
-          })
+          const labelStem = sanitizeFileComponent(label, "screenshot")
+          const fileStem = `${timestampForFile()}-${labelStem}`
+          const capture = yield* Effect.either(captureRunnerScreenshotArtifact({
+            sessionId,
+            record,
+            fileStem,
+            artifactKey: `screenshot-${fileStem}`,
+            artifactLabel: label ?? "screenshot",
+            summary: `Runner screenshot captured for session ${sessionId}.`,
+          }))
 
-          const artifact = createArtifactRecord({
-            artifactRoot: record.health.artifactRoot,
-            key: `screenshot-${timestampForFile()}`,
-            label: label ?? "screenshot",
-            kind: "png",
-            absolutePath: capture.absolutePath,
-            summary: `Simulator screenshot captured for session ${sessionId}.`,
-          })
+          if (capture._tag === "Left") {
+            updateHealthCheck(record, "screenshot", false)
+            yield* persistRecordHealth(sessionId, record)
+            return yield* capture.left
+          }
 
-          yield* artifactStore.registerArtifact(sessionId, artifact)
+          updateHealthCheck(record, "screenshot", true)
           yield* refreshSessionArtifacts(sessionId, record)
+          yield* persistRecordHealth(sessionId, record)
 
           const inlineBinary = outputPolicy.shouldInlineBinary(outputMode)
 
           return {
             kind: "summary+artifact",
             summary: inlineBinary
-              ? `Screenshot captured inline at ${artifact.absolutePath}.`
+              ? `Screenshot captured inline at ${capture.right.artifact.absolutePath}.`
               : `Screenshot captured and returned as an artifact because ${describeScreenshotOffloadReason(outputMode)}.`,
-            artifact,
+            artifact: capture.right.artifact,
+          } satisfies SummaryArtifactResult
+        }),
+      recordVideo: ({ sessionId, duration }) =>
+        Effect.gen(function* () {
+          const record = yield* requireSessionRecord(sessionId)
+
+          yield* assertRunnerActionsAvailable(record)
+
+          if (!isRunnerBackedRecord(record)) {
+            return yield* new UnsupportedCapabilityError({
+              code: "session-video-real-device",
+              capability: "session.video",
+              reason: "This session does not currently expose a live runner transport for video capture.",
+              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+              details: [],
+              wall: false,
+            })
+          }
+
+          const parsedDurationMs = parseDurationStringMs(duration)
+
+          if (parsedDurationMs === null) {
+            return yield* new UserInputError({
+              code: "session-video-duration-invalid",
+              reason: `Unsupported video duration ${duration}.`,
+              nextStep: "Use a positive duration such as 500ms, 5s, 30s, 1m, or 120s.",
+              details: [],
+            })
+          }
+
+          const durationMs = normalizeVideoDurationMs(parsedDurationMs)
+          const fileStem = `${timestampForFile()}-${sanitizeFileComponent(duration, "video")}`
+          const capture = yield* Effect.either(captureRunnerVideoArtifact({
+            sessionId,
+            record,
+            durationMs,
+            fileStem,
+            artifactKey: `video-${fileStem}`,
+            artifactLabel: "video",
+          }))
+
+          if (capture._tag === "Left") {
+            updateHealthCheck(record, "video", false)
+            yield* persistRecordHealth(sessionId, record)
+            return yield* capture.left
+          }
+
+          updateHealthCheck(record, "video", true)
+          yield* refreshSessionArtifacts(sessionId, record)
+          yield* persistRecordHealth(sessionId, record)
+
+          const modeSummary = capture.right.mode === "mp4"
+            ? "MP4 video artifact"
+            : "frame-sequence video artifact"
+          const clampNote = durationMs !== parsedDurationMs
+            ? ` Requested duration ${duration} was clamped to ${durationMs}ms.`
+            : ""
+
+          return {
+            kind: "summary+artifact",
+            summary: `Captured ${modeSummary} at ${capture.right.artifact.absolutePath}.${clampNote}`,
+            artifact: capture.right.artifact,
           } satisfies SummaryArtifactResult
         }),
       closeSession: (sessionId) =>

@@ -13,11 +13,17 @@ import type { OutputMode, SessionLogSource } from "../../domain/output"
 import {
   isLiveRunnerDetails,
   isLiveRunnerTransport,
+  type SimulatorSessionMode,
   type SessionHealth,
 } from "../../domain/session"
 import type { SessionSnapshotResult } from "../../domain/snapshot"
 import { DaemonClient } from "../../services/DaemonClient"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
+
+const defaultTestBundleId = "dev.probe.fixture"
+
+const inferSimulatorSessionMode = (bundleId: string): SimulatorSessionMode =>
+  bundleId === defaultTestBundleId ? "build-and-install" : "attach-to-running"
 
 const formatSessionHealth = (health: SessionHealth): string => {
   const capabilityLines = health.capabilities.map(
@@ -280,12 +286,16 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
 
     switch (subcommand) {
       case "open": {
-        const bundleId = (yield* optionalOption(rest, "--bundle-id")) ?? "dev.probe.fixture"
+        const bundleId = (yield* optionalOption(rest, "--bundle-id")) ?? defaultTestBundleId
         const openTarget = yield* parseSessionOpenTarget(rest)
+        const sessionMode = openTarget.target === "simulator"
+          ? inferSimulatorSessionMode(bundleId)
+          : null
         const client = yield* DaemonClient
         const health = yield* client.openSession({
           target: openTarget.target,
           bundleId,
+          sessionMode,
           simulatorUdid: openTarget.simulatorUdid,
           deviceId: openTarget.deviceId,
           onEvent: eventPrinter(!asJson),
@@ -444,6 +454,28 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
           sessionId,
           label,
           outputMode,
+          onEvent: eventPrinter(!asJson),
+        })
+
+        yield* Effect.sync(() => {
+          if (asJson) {
+            console.log(JSON.stringify(result, null, 2))
+            return
+          }
+
+          console.log(result.summary)
+          console.log(result.artifact.absolutePath)
+        })
+        return
+      }
+
+      case "video": {
+        const sessionId = yield* requireOption(rest, "--session-id")
+        const duration = yield* requireOption(rest, "--duration")
+        const client = yield* DaemonClient
+        const result = yield* client.recordVideo({
+          sessionId,
+          duration,
           onEvent: eventPrinter(!asJson),
         })
 

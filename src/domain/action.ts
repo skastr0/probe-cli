@@ -8,10 +8,10 @@ const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
 export const ActionDirection = Schema.Literal("up", "down", "left", "right")
 export type ActionDirection = typeof ActionDirection.Type
 
-export const ActionKind = Schema.Literal("tap", "press", "swipe", "type", "scroll", "assert")
+export const ActionKind = Schema.Literal("tap", "press", "swipe", "type", "scroll", "assert", "screenshot", "video")
 export type ActionKind = typeof ActionKind.Type
 
-export const ActionResolutionSource = Schema.Literal("ref", "semantic", "absence")
+export const ActionResolutionSource = Schema.Literal("ref", "semantic", "absence", "none")
 export type ActionResolutionSource = typeof ActionResolutionSource.Type
 
 export const SemanticSelectorSchema = Schema.Struct({
@@ -91,6 +91,23 @@ export const AssertActionSchema = Schema.Struct({
 })
 export type AssertAction = typeof AssertActionSchema.Type
 
+export const ScreenshotActionSchema = Schema.Struct({
+  kind: Schema.Literal("screenshot"),
+})
+export type ScreenshotAction = typeof ScreenshotActionSchema.Type
+
+const VideoDurationMsSchema = Schema.Number.pipe(
+  Schema.int(),
+  Schema.greaterThan(0),
+  Schema.lessThanOrEqualTo(120_000),
+)
+
+export const VideoActionSchema = Schema.Struct({
+  kind: Schema.Literal("video"),
+  durationMs: VideoDurationMsSchema,
+})
+export type VideoAction = typeof VideoActionSchema.Type
+
 export const SessionActionSchema = Schema.Union(
   TapActionSchema,
   PressActionSchema,
@@ -98,8 +115,14 @@ export const SessionActionSchema = Schema.Union(
   TypeActionSchema,
   ScrollActionSchema,
   AssertActionSchema,
+  ScreenshotActionSchema,
+  VideoActionSchema,
 )
 export type SessionAction = typeof SessionActionSchema.Type
+
+export type RunnerUiSessionAction = TapAction | PressAction | SwipeAction | TypeAction | ScrollAction
+export type RunnerUiRecordedSessionAction = RecordedTapAction | RecordedPressAction | RecordedSwipeAction | RecordedTypeAction | RecordedScrollAction
+type RunnerUiActionSource = RunnerUiSessionAction | RunnerUiRecordedSessionAction
 
 export const RecordedActionTargetSchema = Schema.Struct({
   preferredRef: NullableString,
@@ -151,6 +174,17 @@ export const RecordedAssertActionSchema = Schema.Struct({
 })
 export type RecordedAssertAction = typeof RecordedAssertActionSchema.Type
 
+export const RecordedScreenshotActionSchema = Schema.Struct({
+  kind: Schema.Literal("screenshot"),
+})
+export type RecordedScreenshotAction = typeof RecordedScreenshotActionSchema.Type
+
+export const RecordedVideoActionSchema = Schema.Struct({
+  kind: Schema.Literal("video"),
+  durationMs: VideoDurationMsSchema,
+})
+export type RecordedVideoAction = typeof RecordedVideoActionSchema.Type
+
 export const RecordedSessionActionSchema = Schema.Union(
   RecordedTapActionSchema,
   RecordedPressActionSchema,
@@ -158,6 +192,8 @@ export const RecordedSessionActionSchema = Schema.Union(
   RecordedTypeActionSchema,
   RecordedScrollActionSchema,
   RecordedAssertActionSchema,
+  RecordedScreenshotActionSchema,
+  RecordedVideoActionSchema,
 )
 export type RecordedSessionAction = typeof RecordedSessionActionSchema.Type
 
@@ -176,6 +212,7 @@ export const ReplayStepReportSchema = Schema.Struct({
   attempts: Schema.Number,
   resolvedBy: ActionResolutionSource,
   matchedRef: NullableString,
+  artifact: Schema.Union(ArtifactRecord, Schema.Null),
   summary: Schema.String,
 })
 export type ReplayStepReport = typeof ReplayStepReportSchema.Type
@@ -210,6 +247,7 @@ export const SessionActionResultSchema = Schema.Struct({
   resolvedBy: ActionResolutionSource,
   statusLabel: NullableString,
   latestSnapshotId: NullableString,
+  artifact: Schema.Union(ArtifactRecord, Schema.Null),
   recordingLength: Schema.Number,
 })
 export type SessionActionResult = typeof SessionActionResultSchema.Type
@@ -238,7 +276,7 @@ export interface FlattenedStoredSnapshotNode {
 }
 
 export interface ResolvedSnapshotTarget extends FlattenedStoredSnapshotNode {
-  readonly resolvedBy: Exclude<ActionResolutionSource, "absence">
+  readonly resolvedBy: Exclude<ActionResolutionSource, "absence" | "none">
 }
 
 export interface TargetResolution {
@@ -266,7 +304,7 @@ export interface RunnerActionLocator {
 }
 
 export interface RunnerUiActionPayload {
-  readonly kind: Exclude<ActionKind, "assert">
+  readonly kind: RunnerUiSessionAction["kind"]
   readonly locator: RunnerActionLocator
   readonly direction: ActionDirection | null
   readonly text: string | null
@@ -560,6 +598,14 @@ export const buildRecordedSessionAction = (
   action: SessionAction,
   resolved: ResolvedSnapshotTarget | null,
 ): RecordedSessionAction => {
+  if (action.kind === "screenshot") {
+    return { kind: action.kind }
+  }
+
+  if (action.kind === "video") {
+    return { kind: action.kind, durationMs: action.durationMs }
+  }
+
   const target = buildRecordedActionTarget(action.target, resolved)
 
   switch (action.kind) {
@@ -670,12 +716,32 @@ export const validateSessionAction = (action: SessionAction): string | null => {
   switch (action.kind) {
     case "press":
       return action.durationMs > 0 ? null : "Press duration must be a positive number of milliseconds."
+    case "video":
+      return Number.isFinite(action.durationMs) && action.durationMs > 0
+        ? null
+        : "Video duration must be a positive number of milliseconds."
     case "scroll":
       return Number.isInteger(action.steps) && action.steps > 0 ? null : "Scroll steps must be a positive integer."
     default:
       return null
   }
 }
+
+export const isRunnerUiSessionAction = (action: SessionAction): action is RunnerUiSessionAction =>
+  action.kind === "tap"
+  || action.kind === "press"
+  || action.kind === "swipe"
+  || action.kind === "type"
+  || action.kind === "scroll"
+
+export const isRunnerUiRecordedSessionAction = (
+  action: RecordedSessionAction,
+): action is RunnerUiRecordedSessionAction =>
+  action.kind === "tap"
+  || action.kind === "press"
+  || action.kind === "swipe"
+  || action.kind === "type"
+  || action.kind === "scroll"
 
 const buildRunnerLocator = (
   snapshot: StoredSnapshotArtifact,
@@ -698,7 +764,7 @@ const buildRunnerLocator = (
 }
 
 export const buildRunnerUiActionPayload = (
-  action: Exclude<SessionAction, AssertAction>,
+  action: RunnerUiActionSource,
   resolved: ResolvedSnapshotTarget,
   snapshot: StoredSnapshotArtifact,
 ): RunnerUiActionPayload => {

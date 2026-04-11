@@ -14,6 +14,7 @@ import {
   UnsupportedCapabilityError,
   UserInputError,
 } from "../domain/errors"
+import { perfTemplateChoiceText } from "../domain/perf"
 import type { DrillQuery } from "../domain/output"
 import { isTextArtifactKind, summarizeContent } from "../domain/output"
 import type { WorkspaceStatus } from "../domain/workspace"
@@ -41,6 +42,7 @@ import {
   SessionReplayResponse,
   SessionSnapshotResponse,
   SessionScreenshotResponse,
+  SessionVideoResponse,
 } from "../rpc/protocol"
 
 const nowIso = (): string => new Date().toISOString()
@@ -108,32 +110,35 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
   {
     area: "simulator",
     status: "supported",
-    summary: "The daemon-backed vertical slice can resolve a simulator, boot it, install the fixture app, attach the runner, tail logs, and capture screenshots into session artifacts.",
-    details: [],
+    summary:
+      "The daemon-backed vertical slice can resolve a simulator, boot it, either build/install Probe's fixture app or attach to a running installed app, tail logs, and capture runner-backed screenshots and videos into session artifacts.",
+    details: [
+      "On Simulator, omit --bundle-id to use Probe's built-in fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app.",
+    ],
   },
   {
     area: "real-device",
     status: "degraded",
-    summary: "Probe can now discover and preflight a real-device target with explicit CoreDevice/DDI/signing checks, but the on-device runner transport remains an honest follow-up seam.",
+    summary: "Probe can now open a live real-device runner session through explicit CoreDevice/DDI/signing checks plus the same bootstrap-manifest + file-mailbox + stdout transport used on simulator.",
     details: [
       "session open supports --target device with optional --device-id selection.",
-      "Successful device opens currently create degraded sessions that surface preflight artifacts and connectivity instead of pretending the runner transport is validated.",
+      "Real-device opens still fail closed when pairing, Developer Mode, signing, or target-app install prerequisites are missing.",
     ],
   },
   {
     area: "runner",
     status: "degraded",
     summary:
-      "Runner control is real, but still uses the honest simulator bootstrap manifest plus file-mailbox ingress plus stdout mixed-log egress seam validated by the runner spikes.",
+      "Runner control is real and still uses the honest XCUITest transport seam: bootstrap manifest plus file-mailbox ingress plus stdout mixed-log egress on simulator and real device.",
     details: [],
   },
   {
     area: "perf",
     status: "degraded",
     summary:
-      "Time Profiler, System Trace, and Metal System Trace can record/export through the daemon, but Probe still keeps unsupported metric families as explicit walls.",
+      "Time Profiler, System Trace, Metal System Trace, Hangs, and Swift Concurrency can record/export through the daemon, but Probe still keeps unsupported metric families as explicit walls.",
     details: [
-      "Current summaries stay inside row-proven exports: time-sample, thread-state, cpu-state, and metal-gpu-intervals.",
+      "Current summaries stay inside row-proven exports: time-sample, thread-state, cpu-state, metal-gpu-intervals, potential-hangs, and swift-task-state/task-lifetime.",
       "System Trace uses bounded recording/export budgets and will fail honest when XML size or row volume outruns the current supported summary.",
       "Network-on-Simulator, full reconstructed call stacks, and per-shader GPU attribution remain explicit walls.",
     ],
@@ -160,15 +165,15 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
 const workspaceKnownWalls: ReadonlyArray<KnownWall> = [
   {
     key: "real-device-sessions",
-    summary: "Real-device sessions now stop at explicit preflight instead of hiding missing setup or transport validation behind simulator-style assumptions.",
+    summary: "Real-device sessions are live now, but they still fail closed on missing pairing, Developer Mode, signing, target-app install, or transport loss instead of pretending recovery happened.",
     details: [
       "Probe does not currently paper over signing, provisioning, or CoreDevice setup as if recovery were automatic.",
-      "A successful real-device open is intentionally degraded until on-device runner transport is validated on hardware.",
+      "Daemon restarts and runner transport loss still require reopening the session rather than expecting transparent recovery.",
     ],
   },
   {
     key: "runner-transport",
-    summary: "The runner still relies on the validated simulator bootstrap manifest plus file-mailbox ingress plus stdout mixed-log egress seam.",
+    summary: "The runner still relies on the validated bootstrap-manifest plus file-mailbox ingress plus stdout mixed-log egress seam on simulator and the current live device path.",
     details: [
       "xcodebuild stdin is not treated as a supported host-to-runner transport in this slice.",
       "Daemon restarts and runner transport loss fail closed instead of pretending the live bridge was recovered.",
@@ -176,18 +181,18 @@ const workspaceKnownWalls: ReadonlyArray<KnownWall> = [
   },
   {
     key: "connected-device-logs-media",
-    summary: "Connected-device log and media capture still do not have the same public CLI parity that Probe has on Simulator.",
+    summary: "Connected-device log capture still does not have the same public CLI parity that Probe has on Simulator, even though runner-backed screenshot/video capture now works on both.",
     details: [
-      "Console.app, Xcode Devices and Simulators, and sysdiagnose remain the honest fallback surfaces from the current research packs.",
-      "Probe should state that wall explicitly instead of implying simulator-style parity on real devices.",
+      "Runner-backed screenshots and videos now share the same XCUITest transport seam on simulator and device.",
+      "Console.app, Xcode Devices and Simulators, and sysdiagnose remain the honest fallback surfaces from the current research packs for connected-device logs.",
     ],
   },
   {
-    key: "fixture-only-runner-target",
-    summary: "The current runner vertical slice is intentionally fixture-backed.",
+    key: "real-device-default-test-bundle",
+    summary: "Simulator and real-device sessions can target arbitrary bundle ids, but the app must already be installed and Probe still depends on the XCUITest host app + runner project for its control surface.",
     details: [
-      "Session open currently supports dev.probe.fixture only.",
-      "Arbitrary bundle-id attach remains a follow-up seam instead of being disguised as partial support.",
+      "Simulator session open supports Probe's fixture build/install flow or attach-to-running for an installed app that is already running.",
+      "Real-device session open verifies the requested bundle id is installed, launches it with devicectl, then attaches the XCUITest runner over the validated transport seam.",
     ],
   },
 ]
@@ -216,6 +221,8 @@ const runHostCommand = (command: string, commandArgs: ReadonlyArray<string>): Pr
       resolve({ stdout, stderr, exitCode })
     })
   })
+
+const resolveFfmpegExecutable = (): string => process.env.PROBE_FFMPEG_PATH ?? "ffmpeg"
 
 const formatCommandFailure = (command: string, result: HostCommandResult): string => {
   const tail = `${result.stdout}${result.stderr}`.trim().split(/\r?\n/).slice(-3).join(" | ")
@@ -538,8 +545,8 @@ export const ProbeKernelLive = Layer.effect(
             key: "host.real-device",
             status: "degraded",
             summary: deviceCount > 0
-              ? `CoreDevice can see ${deviceCount} connected real device(s), and Probe can now open explicit preflight-backed device sessions while keeping the on-device runner transport wall visible.`
-              : "CoreDevice host prerequisites are partially ready (usable iOS DDI), but there is no connected real device available for a preflight-backed device session.",
+              ? `CoreDevice can see ${deviceCount} connected real device(s), and Probe can now attempt live real-device runner sessions when signing and target-app prerequisites are satisfied.`
+              : "CoreDevice host prerequisites are partially ready (usable iOS DDI), but there is no connected real device available for a live device session.",
             details: [
               `host CoreDevice version: ${coreDeviceVersion}`,
               `preferred iOS DDI: ${preferred?.hostDDI ?? "unknown"}`,
@@ -562,6 +569,60 @@ export const ProbeKernelLive = Layer.effect(
         key: "host.real-device",
         status: "blocked",
         summary: "Real-device host diagnostics could not be collected.",
+        details: [error.reason],
+      } satisfies DiagnosticReport)),
+    )
+
+    const collectFfmpegDiagnostic = Effect.tryPromise({
+      try: async (): Promise<DiagnosticReport> => {
+        const ffmpegExecutable = resolveFfmpegExecutable()
+
+        try {
+          const result = await runHostCommand(ffmpegExecutable, ["-version"])
+
+          if (result.exitCode !== 0) {
+            return {
+              key: "host.ffmpeg",
+              status: "degraded",
+              summary: "ffmpeg is not currently available for MP4 stitching, so Probe will retain runner frame-sequence bundles instead.",
+              details: [formatCommandFailure(`${ffmpegExecutable} -version`, result)],
+            }
+          }
+
+          const versionLine = result.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0)
+          return {
+            key: "host.ffmpeg",
+            status: "ready",
+            summary: versionLine
+              ? `ffmpeg is available for MP4 stitching of runner-captured video (${versionLine}).`
+              : "ffmpeg is available for MP4 stitching of runner-captured video.",
+            details: [`executable: ${ffmpegExecutable}`],
+          }
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+            return {
+              key: "host.ffmpeg",
+              status: "degraded",
+              summary: "ffmpeg is not installed, so Probe will retain runner frame-sequence bundles instead of MP4 video artifacts.",
+              details: [`missing executable: ${ffmpegExecutable}`],
+            }
+          }
+
+          throw error
+        }
+      },
+      catch: (error) =>
+        new EnvironmentError({
+          code: "doctor-ffmpeg-diagnostic",
+          reason: error instanceof Error ? error.message : String(error),
+          nextStep: "Inspect ffmpeg availability and retry `probe doctor`.",
+          details: [],
+        }),
+    }).pipe(
+      Effect.catchAll((error) => Effect.succeed({
+        key: "host.ffmpeg",
+        status: "degraded",
+        summary: "ffmpeg availability could not be inspected, so Probe cannot promise MP4 stitching right now.",
         details: [error.reason],
       } satisfies DiagnosticReport)),
     )
@@ -668,6 +729,7 @@ export const ProbeKernelLive = Layer.effect(
       const xcode = yield* collectXcodeDiagnostic
       const simulator = yield* collectSimulatorDiagnostic
       const realDevice = yield* collectRealDeviceDiagnostic
+      const ffmpeg = yield* collectFfmpegDiagnostic
 
       const startupRecovery = isRecord(daemonMetadata?.startupRecovery)
         ? {
@@ -715,7 +777,7 @@ export const ProbeKernelLive = Layer.effect(
           }
 
       return {
-        diagnostics: [daemonDiagnostic, staleSessionDiagnostic, xcode, simulator, realDevice],
+        diagnostics: [daemonDiagnostic, staleSessionDiagnostic, xcode, simulator, realDevice, ffmpeg],
         startupRecovery,
       }
     })
@@ -748,7 +810,7 @@ export const ProbeKernelLive = Layer.effect(
             progress(
               "session.open",
               request.params.target === "device"
-                ? "Opening the real-device preflight session."
+                ? "Opening the real-device runner session."
                 : "Opening the simulator-backed runner session.",
             )
             const result = yield* (request.params.target === "device"
@@ -760,6 +822,7 @@ export const ProbeKernelLive = Layer.effect(
                 })
               : sessionRegistry.openSimulatorSession({
                   bundleId: request.params.bundleId,
+                  sessionMode: request.params.sessionMode ?? undefined,
                   simulatorUdid: request.params.simulatorUdid,
                   rootDir: process.cwd(),
                   emitProgress: progress,
@@ -903,6 +966,21 @@ export const ProbeKernelLive = Layer.effect(
             } satisfies SessionScreenshotResponse
           }
 
+          case "session.video": {
+            progress("session.video", `Capturing video for session ${request.params.sessionId} over ${request.params.duration}.`)
+            const result = yield* sessionRegistry.recordVideo({
+              sessionId: request.params.sessionId,
+              duration: request.params.duration,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionVideoResponse
+          }
+
           case "session.close": {
             progress("session.close", `Closing session ${request.params.sessionId}.`)
             const result = yield* sessionRegistry.closeSession(request.params.sessionId)
@@ -1030,13 +1108,14 @@ export const ProbeKernelLive = Layer.effect(
             commands: [
               "doctor",
               "serve",
-              "session open [--target simulator|device] [--bundle-id dev.probe.fixture] [--simulator-udid <udid>] [--device-id <id>] [--json]",
+              "session open [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--json]",
               "session health --session-id <id> [--json]",
               "session logs --session-id <id> [--source runner|build|wrapper|stdout|simulator] [--lines 80] [--match <text>] [--seconds 2] [--output auto|inline|artifact] [--json]",
               "session snapshot --session-id <id> [--output auto|inline|artifact] [--json]",
               "session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--json]",
+              "session video --session-id <id> --duration <duration> [--json]",
               "session close --session-id <id> [--json]",
-              "perf record --session-id <id> --template time-profiler|system-trace|metal-system-trace [--time-limit 3s] [--json]",
+              `perf record --session-id <id> --template ${perfTemplateChoiceText} [--time-limit <duration>] [--json]`,
               "drill --session-id <id> --artifact <key> <query> [--json]",
             ],
             daemon: {
@@ -1051,14 +1130,14 @@ export const ProbeKernelLive = Layer.effect(
             diagnostics: workspaceDiagnostics.diagnostics,
             knownWalls: [...workspaceKnownWalls],
             notes: [
-              "The current control plane is daemon-backed and real for the simulator fixture vertical slice.",
+              "The current control plane is daemon-backed and real for simulator sessions via either Probe's fixture build/install flow or attach-to-running against an installed app.",
               "Runner command ingress still uses the validated file-backed mailbox because xcodebuild stdin is not proven at this boundary.",
               "Session snapshots keep the full stable-ref tree artifact-backed and only inline interactive/collapsed previews that stay inside the compact snapshot budget.",
               "Session logs support bounded simulator capture plus tails from existing artifact-backed runner/build/wrapper outputs.",
-              "Real-device sessions now expose explicit preflight/connectivity state instead of pretending the on-device runner transport is production-validated.",
-              "Session screenshots use simctl io and remain artifact-backed even when inline output is requested.",
-              "The current runner target only supports dev.probe.fixture; arbitrary bundle ids are a later follow-up seam.",
-              "Perf recording defaults to 3s and stays inside the row-proven template set instead of implying broader Instruments support.",
+              "Real-device sessions now open a live runner when CoreDevice/DDI/signing checks pass, but they still fail closed on missing setup or transport loss.",
+              "Session screenshots and video capture now route through the runner on both simulator and device; ffmpeg only changes whether video is emitted as MP4 or retained as a frame-sequence bundle.",
+              "On Simulator, omit --bundle-id to use Probe's fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app; on device, the app must already be installed so Probe can launch and attach to it.",
+              "Perf recording defaults to 60s for metal-system-trace and 3s for the other supported perf templates.",
               ...(workspaceDiagnostics.startupRecovery?.summary ? [workspaceDiagnostics.startupRecovery.summary] : []),
             ],
           }

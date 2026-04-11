@@ -7,8 +7,9 @@ const OptionalString = Schema.Union(Schema.String, Schema.Undefined)
 export const RUNNER_TRANSPORT_CONTRACT = "probe.runner.transport/hybrid-v1"
 export const RUNNER_COMMAND_INGRESS = "file-mailbox"
 export const RUNNER_EVENT_EGRESS = "stdout-jsonl-mixed-log"
+const RunnerBootstrapSourceSchema = Schema.Literal("simulator-bootstrap-manifest", "device-bootstrap-manifest")
 
-export const RunnerActionSchema = Schema.Literal("ping", "applyInput", "snapshot", "shutdown", "uiAction")
+export const RunnerActionSchema = Schema.Literal("ping", "applyInput", "snapshot", "screenshot", "recordVideo", "shutdown", "uiAction")
 export type RunnerAction = typeof RunnerActionSchema.Type
 
 export const RunnerBootstrapManifestSchema = Schema.Struct({
@@ -19,6 +20,7 @@ export const RunnerBootstrapManifestSchema = Schema.Struct({
   ingressTransport: Schema.Literal(RUNNER_COMMAND_INGRESS),
   sessionIdentifier: Schema.String,
   simulatorUdid: Schema.String,
+  targetBundleId: Schema.String,
 })
 export type RunnerBootstrapManifest = typeof RunnerBootstrapManifestSchema.Type
 
@@ -33,7 +35,7 @@ export const RunnerReadyFrameSchema = Schema.Struct({
   kind: Schema.Literal("ready"),
   attachLatencyMs: Schema.Number,
   bootstrapPath: Schema.String,
-  bootstrapSource: Schema.Literal("simulator-bootstrap-manifest"),
+  bootstrapSource: RunnerBootstrapSourceSchema,
   controlDirectoryPath: Schema.String,
   currentDirectoryPath: Schema.String,
   egressTransport: Schema.Literal(RUNNER_EVENT_EGRESS),

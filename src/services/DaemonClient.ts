@@ -21,7 +21,7 @@ import {
 } from "../domain/errors"
 import type { DrillQuery, DrillResult, OutputMode, SessionLogSource, SessionLogsResult, SummaryArtifactResult } from "../domain/output"
 import type { PerfRecordResult, PerfTemplate } from "../domain/perf"
-import type { SessionHealth } from "../domain/session"
+import type { SessionHealth, SimulatorSessionMode } from "../domain/session"
 import { ArtifactStore } from "./ArtifactStore"
 import {
   sendArtifactDrill,
@@ -37,6 +37,7 @@ import {
   sendSessionReplay,
   sendSessionSnapshot,
   sendSessionScreenshot,
+  sendSessionVideo,
 } from "../rpc/client"
 import { PROBE_PROTOCOL_VERSION } from "../rpc/protocol"
 import type { SessionSnapshotResult } from "../domain/snapshot"
@@ -61,6 +62,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
     readonly openSession: (params: {
       readonly target: "simulator" | "device"
       readonly bundleId: string
+      readonly sessionMode?: SimulatorSessionMode | null
       readonly simulatorUdid: string | null
       readonly deviceId: string | null
       readonly onEvent?: (stage: string, message: string) => void
@@ -151,6 +153,22 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly sessionId: string
       readonly label: string | null
       readonly outputMode: OutputMode
+      readonly onEvent?: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      SummaryArtifactResult,
+      | DaemonNotRunningError
+      | EnvironmentError
+      | ProtocolMismatchError
+      | UserInputError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+      | SessionConflictError
+      | SessionNotFoundError
+      | ArtifactNotFoundError
+    >
+    readonly recordVideo: (params: {
+      readonly sessionId: string
+      readonly duration: string
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
       SummaryArtifactResult,
@@ -297,7 +315,7 @@ export const DaemonClientLive = Layer.effect(
 
           return response.result
         }),
-      openSession: ({ target, bundleId, simulatorUdid, deviceId, onEvent }) =>
+      openSession: ({ target, bundleId, sessionMode, simulatorUdid, deviceId, onEvent }) =>
         Effect.gen(function* () {
           const options = yield* buildOptions(onEvent)
           const response = yield* sendSessionOpen(options, {
@@ -308,6 +326,7 @@ export const DaemonClientLive = Layer.effect(
             params: {
               target,
               bundleId,
+              sessionMode: sessionMode ?? null,
               simulatorUdid,
               deviceId,
             },
@@ -394,6 +413,22 @@ export const DaemonClientLive = Layer.effect(
               sessionId,
               label,
               outputMode,
+            },
+          })
+
+          return response.result
+        }),
+      recordVideo: ({ sessionId, duration, onEvent }) =>
+        Effect.gen(function* () {
+          const options = yield* buildOptions(onEvent)
+          const response = yield* sendSessionVideo(options, {
+            kind: "request",
+            protocolVersion: PROBE_PROTOCOL_VERSION,
+            requestId: randomUUID(),
+            method: "session.video",
+            params: {
+              sessionId,
+              duration,
             },
           })
 
