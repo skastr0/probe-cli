@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,7 @@ def main() -> int:
     parser.add_argument("--destination")
     parser.add_argument("--log-path", required=True)
     parser.add_argument("--stdout-events-path", required=True)
-    parser.add_argument("--stdin-probe-payload", required=True)
+    parser.add_argument("--stdin-probe-payload", required=False, default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -65,6 +66,23 @@ def main() -> int:
         env=os.environ.copy(),
     )
 
+    def forward_stdin() -> None:
+        """Forward host stdin lines to xcodebuild stdin."""
+        try:
+            for line in sys.stdin:
+                if process.poll() is not None:
+                    break
+                try:
+                    process.stdin.write(line)
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+        except Exception:
+            pass
+
+    stdin_thread = threading.Thread(target=forward_stdin, daemon=True)
+    stdin_thread.start()
+
     def forward_signal(signum: int, _frame: object) -> None:
         if process.poll() is None:
             process.terminate()
@@ -79,7 +97,6 @@ def main() -> int:
 
     ready_path = control_dir / "stdout-ready.json"
     stdin_probe_path = control_dir / "stdout-stdin-probe-result.json"
-    probe_sent = False
 
     if process.stdout is None:
         raise SystemExit("xcodebuild stdout pipe was not created")
@@ -114,15 +131,7 @@ def main() -> int:
             kind = event.get("kind")
             if kind == "ready":
                 write_json(ready_path, event)
-                if not probe_sent:
-                    process.stdin.write(
-                        json.dumps(
-                            {"kind": "stdin-probe", "payload": args.stdin_probe_payload}
-                        )
-                        + "\n"
-                    )
-                    process.stdin.flush()
-                    probe_sent = True
+                # Stdin probe is now sent by the host through the forwarded stdin pipe.
             elif kind == "stdin-probe-result":
                 write_json(stdin_probe_path, event)
             elif kind == "response":

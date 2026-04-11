@@ -445,11 +445,19 @@ final class AttachControlSpikeUITests: XCTestCase {
   @MainActor
   func testCommandLoopTransportBoundary() throws {
     let resolvedControlDirectory = try resolveLifecycleControlDirectory()
-    let controlDirectoryURL = URL(
-      fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
-      isDirectory: true,
-    )
-    try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
+    let isDevice = resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
+
+    // For real device, use stdin transport; for simulator, use file-mailbox.
+    let controlDirectoryURL: URL
+    if isDevice {
+      controlDirectoryURL = URL(fileURLWithPath: "/tmp/probe-device-placeholder", isDirectory: true)
+    } else {
+      controlDirectoryURL = URL(
+        fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
+        isDirectory: true,
+      )
+      try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
+    }
 
     let lifecycleState = try attachForLifecycleLoop(
       resolvedControlDirectory: resolvedControlDirectory,
@@ -471,11 +479,18 @@ final class AttachControlSpikeUITests: XCTestCase {
       "PROBE_METRIC transport_boundary_stdin_probe status=\(stdinProbeResult.status) payload=\(stdinProbeResult.payload ?? "<nil>") error=\(stdinProbeResult.error ?? "<nil>")"
     )
 
-    try runLifecycleCommandLoop(
-      controlDirectoryURL: controlDirectoryURL,
-      app: lifecycleState.app,
-      statusLabel: lifecycleState.statusLabel
-    )
+    if isDevice {
+      try runStdinCommandLoop(
+        app: lifecycleState.app,
+        statusLabel: lifecycleState.statusLabel
+      )
+    } else {
+      try runLifecycleCommandLoop(
+        controlDirectoryURL: controlDirectoryURL,
+        app: lifecycleState.app,
+        statusLabel: lifecycleState.statusLabel
+      )
+    }
   }
 
   @MainActor
@@ -532,13 +547,19 @@ final class AttachControlSpikeUITests: XCTestCase {
       foregroundFailureMessage
     )
 
-    let statusLabel = app.staticTexts["fixture.status.label"]
-    XCTAssertTrue(
-      statusLabel.waitForExistence(timeout: interactionTimeout),
-      statusLabelFailureMessage
-    )
-
     let attachLatencyMs = milliseconds(since: attachStartedAt)
+
+    // The ProbeFixture app exposes a "fixture.status.label" element for validation.
+    // Arbitrary target apps (e.g. on real-device sessions) will not have this element,
+    // so we only assert its existence for the fixture bundle ID.
+    let isFixtureApp = resolvedControlDirectory.config.targetBundleId == "dev.probe.fixture"
+    let statusLabel = app.staticTexts["fixture.status.label"]
+    let statusLabelExists = statusLabel.waitForExistence(timeout: interactionTimeout)
+
+    if isFixtureApp {
+      XCTAssertTrue(statusLabelExists, statusLabelFailureMessage)
+    }
+
     let readyFrame = LifecycleReadyFrame(
       kind: "ready",
       attachLatencyMs: attachLatencyMs,
@@ -549,7 +570,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       egressTransport: resolvedControlDirectory.config.egressTransport,
       homeDirectoryPath: NSHomeDirectory(),
       ingressTransport: resolvedControlDirectory.config.ingressTransport,
-      initialStatusLabel: statusLabel.label,
+      initialStatusLabel: statusLabelExists ? statusLabel.label : "",
       processIdentifier: ProcessInfo.processInfo.processIdentifier,
       recordedAt: Self.iso8601Formatter.string(from: Date()),
       runnerTransportContract: resolvedControlDirectory.config.contractVersion,
@@ -558,12 +579,40 @@ final class AttachControlSpikeUITests: XCTestCase {
     )
 
     // Keep file mirrors for lifecycle/transport validation scripts; the runtime consumes stdout as canonical egress.
-    try writeJSON(readyFrame, to: controlDirectoryURL.appendingPathComponent("ready.json"))
+    // On real device the sandbox may prevent writes, so tolerate failure.
+    try? writeJSON(readyFrame, to: controlDirectoryURL.appendingPathComponent("ready.json"))
 
     return LifecycleLoopState(app: app, readyFrame: readyFrame, statusLabel: statusLabel)
   }
 
   private func resolveLifecycleControlDirectory() throws -> ResolvedLifecycleControlDirectory {
+    if let bootstrapJson = ProcessInfo.processInfo.environment["PROBE_BOOTSTRAP_JSON"],
+      !bootstrapJson.isEmpty,
+      let bootstrapData = bootstrapJson.data(using: .utf8)
+    {
+      let bootstrapConfig: LifecycleBootstrapConfig
+      do {
+        bootstrapConfig = try JSONDecoder().decode(LifecycleBootstrapConfig.self, from: bootstrapData)
+      } catch {
+        throw lifecycleBootstrapError(
+          "Bootstrap manifest env:PROBE_BOOTSTRAP_JSON could not be decoded: \(error.localizedDescription)"
+        )
+      }
+
+      try validateLifecycleBootstrapConfig(
+        bootstrapConfig,
+        expectedBootstrapPath: "env:PROBE_BOOTSTRAP_JSON",
+        expectedBootstrapIdentifier: bootstrapConfig.simulatorUdid
+      )
+
+      return ResolvedLifecycleControlDirectory(
+        bootstrapPath: "env:PROBE_BOOTSTRAP_JSON",
+        bootstrapSource: .deviceBootstrapManifest,
+        config: bootstrapConfig,
+        controlDirectoryPath: bootstrapConfig.controlDirectoryPath
+      )
+    }
+
     if let simulatorUdid = ProcessInfo.processInfo.environment["SIMULATOR_UDID"],
       !simulatorUdid.isEmpty
     {
@@ -1963,6 +2012,134 @@ final class AttachControlSpikeUITests: XCTestCase {
         code: 1,
         userInfo: [NSLocalizedDescriptionKey: "Unsupported lifecycle action: \(command.action)"]
       )
+    }
+  }
+
+  private func readCommandFromStdin(timeout: TimeInterval) throws -> LifecycleCommandFrame? {
+    let duplicatedStdin = dup(STDIN_FILENO)
+    guard duplicatedStdin >= 0 else { return nil }
+    defer { close(duplicatedStdin) }
+
+    let originalFlags = fcntl(duplicatedStdin, F_GETFL)
+    if originalFlags >= 0 {
+      _ = fcntl(duplicatedStdin, F_SETFL, originalFlags | O_NONBLOCK)
+    }
+    defer {
+      if originalFlags >= 0 {
+        _ = fcntl(duplicatedStdin, F_SETFL, originalFlags)
+      }
+    }
+
+    let deadline = Date().addingTimeInterval(timeout)
+    var buffer = Data()
+
+    while Date() < deadline {
+      var descriptor = pollfd(
+        fd: duplicatedStdin,
+        events: Int16(POLLIN | POLLERR | POLLHUP),
+        revents: 0
+      )
+      let pollResult = withUnsafeMutablePointer(to: &descriptor) { pointer in
+        poll(pointer, 1, 100)
+      }
+
+      if pollResult < 0 {
+        if errno == EINTR { continue }
+        return nil
+      }
+      if pollResult == 0 { continue }
+      if (descriptor.revents & Int16(POLLERR)) != 0 { return nil }
+      if (descriptor.revents & Int16(POLLHUP)) != 0 && (descriptor.revents & Int16(POLLIN)) == 0 { return nil }
+
+      if (descriptor.revents & Int16(POLLIN)) != 0 {
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        let readCount = read(duplicatedStdin, &chunk, chunk.count)
+        if readCount == 0 { return nil }
+        if readCount < 0 {
+          if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
+          return nil
+        }
+        buffer.append(contentsOf: chunk.prefix(readCount))
+        if let newlineIndex = buffer.firstIndex(of: 0x0A) {
+          let lineData = Data(buffer.prefix(upTo: newlineIndex))
+          return try JSONDecoder().decode(LifecycleCommandFrame.self, from: lineData)
+        }
+      }
+    }
+    return nil
+  }
+
+  @MainActor
+  private func runStdinCommandLoop(
+    app: XCUIApplication,
+    statusLabel: XCUIElement,
+  ) throws {
+    var expectedSequence = 1
+    var handledCommands = 0
+
+    while true {
+      guard let command = try readCommandFromStdin(timeout: lifecycleCommandTimeout) else {
+        XCTFail("Timed out waiting for stdin command #\(expectedSequence).")
+        return
+      }
+
+      let commandStartedAt = Date()
+      let responseFrame: LifecycleResponseFrame
+
+      do {
+        let result = try handleLifecycleCommand(
+          command,
+          app: app,
+          statusLabel: statusLabel,
+          controlDirectoryURL: URL(fileURLWithPath: "/tmp/probe-stdin-placeholder")
+        )
+        responseFrame = LifecycleResponseFrame(
+          action: command.action,
+          error: nil,
+          handledMs: milliseconds(since: commandStartedAt),
+          kind: "response",
+          ok: true,
+          payload: result.payload,
+          snapshotPayloadPath: result.snapshotPayloadPath,
+          recordedAt: Self.iso8601Formatter.string(from: Date()),
+          sequence: command.sequence,
+          snapshotNodeCount: result.snapshotNodeCount,
+          statusLabel: currentStatusLabelText(app: app)
+        )
+      } catch {
+        responseFrame = LifecycleResponseFrame(
+          action: command.action,
+          error: String(describing: error),
+          handledMs: milliseconds(since: commandStartedAt),
+          kind: "response",
+          ok: false,
+          payload: nil,
+          snapshotPayloadPath: nil,
+          recordedAt: Self.iso8601Formatter.string(from: Date()),
+          sequence: command.sequence,
+          snapshotNodeCount: nil,
+          statusLabel: currentStatusLabelText(app: app)
+        )
+      }
+
+      try emitStdoutJSONLine(responseFrame)
+
+      print(
+        "PROBE_METRIC stdin_response sequence=\(responseFrame.sequence) action=\(responseFrame.action) ok=\(responseFrame.ok) handled_ms=\(responseFrame.handledMs)"
+      )
+
+      handledCommands += 1
+      expectedSequence += 1
+
+      if !responseFrame.ok {
+        XCTFail("Stdin command #\(responseFrame.sequence) failed: \(responseFrame.error ?? "unknown")")
+        return
+      }
+
+      if command.action == "shutdown" {
+        print("PROBE_METRIC stdin_shutdown handled_commands=\(handledCommands)")
+        return
+      }
     }
   }
 
