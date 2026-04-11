@@ -4,7 +4,7 @@ import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { basename, join, relative } from "node:path"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Fiber, Layer } from "effect"
 import {
   PerfRecordResult,
   PerfTemplate,
@@ -34,6 +34,9 @@ const nowIso = (): string => new Date().toISOString()
 const timestampForFile = (): string => nowIso().replace(/[:.]/g, "-")
 
 const defaultCommandOverheadMs = 120_000
+const recordingOverheadMs = 240_000
+const recordingGracePeriodMs = 60_000
+const runnerKeepaliveIntervalMs = 10_000
 const maxPerfTimeLimitMs = 5 * 60_000
 const mib = 1024 * 1024
 const maxExportFileSizeBytes = 8 * mib
@@ -365,6 +368,7 @@ const runCommand = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly timeoutMs: number
+  readonly gracePeriodMs?: number
   readonly allowFailure?: boolean
 }): Promise<CommandResult> =>
   new Promise((resolve, reject) => {
@@ -379,12 +383,7 @@ const runCommand = (args: {
 
     const timeout = setTimeout(() => {
       timedOut = true
-      child.kill("SIGTERM")
-      setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill("SIGKILL")
-        }
-      }, 2_000)
+      stopChildProcess(child, args.gracePeriodMs)
     }, args.timeoutMs)
 
     child.stdout?.setEncoding("utf8")
@@ -455,19 +454,23 @@ const cleanupOutputFile = async (path: string): Promise<void> => {
   await rm(path, { force: true }).catch(() => undefined)
 }
 
-const stopChildProcess = (child: ReturnType<typeof spawn>) => {
+const stopChildProcess = (
+  child: ReturnType<typeof spawn>,
+  gracePeriodMs = 2_000,
+) => {
   child.kill("SIGTERM")
   setTimeout(() => {
     if (child.exitCode === null) {
       child.kill("SIGKILL")
     }
-  }, 2_000)
+  }, gracePeriodMs)
 }
 
 const runCommandToFile = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly timeoutMs: number
+  readonly gracePeriodMs?: number
   readonly outputPath: string
   readonly budget: ExportBudget
 }): Promise<StreamedCommandResult> =>
@@ -485,7 +488,7 @@ const runCommandToFile = (args: {
 
     const timeout = setTimeout(() => {
       timedOut = true
-      stopChildProcess(child)
+      stopChildProcess(child, args.gracePeriodMs)
     }, args.timeoutMs)
 
     child.stderr?.setEncoding("utf8")
@@ -495,7 +498,7 @@ const runCommandToFile = (args: {
 
     const outputPromise = pipeline(child.stdout!, outputGuard, outputStream).catch((error) => {
       pipelineError = error
-      stopChildProcess(child)
+      stopChildProcess(child, args.gracePeriodMs)
     })
 
     child.once("error", (error) => {
@@ -694,12 +697,14 @@ interface PerfCommandRunner {
     readonly command: string
     readonly commandArgs: ReadonlyArray<string>
     readonly timeoutMs: number
+    readonly gracePeriodMs?: number
     readonly allowFailure?: boolean
   }) => Promise<CommandResult>
   readonly exportToFile: (args: {
     readonly command: string
     readonly commandArgs: ReadonlyArray<string>
     readonly timeoutMs: number
+    readonly gracePeriodMs?: number
     readonly outputPath: string
     readonly budget: ExportBudget
   }) => Promise<StreamedCommandResult>
@@ -714,6 +719,7 @@ interface PerfArtifactStoreAccess {
 
 interface PerfSessionRegistryAccess {
   readonly getSessionHealth: (sessionId: string) => Effect.Effect<SessionHealth, SessionNotFoundError | EnvironmentError>
+  readonly sendRunnerKeepalive: (sessionId: string) => Effect.Effect<void, SessionNotFoundError | EnvironmentError>
 }
 
 const liveCommandRunner: PerfCommandRunner = {
@@ -859,6 +865,19 @@ export const createPerfService = (dependencies: {
         `Recording ${spec.displayName} for pid ${runnerDetails.targetProcessId} on device ${sessionBeforeRecord.target.deviceId}.`,
       )
 
+      const keepaliveFiber = yield* Effect.gen(function* () {
+        yield* Effect.sleep(runnerKeepaliveIntervalMs)
+        yield* dependencies.sessionRegistry.sendRunnerKeepalive(sessionId)
+      }).pipe(
+        Effect.catchAll((error) =>
+          Effect.sync(() => {
+            emitProgress("perf.record", `Runner keepalive failed: ${error instanceof Error ? error.message : String(error)}`)
+          })
+        ),
+        Effect.forever,
+        Effect.fork,
+      )
+
       yield* Effect.tryPromise({
         try: () =>
           commandRunner.capture({
@@ -880,7 +899,8 @@ export const createPerfService = (dependencies: {
               baseName,
               "--no-prompt",
             ],
-            timeoutMs: timeLimitMs + defaultCommandOverheadMs,
+            timeoutMs: timeLimitMs + recordingOverheadMs,
+            gracePeriodMs: recordingGracePeriodMs,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -891,7 +911,9 @@ export const createPerfService = (dependencies: {
                 nextStep: "Inspect xctrace stderr and retry the profiling command.",
                 details: [],
               }),
-      })
+      }).pipe(
+        Effect.ensuring(Fiber.interrupt(keepaliveFiber)),
+      )
 
       const traceExists = yield* Effect.tryPromise({
         try: () => fileExists(tracePath),

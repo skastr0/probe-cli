@@ -813,6 +813,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
       SessionConflictError | EnvironmentError | UserInputError | UnsupportedCapabilityError | ChildProcessError
     >
     readonly getSessionHealth: (sessionId: string) => Effect.Effect<SessionHealth, SessionNotFoundError | EnvironmentError>
+    readonly sendRunnerKeepalive: (sessionId: string) => Effect.Effect<void, SessionNotFoundError | EnvironmentError>
     readonly getSessionLogs: (params: {
       readonly sessionId: string
       readonly source: SessionLogSource
@@ -3185,6 +3186,17 @@ export const SessionRegistryLive = Layer.scoped(
           yield* persistHealth(sessionId, record.health)
           yield* syncDaemonMetadata
           return record.health
+        }),
+      sendRunnerKeepalive: (sessionId) =>
+        Effect.gen(function* () {
+          const record = yield* requireSessionRecord(sessionId)
+
+          if (!isRunnerBackedRecord(record)) {
+            return
+          }
+
+          yield* sendRunnerCommand(sessionId, record, "ping", "perf-keepalive")
+          record.nextSequence += 1
         }),
       getSessionLogs: ({
         sessionId,

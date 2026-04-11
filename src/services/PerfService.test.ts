@@ -277,6 +277,7 @@ const createCommandRunner = (options: {
     readonly schema: string
     readonly budget: { readonly maxBytes: number; readonly maxRows: number }
   }) => Promise<void> | void
+  readonly recordDelayMs?: number
 }) => {
   const stats = {
     captureCalls: 0,
@@ -321,6 +322,10 @@ const createCommandRunner = (options: {
 
           if (!outputPath) {
             throw new Error("Missing --output path in record stub")
+          }
+
+          if (options.recordDelayMs !== undefined) {
+            await new Promise((resolve) => setTimeout(resolve, options.recordDelayMs))
           }
 
           await mkdir(outputPath, { recursive: true })
@@ -397,6 +402,7 @@ describe("PerfService", () => {
                   lastOk: false,
                 }),
           ),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -445,6 +451,7 @@ describe("PerfService", () => {
                   reason: "Runner health check degraded after recording",
                 }),
           ),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -473,11 +480,49 @@ describe("PerfService", () => {
     })
   })
 
+  test("sends runner keepalives during slow recordings", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      let keepaliveCalls = 0
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () =>
+          Effect.sync(() => {
+            keepaliveCalls += 1
+          }),
+      }
+      const commandRunner = createCommandRunner({
+        exports: {
+          "time-sample": timeProfilerXml,
+        },
+        recordDelayMs: 11_000,
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          template: "time-profiler",
+          timeLimit: "12s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.template).toBe("time-profiler")
+      expect(keepaliveCalls).toBeGreaterThanOrEqual(1)
+    })
+  }, 20_000)
+
   test("maps export file size overrun into a typed environment failure", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -524,6 +569,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({ exports: {} })
       const perfService = createPerfService({
@@ -562,6 +608,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       // Provide minimal stubs for the template list/version calls
       const baseRunner = createCommandRunner({ exports: {} })
@@ -616,6 +663,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -653,6 +701,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -694,6 +743,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -730,6 +780,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
@@ -768,6 +819,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({ exports: {} })
       const perfService = createPerfService({
@@ -807,6 +859,7 @@ describe("PerfService", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
         exports: {
