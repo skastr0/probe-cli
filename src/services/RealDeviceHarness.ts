@@ -35,6 +35,9 @@ const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
 const runnerCommandIngress = RUNNER_COMMAND_INGRESS
 const runnerEventEgress = RUNNER_EVENT_EGRESS
+const runnerBootstrapEnvKey = "PROBE_BOOTSTRAP_JSON"
+const runnerInjectedBootstrapPath = `env:${runnerBootstrapEnvKey}`
+const xctestrunMetadataKey = "__xctestrun_metadata__"
 
 interface CommandResult {
   readonly stdout: string
@@ -108,6 +111,19 @@ interface PreflightContext {
   readonly developmentTeam: string
   readonly selectedDevice: RealDeviceCandidate
   readonly metaDirectory: string
+}
+
+interface XmlElementRange {
+  readonly start: number
+  readonly end: number
+  readonly tagName: string
+  readonly raw: string
+}
+
+interface DictEntryRange {
+  readonly key: string
+  readonly keyRange: XmlElementRange
+  readonly valueRange: XmlElementRange
 }
 
 export interface OpenedRealDevicePreflightSession {
@@ -537,26 +553,342 @@ const parseLaunchedTargetProcessId = (payload: unknown, bundleId: string): numbe
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-const writeBootstrapManifest = async (args: {
-  readonly bootstrapPath: string
+const decodeXmlText = (value: string): string =>
+  value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&")
+
+const escapePlistText = (value: string): string =>
+  value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;")
+
+const skipXmlWhitespace = (xml: string, start: number): number => {
+  let cursor = start
+
+  while (cursor < xml.length && /\s/u.test(xml[cursor]!)) {
+    cursor += 1
+  }
+
+  return cursor
+}
+
+const findMatchingXmlContainerEnd = (xml: string, start: number, tagName: "dict" | "array"): number => {
+  const pattern = new RegExp(`<\\/?${tagName}\\b[^>]*>`, "gu")
+  pattern.lastIndex = start
+
+  let depth = 0
+
+  while (true) {
+    const match = pattern.exec(xml)
+
+    if (!match) {
+      throw new Error(`Could not find closing </${tagName}> tag.`)
+    }
+
+    const token = match[0]
+
+    if (token.startsWith("</")) {
+      depth -= 1
+    } else if (!token.endsWith("/>")) {
+      depth += 1
+    }
+
+    if (depth === 0) {
+      return pattern.lastIndex
+    }
+  }
+}
+
+const readXmlElement = (xml: string, start: number): XmlElementRange | null => {
+  const elementStart = skipXmlWhitespace(xml, start)
+
+  if (elementStart >= xml.length || xml[elementStart] !== "<") {
+    return null
+  }
+
+  const remainder = xml.slice(elementStart)
+  const selfClosingMatch = remainder.match(/^<([A-Za-z][A-Za-z0-9_-]*)\b[^>]*\/>/u)
+
+  if (selfClosingMatch) {
+    const raw = selfClosingMatch[0]
+
+    return {
+      start: elementStart,
+      end: elementStart + raw.length,
+      tagName: selfClosingMatch[1]!,
+      raw,
+    }
+  }
+
+  const openTagMatch = remainder.match(/^<([A-Za-z][A-Za-z0-9_-]*)\b[^>]*>/u)
+
+  if (!openTagMatch) {
+    throw new Error(`Unsupported XML element near index ${elementStart}.`)
+  }
+
+  const rawOpenTag = openTagMatch[0]
+  const tagName = openTagMatch[1]!
+
+  if (tagName === "dict" || tagName === "array") {
+    const end = findMatchingXmlContainerEnd(xml, elementStart, tagName)
+
+    return {
+      start: elementStart,
+      end,
+      tagName,
+      raw: xml.slice(elementStart, end),
+    }
+  }
+
+  const closeTag = `</${tagName}>`
+  const closeTagStart = xml.indexOf(closeTag, elementStart + rawOpenTag.length)
+
+  if (closeTagStart === -1) {
+    throw new Error(`Could not find closing ${closeTag} tag.`)
+  }
+
+  const end = closeTagStart + closeTag.length
+
+  return {
+    start: elementStart,
+    end,
+    tagName,
+    raw: xml.slice(elementStart, end),
+  }
+}
+
+const readImmediateDictEntries = (dictXml: string): Array<DictEntryRange> => {
+  const openingMatch = dictXml.match(/^<dict\b[^>]*>/u)
+
+  if (!openingMatch) {
+    throw new Error("Expected plist dict XML.")
+  }
+
+  const contentStart = openingMatch[0].length
+  const closingStart = dictXml.lastIndexOf("</dict>")
+
+  if (closingStart === -1) {
+    throw new Error("Plist dict XML was missing a closing </dict> tag.")
+  }
+
+  const entries: Array<DictEntryRange> = []
+  let cursor = contentStart
+
+  while (true) {
+    cursor = skipXmlWhitespace(dictXml, cursor)
+
+    if (cursor >= closingStart) {
+      return entries
+    }
+
+    const keyRange = readXmlElement(dictXml, cursor)
+
+    if (!keyRange || keyRange.tagName !== "key") {
+      throw new Error("Expected a <key> entry while parsing plist dict XML.")
+    }
+
+    const valueRange = readXmlElement(dictXml, keyRange.end)
+
+    if (!valueRange) {
+      throw new Error(`Expected a plist value for key ${keyRange.raw}.`)
+    }
+
+    entries.push({
+      key: decodeXmlText(keyRange.raw.replace(/^<key\b[^>]*>/u, "").replace(/<\/key>$/u, "")),
+      keyRange,
+      valueRange,
+    })
+    cursor = valueRange.end
+  }
+}
+
+const inspectDictFormatting = (dictXml: string): {
+  readonly closingAnchor: number
+  readonly entryIndent: string
+  readonly indentUnit: string
+  readonly newline: string
+} => {
+  const closingMatch = dictXml.match(/\n([ \t]*)<\/dict>\s*$/u)
+  const closingAnchor = closingMatch
+    ? dictXml.length - closingMatch[0].length
+    : dictXml.lastIndexOf("</dict>")
+
+  if (closingAnchor === -1) {
+    throw new Error("Plist dict XML was missing a closing </dict> tag.")
+  }
+
+  const closingIndent = closingMatch?.[1] ?? ""
+  const firstChildIndent = dictXml.match(/\n([ \t]*)<key>/u)?.[1] ?? null
+  const indentUnit = firstChildIndent
+    && firstChildIndent.startsWith(closingIndent)
+    && firstChildIndent.length > closingIndent.length
+    ? firstChildIndent.slice(closingIndent.length)
+    : "  "
+
+  return {
+    closingAnchor,
+    entryIndent: firstChildIndent ?? `${closingIndent}${indentUnit}`,
+    indentUnit,
+    newline: "\n",
+  }
+}
+
+const upsertPlistStringEntry = (dictXml: string, key: string, value: string): string => {
+  if (/^<dict\b[^>]*\/>$/u.test(dictXml)) {
+    const encodedKey = escapePlistText(key)
+    const encodedValue = escapePlistText(value)
+    return [
+      "<dict>",
+      `  <key>${encodedKey}</key>`,
+      `  <string>${encodedValue}</string>`,
+      "</dict>",
+    ].join("\n")
+  }
+
+  const entries = readImmediateDictEntries(dictXml)
+  const existing = entries.find((entry) => entry.key === key)
+  const encodedValue = escapePlistText(value)
+
+  if (existing) {
+    const replacement = `<string>${encodedValue}</string>`
+    return `${dictXml.slice(0, existing.valueRange.start)}${replacement}${dictXml.slice(existing.valueRange.end)}`
+  }
+
+  const formatting = inspectDictFormatting(dictXml)
+  const insertion = [
+    "",
+    `${formatting.entryIndent}<key>${escapePlistText(key)}</key>`,
+    `${formatting.entryIndent}<string>${encodedValue}</string>`,
+  ].join(formatting.newline)
+
+  return `${dictXml.slice(0, formatting.closingAnchor)}${insertion}${dictXml.slice(formatting.closingAnchor)}`
+}
+
+const upsertBootstrapEnvironmentVariables = (targetDictXml: string, bootstrapJson: string): string => {
+  const entries = readImmediateDictEntries(targetDictXml)
+  const environmentVariablesEntry = entries.find((entry) => entry.key === "EnvironmentVariables")
+
+  if (environmentVariablesEntry) {
+    const environmentVariablesDict = environmentVariablesEntry.valueRange.tagName === "dict"
+      ? targetDictXml.slice(environmentVariablesEntry.valueRange.start, environmentVariablesEntry.valueRange.end)
+      : "<dict></dict>"
+    const updatedEnvironmentVariablesDict = upsertPlistStringEntry(
+      environmentVariablesDict,
+      runnerBootstrapEnvKey,
+      bootstrapJson,
+    )
+
+    return [
+      targetDictXml.slice(0, environmentVariablesEntry.valueRange.start),
+      updatedEnvironmentVariablesDict,
+      targetDictXml.slice(environmentVariablesEntry.valueRange.end),
+    ].join("")
+  }
+
+  const formatting = inspectDictFormatting(targetDictXml)
+  const nestedEntryIndent = `${formatting.entryIndent}${formatting.indentUnit}`
+  const insertion = [
+    "",
+    `${formatting.entryIndent}<key>EnvironmentVariables</key>`,
+    `${formatting.entryIndent}<dict>`,
+    `${nestedEntryIndent}<key>${runnerBootstrapEnvKey}</key>`,
+    `${nestedEntryIndent}<string>${escapePlistText(bootstrapJson)}</string>`,
+    `${formatting.entryIndent}</dict>`,
+  ].join(formatting.newline)
+
+  return `${targetDictXml.slice(0, formatting.closingAnchor)}${insertion}${targetDictXml.slice(formatting.closingAnchor)}`
+}
+
+export const injectBootstrapJsonIntoXctestrunPlist = (plistXml: string, bootstrapJson: string): string => {
+  const plistStart = plistXml.indexOf("<plist")
+  const searchStart = plistStart === -1
+    ? 0
+    : plistXml.indexOf(">", plistStart) + 1
+  const rootDictStart = plistXml.indexOf("<dict", searchStart)
+
+  if (rootDictStart === -1) {
+    throw new Error("The xctestrun file did not contain a root plist dict.")
+  }
+
+  const rootDictRange = readXmlElement(plistXml, rootDictStart)
+
+  if (!rootDictRange || rootDictRange.tagName !== "dict") {
+    throw new Error("The xctestrun root element was not a plist dict.")
+  }
+
+  const replacements = readImmediateDictEntries(rootDictRange.raw)
+    .flatMap((entry) => {
+      if (entry.key === xctestrunMetadataKey || entry.valueRange.tagName !== "dict") {
+        return []
+      }
+
+      const targetDictXml = rootDictRange.raw.slice(entry.valueRange.start, entry.valueRange.end)
+
+      return [{
+        start: rootDictRange.start + entry.valueRange.start,
+        end: rootDictRange.start + entry.valueRange.end,
+        replacement: upsertBootstrapEnvironmentVariables(targetDictXml, bootstrapJson),
+      }]
+    })
+
+  if (replacements.length === 0) {
+    throw new Error("The xctestrun file did not contain any test target dictionaries.")
+  }
+
+  let updated = plistXml
+
+  for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+    updated = `${updated.slice(0, replacement.start)}${replacement.replacement}${updated.slice(replacement.end)}`
+  }
+
+  return updated
+}
+
+const createBootstrapManifest = (args: {
   readonly controlDirectoryPath: string
   readonly sessionIdentifier: string
   readonly simulatorUdid: string
   readonly targetBundleId: string
-}): Promise<void> => {
-  const manifest: RunnerBootstrapManifest = {
-    contractVersion: runnerTransportContract,
-    controlDirectoryPath: args.controlDirectoryPath,
-    egressTransport: runnerEventEgress,
-    generatedAt: nowIso(),
-    ingressTransport: runnerCommandIngress,
-    sessionIdentifier: args.sessionIdentifier,
-    simulatorUdid: args.simulatorUdid,
-    targetBundleId: args.targetBundleId,
-  }
+}): RunnerBootstrapManifest => ({
+  contractVersion: runnerTransportContract,
+  controlDirectoryPath: args.controlDirectoryPath,
+  egressTransport: runnerEventEgress,
+  generatedAt: nowIso(),
+  ingressTransport: runnerCommandIngress,
+  sessionIdentifier: args.sessionIdentifier,
+  simulatorUdid: args.simulatorUdid,
+  targetBundleId: args.targetBundleId,
+})
 
+const writeBootstrapManifest = async (args: {
+  readonly bootstrapPath: string
+  readonly manifest: RunnerBootstrapManifest
+}): Promise<void> => {
   await ensureDirectory(dirname(args.bootstrapPath))
-  await writeFile(args.bootstrapPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8")
+  await writeFile(args.bootstrapPath, `${JSON.stringify(args.manifest, null, 2)}\n`, "utf8")
+}
+
+const injectBootstrapManifestIntoXctestrun = async (args: {
+  readonly sourcePath: string
+  readonly destinationPath: string
+  readonly bootstrapManifest: RunnerBootstrapManifest
+}): Promise<string> => {
+  const originalXctestrun = await readFile(args.sourcePath, "utf8")
+  const injectedXctestrun = injectBootstrapJsonIntoXctestrunPlist(
+    originalXctestrun,
+    JSON.stringify(args.bootstrapManifest),
+  )
+
+  await ensureDirectory(dirname(args.destinationPath))
+  await writeFile(args.destinationPath, injectedXctestrun, "utf8")
+  return args.destinationPath
 }
 
 const processExists = (pid: number): boolean => {
@@ -776,7 +1108,7 @@ const assertReadyTransportContract = (args: {
     throw new EnvironmentError({
       code: "runner-bootstrap-path-mismatch",
       reason: `Expected runner bootstrap path ${args.expectedBootstrapPath}, received ${args.ready.bootstrapPath}.`,
-      nextStep: "Inspect the device bootstrap manifest path and retry the session open.",
+      nextStep: "Inspect the injected device bootstrap handoff and retry the session open.",
       details: [],
     })
   }
@@ -821,25 +1153,29 @@ const assertReadyTransportContract = (args: {
   }
 
   if (args.ready.controlDirectoryPath !== args.expectedControlDirectoryPath) {
-    throw new EnvironmentError({
-      code: "runner-control-directory-mismatch",
-      reason:
-        `Expected control directory ${args.expectedControlDirectoryPath}, received ${args.ready.controlDirectoryPath}.`,
-      nextStep: "Inspect the device bootstrap manifest control directory path and retry the session open.",
-      details: [],
-    })
+    if (args.ready.bootstrapSource !== "device-bootstrap-manifest") {
+      throw new EnvironmentError({
+        code: "runner-control-directory-mismatch",
+        reason:
+          `Expected control directory ${args.expectedControlDirectoryPath}, received ${args.ready.controlDirectoryPath}.`,
+        nextStep: "Inspect the device bootstrap manifest control directory path and retry the session open.",
+        details: [],
+      })
+    }
+    // On real device the XCUITest runner sandbox prevents writing to host-chosen paths,
+    // so the runner redirects to its own temp directory. The host reads the actual path
+    // from the ready frame and uses it for command file writes.
   }
 }
 
 const startWrapperProcess = async (args: {
   readonly rootDir: string
-  readonly projectPath: string
+  readonly xctestrunPath: string
   readonly destination: string
   readonly observerControlDirectory: string
   readonly wrapperStderrPath: string
   readonly logPath: string
   readonly stdoutEventsPath: string
-  readonly derivedDataPath: string
   readonly resultBundlePath: string
   readonly developmentTeam: string
 }): Promise<{
@@ -863,22 +1199,16 @@ const startWrapperProcess = async (args: {
       wrapperScript,
       "--control-dir",
       args.observerControlDirectory,
-      "--destination",
-      args.destination,
       "--log-path",
       args.logPath,
       "--stdout-events-path",
       args.stdoutEventsPath,
-      "--stdin-probe-payload",
-      "probe-daemon-session",
       "--",
       "xcodebuild",
-      "-project",
-      args.projectPath,
-      "-scheme",
-      runnerScheme,
-      "-derivedDataPath",
-      args.derivedDataPath,
+      "-xctestrun",
+      args.xctestrunPath,
+      "-destination",
+      args.destination,
       "-resultBundlePath",
       args.resultBundlePath,
       `DEVELOPMENT_TEAM=${args.developmentTeam}`,
@@ -888,7 +1218,7 @@ const startWrapperProcess = async (args: {
     {
       cwd: args.rootDir,
       detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["pipe", "ignore", "pipe"],
     },
   )
 
@@ -1350,7 +1680,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
             const sessionLogPath = join(liveLogsDirectory, "xcodebuild-session.log")
             const wrapperStderrPath = join(liveLogsDirectory, "runner-wrapper.stderr.log")
             const observerControlDirectory = join(args.runnerDirectory, "observer-control")
-            const runtimeControlDirectory = join(args.runnerDirectory, "runtime-control")
+            const runtimeControlDirectory = join("/tmp", `probe-runtime-${args.sessionId}`)
             const stdoutEventsPath = join(args.runnerDirectory, "stdout-events.ndjson")
             const resultBundlePath = join(args.runnerDirectory, "ProbeRunnerTransportBoundary.xcresult")
             const destination = `platform=iOS,id=${preflight.device.identifier}`
@@ -1452,25 +1782,32 @@ export const RealDeviceHarnessLive = Layer.succeed(
               })
             }
 
-            bootstrapPath = join(runnerBootstrapRootPath, `device-${preflight.device.identifier}.json`)
-            await writeBootstrapManifest({
-              bootstrapPath,
+            const bootstrapManifest = createBootstrapManifest({
               controlDirectoryPath: runtimeControlDirectory,
               sessionIdentifier: args.sessionId,
               simulatorUdid: preflight.device.identifier,
               targetBundleId: args.bundleId,
             })
+            bootstrapPath = join(runnerBootstrapRootPath, `device-${preflight.device.identifier}.json`)
+            await writeBootstrapManifest({
+              bootstrapPath,
+              manifest: bootstrapManifest,
+            })
+            const injectedXctestrunPath = await injectBootstrapManifestIntoXctestrun({
+              sourcePath: preflight.xctestrunPath,
+              destinationPath: join(dirname(preflight.xctestrunPath), "device-injected.xctestrun"),
+              bootstrapManifest,
+            })
 
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
               rootDir: args.rootDir,
-              projectPath: preflight.projectPath,
+              xctestrunPath: injectedXctestrunPath,
               destination,
               observerControlDirectory,
               wrapperStderrPath,
               logPath: sessionLogPath,
               stdoutEventsPath,
-              derivedDataPath: preflight.derivedDataPath,
               resultBundlePath,
               developmentTeam: preflight.developmentTeam,
             })
@@ -1501,11 +1838,18 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             assertReadyTransportContract({
               ready,
-              expectedBootstrapPath: bootstrapPath,
+              expectedBootstrapPath: runnerInjectedBootstrapPath,
               expectedControlDirectoryPath: runtimeControlDirectory,
               expectedSessionIdentifier: args.sessionId,
               expectedDeviceUdid: preflight.device.identifier,
             })
+
+            // Send stdin probe through the wrapper's stdin pipe.
+            // The wrapper forwards all stdin lines to xcodebuild, and the runner
+            // reads the probe from stdin after emitting the ready frame.
+            if (wrapper.process.stdin) {
+              wrapper.process.stdin.write(`${JSON.stringify({ kind: "stdin-probe", payload: "probe-daemon-session" })}\n`)
+            }
 
             const stdinProbe = await waitForFreshJson<RunnerStdinProbeResultFrame>({
               path: join(observerControlDirectory, "stdout-stdin-probe-result.json"),
@@ -1520,23 +1864,29 @@ export const RealDeviceHarnessLive = Layer.succeed(
               logPath: sessionLogPath,
             })
 
+            const wrapperStdin = wrapper.process.stdin
+            const isDeviceSession = ready.bootstrapSource === "device-bootstrap-manifest"
+
             const sendCommand = async (
               sequence: number,
               action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
               payload?: string,
             ): Promise<RunnerCommandResult> => {
               const commandStartedAt = Date.now()
-              const commandPath = join(ready.controlDirectoryPath, `command-${String(sequence).padStart(3, "0")}.json`)
+              const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
               const stdoutResponsePath = join(
                 observerControlDirectory,
                 `stdout-response-${String(sequence).padStart(3, "0")}.json`,
               )
 
-              await writeFile(
-                commandPath,
-                encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null }),
-                "utf8",
-              )
+              if (isDeviceSession && wrapperStdin) {
+                // Real device: send command via stdin pipe through the wrapper to xcodebuild
+                wrapperStdin.write(`${JSON.stringify(commandFrame)}\n`)
+              } else {
+                // Simulator: write command to file-mailbox
+                const commandPath = join(ready.controlDirectoryPath, `command-${String(sequence).padStart(3, "0")}.json`)
+                await writeFile(commandPath, commandFrame, "utf8")
+              }
 
               const stdoutResponse = await waitForFreshJson<RunnerResponseFrame>({
                 path: stdoutResponsePath,
@@ -1600,7 +1950,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               ddiServicesJsonPath: preflight.ddiServicesJsonPath,
               preflightReportPath: preflight.preflightReportPath,
               buildLogPath: preflight.buildLogPath,
-              xctestrunPath: preflight.xctestrunPath,
+              xctestrunPath: injectedXctestrunPath,
               targetAppPath: preflight.targetAppPath,
               runnerAppPath: preflight.runnerAppPath,
               runnerXctestPath: preflight.runnerXctestPath,
