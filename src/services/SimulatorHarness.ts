@@ -8,6 +8,7 @@ import {
   UnsupportedCapabilityError,
   UserInputError,
 } from "../domain/errors"
+import type { SimulatorSessionMode } from "../domain/session"
 import {
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
@@ -16,16 +17,21 @@ import {
   RUNNER_COMMAND_INGRESS,
   RUNNER_EVENT_EGRESS,
   RUNNER_TRANSPORT_CONTRACT,
+  type RunnerAction,
   type RunnerReadyFrame,
   type RunnerResponseFrame,
   type RunnerStdinProbeResultFrame,
 } from "./runnerProtocol"
 
-const fixtureBundleId = "dev.probe.fixture"
+const defaultTestBundleId = "dev.probe.fixture"
 const commandPollIntervalMs = 50
 const commandTimeoutMs = 20_000
 const runnerReadyTimeoutMs = 120_000
+const recordVideoTimeoutBufferMs = 30_000
+const maxRecordVideoDurationMs = 120_000
+const defaultRecordVideoDurationMs = 10_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
+const simulatorRunnerBuildCacheRoot = ".probe/simulator-runner-builds"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
 const runnerCommandIngress = RUNNER_COMMAND_INGRESS
 const runnerEventEgress = RUNNER_EVENT_EGRESS
@@ -68,14 +74,14 @@ export interface RunnerCommandResult {
   readonly hostRttMs: number
 }
 
-export interface OpenedFixtureSession {
+export interface OpenedSimulatorSession {
   readonly simulator: {
     readonly udid: string
     readonly name: string
     readonly runtime: string
   }
   readonly bundleId: string
-  readonly fixtureProcessId: number
+  readonly targetProcessId: number
   readonly wrapperProcessId: number
   readonly testProcessId: number
   readonly attachLatencyMs: number
@@ -97,7 +103,7 @@ export interface OpenedFixtureSession {
   readonly nextSequence: number
   readonly sendCommand: (
     sequence: number,
-    action: "ping" | "applyInput" | "snapshot" | "shutdown" | "uiAction",
+    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
     payload?: string,
   ) => Promise<RunnerCommandResult>
   readonly isWrapperRunning: () => boolean
@@ -113,6 +119,20 @@ interface RunnerBootstrapManifest {
   readonly ingressTransport: typeof runnerCommandIngress
   readonly sessionIdentifier: string
   readonly simulatorUdid: string
+  readonly targetBundleId: string
+}
+
+const resolveCommandTimeoutMs = (action: RunnerAction, payload?: string): number => {
+  if (action !== "recordVideo") {
+    return commandTimeoutMs
+  }
+
+  const parsedDurationMs = Number(payload ?? "")
+  const durationMs = Number.isFinite(parsedDurationMs) && parsedDurationMs > 0
+    ? Math.min(parsedDurationMs, maxRecordVideoDurationMs)
+    : defaultRecordVideoDurationMs
+
+  return Math.max(commandTimeoutMs, durationMs + recordVideoTimeoutBufferMs)
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -144,6 +164,7 @@ const writeBootstrapManifest = async (args: {
   readonly controlDirectoryPath: string
   readonly sessionIdentifier: string
   readonly simulatorUdid: string
+  readonly targetBundleId: string
 }): Promise<void> => {
   const manifest: RunnerBootstrapManifest = {
     contractVersion: runnerTransportContract,
@@ -153,6 +174,7 @@ const writeBootstrapManifest = async (args: {
     ingressTransport: runnerCommandIngress,
     sessionIdentifier: args.sessionIdentifier,
     simulatorUdid: args.simulatorUdid,
+    targetBundleId: args.targetBundleId,
   }
 
   await ensureDirectory(dirname(args.bootstrapPath))
@@ -478,13 +500,13 @@ const runCommandWithCapturedStdout = async (args: {
   })
 }
 
-const parseFixtureProcessId = (stdout: string): number => {
+const parseProcessId = (stdout: string): number => {
   const match = stdout.match(/:\s*(\d+)\s*$/)
 
   if (!match) {
     throw new EnvironmentError({
-      code: "fixture-launch-pid-parse",
-      reason: `Could not parse a fixture process id from simctl output: ${stdout}`,
+      code: "launch-pid-parse",
+      reason: `Could not parse a target process id from simctl output: ${stdout}`,
       nextStep: "Inspect the simctl launch output and retry the session open.",
       details: [],
     })
@@ -492,6 +514,138 @@ const parseFixtureProcessId = (stdout: string): number => {
 
   return Number(match[1])
 }
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+export const isInstalledAppListMatch = (stdout: string, bundleId: string): boolean => {
+  const escapedBundleId = escapeRegExp(bundleId)
+  const bundleIdPattern = new RegExp(`(^|[^A-Za-z0-9._-])${escapedBundleId}($|[^A-Za-z0-9._-])`, "m")
+  return bundleIdPattern.test(stdout)
+}
+
+interface AttachTargetProcessResolverCommands {
+  readonly runCommand: typeof runCommand
+  readonly runCommandWithExit: typeof runCommandWithExit
+}
+
+const defaultAttachTargetProcessResolverCommands: AttachTargetProcessResolverCommands = {
+  runCommand,
+  runCommandWithExit,
+}
+
+interface SimulatorRunnerBuildCommands {
+  readonly runCommand: typeof runCommand
+}
+
+const defaultSimulatorRunnerBuildCommands: SimulatorRunnerBuildCommands = {
+  runCommand,
+}
+
+export const resolveAttachTargetProcessId = async (
+  args: {
+  readonly simulatorUdid: string
+  readonly bundleId: string
+  },
+  commands: AttachTargetProcessResolverCommands = defaultAttachTargetProcessResolverCommands,
+): Promise<number> => {
+  // Step 1: Verify the app is installed
+  const installedApps = await commands.runCommand({
+    command: "xcrun",
+    commandArgs: ["simctl", "listapps", args.simulatorUdid],
+  })
+
+  if (!isInstalledAppListMatch(installedApps.stdout, args.bundleId)) {
+    throw new EnvironmentError({
+      code: "target-app-not-installed",
+      reason: `The target app ${args.bundleId} is not installed on simulator ${args.simulatorUdid}.`,
+      nextStep:
+        `Install ${args.bundleId} on simulator ${args.simulatorUdid} with your own app pipeline, then launch it and retry the attach-to-running session open.`,
+      details: [],
+    })
+  }
+
+  // Step 2: Check if the app is already running by querying launchctl inside the simulator.
+  // simctl spawn <udid> launchctl list prints all running services with their PIDs.
+  // We look for a line containing the bundle ID to extract the PID.
+  const launchctlResult = await commands.runCommandWithExit({
+    command: "xcrun",
+    commandArgs: ["simctl", "spawn", args.simulatorUdid, "launchctl", "list"],
+  })
+
+  const runningPid = extractPidFromLaunchctlList(launchctlResult.stdout, args.bundleId)
+
+  if (runningPid !== null) {
+    return runningPid
+  }
+
+  throw new EnvironmentError({
+    code: "target-app-not-running",
+    reason: `The target app ${args.bundleId} is installed on simulator ${args.simulatorUdid} but is not currently running.`,
+    nextStep: `Launch ${args.bundleId} on simulator ${args.simulatorUdid}, then retry the attach-to-running session open.`,
+    details: [
+      "Attach-to-running mode requires the app to be already running. Probe does not launch the target app in this mode.",
+    ],
+  })
+}
+
+export const extractPidFromLaunchctlList = (stdout: string, bundleId: string): number | null => {
+  // launchctl list output lines look like:
+  // <PID>  <exit-status>  <label>
+  // The label for iOS apps contains the bundle identifier.
+  // Example: "12345  -  dev.probe.fixture"
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed.includes(bundleId)) {
+      continue
+    }
+
+    // Try to extract the leading PID (a positive integer)
+    const pidMatch = trimmed.match(/^(\d+)\s/)
+    if (pidMatch) {
+      const pid = Number(pidMatch[1])
+      if (pid > 0 && Number.isFinite(pid)) {
+        return pid
+      }
+    }
+  }
+
+  return null
+}
+
+export const buildProbeRunnerForSimulator = async (
+  args: {
+    readonly projectPath: string
+    readonly simulatorUdid: string
+    readonly derivedDataPath: string
+    readonly buildLogPath: string
+  },
+  commands: SimulatorRunnerBuildCommands = defaultSimulatorRunnerBuildCommands,
+): Promise<void> => {
+  await commands.runCommand({
+    command: "xcodebuild",
+    commandArgs: [
+      "-project",
+      args.projectPath,
+      "-scheme",
+      "ProbeRunner",
+      "-destination",
+      `platform=iOS Simulator,id=${args.simulatorUdid}`,
+      "-derivedDataPath",
+      args.derivedDataPath,
+      "CODE_SIGNING_ALLOWED=NO",
+      "build-for-testing",
+    ],
+    logPath: args.buildLogPath,
+  })
+}
+
+const resolveSimulatorRunnerDerivedDataPath = (rootDir: string, simulatorUdid: string): string =>
+  join(
+    rootDir,
+    simulatorRunnerBuildCacheRoot,
+    sanitizeFileComponent(simulatorUdid, "simulator"),
+    "derived-data",
+  )
 
 const assertReadyTransportContract = (args: {
   readonly ready: ReadyFrame
@@ -677,15 +831,16 @@ const stopWrapperProcess = async (wrapper: {
 export class SimulatorHarness extends Context.Tag("@probe/SimulatorHarness")<
   SimulatorHarness,
   {
-    readonly openFixtureSession: (args: {
+    readonly openSession: (args: {
       readonly rootDir: string
       readonly sessionId: string
       readonly artifactRoot: string
       readonly runnerDirectory: string
       readonly logsDirectory: string
       readonly bundleId: string
+      readonly sessionMode?: SimulatorSessionMode
       readonly simulatorUdid: string | null
-    }) => Effect.Effect<OpenedFixtureSession, EnvironmentError | UserInputError | UnsupportedCapabilityError | ChildProcessError>
+    }) => Effect.Effect<OpenedSimulatorSession, EnvironmentError | UserInputError | UnsupportedCapabilityError | ChildProcessError>
     readonly captureSimulatorLogStream: (args: {
       readonly simulatorUdid: string
       readonly logsDirectory: string
@@ -700,33 +855,28 @@ export class SimulatorHarness extends Context.Tag("@probe/SimulatorHarness")<
       readonly summary: string
       readonly details: ReadonlyArray<string>
     }, EnvironmentError>
-    readonly captureScreenshot: (args: {
-      readonly simulatorUdid: string
-      readonly screenshotsDirectory: string
-      readonly label: string | null
-    }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError | ChildProcessError>
   }
 >() {}
 
 export const SimulatorHarnessLive = Layer.succeed(
   SimulatorHarness,
   SimulatorHarness.of({
-    openFixtureSession: (args) => {
+    openSession: (args) => {
       let wrapper: Awaited<ReturnType<typeof startWrapperProcess>> | null = null
       let bootstrapPath: string | null = null
+      const sessionMode = args.sessionMode ?? "build-and-install"
 
       return Effect.tryPromise({
         try: async () => {
           try {
-            if (args.bundleId !== fixtureBundleId) {
-              throw new UnsupportedCapabilityError({
-                code: "fixture-only-bundle-id",
-                capability: "session.open.bundle-id",
-                reason: `The current vertical slice only supports the fixture bundle id ${fixtureBundleId}.`,
+            if (sessionMode === "build-and-install" && args.bundleId !== defaultTestBundleId) {
+              throw new UserInputError({
+                code: "simulator-session-mode-bundle-mismatch",
+                reason:
+                  `Simulator build-and-install mode can only target ${defaultTestBundleId}; received ${args.bundleId}.`,
                 nextStep:
-                  "Open the fixture-backed session with the default bundle id, or extend the runner target before requesting arbitrary app sessions.",
+                  `Retry in attach-to-running mode for ${args.bundleId}, or omit --bundle-id to use Probe's built-in fixture app.`,
                 details: [],
-                wall: false,
               })
             }
 
@@ -737,7 +887,6 @@ export const SimulatorHarnessLive = Layer.succeed(
             const observerControlDirectory = join(args.runnerDirectory, "observer-control")
             const runtimeControlDirectory = join(args.runnerDirectory, "runtime-control")
             const stdoutEventsPath = join(args.runnerDirectory, "stdout-events.ndjson")
-            const derivedDataPath = join(args.runnerDirectory, "derived-data")
             const resultBundlePath = join(args.runnerDirectory, "ProbeRunnerTransportBoundary.xcresult")
 
             await Promise.all([
@@ -781,50 +930,56 @@ export const SimulatorHarnessLive = Layer.succeed(
               commandArgs: ["simctl", "bootstatus", selected.device.udid, "-b"],
             })
 
-            await runCommand({
-              command: "xcodebuild",
-              commandArgs: [
-                "-project",
-                projectPath,
-                "-scheme",
-                "ProbeRunner",
-                "-destination",
-                `platform=iOS Simulator,id=${selected.device.udid}`,
-                "-derivedDataPath",
-                derivedDataPath,
-                "CODE_SIGNING_ALLOWED=NO",
-                "build-for-testing",
-              ],
-              logPath: buildLogPath,
+            const derivedDataPath = resolveSimulatorRunnerDerivedDataPath(args.rootDir, selected.device.udid)
+
+            await buildProbeRunnerForSimulator({
+              projectPath,
+              simulatorUdid: selected.device.udid,
+              derivedDataPath,
+              buildLogPath,
             })
 
-            const appPath = join(derivedDataPath, "Build", "Products", "Debug-iphonesimulator", "ProbeFixture.app")
+            const targetProcessId = sessionMode === "attach-to-running"
+              ? await resolveAttachTargetProcessId({
+                  simulatorUdid: selected.device.udid,
+                  bundleId: args.bundleId,
+                })
+              : await (async () => {
+                  const targetAppPath = join(
+                    derivedDataPath,
+                    "Build",
+                    "Products",
+                    "Debug-iphonesimulator",
+                    "ProbeFixture.app",
+                  )
 
-            if (!(await fileExists(appPath))) {
-              throw new EnvironmentError({
-                code: "fixture-app-missing",
-                reason: `Expected ProbeFixture.app at ${appPath} after build-for-testing.`,
-                nextStep: "Inspect the build log artifact and verify the Xcode build products layout.",
-                details: [],
-              })
-            }
+                  if (!(await fileExists(targetAppPath))) {
+                    throw new EnvironmentError({
+                      code: "target-app-missing",
+                      reason: `Expected the default test app at ${targetAppPath} after build-for-testing.`,
+                      nextStep: "Inspect the build log artifact and verify the Xcode build products layout.",
+                      details: [],
+                    })
+                  }
 
-            await runCommand({
-              command: "xcrun",
-              commandArgs: ["simctl", "install", selected.device.udid, appPath],
-            })
+                  await runCommand({
+                    command: "xcrun",
+                    commandArgs: ["simctl", "install", selected.device.udid, targetAppPath],
+                  })
 
-            const launchResult = await runCommand({
-              command: "xcrun",
-              commandArgs: [
-                "simctl",
-                "launch",
-                "--terminate-running-process",
-                selected.device.udid,
-                fixtureBundleId,
-              ],
-            })
-            const fixtureProcessId = parseFixtureProcessId(launchResult.stdout.trim())
+                  const launchResult = await runCommand({
+                    command: "xcrun",
+                    commandArgs: [
+                      "simctl",
+                      "launch",
+                      "--terminate-running-process",
+                      selected.device.udid,
+                      defaultTestBundleId,
+                    ],
+                  })
+
+                  return parseProcessId(launchResult.stdout.trim())
+                })()
 
             bootstrapPath = join(runnerBootstrapRootPath, `${selected.device.udid}.json`)
             await writeBootstrapManifest({
@@ -832,6 +987,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               controlDirectoryPath: runtimeControlDirectory,
               sessionIdentifier: args.sessionId,
               simulatorUdid: selected.device.udid,
+              targetBundleId: args.bundleId,
             })
 
             const startedAt = Date.now()
@@ -893,7 +1049,7 @@ export const SimulatorHarnessLive = Layer.succeed(
 
             const sendCommand = async (
               sequence: number,
-              action: "ping" | "applyInput" | "snapshot" | "shutdown" | "uiAction",
+              action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
               payload?: string,
             ): Promise<RunnerCommandResult> => {
               const startedAt = Date.now()
@@ -911,7 +1067,7 @@ export const SimulatorHarnessLive = Layer.succeed(
 
               const stdoutResponse = await waitForFreshJson<ResponseFrame>({
                 path: stdoutResponsePath,
-                timeoutMs: commandTimeoutMs,
+                timeoutMs: resolveCommandTimeoutMs(action, payload),
                 minMtimeMs: startedAt,
                 isRunning: isWrapperRunning,
                 decode: decodeRunnerResponseFrame,
@@ -966,17 +1122,17 @@ export const SimulatorHarnessLive = Layer.succeed(
                 name: selected.device.name,
                 runtime: selected.runtime,
               },
-              bundleId: fixtureBundleId,
-              fixtureProcessId,
+              bundleId: args.bundleId,
+              targetProcessId,
               wrapperProcessId: wrapper.process.pid ?? -1,
               testProcessId: ready.processIdentifier,
               attachLatencyMs: ready.attachLatencyMs,
               bootstrapPath: ready.bootstrapPath,
-              bootstrapSource: ready.bootstrapSource,
-              runnerTransportContract: ready.runnerTransportContract,
+              bootstrapSource: "simulator-bootstrap-manifest",
+              runnerTransportContract,
               sessionIdentifier: ready.sessionIdentifier,
-              commandIngress: ready.ingressTransport,
-              eventEgress: ready.egressTransport,
+              commandIngress: runnerCommandIngress,
+              eventEgress: runnerEventEgress,
               runtimeControlDirectory: ready.controlDirectoryPath,
               observerControlDirectory,
               logPath: sessionLogPath,
@@ -1102,30 +1258,6 @@ export const SimulatorHarnessLive = Layer.succeed(
                 code: "simulator-log-capture",
                 reason: error instanceof Error ? error.message : String(error),
                 nextStep: "Inspect the simulator log capture command and retry the session logs request.",
-                details: [],
-              }),
-      }),
-    captureScreenshot: (args) =>
-      Effect.tryPromise({
-        try: async () => {
-          const fileName = `${timestampForFile()}-${sanitizeFileComponent(args.label, "screenshot")}.png`
-          const absolutePath = join(args.screenshotsDirectory, fileName)
-          await ensureDirectory(args.screenshotsDirectory)
-
-          await runCommand({
-            command: "xcrun",
-            commandArgs: ["simctl", "io", args.simulatorUdid, "screenshot", "--type=png", absolutePath],
-          })
-
-          return { absolutePath }
-        },
-        catch: (error) =>
-          error instanceof EnvironmentError || error instanceof ChildProcessError
-            ? error
-            : new EnvironmentError({
-                code: "simulator-screenshot-capture",
-                reason: error instanceof Error ? error.message : String(error),
-                nextStep: "Inspect the simctl screenshot command and retry the session screenshot request.",
                 details: [],
               }),
       }),
