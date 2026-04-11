@@ -13,6 +13,9 @@ export const SessionPhase = Schema.Literal(
 )
 export type SessionPhase = typeof SessionPhase.Type
 
+export const SimulatorSessionMode = Schema.Literal("build-and-install", "attach-to-running")
+export type SimulatorSessionMode = typeof SimulatorSessionMode.Type
+
 export const SessionLifecycleState = SessionPhase
 export type SessionLifecycleState = typeof SessionLifecycleState.Type
 
@@ -68,6 +71,19 @@ export const LiveRunnerTransportContract = Schema.Struct({
 })
 export type LiveRunnerTransportContract = typeof LiveRunnerTransportContract.Type
 
+export const RealDeviceLiveTransportContract = Schema.Struct({
+  kind: Schema.Literal("real-device-live"),
+  contract: Schema.Literal("probe.runner.transport/hybrid-v1"),
+  bootstrapSource: Schema.Literal("device-bootstrap-manifest"),
+  bootstrapPath: Schema.String,
+  sessionIdentifier: Schema.String,
+  commandIngress: Schema.Literal("file-mailbox"),
+  eventEgress: Schema.Literal("stdout-jsonl-mixed-log"),
+  stdinProbeStatus: Schema.String,
+  note: Schema.String,
+})
+export type RealDeviceLiveTransportContract = typeof RealDeviceLiveTransportContract.Type
+
 export const RealDevicePreflightTransportContract = Schema.Struct({
   kind: Schema.Literal("real-device-preflight"),
   contract: Schema.Literal("probe.runner.transport/unvalidated-device-v1"),
@@ -84,6 +100,7 @@ export type RealDevicePreflightTransportContract = typeof RealDevicePreflightTra
 
 export const SessionTransportDetails = Schema.Union(
   LiveRunnerTransportContract,
+  RealDeviceLiveTransportContract,
   RealDevicePreflightTransportContract,
 )
 export type SessionTransportDetails = typeof SessionTransportDetails.Type
@@ -92,7 +109,7 @@ export const LiveRunnerSessionDetails = Schema.Struct({
   kind: Schema.Literal("simulator-runner"),
   wrapperProcessId: Schema.Number,
   testProcessId: Schema.Number,
-  fixtureProcessId: Schema.Number,
+  targetProcessId: Schema.Number,
   attachLatencyMs: Schema.Number,
   runtimeControlDirectory: Schema.String,
   observerControlDirectory: Schema.String,
@@ -105,11 +122,31 @@ export const LiveRunnerSessionDetails = Schema.Struct({
 })
 export type LiveRunnerSessionDetails = typeof LiveRunnerSessionDetails.Type
 
+export const RealDeviceLiveRunnerDetails = Schema.Struct({
+  kind: Schema.Literal("real-device-live"),
+  wrapperProcessId: Schema.Number,
+  testProcessId: Schema.Number,
+  targetProcessId: Schema.Number,
+  attachLatencyMs: Schema.Number,
+  runtimeControlDirectory: Schema.String,
+  observerControlDirectory: Schema.String,
+  logPath: Schema.String,
+  buildLogPath: Schema.String,
+  stdoutEventsPath: Schema.String,
+  resultBundlePath: Schema.String,
+  wrapperStderrPath: Schema.String,
+  stdinProbeStatus: Schema.String,
+  connectionStatus: SessionConnectionStatus,
+  lastCheckedAt: Schema.String,
+  note: Schema.String,
+})
+export type RealDeviceLiveRunnerDetails = typeof RealDeviceLiveRunnerDetails.Type
+
 export const RealDevicePreflightRunnerDetails = Schema.Struct({
   kind: Schema.Literal("real-device-preflight"),
   wrapperProcessId: Schema.Null,
   testProcessId: Schema.Null,
-  fixtureProcessId: Schema.Null,
+  targetProcessId: Schema.Null,
   attachLatencyMs: Schema.Null,
   runtimeControlDirectory: Schema.Null,
   observerControlDirectory: Schema.Null,
@@ -127,6 +164,7 @@ export type RealDevicePreflightRunnerDetails = typeof RealDevicePreflightRunnerD
 
 export const SessionRunnerDetails = Schema.Union(
   LiveRunnerSessionDetails,
+  RealDeviceLiveRunnerDetails,
   RealDevicePreflightRunnerDetails,
 )
 export type SessionRunnerDetails = typeof SessionRunnerDetails.Type
@@ -175,7 +213,8 @@ export type SessionHealth = typeof ProbeSessionHealth.Type
 
 export const isLiveRunnerTransport = (
   transport: SessionTransportDetails,
-): transport is LiveRunnerTransportContract => transport.kind === "simulator-runner"
+): transport is LiveRunnerTransportContract | RealDeviceLiveTransportContract =>
+  transport.kind === "simulator-runner" || transport.kind === "real-device-live"
 
 export const isRealDevicePreflightTransport = (
   transport: SessionTransportDetails,
@@ -183,7 +222,8 @@ export const isRealDevicePreflightTransport = (
 
 export const isLiveRunnerDetails = (
   runner: SessionRunnerDetails,
-): runner is LiveRunnerSessionDetails => runner.kind === "simulator-runner"
+): runner is LiveRunnerSessionDetails | RealDeviceLiveRunnerDetails =>
+  runner.kind === "simulator-runner" || runner.kind === "real-device-live"
 
 export const isRealDevicePreflightRunnerDetails = (
   runner: SessionRunnerDetails,

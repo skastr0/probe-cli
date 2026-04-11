@@ -24,6 +24,7 @@ def write_json(path: Path, value: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--control-dir", required=True)
+    parser.add_argument("--destination")
     parser.add_argument("--log-path", required=True)
     parser.add_argument("--stdout-events-path", required=True)
     parser.add_argument("--stdin-probe-payload", required=True)
@@ -35,6 +36,17 @@ def main() -> int:
         command = command[1:]
     if not command:
         raise SystemExit("Missing command to execute.")
+
+    if args.destination:
+        if Path(command[0]).name != "xcodebuild":
+            raise SystemExit("--destination currently requires an xcodebuild command.")
+
+        if "-destination" in command:
+            raise SystemExit(
+                "Provide either --destination or an explicit xcodebuild -destination, not both."
+            )
+
+        command = [command[0], "-destination", args.destination, *command[1:]]
 
     control_dir = Path(args.control_dir)
     control_dir.mkdir(parents=True, exist_ok=True)

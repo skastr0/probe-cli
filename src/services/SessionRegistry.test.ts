@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Either, Layer, ManagedRuntime } from "effect"
@@ -38,6 +38,51 @@ const withTempRoot = async <T>(run: (root: string) => Promise<T>) => {
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+}
+
+const withProbeFfmpegPath = async <T>(ffmpegPath: string | undefined, run: () => Promise<T>): Promise<T> => {
+  const previous = process.env.PROBE_FFMPEG_PATH
+
+  if (ffmpegPath === undefined) {
+    delete process.env.PROBE_FFMPEG_PATH
+  } else {
+    process.env.PROBE_FFMPEG_PATH = ffmpegPath
+  }
+
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) {
+      delete process.env.PROBE_FFMPEG_PATH
+    } else {
+      process.env.PROBE_FFMPEG_PATH = previous
+    }
+  }
+}
+
+const createFakeFfmpegExecutable = async (root: string): Promise<string> => {
+  const executablePath = join(root, "fake-ffmpeg")
+
+  await writeFile(
+    executablePath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "-version" ]; then',
+      '  echo "ffmpeg version fake-test"',
+      "  exit 0",
+      "fi",
+      'output=""',
+      'for arg in "$@"; do',
+      '  output="$arg"',
+      "done",
+      'printf "fake mp4 data" > "$output"',
+      "exit 0",
+      "",
+    ].join("\n"),
+    "utf8",
+  )
+  await chmod(executablePath, 0o755)
+  return executablePath
 }
 
 const waitFor = async <T>(
@@ -338,10 +383,17 @@ interface FakeHarnessRunnerCommand {
   readonly payload: string | null
 }
 
+interface FakeHarnessOpenArgs {
+  readonly bundleId: string
+  readonly simulatorUdid: string | null
+  readonly sessionMode: "build-and-install" | "attach-to-running" | undefined
+}
+
 const createFakeHarness = (options?: {
   readonly onOpenStart?: () => void
   readonly releaseOpen?: Promise<void>
   readonly failWith?: Error
+  readonly captureOpenArgs?: (args: FakeHarnessOpenArgs) => void
   readonly captureSessionControl?: (control: FakeHarnessSessionControl) => void
   readonly captureRunnerCommand?: (command: FakeHarnessRunnerCommand) => void
   readonly interceptUiAction?: (
@@ -349,10 +401,15 @@ const createFakeHarness = (options?: {
   ) => FakeHarnessUiActionInterceptResult | null | undefined
 }) => {
   return SimulatorHarness.of({
-    openFixtureSession: (args) =>
+    openSession: (args) =>
       Effect.tryPromise({
         try: async () => {
           options?.onOpenStart?.()
+          options?.captureOpenArgs?.({
+            bundleId: args.bundleId,
+            simulatorUdid: args.simulatorUdid,
+            sessionMode: args.sessionMode,
+          })
 
           if (options?.releaseOpen) {
             await options.releaseOpen
@@ -415,6 +472,11 @@ const createFakeHarness = (options?: {
             closeCalls += 1
             finishExit({ code: 0, signal: null })
           }
+
+          const pngFixtureBytes = Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==",
+            "base64",
+          )
 
           let statusLabel = "Ready for attach/control validation"
           let inputValue = ""
@@ -598,7 +660,7 @@ const createFakeHarness = (options?: {
               runtime: "iOS 18.0",
             },
             bundleId: args.bundleId,
-            fixtureProcessId: 101,
+            targetProcessId: 101,
             wrapperProcessId: 202,
             testProcessId: 303,
             attachLatencyMs: 12,
@@ -661,6 +723,57 @@ const createFakeHarness = (options?: {
                 }
               }
 
+              if (action === "screenshot") {
+                const snapshotPayloadPath = join(runtimeControlDirectory, `screenshot-${String(_sequence).padStart(3, "0")}.png`)
+                await writeFile(snapshotPayloadPath, pngFixtureBytes)
+
+                return {
+                  ok: true,
+                  action,
+                  error: null,
+                  payload: "screenshot-captured",
+                  snapshotPayloadPath,
+                  handledMs: 1,
+                  statusLabel,
+                  snapshotNodeCount: null,
+                  hostRttMs: 1,
+                }
+              }
+
+              if (action === "recordVideo") {
+                const durationMs = Math.min(Math.max(Number(payload ?? "10000") || 10_000, 1), 120_000)
+                const framesDirectoryPath = join(runtimeControlDirectory, `video-frames-${String(_sequence).padStart(3, "0")}`)
+                const framePath = join(framesDirectoryPath, "frame-00000.png")
+                const manifestPath = join(framesDirectoryPath, "manifest.json")
+
+                await mkdir(framesDirectoryPath, { recursive: true })
+                await Promise.all([
+                  writeFile(framePath, pngFixtureBytes),
+                  writeFile(
+                    manifestPath,
+                    `${JSON.stringify({
+                      durationMs,
+                      fps: 10,
+                      frameCount: 1,
+                      framesDirectoryPath,
+                    }, null, 2)}\n`,
+                    "utf8",
+                  ),
+                ])
+
+                return {
+                  ok: true,
+                  action,
+                  error: null,
+                  payload: "video-captured",
+                  snapshotPayloadPath: framesDirectoryPath,
+                  handledMs: 1,
+                  statusLabel,
+                  snapshotNodeCount: null,
+                  hostRttMs: 1,
+                }
+              }
+
               return {
                 ok: true,
                 action,
@@ -708,22 +821,6 @@ const createFakeHarness = (options?: {
             details: [],
           }),
       }),
-    captureScreenshot: (args) =>
-      Effect.tryPromise({
-        try: async () => {
-          const absolutePath = join(args.screenshotsDirectory, "screenshot.png")
-          await mkdir(args.screenshotsDirectory, { recursive: true })
-          await writeFile(absolutePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
-          return { absolutePath }
-        },
-        catch: (error) =>
-          new EnvironmentError({
-            code: "fake-harness-screenshot",
-            reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Inspect the fake harness screenshot path.",
-              details: [],
-            }),
-      }),
     reapStaleRunnerSession: (args) =>
       Effect.succeed({
         summary: `No stale runner cleanup was needed for session ${args.sessionId}.`,
@@ -737,6 +834,20 @@ const createFakeRealDeviceHarness = (options?: {
   readonly connectionStates?: ReadonlyArray<"connected" | "disconnected">
 }) => {
   let connectionIndex = 0
+  let running = true
+  let resolveExit!: (value: { readonly code: number | null; readonly signal: string | null }) => void
+  const waitForExit = new Promise<{ readonly code: number | null; readonly signal: string | null }>((resolve) => {
+    resolveExit = resolve
+  })
+
+  const finishExit = (value: { readonly code: number | null; readonly signal: string | null }) => {
+    if (!running) {
+      return
+    }
+
+    running = false
+    resolveExit(value)
+  }
 
   return RealDeviceHarness.of({
     openPreflightSession: (args) =>
@@ -758,9 +869,12 @@ const createFakeRealDeviceHarness = (options?: {
           const preflightReportPath = join(metaDirectory, "real-device-preflight.json")
           const buildLogPath = join(logsDirectory, "xcodebuild-build-for-testing-device.log")
           const xctestrunPath = join(args.runnerDirectory, "fake.xctestrun")
-          const fixtureAppPath = join(args.runnerDirectory, "ProbeFixture.app")
+          const targetAppPath = join(args.runnerDirectory, "ProbeFixture.app")
           const runnerAppPath = join(args.runnerDirectory, "ProbeRunnerUITests-Runner.app")
           const runnerXctestPath = join(args.runnerDirectory, "ProbeRunnerUITests.xctest")
+
+          await mkdir(metaDirectory, { recursive: true })
+          await mkdir(logsDirectory, { recursive: true })
 
           await Promise.all([
             writeFile(preferredDdiJsonPath, "{}\n", "utf8"),
@@ -769,12 +883,13 @@ const createFakeRealDeviceHarness = (options?: {
             writeFile(preflightReportPath, "{}\n", "utf8"),
             writeFile(buildLogPath, "build ok\n", "utf8"),
             writeFile(xctestrunPath, "<plist/>\n", "utf8"),
-            mkdir(fixtureAppPath, { recursive: true }),
+            mkdir(targetAppPath, { recursive: true }),
             mkdir(runnerAppPath, { recursive: true }),
             mkdir(runnerXctestPath, { recursive: true }),
           ])
 
           return {
+            mode: "preflight",
             device: {
               identifier: "device-1",
               name: "Test iPhone",
@@ -789,7 +904,7 @@ const createFakeRealDeviceHarness = (options?: {
             preflightReportPath,
             buildLogPath,
             xctestrunPath,
-            fixtureAppPath,
+            targetAppPath,
             runnerAppPath,
             runnerXctestPath,
             integrationPoints: [
@@ -815,6 +930,145 @@ const createFakeRealDeviceHarness = (options?: {
               }
             },
             close: async () => undefined,
+          }
+        },
+        catch: (error) => error as EnvironmentError,
+      }),
+    openLiveSession: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (options?.failWith) {
+            throw options.failWith
+          }
+
+          const nextStatus = options?.connectionStates?.[0] ?? "connected"
+          const metaDirectory = join(args.artifactRoot, "meta")
+          const logsDirectory = join(args.logsDirectory, "device-live")
+          const buildLogsDirectory = join(args.logsDirectory, "device-preflight")
+          const observerControlDirectory = join(args.runnerDirectory, "observer-control")
+          const runtimeControlDirectory = join(args.runnerDirectory, "runtime-control")
+          const preferredDdiJsonPath = join(metaDirectory, "preferred-ddi.json")
+          const devicesJsonPath = join(metaDirectory, "devices.json")
+          const ddiServicesJsonPath = join(metaDirectory, "ddi-services.json")
+          const preflightReportPath = join(metaDirectory, "real-device-preflight.json")
+          const installedAppsJsonPath = join(metaDirectory, "installed-apps.json")
+          const launchJsonPath = join(metaDirectory, "target-app-launch.json")
+          const buildLogPath = join(buildLogsDirectory, "xcodebuild-build-for-testing-device.log")
+          const logPath = join(logsDirectory, "xcodebuild-session.log")
+          const stdoutEventsPath = join(args.runnerDirectory, "stdout-events.ndjson")
+          const resultBundlePath = join(args.runnerDirectory, "ProbeRunnerTransportBoundary.xcresult")
+          const wrapperStderrPath = join(logsDirectory, "runner-wrapper.stderr.log")
+          const xctestrunPath = join(args.runnerDirectory, "fake.xctestrun")
+          const targetAppPath = join(args.runnerDirectory, "ProbeFixture.app")
+          const runnerAppPath = join(args.runnerDirectory, "ProbeRunnerUITests-Runner.app")
+          const runnerXctestPath = join(args.runnerDirectory, "ProbeRunnerUITests.xctest")
+
+          await mkdir(metaDirectory, { recursive: true })
+          await mkdir(logsDirectory, { recursive: true })
+          await mkdir(buildLogsDirectory, { recursive: true })
+          await mkdir(observerControlDirectory, { recursive: true })
+          await mkdir(runtimeControlDirectory, { recursive: true })
+          await mkdir(resultBundlePath, { recursive: true })
+
+          await Promise.all([
+            writeFile(preferredDdiJsonPath, "{}\n", "utf8"),
+            writeFile(devicesJsonPath, "{}\n", "utf8"),
+            writeFile(ddiServicesJsonPath, "{}\n", "utf8"),
+            writeFile(preflightReportPath, "{}\n", "utf8"),
+            writeFile(installedAppsJsonPath, "{}\n", "utf8"),
+            writeFile(launchJsonPath, "{}\n", "utf8"),
+            writeFile(buildLogPath, "build ok\n", "utf8"),
+            writeFile(logPath, "runner ok\n", "utf8"),
+            writeFile(stdoutEventsPath, "{}\n", "utf8"),
+            writeFile(wrapperStderrPath, "", "utf8"),
+            writeFile(xctestrunPath, "<plist/>\n", "utf8"),
+            mkdir(targetAppPath, { recursive: true }),
+            mkdir(runnerAppPath, { recursive: true }),
+            mkdir(runnerXctestPath, { recursive: true }),
+          ])
+
+          running = true
+
+          return {
+            mode: "live",
+            device: {
+              identifier: "device-1",
+              name: "Test iPhone",
+              runtime: "iOS 18.0",
+            },
+            bundleId: args.bundleId,
+            hostCoreDeviceVersion: "506.7",
+            preferredDdiPath: "file:///Library/Developer/DeveloperDiskImages/iOS_DDI/",
+            preferredDdiJsonPath,
+            devicesJsonPath,
+            ddiServicesJsonPath,
+            preflightReportPath,
+            buildLogPath,
+            xctestrunPath,
+            targetAppPath,
+            runnerAppPath,
+            runnerXctestPath,
+            integrationPoints: [
+              "xcrun devicectl list preferredDDI --json-output <path>",
+              "xcrun devicectl list devices --json-output <path>",
+              "xcrun devicectl device info apps --device device-1 --bundle-id <bundle-id> --json-output <path>",
+              "xcrun devicectl device process launch --device device-1 --terminate-existing <bundle-id> --json-output <path>",
+            ],
+            warnings: ["Fake real-device live runner warning."],
+            connection: {
+              status: nextStatus,
+              checkedAt: "2026-04-10T00:00:00.000Z",
+              summary: nextStatus === "connected" ? "Device connected." : "Device disconnected.",
+              details: [],
+            },
+            refreshConnection: async () => {
+              const states = options?.connectionStates ?? ["connected"]
+              const status = states[Math.min(connectionIndex, states.length - 1)]!
+              connectionIndex += 1
+              return {
+                status,
+                checkedAt: new Date().toISOString(),
+                summary: status === "connected" ? "Device connected." : "Device disconnected.",
+                details: [],
+              }
+            },
+            close: async () => {
+              finishExit({ code: 0, signal: null })
+            },
+            bootstrapPath: "/tmp/probe-runner-bootstrap/device-device-1.json",
+            bootstrapSource: "device-bootstrap-manifest",
+            runnerTransportContract: "probe.runner.transport/hybrid-v1",
+            sessionIdentifier: args.sessionId,
+            commandIngress: "file-mailbox",
+            eventEgress: "stdout-jsonl-mixed-log",
+            wrapperProcessId: 4401,
+            testProcessId: 4402,
+            targetProcessId: 4403,
+            attachLatencyMs: 321,
+            runtimeControlDirectory,
+            observerControlDirectory,
+            logPath,
+            stdoutEventsPath,
+            resultBundlePath,
+            wrapperStderrPath,
+            stdinProbeStatus: "timeout",
+            installedAppsJsonPath,
+            launchJsonPath,
+            nextSequence: 2,
+            initialPingRttMs: 18,
+            sendCommand: async (sequence, action) => ({
+              ok: true,
+              action,
+              error: null,
+              payload: action === "ping" ? "pong" : null,
+              snapshotPayloadPath: null,
+              handledMs: 5,
+              statusLabel: `ok-${sequence}`,
+              snapshotNodeCount: null,
+              hostRttMs: 7,
+            }),
+            isWrapperRunning: () => running,
+            waitForExit,
           }
         },
         catch: (error) => error as EnvironmentError,
@@ -1205,6 +1459,57 @@ describe("SessionRegistry", () => {
 
         const failedHealth = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
         expect(failedHealth.warnings.some((warning) => warning.includes("Close and reopen the session"))).toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("passes attach-to-running mode through and reports arbitrary simulator bundle ids", async () => {
+    await withTempRoot(async (root) => {
+      let capturedOpenArgs: FakeHarnessOpenArgs | null = null
+
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          captureOpenArgs: (args) => {
+            capturedOpenArgs = args
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession({
+          ...openParams,
+          bundleId: "com.example.notes",
+          sessionMode: "attach-to-running",
+        }))
+
+        expect(capturedOpenArgs).not.toBeNull()
+
+        if (capturedOpenArgs === null) {
+          throw new Error("Expected attach-to-running open args to be captured")
+        }
+
+        const openArgs = capturedOpenArgs as FakeHarnessOpenArgs
+
+        expect(openArgs.bundleId).toBe("com.example.notes")
+        expect(openArgs.simulatorUdid).toBeNull()
+        expect(openArgs.sessionMode).toBe("attach-to-running")
+        expect(session.target.bundleId).toBe("com.example.notes")
+        expect(
+          session.capabilities.some((capability) =>
+            capability.summary.includes("default test bundle")
+            || capability.details.some((detail) => detail.includes("default test bundle")),
+          ),
+        ).toBe(false)
+        expect(session.warnings.some((warning) => warning.includes("arbitrary target bundle ids"))).toBe(false)
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {
@@ -1712,6 +2017,85 @@ describe("SessionRegistry", () => {
     })
   })
 
+  test("records runner video as an mp4 artifact and parses duration strings", async () => {
+    await withTempRoot(async (root) => {
+      const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
+
+      await withProbeFfmpegPath(fakeFfmpegPath, async () => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const result = await runtime.runPromise(registry.recordVideo({
+            sessionId: session.sessionId,
+            duration: "1m",
+          }))
+
+          expect(result.artifact.kind).toBe("mp4")
+          expect(result.artifact.absolutePath).toContain("/video/")
+          expect(result.summary).toContain("MP4 video artifact")
+          expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake mp4 data")
+
+          const recordVideoCommand = runnerCommands.find((command) => command.action === "recordVideo")
+          expect(recordVideoCommand?.payload).toBe("60000")
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
+  test("falls back to a frame-sequence bundle when ffmpeg is unavailable", async () => {
+    await withTempRoot(async (root) => {
+      await withProbeFfmpegPath(join(root, "missing-ffmpeg"), async () => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const result = await runtime.runPromise(registry.recordVideo({
+            sessionId: session.sessionId,
+            duration: "5s",
+          }))
+
+          expect(result.artifact.kind).toBe("directory")
+          expect(result.artifact.absolutePath).toContain("/video/")
+          expect(result.summary).toContain("frame-sequence video artifact")
+
+          const bundleEntries = await readdir(result.artifact.absolutePath)
+          expect(bundleEntries).toEqual(expect.arrayContaining(["frames.json", "frames.tar.gz"]))
+
+          const manifest = JSON.parse(await readFile(join(result.artifact.absolutePath, "frames.json"), "utf8")) as {
+            readonly frameCount: number
+            readonly durationMs: number
+            readonly archiveFile: string
+          }
+          expect(manifest.frameCount).toBe(1)
+          expect(manifest.durationMs).toBe(5_000)
+          expect(manifest.archiveFile).toBe("frames.tar.gz")
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
   test("captures stable snapshot artifacts and inline previews", async () => {
     await withTempRoot(async (root) => {
       const runtime = makeRuntime(root, createFakeHarness())
@@ -1880,7 +2264,7 @@ describe("SessionRegistry", () => {
         const replayScript: ActionRecordingScript = {
           ...exportedScript,
           steps: exportedScript.steps.map((step, stepIndex) =>
-            stepIndex === 1
+            stepIndex === 1 && "target" in step
               ? {
                   ...step,
                   target: {
@@ -2048,6 +2432,50 @@ describe("SessionRegistry", () => {
     })
   })
 
+  test("records screenshot and video artifact refs in replay reports", async () => {
+    await withTempRoot(async (root) => {
+      const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
+
+      await withProbeFfmpegPath(fakeFfmpegPath, async () => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const replayScript: ActionRecordingScript = {
+            contract: "probe.action-recording/script-v1",
+            recordedAt: "2026-04-10T00:00:00.000Z",
+            sessionId: null,
+            bundleId: "dev.probe.fixture",
+            steps: [
+              { kind: "screenshot" },
+              { kind: "video", durationMs: 5_000 },
+            ],
+          }
+
+          const replayed = await runtime.runPromise(registry.replayRecording({
+            sessionId: session.sessionId,
+            script: replayScript,
+          }))
+
+          expect(replayed.stepCount).toBe(2)
+
+          const report = JSON.parse(await readFile(replayed.artifact.absolutePath, "utf8")) as ReplayReport
+          expect(report.status).toBe("succeeded")
+          expect(report.steps[0]?.artifact?.kind).toBe("png")
+          expect(report.steps[0]?.artifact?.absolutePath).toContain("/screenshots/step-001-screenshot.png")
+          expect(report.steps[1]?.artifact?.kind).toBe("mp4")
+          expect(report.steps[1]?.artifact?.absolutePath).toContain("/video/step-002-video.mp4")
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
   test("writes replay failure artifacts when retries are exhausted", async () => {
     await withTempRoot(async (root) => {
       const runtime = makeRuntime(root, createFakeHarness({
@@ -2188,7 +2616,7 @@ describe("SessionRegistry", () => {
     })
   })
 
-  test("opens a degraded real-device preflight session with explicit capability differences", async () => {
+  test("opens a ready real-device live session with runner and perf support", async () => {
     await withTempRoot(async (root) => {
       const runtime = makeRuntime(root, createFakeHarness(), {
         realDeviceHarness: createFakeRealDeviceHarness(),
@@ -2201,18 +2629,22 @@ describe("SessionRegistry", () => {
 
         const session = await runtime.runPromise(registry.openDeviceSession(deviceOpenParams))
 
-        expect(session.state).toBe("degraded")
+        expect(session.state).toBe("ready")
         expect(session.target.platform).toBe("device")
         expect(session.connection.status).toBe("connected")
-        expect(session.resources.runner).toBe("degraded")
-        expect(session.transport.kind).toBe("real-device-preflight")
-        expect(session.runner.kind).toBe("real-device-preflight")
+        expect(session.resources.runner).toBe("ready")
+        expect(session.transport.kind).toBe("real-device-live")
+        expect(session.runner.kind).toBe("real-device-live")
 
         const realDeviceCapability = session.capabilities.find((capability) => capability.area === "real-device")
         const simulatorCapability = session.capabilities.find((capability) => capability.area === "simulator")
+        const runnerCapability = session.capabilities.find((capability) => capability.area === "runner")
+        const perfCapability = session.capabilities.find((capability) => capability.area === "perf")
 
-        expect(realDeviceCapability?.status).toBe("degraded")
+        expect(realDeviceCapability?.status).toBe("supported")
         expect(simulatorCapability?.status).toBe("unsupported")
+        expect(runnerCapability?.status).toBe("supported")
+        expect(perfCapability?.status).toBe("supported")
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {
