@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { access, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { join, relative } from "node:path"
 import { Context, Effect, Layer, Ref } from "effect"
 import {
@@ -88,6 +88,8 @@ interface RunnerVideoCaptureManifest {
   readonly frameCount: number
   readonly framesDirectoryPath: string
 }
+
+type VideoArtifactMode = "mp4" | "mov" | "frame-sequence"
 
 const parseDurationStringMs = (value: string): number | null => {
   const match = value.match(/^(\d+)(ms|s|m|h)$/)
@@ -252,6 +254,19 @@ const sanitizeFileComponent = (value: string | null | undefined, fallback: strin
     .replace(/^-+|-+$/g, "")
 
   return sanitized.length > 0 ? sanitized : fallback
+}
+
+const describeVideoArtifactLabel = (mode: VideoArtifactMode, options?: { readonly includeArtifact?: boolean }): string => {
+  const suffix = options?.includeArtifact === false ? "" : " artifact"
+
+  switch (mode) {
+    case "mp4":
+      return `MP4 video${suffix}`
+    case "mov":
+      return `QuickTime video${suffix}`
+    case "frame-sequence":
+      return `frame-sequence video${suffix}`
+  }
 }
 
 const isHittabilityFailure = (reason: string): boolean => /\bhittable\b|\boffscreen\b/i.test(reason)
@@ -605,12 +620,13 @@ const buildSimulatorCapabilities = (): ReadonlyArray<CapabilityReport> => [
     area: "simulator",
     status: "supported",
     summary:
-      "The daemon can resolve a concrete simulator UDID, boot it, either build/install Probe's fixture app or attach to an already-running installed app, and capture runner-backed screenshots and videos into the session artifact root.",
+      "The daemon can resolve a concrete simulator UDID, boot it, either build/install Probe's fixture app or attach to an already-running installed app, and capture native simulator screenshots and videos into the session artifact root.",
     details: [
       "Uses simctl list --json plus bootstatus -b for deterministic simulator selection.",
       "Fixture sessions use simctl install and simctl launch --terminate-running-process before runner attach.",
       "Arbitrary-app sessions verify installation/running state with simctl launch plus simctl listapps before runner attach.",
-      "Runner-backed screenshots land under screenshots/, and runner-backed video artifacts land under video/.",
+      "Screenshots use simctl io screenshot and land under screenshots/.",
+      "Videos use simctl io recordVideo and land under video/.",
     ],
   },
   {
@@ -1292,6 +1308,18 @@ export const SessionRegistryLive = Layer.scoped(
         yield* Effect.tryPromise({
           try: async () => {
             await mkdir(screenshotsDirectory, { recursive: true })
+
+            if (response.inlinePayload != null) {
+              if (response.inlinePayloadEncoding !== "base64") {
+                throw new Error(
+                  `Expected base64 inline screenshot payload, received ${response.inlinePayloadEncoding ?? "unknown"}.`,
+                )
+              }
+
+              await writeFile(absolutePath, Buffer.from(response.inlinePayload, "base64"))
+              return
+            }
+
             await rename(response.snapshotPayloadPath!, absolutePath)
           },
           catch: (error) =>
@@ -1318,6 +1346,73 @@ export const SessionRegistryLive = Layer.scoped(
           artifact,
           statusLabel: response.statusLabel,
         }
+      })
+
+    const captureSimulatorScreenshotArtifact = (args: {
+      readonly sessionId: string
+      readonly record: SimulatorActiveSessionRecord
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+      readonly summary: string
+    }) =>
+      Effect.gen(function* () {
+        const screenshotsDirectory = join(args.record.health.artifactRoot, "screenshots")
+        const absolutePath = join(screenshotsDirectory, `${args.fileStem}.png`)
+
+        yield* simulatorHarness.captureSimulatorScreenshot({
+          simulatorUdid: args.record.health.target.deviceId,
+          absolutePath,
+        })
+
+        const artifact = createArtifactRecord({
+          artifactRoot: args.record.health.artifactRoot,
+          key: args.artifactKey,
+          label: args.artifactLabel,
+          kind: "png",
+          absolutePath,
+          summary: args.summary,
+        })
+
+        yield* artifactStore.registerArtifact(args.sessionId, artifact)
+
+        return {
+          artifact,
+          statusLabel: null,
+        }
+      })
+
+    const captureScreenshotArtifact = (args: {
+      readonly sessionId: string
+      readonly record: ActiveSessionRecord
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+      readonly summary: string
+    }) =>
+      Effect.gen(function* () {
+        if (isSimulatorRecord(args.record)) {
+          return yield* captureSimulatorScreenshotArtifact({
+            ...args,
+            record: args.record,
+          })
+        }
+
+        if (!isRunnerBackedRecord(args.record)) {
+          return yield* new UnsupportedCapabilityError({
+            code: "session-screenshot-real-device",
+            capability: "session.screenshot",
+            reason: "This session does not currently expose a live runner transport for screenshots.",
+            nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+            details: [],
+            wall: false,
+          })
+        }
+
+        return yield* captureRunnerScreenshotArtifact({
+          ...args,
+          record: args.record,
+        })
       })
 
     const materializeFrameSequenceArtifact = (args: {
@@ -1591,6 +1686,153 @@ export const SessionRegistryLive = Layer.scoped(
           statusLabel: response.statusLabel,
           mode: "mp4" as const,
         }
+      })
+
+    const captureSimulatorVideoArtifact = (args: {
+      readonly sessionId: string
+      readonly record: SimulatorActiveSessionRecord
+      readonly durationMs: number
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+    }) =>
+      Effect.gen(function* () {
+        const videoDirectory = join(args.record.health.artifactRoot, "video")
+        const movPath = join(videoDirectory, `${args.fileStem}.mov`)
+
+        yield* simulatorHarness.recordSimulatorVideo({
+          simulatorUdid: args.record.health.target.deviceId,
+          absolutePath: movPath,
+          durationMs: args.durationMs,
+        })
+
+        const ffmpegAvailable = yield* Effect.tryPromise({
+          try: isFfmpegAvailable,
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-ffmpeg-check",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect ffmpeg availability and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (!ffmpegAvailable) {
+          const artifact = createArtifactRecord({
+            artifactRoot: args.record.health.artifactRoot,
+            key: args.artifactKey,
+            label: args.artifactLabel,
+            kind: "mov",
+            absolutePath: movPath,
+            summary:
+              `Native simulator QuickTime video captured over simctl with requested duration ${args.durationMs}ms because ffmpeg was not available to remux it to MP4.`,
+          })
+
+          yield* artifactStore.registerArtifact(args.sessionId, artifact)
+
+          return {
+            artifact,
+            statusLabel: null,
+            mode: "mov" as const,
+          }
+        }
+
+        const ffmpegExecutable = resolveFfmpegExecutable()
+        const absolutePath = join(videoDirectory, `${args.fileStem}.mp4`)
+        const ffmpegResult = yield* Effect.tryPromise({
+          try: () =>
+            runHostCommand({
+              command: ffmpegExecutable,
+              commandArgs: [
+                "-y",
+                "-i",
+                movPath,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                absolutePath,
+              ],
+              timeoutMs: args.durationMs + 30_000,
+            }),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-ffmpeg-run",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect ffmpeg availability and retry the video request.",
+              details: [],
+            }),
+        })
+
+        if (ffmpegResult.exitCode !== 0) {
+          return yield* new EnvironmentError({
+            code: "session-video-ffmpeg-run",
+            reason: formatHostCommandFailure(`${ffmpegExecutable} -i`, ffmpegResult),
+            nextStep: "Inspect ffmpeg availability and retry the video request.",
+            details: [],
+          })
+        }
+
+        yield* Effect.tryPromise({
+          try: () => rm(movPath, { force: true }).catch(() => undefined),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-cleanup",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect the session video directory and retry the video request.",
+              details: [],
+            }),
+        })
+
+        const artifact = createArtifactRecord({
+          artifactRoot: args.record.health.artifactRoot,
+          key: args.artifactKey,
+          label: args.artifactLabel,
+          kind: "mp4",
+          absolutePath,
+          summary: `Native simulator video captured over simctl and remuxed to MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
+        })
+
+        yield* artifactStore.registerArtifact(args.sessionId, artifact)
+
+        return {
+          artifact,
+          statusLabel: null,
+          mode: "mp4" as const,
+        }
+      })
+
+    const captureVideoArtifact = (args: {
+      readonly sessionId: string
+      readonly record: ActiveSessionRecord
+      readonly durationMs: number
+      readonly fileStem: string
+      readonly artifactKey: string
+      readonly artifactLabel: string
+    }) =>
+      Effect.gen(function* () {
+        if (isSimulatorRecord(args.record)) {
+          return yield* captureSimulatorVideoArtifact({
+            ...args,
+            record: args.record,
+          })
+        }
+
+        if (!isRunnerBackedRecord(args.record)) {
+          return yield* new UnsupportedCapabilityError({
+            code: "session-video-real-device",
+            capability: "session.video",
+            reason: "This session does not currently expose a live runner transport for video capture.",
+            nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+            details: [],
+            wall: false,
+          })
+        }
+
+        return yield* captureRunnerVideoArtifact({
+          ...args,
+          record: args.record,
+        })
       })
 
     const persistRecordHealth = (sessionId: string, record: ActiveSessionRecord) =>
@@ -2129,7 +2371,19 @@ export const SessionRegistryLive = Layer.scoped(
         }
 
         const rawPayload = yield* Effect.tryPromise({
-          try: () => readFile(response.snapshotPayloadPath!, "utf8"),
+          try: async () => {
+            if (response.inlinePayload != null) {
+              if (response.inlinePayloadEncoding !== "utf8") {
+                throw new Error(
+                  `Expected utf8 inline snapshot payload, received ${response.inlinePayloadEncoding ?? "unknown"}.`,
+                )
+              }
+
+              return response.inlinePayload
+            }
+
+            return await readFile(response.snapshotPayloadPath!, "utf8")
+          },
           catch: (error) =>
             new EnvironmentError({
               code: "session-snapshot-read",
@@ -3363,13 +3617,13 @@ export const SessionRegistryLive = Layer.scoped(
 
           if (action.kind === "screenshot") {
             const fileStem = `${timestampForFile()}-screenshot`
-            const captureResult = yield* Effect.either(captureRunnerScreenshotArtifact({
+            const captureResult = yield* Effect.either(captureScreenshotArtifact({
               sessionId,
               record,
               fileStem,
               artifactKey: `screenshot-${fileStem}`,
               artifactLabel: "screenshot",
-              summary: `Runner screenshot captured for session ${sessionId}.`,
+              summary: `Screenshot captured for session ${sessionId}.`,
             }))
 
             if (captureResult._tag === "Left") {
@@ -3399,7 +3653,7 @@ export const SessionRegistryLive = Layer.scoped(
             const durationMs = normalizeVideoDurationMs(action.durationMs)
             const normalizedAction: SessionAction = { kind: "video", durationMs }
             const fileStem = `${timestampForFile()}-video`
-            const captureResult = yield* Effect.either(captureRunnerVideoArtifact({
+            const captureResult = yield* Effect.either(captureVideoArtifact({
               sessionId,
               record,
               durationMs,
@@ -3419,9 +3673,7 @@ export const SessionRegistryLive = Layer.scoped(
             yield* persistHealth(sessionId, record.health)
             yield* syncDaemonMetadata
 
-            const modeSummary = captureResult.right.mode === "mp4"
-              ? "MP4 video artifact"
-              : "frame-sequence video artifact"
+            const modeSummary = describeVideoArtifactLabel(captureResult.right.mode)
             const clampNote = durationMs !== action.durationMs
               ? ` Requested duration ${action.durationMs}ms was clamped to ${durationMs}ms.`
               : ""
@@ -3632,7 +3884,7 @@ export const SessionRegistryLive = Layer.scoped(
 
               if (step.kind === "screenshot") {
                 const fileStem = `step-${String(index + 1).padStart(3, "0")}-screenshot`
-                const capture = yield* Effect.either(captureRunnerScreenshotArtifact({
+                const capture = yield* Effect.either(captureScreenshotArtifact({
                   sessionId,
                   record,
                   fileStem,
@@ -3666,7 +3918,7 @@ export const SessionRegistryLive = Layer.scoped(
               if (step.kind === "video") {
                 const durationMs = normalizeVideoDurationMs(step.durationMs)
                 const fileStem = `step-${String(index + 1).padStart(3, "0")}-video`
-                const capture = yield* Effect.either(captureRunnerVideoArtifact({
+                const capture = yield* Effect.either(captureVideoArtifact({
                   sessionId,
                   record,
                   durationMs,
@@ -3684,9 +3936,7 @@ export const SessionRegistryLive = Layer.scoped(
                   retriedStepCount += 1
                 }
 
-                const modeSummary = capture.right.mode === "mp4"
-                  ? "MP4 video"
-                  : "frame-sequence video"
+                const modeSummary = describeVideoArtifactLabel(capture.right.mode, { includeArtifact: false })
                 const clampNote = durationMs !== step.durationMs
                   ? ` Requested duration ${step.durationMs}ms was clamped to ${durationMs}ms.`
                   : ""
@@ -3892,26 +4142,15 @@ export const SessionRegistryLive = Layer.scoped(
 
           yield* assertRunnerActionsAvailable(record)
 
-          if (!isRunnerBackedRecord(record)) {
-            return yield* new UnsupportedCapabilityError({
-              code: "session-screenshot-real-device",
-              capability: "session.screenshot",
-              reason: "This session does not currently expose a live runner transport for screenshots.",
-              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-              details: [],
-              wall: false,
-            })
-          }
-
           const labelStem = sanitizeFileComponent(label, "screenshot")
           const fileStem = `${timestampForFile()}-${labelStem}`
-          const capture = yield* Effect.either(captureRunnerScreenshotArtifact({
+          const capture = yield* Effect.either(captureScreenshotArtifact({
             sessionId,
             record,
             fileStem,
             artifactKey: `screenshot-${fileStem}`,
             artifactLabel: label ?? "screenshot",
-            summary: `Runner screenshot captured for session ${sessionId}.`,
+            summary: `Screenshot captured for session ${sessionId}.`,
           }))
 
           if (capture._tag === "Left") {
@@ -3940,17 +4179,6 @@ export const SessionRegistryLive = Layer.scoped(
 
           yield* assertRunnerActionsAvailable(record)
 
-          if (!isRunnerBackedRecord(record)) {
-            return yield* new UnsupportedCapabilityError({
-              code: "session-video-real-device",
-              capability: "session.video",
-              reason: "This session does not currently expose a live runner transport for video capture.",
-              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-              details: [],
-              wall: false,
-            })
-          }
-
           const parsedDurationMs = parseDurationStringMs(duration)
 
           if (parsedDurationMs === null) {
@@ -3964,7 +4192,7 @@ export const SessionRegistryLive = Layer.scoped(
 
           const durationMs = normalizeVideoDurationMs(parsedDurationMs)
           const fileStem = `${timestampForFile()}-${sanitizeFileComponent(duration, "video")}`
-          const capture = yield* Effect.either(captureRunnerVideoArtifact({
+          const capture = yield* Effect.either(captureVideoArtifact({
             sessionId,
             record,
             durationMs,
@@ -3983,9 +4211,7 @@ export const SessionRegistryLive = Layer.scoped(
           yield* refreshSessionArtifacts(sessionId, record)
           yield* persistRecordHealth(sessionId, record)
 
-          const modeSummary = capture.right.mode === "mp4"
-            ? "MP4 video artifact"
-            : "frame-sequence video artifact"
+          const modeSummary = describeVideoArtifactLabel(capture.right.mode)
           const clampNote = durationMs !== parsedDurationMs
             ? ` Requested duration ${duration} was clamped to ${durationMs}ms.`
             : ""

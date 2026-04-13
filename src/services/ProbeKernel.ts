@@ -1135,7 +1135,7 @@ export const ProbeKernelLive = Layer.effect(
               "Session snapshots keep the full stable-ref tree artifact-backed and only inline interactive/collapsed previews that stay inside the compact snapshot budget.",
               "Session logs support bounded simulator capture plus tails from existing artifact-backed runner/build/wrapper outputs.",
               "Real-device sessions now open a live runner when CoreDevice/DDI/signing checks pass, but they still fail closed on missing setup or transport loss.",
-              "Session screenshots and video capture now route through the runner on both simulator and device; ffmpeg only changes whether video is emitted as MP4 or retained as a frame-sequence bundle.",
+              "Session screenshots now use native simctl capture on Simulator and runner capture on device; simulator video uses native simctl capture while device video still uses the runner frame loop, with ffmpeg remux/stitching improving the emitted artifact format when available.",
               "On Simulator, omit --bundle-id to use Probe's fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app; on device, the app must already be installed so Probe can launch and attach to it.",
               "Perf recording defaults to 60s for metal-system-trace and 3s for the other supported perf templates.",
               ...(workspaceDiagnostics.startupRecovery?.summary ? [workspaceDiagnostics.startupRecovery.summary] : []),

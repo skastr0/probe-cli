@@ -68,6 +68,8 @@ export interface RunnerCommandResult {
   readonly error: string | null
   readonly payload: string | null
   readonly snapshotPayloadPath: string | null
+  readonly inlinePayload?: string | null
+  readonly inlinePayloadEncoding?: string | null
   readonly handledMs: number
   readonly statusLabel: string
   readonly snapshotNodeCount: number | null
@@ -500,6 +502,123 @@ const runCommandWithCapturedStdout = async (args: {
   })
 }
 
+const captureSimulatorScreenshotWithSimctl = async (args: {
+  readonly simulatorUdid: string
+  readonly absolutePath: string
+}): Promise<void> => {
+  await ensureDirectory(dirname(args.absolutePath))
+  await removeFileIfExists(args.absolutePath)
+
+  await runCommand({
+    command: "xcrun",
+    commandArgs: ["simctl", "io", args.simulatorUdid, "screenshot", args.absolutePath],
+  })
+
+  if (!(await fileExists(args.absolutePath))) {
+    throw new Error(`simctl screenshot completed without creating ${args.absolutePath}.`)
+  }
+}
+
+const recordSimulatorVideoWithSimctl = async (args: {
+  readonly simulatorUdid: string
+  readonly absolutePath: string
+  readonly durationMs: number
+}): Promise<void> => {
+  await ensureDirectory(dirname(args.absolutePath))
+  await removeFileIfExists(args.absolutePath)
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      "xcrun",
+      ["simctl", "io", args.simulatorUdid, "recordVideo", "--force", args.absolutePath],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
+      },
+    )
+
+    let stdout = ""
+    let stderr = ""
+    let stopRequested = false
+    let recordingStarted = false
+
+    const requestStop = () => {
+      if (stopRequested || child.killed || child.exitCode !== null) {
+        return
+      }
+
+      stopRequested = true
+      child.kill("SIGINT")
+    }
+
+    const startupTimeout = setTimeout(() => {
+      if (!recordingStarted) {
+        requestStop()
+      }
+    }, 15_000)
+
+    let stopTimer = setTimeout(requestStop, args.durationMs)
+    const hardTimeout = setTimeout(() => {
+      requestStop()
+
+      setTimeout(() => {
+        if (child.exitCode === null) {
+          child.kill("SIGKILL")
+        }
+      }, 2_000)
+    }, args.durationMs + 30_000)
+
+    child.stdout?.setEncoding("utf8")
+    child.stderr?.setEncoding("utf8")
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk
+    })
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk
+
+      if (!recordingStarted && stderr.includes("Recording started")) {
+        recordingStarted = true
+        clearTimeout(stopTimer)
+        stopTimer = setTimeout(requestStop, args.durationMs)
+      }
+    })
+
+    child.once("error", (error) => {
+      clearTimeout(startupTimeout)
+      clearTimeout(stopTimer)
+      clearTimeout(hardTimeout)
+      reject(error)
+    })
+    child.once("close", (exitCode, signal) => {
+      clearTimeout(startupTimeout)
+      clearTimeout(stopTimer)
+      clearTimeout(hardTimeout)
+
+      const completedGracefully = exitCode === 0 || (stopRequested && signal === "SIGINT")
+
+      if (completedGracefully) {
+        resolve()
+        return
+      }
+
+      reject(
+        new ChildProcessError({
+          code: "command-failed",
+          command: `xcrun simctl io ${args.simulatorUdid} recordVideo ${args.absolutePath}`,
+          reason: `xcrun simctl io recordVideo exited with ${exitCode ?? signal ?? "unknown"}.`,
+          nextStep: "Inspect the simulator media capture command and retry the video request.",
+          exitCode,
+          stderrExcerpt: `${stdout}${stderr}`.split(/\r?\n/).slice(-80).join("\n"),
+        }),
+      )
+    })
+  })
+
+  if (!(await fileExists(args.absolutePath))) {
+    throw new Error(`simctl recordVideo completed without creating ${args.absolutePath}.`)
+  }
+}
+
 const parseProcessId = (stdout: string): number => {
   const match = stdout.match(/:\s*(\d+)\s*$/)
 
@@ -749,6 +868,7 @@ const startWrapperProcess = async (args: {
 }> => {
   await ensureDirectory(args.observerControlDirectory)
   await ensureDirectory(dirname(args.wrapperStderrPath))
+  await writeFile(args.wrapperStderrPath, "", "utf8")
 
   const wrapperScript = join(
     args.rootDir,
@@ -846,6 +966,15 @@ export class SimulatorHarness extends Context.Tag("@probe/SimulatorHarness")<
       readonly logsDirectory: string
       readonly captureSeconds: number
       readonly predicate: string | null
+    }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError | ChildProcessError>
+    readonly captureSimulatorScreenshot: (args: {
+      readonly simulatorUdid: string
+      readonly absolutePath: string
+    }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError | ChildProcessError>
+    readonly recordSimulatorVideo: (args: {
+      readonly simulatorUdid: string
+      readonly absolutePath: string
+      readonly durationMs: number
     }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError | ChildProcessError>
     readonly reapStaleRunnerSession: (args: {
       readonly sessionId: string
@@ -1084,6 +1213,8 @@ export const SimulatorHarnessLive = Layer.succeed(
                 error: stdoutResponse.error ?? null,
                 payload: stdoutResponse.payload ?? null,
                 snapshotPayloadPath: stdoutResponse.snapshotPayloadPath ?? null,
+                inlinePayload: stdoutResponse.inlinePayload ?? null,
+                inlinePayloadEncoding: stdoutResponse.inlinePayloadEncoding ?? null,
                 handledMs: stdoutResponse.handledMs,
                 statusLabel: stdoutResponse.statusLabel,
                 snapshotNodeCount: stdoutResponse.snapshotNodeCount ?? null,
@@ -1258,6 +1389,38 @@ export const SimulatorHarnessLive = Layer.succeed(
                 code: "simulator-log-capture",
                 reason: error instanceof Error ? error.message : String(error),
                 nextStep: "Inspect the simulator log capture command and retry the session logs request.",
+                details: [],
+              }),
+      }),
+    captureSimulatorScreenshot: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          await captureSimulatorScreenshotWithSimctl(args)
+          return { absolutePath: args.absolutePath }
+        },
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "simulator-screenshot-capture",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the simctl screenshot command and retry the screenshot request.",
+                details: [],
+              }),
+      }),
+    recordSimulatorVideo: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          await recordSimulatorVideoWithSimctl(args)
+          return { absolutePath: args.absolutePath }
+        },
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "simulator-video-capture",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the simctl recordVideo command and retry the video request.",
                 details: [],
               }),
       }),

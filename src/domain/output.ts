@@ -9,7 +9,7 @@ export type OutputMode = typeof OutputMode.Type
 export const OutputFormat = Schema.Literal("json", "text")
 export type OutputFormat = typeof OutputFormat.Type
 
-export const ArtifactKind = Schema.Literal("json", "text", "ndjson", "xml", "directory", "png", "mp4")
+export const ArtifactKind = Schema.Literal("json", "text", "ndjson", "xml", "directory", "png", "mp4", "mov")
 export type ArtifactKind = typeof ArtifactKind.Type
 
 export const SessionLogSource = Schema.Literal("runner", "build", "wrapper", "stdout", "simulator")

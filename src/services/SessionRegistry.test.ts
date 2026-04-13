@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { Effect, Either, Layer, ManagedRuntime } from "effect"
 import type { ActionRecordingScript, ReplayReport } from "../domain/action"
 import type { SessionDebuggerDetails } from "../domain/debug"
@@ -400,6 +400,12 @@ const createFakeHarness = (options?: {
     action: FakeHarnessUiActionIntercept,
   ) => FakeHarnessUiActionInterceptResult | null | undefined
 }) => {
+  const pngFixtureBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==",
+    "base64",
+  )
+  const videoFixtureBytes = Buffer.from("fake native simulator video", "utf8")
+
   return SimulatorHarness.of({
     openSession: (args) =>
       Effect.tryPromise({
@@ -472,11 +478,6 @@ const createFakeHarness = (options?: {
             closeCalls += 1
             finishExit({ code: 0, signal: null })
           }
-
-          const pngFixtureBytes = Buffer.from(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==",
-            "base64",
-          )
 
           let statusLabel = "Ready for attach/control validation"
           let inputValue = ""
@@ -818,6 +819,36 @@ const createFakeHarness = (options?: {
             code: "fake-harness-log-capture",
             reason: error instanceof Error ? error.message : String(error),
             nextStep: "Inspect the fake harness log capture path.",
+            details: [],
+          }),
+      }),
+    captureSimulatorScreenshot: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          await mkdir(dirname(args.absolutePath), { recursive: true })
+          await writeFile(args.absolutePath, pngFixtureBytes)
+          return { absolutePath: args.absolutePath }
+        },
+        catch: (error) =>
+          new EnvironmentError({
+            code: "fake-harness-screenshot-capture",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the fake harness screenshot path.",
+            details: [],
+          }),
+      }),
+    recordSimulatorVideo: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          await mkdir(dirname(args.absolutePath), { recursive: true })
+          await writeFile(args.absolutePath, videoFixtureBytes)
+          return { absolutePath: args.absolutePath }
+        },
+        catch: (error) =>
+          new EnvironmentError({
+            code: "fake-harness-video-capture",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the fake harness video path.",
             details: [],
           }),
       }),
@@ -1984,7 +2015,12 @@ describe("SessionRegistry", () => {
 
   test("captures screenshots as png artifacts even when inline output is requested", async () => {
     await withTempRoot(async (root) => {
-      const runtime = makeRuntime(root, createFakeHarness())
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
 
       try {
         const registry = await runtime.runPromise(Effect.gen(function* () {
@@ -2006,6 +2042,7 @@ describe("SessionRegistry", () => {
 
         const screenshotBytes = await readFile(result.artifact.absolutePath)
         expect(screenshotBytes.byteLength).toBeGreaterThan(0)
+        expect(runnerCommands.some((command) => command.action === "screenshot")).toBe(false)
 
         const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
         expect(health.artifacts.some((artifact) => artifact.kind === "png")).toBe(true)
@@ -2017,7 +2054,7 @@ describe("SessionRegistry", () => {
     })
   })
 
-  test("records runner video as an mp4 artifact and parses duration strings", async () => {
+  test("records simulator video as a remuxed mp4 artifact without runner stitching", async () => {
     await withTempRoot(async (root) => {
       const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
 
@@ -2044,9 +2081,7 @@ describe("SessionRegistry", () => {
           expect(result.artifact.absolutePath).toContain("/video/")
           expect(result.summary).toContain("MP4 video artifact")
           expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake mp4 data")
-
-          const recordVideoCommand = runnerCommands.find((command) => command.action === "recordVideo")
-          expect(recordVideoCommand?.payload).toBe("60000")
+          expect(runnerCommands.some((command) => command.action === "recordVideo")).toBe(false)
 
           await runtime.runPromise(registry.closeSession(session.sessionId))
         } finally {
@@ -2056,10 +2091,16 @@ describe("SessionRegistry", () => {
     })
   })
 
-  test("falls back to a frame-sequence bundle when ffmpeg is unavailable", async () => {
+  test("falls back to a native simulator mov artifact when ffmpeg is unavailable", async () => {
     await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+
       await withProbeFfmpegPath(join(root, "missing-ffmpeg"), async () => {
-        const runtime = makeRuntime(root, createFakeHarness())
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
 
         try {
           const registry = await runtime.runPromise(Effect.gen(function* () {
@@ -2069,24 +2110,15 @@ describe("SessionRegistry", () => {
           const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
           const result = await runtime.runPromise(registry.recordVideo({
             sessionId: session.sessionId,
-            duration: "5s",
+            duration: "1m",
           }))
 
-          expect(result.artifact.kind).toBe("directory")
+          expect(result.artifact.kind).toBe("mov")
           expect(result.artifact.absolutePath).toContain("/video/")
-          expect(result.summary).toContain("frame-sequence video artifact")
-
-          const bundleEntries = await readdir(result.artifact.absolutePath)
-          expect(bundleEntries).toEqual(expect.arrayContaining(["frames.json", "frames.tar.gz"]))
-
-          const manifest = JSON.parse(await readFile(join(result.artifact.absolutePath, "frames.json"), "utf8")) as {
-            readonly frameCount: number
-            readonly durationMs: number
-            readonly archiveFile: string
-          }
-          expect(manifest.frameCount).toBe(1)
-          expect(manifest.durationMs).toBe(5_000)
-          expect(manifest.archiveFile).toBe("frames.tar.gz")
+          expect(result.artifact.absolutePath.endsWith(".mov")).toBe(true)
+          expect(result.summary).toContain("QuickTime video artifact")
+          expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake native simulator video")
+          expect(runnerCommands.some((command) => command.action === "recordVideo")).toBe(false)
 
           await runtime.runPromise(registry.closeSession(session.sessionId))
         } finally {
