@@ -426,11 +426,55 @@ probe drill --session-id <id> --artifact result-bundle --xcresult summary --json
 
 These are the things Probe needs so it does not lose on basic agent usability.
 
-## 6.1 First-class multi-step execution
+## 6.0 Transport reliability (prerequisite for everything else)
 
 ### Why
 
-Probe must stop forcing agents to stitch together one action at a time with excessive orchestration overhead.
+The runner transport is the foundation that every other feature builds on. If agents cannot send commands and receive responses reliably, nothing else matters.
+
+The current simulator transport uses file-mailbox polling: host writes a command file, runner polls a directory every second with a 20-second timeout, then writes a response file. This transport loses the race on the second action every time. The first action after session open succeeds, but the round-trip for subsequent actions exceeds the 20-second timeout and the runner exits.
+
+This is not a degraded fallback. This is broken behavior that lies about being usable.
+
+### Direction
+
+Replace file-mailbox with HTTP POST, matching the transport already proven on real-device sessions (work item 041) and by `agent-device`. The runner starts an `NWListener` TCP server inside the XCUITest process, the daemon sends `fetch()` requests. No file polling. No per-command timeout. The runner stays alive for the session lifetime — the daemon decides when the session ends.
+
+### Hard rules
+
+- **No silent degradation.** If the HTTP server fails to start, that's a hard error with a diagnostic message. No fallback to polling.
+- **No per-command timeout in the runner.** The runner is a server. It listens. The daemon controls lifetime.
+- **File-mailbox is removed, not deprecated.** It is architecturally incompatible with interactive use.
+
+### Impact
+
+This unblocks the entire interactive exploration loop: agent snapshots, sees something, taps, snapshots again, repeats. Sub-second round-trips. No timeout anxiety. The agent can think for 30 seconds between actions and the runner is still there.
+
+## 6.1 Interactive exploration is the primary path
+
+### Why
+
+The agent's primary workflow is NOT replaying a pre-written flow. It is:
+
+```
+snapshot → observe → decide → tap → snapshot → observe → decide → tap → ...
+```
+
+Every step depends on what the agent sees after the previous step. You cannot pre-write a `flow.json` for this because you don't know what's on screen until you snapshot it.
+
+`probe session run --file flow.json` is a replay tool. It assumes you already know the full sequence. Replay is downstream — you record an interactive session and replay it later.
+
+The primary path MUST be fast per-action round-trips: snapshot, tap, snapshot, tap — with sub-second latency between each. Replay builds on top of a working interactive loop, not the other way around.
+
+### Direction
+
+The interactive loop IS the product. Everything else — `session run`, `validate`, replay — is built on top of that loop working.
+
+## 6.2 First-class multi-step execution
+
+### Why
+
+For flows the agent DOES know in advance (replay, validation plans, test suites), Probe should execute them as a single submission rather than N individual CLI round-trips.
 
 ### Direction
 
@@ -1239,14 +1283,20 @@ These are promising but should follow commerce/accessibility/perf.
 
 ## 14. V2 sequencing recommendation
 
+## 14.0 P-critical — transport (blocks everything)
+
+1. Replace simulator file-mailbox with HTTP POST (work item 046)
+2. Remove file-mailbox code entirely
+3. Validate interactive exploration loop: 10+ sequential actions without timeout
+
 ## 14.1 P0 — table stakes and structure
 
-1. `probe session run`
-2. unified selectors
-3. built-in retries
-4. waits and asserts as first-class flow steps
-5. `session list` and `session show`
-6. `logs mark` and better logs packaging
+1. unified selectors
+2. built-in retries
+3. waits and asserts as first-class flow steps
+4. `session list` and `session show`
+5. `logs mark` and better logs packaging
+6. `probe session run` (multi-step execution — this is replay, not the primary path)
 7. replay/result report polish
 
 ## 14.2 P1 — first validation lanes
