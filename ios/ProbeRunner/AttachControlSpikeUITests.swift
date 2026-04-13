@@ -43,6 +43,8 @@ final class AttachControlSpikeUITests: XCTestCase {
     let action: String
     let error: String?
     let handledMs: Int
+    let inlinePayload: String?
+    let inlinePayloadEncoding: String?
     let kind: String
     let ok: Bool
     let payload: String?
@@ -54,9 +56,17 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private struct LifecycleCommandResult {
+    let inlinePayload: String?
+    let inlinePayloadEncoding: String?
     let payload: String?
     let snapshotPayloadPath: String?
     let snapshotNodeCount: Int?
+  }
+
+  private struct ParsedHTTPRequest {
+    let method: String
+    let target: String
+    let body: Data
   }
 
   private struct LifecycleVideoCaptureManifest: Codable {
@@ -564,7 +574,11 @@ final class AttachControlSpikeUITests: XCTestCase {
     // so we only assert its existence for the fixture bundle ID.
     let isFixtureApp = resolvedControlDirectory.config.targetBundleId == "dev.probe.fixture"
     let statusLabel = app.staticTexts["fixture.status.label"]
-    let statusLabelExists = statusLabel.waitForExistence(timeout: interactionTimeout)
+    // Only wait for the fixture status label on fixture apps.
+    // Non-fixture apps won't have this element and the wait just wastes time.
+    let statusLabelExists = isFixtureApp
+      ? statusLabel.waitForExistence(timeout: interactionTimeout)
+      : false
 
     if isFixtureApp {
       XCTAssertTrue(statusLabelExists, statusLabelFailureMessage)
@@ -856,6 +870,8 @@ final class AttachControlSpikeUITests: XCTestCase {
         action: command.action,
         error: nil,
         handledMs: milliseconds(since: startedAt),
+        inlinePayload: result.inlinePayload,
+        inlinePayloadEncoding: result.inlinePayloadEncoding,
         kind: "response",
         ok: true,
         payload: result.payload,
@@ -870,6 +886,8 @@ final class AttachControlSpikeUITests: XCTestCase {
         action: command.action,
         error: String(describing: error),
         handledMs: milliseconds(since: startedAt),
+        inlinePayload: nil,
+        inlinePayloadEncoding: nil,
         kind: "response",
         ok: false,
         payload: nil,
@@ -1006,7 +1024,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       }
 
       let combined = buffer + data
-      guard let body = self.parseHTTPRequestBody(from: combined) else {
+      guard let request = self.parseHTTPRequest(from: combined) else {
         self.receiveHTTPRequest(
           on: connection,
           buffer: combined,
@@ -1019,8 +1037,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       }
 
       Task { @MainActor in
-        let response = self.handleHTTPRequestBody(
-          body,
+        let response = self.handleHTTPRequest(
+          request,
           controlDirectoryURL: controlDirectoryURL,
           app: app,
           statusLabel: statusLabel,
@@ -1035,29 +1053,69 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   @MainActor
-  private func handleHTTPRequestBody(
-    _ body: Data,
+  private func handleHTTPRequest(
+    _ request: ParsedHTTPRequest,
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
   ) -> (data: Data, shouldShutdown: Bool) {
-    do {
-      let command = try JSONDecoder().decode(LifecycleCommandFrame.self, from: body)
-      let responseFrame = executeLifecycleCommandFrame(
-        command,
-        startedAt: Date(),
-        app: app,
-        statusLabel: statusLabel,
-        controlDirectoryURL: controlDirectoryURL,
-      )
+    switch request.method.uppercased() {
+    case "POST":
+      guard request.target == "/command" else {
+        return (
+          (try? encodeHTTPJSONResponse(status: 404, value: ["error": "Unsupported HTTP target \(request.target)"]))
+            ?? Data("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+          false
+        )
+      }
+
+      do {
+        let command = try JSONDecoder().decode(LifecycleCommandFrame.self, from: request.body)
+        let responseFrame = executeLifecycleCommandFrame(
+          command,
+          startedAt: Date(),
+          app: app,
+          statusLabel: statusLabel,
+          controlDirectoryURL: controlDirectoryURL,
+        )
+        return (
+          try encodeHTTPJSONResponse(status: 200, value: responseFrame),
+          command.action == "shutdown"
+        )
+      } catch {
+        return (
+          (try? encodeHTTPJSONResponse(status: 400, value: ["error": String(describing: error)]))
+            ?? Data("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+          false
+        )
+      }
+
+    case "GET":
+      do {
+        let artifactData = try readHTTPArtifactData(
+          target: request.target,
+          controlDirectoryURL: controlDirectoryURL
+        )
+        return (
+          try encodeHTTPBinaryResponse(
+            status: 200,
+            contentType: contentType(forArtifactTarget: request.target),
+            body: artifactData
+          ),
+          false
+        )
+      } catch {
+        return (
+          (try? encodeHTTPJSONResponse(status: 404, value: ["error": String(describing: error)]))
+            ?? Data("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+          false
+        )
+      }
+
+    default:
       return (
-        try encodeHTTPJSONResponse(status: 200, value: responseFrame),
-        command.action == "shutdown"
-      )
-    } catch {
-      return (
-        (try? encodeHTTPJSONResponse(status: 400, value: ["error": String(describing: error)]))
-          ?? Data("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+        (try? encodeHTTPJSONResponse(status: 405, value: ["error": "Unsupported HTTP method \(request.method)"]))
+          ?? Data("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
         false
       )
     }
@@ -1070,7 +1128,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     })
   }
 
-  private func parseHTTPRequestBody(from data: Data) -> Data? {
+  private func parseHTTPRequest(from data: Data) -> ParsedHTTPRequest? {
     guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else {
       return nil
     }
@@ -1078,16 +1136,35 @@ final class AttachControlSpikeUITests: XCTestCase {
     let headerData = data.subdata(in: 0..<headerEnd.lowerBound)
     let bodyStart = headerEnd.upperBound
     let headers = String(decoding: headerData, as: UTF8.self)
+    let headerLines = headers.components(separatedBy: "\r\n")
 
-    guard let contentLength = extractHTTPContentLength(from: headers) else {
+    guard let requestLine = headerLines.first, !requestLine.isEmpty else {
       return nil
     }
+
+    let requestParts = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
+
+    guard requestParts.count >= 2 else {
+      return nil
+    }
+
+    let method = requestParts[0]
+    let target = requestParts[1]
+    let contentLength = extractHTTPContentLength(from: headers) ?? 0
 
     guard data.count >= bodyStart + contentLength else {
       return nil
     }
 
-    return data.subdata(in: bodyStart..<(bodyStart + contentLength))
+    let body = contentLength == 0
+      ? Data()
+      : data.subdata(in: bodyStart..<(bodyStart + contentLength))
+
+    return ParsedHTTPRequest(
+      method: method,
+      target: target,
+      body: body
+    )
   }
 
   private func extractHTTPContentLength(from headers: String) -> Int? {
@@ -1106,9 +1183,27 @@ final class AttachControlSpikeUITests: XCTestCase {
 
   private func encodeHTTPJSONResponse<T: Encodable>(status: Int, value: T) throws -> Data {
     let body = try JSONEncoder().encode(value)
+    return encodeHTTPResponse(
+      status: status,
+      reason: status == 200 ? "OK" : "Error",
+      contentType: "application/json",
+      body: body
+    )
+  }
+
+  private func encodeHTTPBinaryResponse(status: Int, contentType: String, body: Data) throws -> Data {
+    encodeHTTPResponse(
+      status: status,
+      reason: status == 200 ? "OK" : "Error",
+      contentType: contentType,
+      body: body
+    )
+  }
+
+  private func encodeHTTPResponse(status: Int, reason: String, contentType: String, body: Data) -> Data {
     let headers = [
-      "HTTP/1.1 \(status) OK",
-      "Content-Type: application/json",
+      "HTTP/1.1 \(status) \(reason)",
+      "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
       "Connection: close",
       "",
@@ -1118,6 +1213,42 @@ final class AttachControlSpikeUITests: XCTestCase {
     var response = Data(headers.utf8)
     response.append(body)
     return response
+  }
+
+  private func readHTTPArtifactData(target: String, controlDirectoryURL: URL) throws -> Data {
+    guard let components = URLComponents(string: "http://probe.local\(target)"),
+      components.path == "/artifact",
+      let requestedPath = components.queryItems?.first(where: { $0.name == "path" })?.value,
+      !requestedPath.isEmpty
+    else {
+      throw lifecycleBootstrapError("Artifact requests must target /artifact?path=<absolute-path>.")
+    }
+
+    let controlRoot = controlDirectoryURL.path
+    guard requestedPath == controlRoot || requestedPath.hasPrefix("\(controlRoot)/") else {
+      throw lifecycleBootstrapError("Artifact request \(requestedPath) escaped the lifecycle control directory.")
+    }
+
+    let artifactURL = URL(fileURLWithPath: requestedPath)
+    return try Data(contentsOf: artifactURL)
+  }
+
+  private func contentType(forArtifactTarget target: String) -> String {
+    guard let components = URLComponents(string: "http://probe.local\(target)"),
+      let requestedPath = components.queryItems?.first(where: { $0.name == "path" })?.value
+    else {
+      return "application/octet-stream"
+    }
+
+    if requestedPath.hasSuffix(".json") {
+      return "application/json"
+    }
+
+    if requestedPath.hasSuffix(".png") {
+      return "image/png"
+    }
+
+    return "application/octet-stream"
   }
 
   private func emitStdoutJSONLine<T: Encodable>(_ value: T) throws {
@@ -2162,8 +2293,9 @@ final class AttachControlSpikeUITests: XCTestCase {
     switch command.action {
     case "ping":
       let pingPayload = command.payload ?? ""
-      _ = statusLabel.waitForExistence(timeout: interactionTimeout)
       return LifecycleCommandResult(
+        inlinePayload: nil,
+        inlinePayloadEncoding: nil,
         payload: "pong:\(pingPayload)",
         snapshotPayloadPath: nil,
         snapshotNodeCount: nil
@@ -2198,6 +2330,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       )
 
       return LifecycleCommandResult(
+        inlinePayload: nil,
+        inlinePayloadEncoding: nil,
         payload: statusLabel.label,
         snapshotPayloadPath: nil,
         snapshotNodeCount: nil
@@ -2220,8 +2354,11 @@ final class AttachControlSpikeUITests: XCTestCase {
         root: compactRoot
       )
       let payloadURL = lifecycleSnapshotPayloadURL(in: controlDirectoryURL, sequence: command.sequence)
-      try writeJSON(payload, to: payloadURL)
+      let payloadData = try JSONEncoder().encode(payload)
+      try payloadData.write(to: payloadURL, options: .atomic)
       return LifecycleCommandResult(
+        inlinePayload: String(decoding: payloadData, as: UTF8.self),
+        inlinePayloadEncoding: "utf8",
         payload: "snapshot-captured",
         snapshotPayloadPath: payloadURL.path,
         snapshotNodeCount: compactNodeCount
@@ -2229,9 +2366,12 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     case "screenshot":
       let screenshot = XCUIScreen.main.screenshot()
+      let pngData = screenshot.pngRepresentation
       let payloadURL = lifecycleScreenshotPayloadURL(in: controlDirectoryURL, sequence: command.sequence)
-      try screenshot.pngRepresentation.write(to: payloadURL, options: .atomic)
+      try pngData.write(to: payloadURL, options: .atomic)
       return LifecycleCommandResult(
+        inlinePayload: pngData.base64EncodedString(),
+        inlinePayloadEncoding: "base64",
         payload: "screenshot-captured",
         snapshotPayloadPath: payloadURL.path,
         snapshotNodeCount: nil
@@ -2276,6 +2416,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       try writeJSON(manifest, to: framesDirectoryURL.appendingPathComponent("manifest.json"))
 
       return LifecycleCommandResult(
+        inlinePayload: nil,
+        inlinePayloadEncoding: nil,
         payload: "video-captured",
         snapshotPayloadPath: framesDirectoryURL.path,
         snapshotNodeCount: nil
@@ -2286,6 +2428,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       let actionPayload = try JSONDecoder().decode(RunnerUIActionPayload.self, from: payloadData)
       let summary = try performRunnerUIAction(actionPayload, app: app)
       return LifecycleCommandResult(
+        inlinePayload: nil,
+        inlinePayloadEncoding: nil,
         payload: summary,
         snapshotPayloadPath: nil,
         snapshotNodeCount: nil
@@ -2293,6 +2437,8 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     case "shutdown":
       return LifecycleCommandResult(
+        inlinePayload: nil,
+        inlinePayloadEncoding: nil,
         payload: "shutdown-ack",
         snapshotPayloadPath: nil,
         snapshotNodeCount: nil

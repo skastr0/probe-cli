@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
-import net from "node:net"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
 import {
@@ -31,6 +30,7 @@ const commandTimeoutMs = 20_000
 const recordVideoTimeoutBufferMs = 30_000
 const maxRecordVideoDurationMs = 120_000
 const defaultRecordVideoDurationMs = 10_000
+const runnerArtifactDownloadTimeoutMs = 15_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
 const runnerCommandIngress = RUNNER_COMMAND_INGRESS
@@ -71,11 +71,33 @@ interface DevicectlDevicesPayload {
   }
 }
 
+interface DevicectlDeviceDetailsPayload {
+  readonly info?: {
+    readonly outcome?: string
+  }
+  readonly result?: {
+    readonly connectionProperties?: {
+      readonly tunnelIPAddress?: string
+    }
+    readonly device?: {
+      readonly connectionProperties?: {
+        readonly tunnelIPAddress?: string
+      }
+    }
+  }
+}
+
 interface RealDeviceCandidate {
   readonly identifier: string
   readonly name: string
   readonly runtime: string | null
   readonly matchKeys: ReadonlyArray<string>
+}
+
+interface RunnerVideoArtifactManifest {
+  readonly durationMs: number
+  readonly fps: number
+  readonly frameCount: number
 }
 
 interface PreflightIssue {
@@ -301,6 +323,11 @@ const toText = (value: unknown): string | null => {
   return null
 }
 
+const toNonEmptyText = (value: unknown): string | null => {
+  const text = toText(value)
+  return text && text.trim().length > 0 ? text.trim() : null
+}
+
 const readFirstText = (
   root: Record<string, unknown>,
   paths: ReadonlyArray<ReadonlyArray<string>>,
@@ -325,24 +352,32 @@ const formatCommandFailure = (command: string, result: CommandResult): string =>
     : `${command} exited with ${result.exitCode ?? "unknown"}.`
 }
 
-const extractDeviceCandidate = (value: unknown): RealDeviceCandidate | null => {
+export const extractDeviceCandidate = (value: unknown): RealDeviceCandidate | null => {
   if (!isRecord(value)) {
     return null
   }
 
-  const identifier = readFirstText(value, [
+  const coreDeviceIdentifier = readFirstText(value, [
     ["identifier"],
     ["deviceIdentifier"],
     ["deviceId"],
+    ["deviceProperties", "identifier"],
+  ])
+
+  const hardwareUdid = readFirstText(value, [
+    ["hardwareProperties", "udid"],
+    ["connectionProperties", "udid"],
     ["udid"],
     ["uuid"],
+  ])
+
+  const identifier = hardwareUdid ?? coreDeviceIdentifier ?? readFirstText(value, [
     ["serialNumber"],
     ["ecid"],
     ["hardwareProperties", "udid"],
     ["hardwareProperties", "serialNumber"],
     ["hardwareProperties", "ecid"],
     ["connectionProperties", "udid"],
-    ["deviceProperties", "identifier"],
   ])
 
   const name = readFirstText(value, [
@@ -372,6 +407,8 @@ const extractDeviceCandidate = (value: unknown): RealDeviceCandidate | null => {
     runtime,
     matchKeys: dedupeStrings([
       identifier,
+      ...(coreDeviceIdentifier && coreDeviceIdentifier !== identifier ? [coreDeviceIdentifier] : []),
+      ...(hardwareUdid && hardwareUdid !== identifier ? [hardwareUdid] : []),
       name,
       ...(runtime ? [`${name} (${runtime})`] : []),
       ...(readFirstText(value, [["serialNumber"], ["hardwareProperties", "serialNumber"]])
@@ -536,6 +573,171 @@ const findFirstNumberByKey = (value: unknown, keyPattern: RegExp): number | null
   return null
 }
 
+export const extractDeviceTunnelIp = (payload: DevicectlDeviceDetailsPayload): string | null => {
+  if (payload.info?.outcome && payload.info.outcome !== "success") {
+    return null
+  }
+
+  return toNonEmptyText(
+    payload.result?.connectionProperties?.tunnelIPAddress
+      ?? payload.result?.device?.connectionProperties?.tunnelIPAddress
+      ?? null,
+  )
+}
+
+export const buildRunnerHttpCommandUrls = (args: {
+  readonly port: number
+  readonly tunnelIp: string | null
+}): ReadonlyArray<string> => {
+  const urls = [`http://127.0.0.1:${args.port}/command`]
+
+  if (args.tunnelIp) {
+    urls.unshift(`http://[${args.tunnelIp}]:${args.port}/command`)
+  }
+
+  return urls
+}
+
+export const buildRunnerHttpArtifactUrls = (args: {
+  readonly commandUrls: ReadonlyArray<string>
+  readonly artifactPath: string
+}): ReadonlyArray<string> =>
+  args.commandUrls.map((commandUrl) => {
+    const artifactUrl = new URL(commandUrl)
+    artifactUrl.pathname = "/artifact"
+    artifactUrl.search = ""
+    artifactUrl.searchParams.set("path", args.artifactPath)
+    return artifactUrl.toString()
+  })
+
+export const decodeRunnerVideoArtifactManifest = (value: unknown): RunnerVideoArtifactManifest => {
+  if (!isRecord(value)) {
+    throw new Error("runner video manifest must be an object")
+  }
+
+  const durationMs = value.durationMs
+  const fps = value.fps
+  const frameCount = value.frameCount
+
+  if (
+    typeof durationMs !== "number"
+    || typeof fps !== "number"
+    || typeof frameCount !== "number"
+    || !Number.isFinite(durationMs)
+    || !Number.isFinite(fps)
+    || !Number.isFinite(frameCount)
+    || durationMs <= 0
+    || fps <= 0
+    || frameCount <= 0
+    || !Number.isInteger(frameCount)
+  ) {
+    throw new Error("runner video manifest is missing one or more required numeric fields")
+  }
+
+  return {
+    durationMs,
+    fps,
+    frameCount,
+  }
+}
+
+const buildRunnerVideoFrameFileName = (frameIndex: number): string =>
+  `frame-${String(frameIndex).padStart(5, "0")}.png`
+
+const downloadRunnerHttpArtifact = async (args: {
+  readonly artifactUrls: ReadonlyArray<string>
+  readonly description: string
+}): Promise<Uint8Array> => {
+  const perEndpointTimeoutMs = Math.max(
+    1_000,
+    Math.ceil(runnerArtifactDownloadTimeoutMs / Math.max(args.artifactUrls.length, 1)),
+  )
+  const failures: Array<string> = []
+
+  for (const artifactUrl of args.artifactUrls) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), perEndpointTimeoutMs)
+
+    try {
+      const response = await fetch(artifactUrl, {
+        method: "GET",
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        const responseText = await response.text()
+        failures.push(`${artifactUrl} returned ${response.status}: ${responseText.trim() || "<empty-body>"}`)
+        continue
+      }
+
+      return new Uint8Array(await response.arrayBuffer())
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        failures.push(`${artifactUrl} timed out after ${perEndpointTimeoutMs} ms`)
+      } else {
+        failures.push(`${artifactUrl} failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  throw new Error(
+    `Runner HTTP artifact download failed for ${args.description}: ${failures.join(" | ") || "unknown failure"}`,
+  )
+}
+
+export const materializeDeviceRunnerVideoArtifacts = async (args: {
+  readonly commandUrls: ReadonlyArray<string>
+  readonly deviceFramesDirectoryPath: string
+  readonly observerControlDirectory: string
+  readonly sequence: number
+}): Promise<string> => {
+  const hostFramesDirectory = join(args.observerControlDirectory, `video-frames-${String(args.sequence).padStart(3, "0")}`)
+  const manifestFileName = "manifest.json"
+
+  await rm(hostFramesDirectory, { recursive: true, force: true }).catch(() => undefined)
+  await ensureDirectory(hostFramesDirectory)
+
+  try {
+    const manifestPath = join(args.deviceFramesDirectoryPath, manifestFileName)
+    const manifestData = await downloadRunnerHttpArtifact({
+      artifactUrls: buildRunnerHttpArtifactUrls({
+        commandUrls: args.commandUrls,
+        artifactPath: manifestPath,
+      }),
+      description: `video manifest ${manifestPath}`,
+    })
+    const manifestText = Buffer.from(manifestData).toString("utf8")
+    const manifest = decodeRunnerVideoArtifactManifest(JSON.parse(manifestText) as unknown)
+
+    await writeFile(
+      join(hostFramesDirectory, manifestFileName),
+      manifestText.endsWith("\n") ? manifestText : `${manifestText}\n`,
+      "utf8",
+    )
+
+    for (let frameIndex = 0; frameIndex < manifest.frameCount; frameIndex += 1) {
+      const frameFileName = buildRunnerVideoFrameFileName(frameIndex)
+      const framePath = join(args.deviceFramesDirectoryPath, frameFileName)
+      const frameData = await downloadRunnerHttpArtifact({
+        artifactUrls: buildRunnerHttpArtifactUrls({
+          commandUrls: args.commandUrls,
+          artifactPath: framePath,
+        }),
+        description: `video frame ${frameFileName}`,
+      })
+
+      await writeFile(join(hostFramesDirectory, frameFileName), frameData)
+    }
+
+    return hostFramesDirectory
+  } catch (error) {
+    await rm(hostFramesDirectory, { recursive: true, force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
 const bundleIdentifierKeyPattern = /^(bundleidentifier|bundleid|bundle_id|identifier)$/i
 const processIdentifierKeyPattern = /^(processidentifier|processid|process_id|pid)$/i
 
@@ -555,30 +757,33 @@ const parseLaunchedTargetProcessId = (payload: unknown, bundleId: string): numbe
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-const allocateFreeTcpPort = async (): Promise<number> =>
-  await new Promise((resolve, reject) => {
-    const server = net.createServer()
-    server.unref()
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address()
-
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("Could not resolve the allocated runner port.")))
-        return
-      }
-
-      const { port } = address
-      server.close((error) => {
-        if (error) {
-          reject(error)
-          return
-        }
-
-        resolve(port)
-      })
-    })
+const resolveDeviceTunnelIp = async (args: {
+  readonly deviceId: string
+  readonly jsonPath: string
+  readonly logPath: string
+}): Promise<string | null> => {
+  const result = await runCommand({
+    command: "/usr/bin/xcrun",
+    commandArgs: [
+      "devicectl",
+      "device",
+      "info",
+      "details",
+      "--device",
+      args.deviceId,
+      "--json-output",
+      args.jsonPath,
+    ],
   })
+  await writeCommandLog(args.logPath, result)
+
+  if (result.exitCode !== 0 || !(await fileExists(args.jsonPath))) {
+    return null
+  }
+
+  const payload = JSON.parse(await readFile(args.jsonPath, "utf8")) as DevicectlDeviceDetailsPayload
+  return extractDeviceTunnelIp(payload)
+}
 
 const decodeXmlText = (value: string): string =>
   value
@@ -1134,45 +1339,56 @@ const waitForFreshJson = async <T>(args: {
 }
 
 const sendRunnerHttpCommand = async (args: {
-  readonly port: number
+  readonly commandUrls: ReadonlyArray<string>
   readonly commandFrame: string
   readonly action: RunnerAction
   readonly payload?: string
 }): Promise<RunnerResponseFrame> => {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), resolveCommandTimeoutMs(args.action, args.payload))
+  const totalTimeoutMs = resolveCommandTimeoutMs(args.action, args.payload)
+  const perEndpointTimeoutMs = Math.max(1_000, Math.ceil(totalTimeoutMs / Math.max(args.commandUrls.length, 1)))
+  const failures: Array<string> = []
 
-  try {
-    const response = await fetch(`http://127.0.0.1:${args.port}/command`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: args.commandFrame,
-      signal: controller.signal,
-    })
-    const responseText = await response.text()
-
-    if (!response.ok) {
-      throw new Error(`Runner HTTP command failed with ${response.status}: ${responseText.trim() || "<empty-body>"}`)
-    }
+  for (const commandUrl of args.commandUrls) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), perEndpointTimeoutMs)
 
     try {
-      return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
-    } catch (error) {
-      throw new Error(
-        `Runner HTTP response was not a valid response frame: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Timed out waiting for runner HTTP ${args.action} response.`)
-    }
+      const response = await fetch(commandUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: args.commandFrame,
+        signal: controller.signal,
+      })
+      const responseText = await response.text()
 
-    throw error
-  } finally {
-    clearTimeout(timeout)
+      if (!response.ok) {
+        failures.push(`${commandUrl} returned ${response.status}: ${responseText.trim() || "<empty-body>"}`)
+        continue
+      }
+
+      try {
+        return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
+      } catch (error) {
+        failures.push(
+          `${commandUrl} returned an invalid response frame: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        failures.push(`${commandUrl} timed out after ${perEndpointTimeoutMs} ms`)
+      } else {
+        failures.push(`${commandUrl} failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    } finally {
+      clearTimeout(timeout)
+    }
   }
+
+  throw new Error(
+    `Runner HTTP ${args.action} failed for ${args.commandUrls.join(", ")}: ${failures.join(" | ") || "unknown failure"}`,
+  )
 }
 
 const assertReadyTransportContract = (args: {
@@ -1290,6 +1506,7 @@ const startWrapperProcess = async (args: {
 }> => {
   await ensureDirectory(args.observerControlDirectory)
   await ensureDirectory(dirname(args.wrapperStderrPath))
+  await writeFile(args.wrapperStderrPath, "", "utf8")
 
   const wrapperScript = join(
     args.rootDir,
@@ -1783,6 +2000,8 @@ export const RealDeviceHarnessLive = Layer.succeed(
             const launchJsonPath = join(preflight.metaDirectory, "target-app-launch.json")
             const installedAppsLogPath = join(liveLogsDirectory, "devicectl-device-info-apps.log")
             const launchLogPath = join(liveLogsDirectory, "devicectl-device-process-launch.log")
+            const deviceDetailsJsonPath = join(preflight.metaDirectory, "device-details.json")
+            const deviceDetailsLogPath = join(liveLogsDirectory, "devicectl-device-info-details.log")
             const sessionLogPath = join(liveLogsDirectory, "xcodebuild-session.log")
             const wrapperStderrPath = join(liveLogsDirectory, "runner-wrapper.stderr.log")
             const observerControlDirectory = join(args.runnerDirectory, "observer-control")
@@ -1797,7 +2016,9 @@ export const RealDeviceHarnessLive = Layer.succeed(
               ensureDirectory(observerControlDirectory),
               ensureDirectory(runtimeControlDirectory),
             ])
-            const runnerPort = await allocateFreeTcpPort()
+            // Use port 0 so the runner's NWListener auto-assigns an available port.
+            // The actual port is reported back in the ready frame's runnerPort field.
+            const runnerPort = 0
 
             const installedAppsResult = await runCommand({
               command: "/usr/bin/xcrun",
@@ -1954,6 +2175,17 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const isDeviceSession = ready.bootstrapSource === "device-bootstrap-manifest"
             const deviceRunnerPort = ready.runnerPort ?? runnerPort
+            const deviceTunnelIp = isDeviceSession
+              ? await resolveDeviceTunnelIp({
+                  deviceId: preflight.device.identifier,
+                  jsonPath: deviceDetailsJsonPath,
+                  logPath: deviceDetailsLogPath,
+                })
+              : null
+            const deviceCommandUrls = buildRunnerHttpCommandUrls({
+              port: deviceRunnerPort,
+              tunnelIp: deviceTunnelIp,
+            })
 
             const sendCommand = async (
               sequence: number,
@@ -1964,7 +2196,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
               const responseFrame = isDeviceSession
                 ? await sendRunnerHttpCommand({
-                    port: deviceRunnerPort,
+                    commandUrls: deviceCommandUrls,
                     commandFrame,
                     action,
                     payload,
@@ -1990,13 +2222,26 @@ export const RealDeviceHarnessLive = Layer.succeed(
                       logPath: sessionLogPath,
                     })
                   })()
+              const snapshotPayloadPath = isDeviceSession
+                && action === "recordVideo"
+                && responseFrame.ok
+                && responseFrame.snapshotPayloadPath
+                ? await materializeDeviceRunnerVideoArtifacts({
+                    commandUrls: deviceCommandUrls,
+                    deviceFramesDirectoryPath: responseFrame.snapshotPayloadPath,
+                    observerControlDirectory,
+                    sequence,
+                  })
+                : responseFrame.snapshotPayloadPath ?? null
 
               return {
                 ok: responseFrame.ok,
                 action: responseFrame.action,
                 error: responseFrame.error ?? null,
                 payload: responseFrame.payload ?? null,
-                snapshotPayloadPath: responseFrame.snapshotPayloadPath ?? null,
+                snapshotPayloadPath,
+                inlinePayload: responseFrame.inlinePayload ?? null,
+                inlinePayloadEncoding: responseFrame.inlinePayloadEncoding ?? null,
                 handledMs: responseFrame.handledMs,
                 statusLabel: responseFrame.statusLabel,
                 snapshotNodeCount: responseFrame.snapshotNodeCount ?? null,

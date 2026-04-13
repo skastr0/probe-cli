@@ -62,6 +62,8 @@ export const RunnerResponseFrameSchema = Schema.Struct({
   error: OptionalNullableString,
   payload: OptionalNullableString,
   snapshotPayloadPath: OptionalNullableString,
+  inlinePayload: OptionalNullableString,
+  inlinePayloadEncoding: OptionalNullableString,
   handledMs: Schema.Number,
   statusLabel: Schema.String,
   snapshotNodeCount: OptionalNullableNumber,
