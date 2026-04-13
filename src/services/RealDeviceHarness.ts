@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import net from "node:net"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
 import {
@@ -12,16 +13,15 @@ import type { RunnerCommandResult } from "./SimulatorHarness"
 import {
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
-  decodeRunnerStdinProbeResultFrame,
   encodeRunnerCommandFrame,
   RUNNER_COMMAND_INGRESS,
   RUNNER_EVENT_EGRESS,
+  RUNNER_HTTP_COMMAND_INGRESS,
   RUNNER_TRANSPORT_CONTRACT,
   type RunnerAction,
   type RunnerBootstrapManifest,
   type RunnerReadyFrame,
   type RunnerResponseFrame,
-  type RunnerStdinProbeResultFrame,
 } from "./runnerProtocol"
 
 const runnerScheme = "ProbeRunner"
@@ -34,8 +34,10 @@ const defaultRecordVideoDurationMs = 10_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
 const runnerCommandIngress = RUNNER_COMMAND_INGRESS
+const runnerHttpCommandIngress = RUNNER_HTTP_COMMAND_INGRESS
 const runnerEventEgress = RUNNER_EVENT_EGRESS
 const runnerBootstrapEnvKey = "PROBE_BOOTSTRAP_JSON"
+const runnerPortEnvKey = "PROBE_RUNNER_PORT"
 const runnerInjectedBootstrapPath = `env:${runnerBootstrapEnvKey}`
 const xctestrunMetadataKey = "__xctestrun_metadata__"
 
@@ -158,7 +160,7 @@ export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePrefli
   readonly bootstrapSource: "device-bootstrap-manifest"
   readonly runnerTransportContract: typeof runnerTransportContract
   readonly sessionIdentifier: string
-  readonly commandIngress: typeof runnerCommandIngress
+  readonly commandIngress: RunnerReadyFrame["ingressTransport"]
   readonly eventEgress: typeof runnerEventEgress
   readonly wrapperProcessId: number
   readonly testProcessId: number
@@ -553,6 +555,31 @@ const parseLaunchedTargetProcessId = (payload: unknown, bundleId: string): numbe
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
+const allocateFreeTcpPort = async (): Promise<number> =>
+  await new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Could not resolve the allocated runner port.")))
+        return
+      }
+
+      const { port } = address
+      server.close((error) => {
+        if (error) {
+          reject(error)
+          return
+        }
+
+        resolve(port)
+      })
+    })
+  })
+
 const decodeXmlText = (value: string): string =>
   value
     .replaceAll("&lt;", "<")
@@ -771,7 +798,10 @@ const upsertPlistStringEntry = (dictXml: string, key: string, value: string): st
   return `${dictXml.slice(0, formatting.closingAnchor)}${insertion}${dictXml.slice(formatting.closingAnchor)}`
 }
 
-const upsertBootstrapEnvironmentVariables = (targetDictXml: string, bootstrapJson: string): string => {
+const upsertEnvironmentVariables = (
+  targetDictXml: string,
+  environmentVariables: ReadonlyArray<readonly [key: string, value: string]>,
+): string => {
   const entries = readImmediateDictEntries(targetDictXml)
   const environmentVariablesEntry = entries.find((entry) => entry.key === "EnvironmentVariables")
 
@@ -779,10 +809,9 @@ const upsertBootstrapEnvironmentVariables = (targetDictXml: string, bootstrapJso
     const environmentVariablesDict = environmentVariablesEntry.valueRange.tagName === "dict"
       ? targetDictXml.slice(environmentVariablesEntry.valueRange.start, environmentVariablesEntry.valueRange.end)
       : "<dict></dict>"
-    const updatedEnvironmentVariablesDict = upsertPlistStringEntry(
+    const updatedEnvironmentVariablesDict = environmentVariables.reduce(
+      (dictXml, [key, value]) => upsertPlistStringEntry(dictXml, key, value),
       environmentVariablesDict,
-      runnerBootstrapEnvKey,
-      bootstrapJson,
     )
 
     return [
@@ -794,19 +823,25 @@ const upsertBootstrapEnvironmentVariables = (targetDictXml: string, bootstrapJso
 
   const formatting = inspectDictFormatting(targetDictXml)
   const nestedEntryIndent = `${formatting.entryIndent}${formatting.indentUnit}`
+  const environmentVariableEntries = environmentVariables.flatMap(([key, value]) => [
+    `${nestedEntryIndent}<key>${escapePlistText(key)}</key>`,
+    `${nestedEntryIndent}<string>${escapePlistText(value)}</string>`,
+  ])
   const insertion = [
     "",
     `${formatting.entryIndent}<key>EnvironmentVariables</key>`,
     `${formatting.entryIndent}<dict>`,
-    `${nestedEntryIndent}<key>${runnerBootstrapEnvKey}</key>`,
-    `${nestedEntryIndent}<string>${escapePlistText(bootstrapJson)}</string>`,
+    ...environmentVariableEntries,
     `${formatting.entryIndent}</dict>`,
   ].join(formatting.newline)
 
   return `${targetDictXml.slice(0, formatting.closingAnchor)}${insertion}${targetDictXml.slice(formatting.closingAnchor)}`
 }
 
-export const injectBootstrapJsonIntoXctestrunPlist = (plistXml: string, bootstrapJson: string): string => {
+export const injectEnvironmentVariablesIntoXctestrunPlist = (
+  plistXml: string,
+  environmentVariables: Record<string, string>,
+): string => {
   const plistStart = plistXml.indexOf("<plist")
   const searchStart = plistStart === -1
     ? 0
@@ -830,11 +865,12 @@ export const injectBootstrapJsonIntoXctestrunPlist = (plistXml: string, bootstra
       }
 
       const targetDictXml = rootDictRange.raw.slice(entry.valueRange.start, entry.valueRange.end)
+      const environmentVariableEntries = Object.entries(environmentVariables)
 
       return [{
         start: rootDictRange.start + entry.valueRange.start,
         end: rootDictRange.start + entry.valueRange.end,
-        replacement: upsertBootstrapEnvironmentVariables(targetDictXml, bootstrapJson),
+        replacement: upsertEnvironmentVariables(targetDictXml, environmentVariableEntries),
       }]
     })
 
@@ -850,6 +886,11 @@ export const injectBootstrapJsonIntoXctestrunPlist = (plistXml: string, bootstra
 
   return updated
 }
+
+export const injectBootstrapJsonIntoXctestrunPlist = (plistXml: string, bootstrapJson: string): string =>
+  injectEnvironmentVariablesIntoXctestrunPlist(plistXml, {
+    [runnerBootstrapEnvKey]: bootstrapJson,
+  })
 
 const createBootstrapManifest = (args: {
   readonly controlDirectoryPath: string
@@ -875,21 +916,36 @@ const writeBootstrapManifest = async (args: {
   await writeFile(args.bootstrapPath, `${JSON.stringify(args.manifest, null, 2)}\n`, "utf8")
 }
 
-const injectBootstrapManifestIntoXctestrun = async (args: {
+const injectEnvironmentIntoXctestrun = async (args: {
   readonly sourcePath: string
   readonly destinationPath: string
-  readonly bootstrapManifest: RunnerBootstrapManifest
+  readonly environmentVariables: Record<string, string>
 }): Promise<string> => {
   const originalXctestrun = await readFile(args.sourcePath, "utf8")
-  const injectedXctestrun = injectBootstrapJsonIntoXctestrunPlist(
+  const injectedXctestrun = injectEnvironmentVariablesIntoXctestrunPlist(
     originalXctestrun,
-    JSON.stringify(args.bootstrapManifest),
+    args.environmentVariables,
   )
 
   await ensureDirectory(dirname(args.destinationPath))
   await writeFile(args.destinationPath, injectedXctestrun, "utf8")
   return args.destinationPath
 }
+
+const injectBootstrapManifestIntoXctestrun = async (args: {
+  readonly sourcePath: string
+  readonly destinationPath: string
+  readonly bootstrapManifest: RunnerBootstrapManifest
+  readonly runnerPort: number
+}): Promise<string> =>
+  injectEnvironmentIntoXctestrun({
+    sourcePath: args.sourcePath,
+    destinationPath: args.destinationPath,
+    environmentVariables: {
+      [runnerBootstrapEnvKey]: JSON.stringify(args.bootstrapManifest),
+      [runnerPortEnvKey]: String(args.runnerPort),
+    },
+  })
 
 const processExists = (pid: number): boolean => {
   try {
@@ -1077,6 +1133,48 @@ const waitForFreshJson = async <T>(args: {
   })
 }
 
+const sendRunnerHttpCommand = async (args: {
+  readonly port: number
+  readonly commandFrame: string
+  readonly action: RunnerAction
+  readonly payload?: string
+}): Promise<RunnerResponseFrame> => {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), resolveCommandTimeoutMs(args.action, args.payload))
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${args.port}/command`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: args.commandFrame,
+      signal: controller.signal,
+    })
+    const responseText = await response.text()
+
+    if (!response.ok) {
+      throw new Error(`Runner HTTP command failed with ${response.status}: ${responseText.trim() || "<empty-body>"}`)
+    }
+
+    try {
+      return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
+    } catch (error) {
+      throw new Error(
+        `Runner HTTP response was not a valid response frame: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Timed out waiting for runner HTTP ${args.action} response.`)
+    }
+
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 const assertReadyTransportContract = (args: {
   readonly ready: RunnerReadyFrame
   readonly expectedBootstrapPath: string
@@ -1113,12 +1211,21 @@ const assertReadyTransportContract = (args: {
     })
   }
 
-  if (args.ready.ingressTransport !== runnerCommandIngress || args.ready.egressTransport !== runnerEventEgress) {
+  if (args.ready.ingressTransport !== runnerHttpCommandIngress || args.ready.egressTransport !== runnerEventEgress) {
     throw new EnvironmentError({
       code: "runner-transport-shape-mismatch",
       reason:
-        `Expected ${runnerCommandIngress}/${runnerEventEgress}, received ${args.ready.ingressTransport}/${args.ready.egressTransport}.`,
+        `Expected ${runnerHttpCommandIngress}/${runnerEventEgress}, received ${args.ready.ingressTransport}/${args.ready.egressTransport}.`,
       nextStep: "Align the host and runner transport settings before retrying the session open.",
+      details: [],
+    })
+  }
+
+  if (!Number.isInteger(args.ready.runnerPort) || (args.ready.runnerPort ?? 0) <= 0) {
+    throw new EnvironmentError({
+      code: "runner-port-missing",
+      reason: "The real-device runner ready frame did not report a usable HTTP runner port.",
+      nextStep: "Inspect the injected runner-port environment variable and the on-device HTTP listener startup before retrying.",
       details: [],
     })
   }
@@ -1163,8 +1270,7 @@ const assertReadyTransportContract = (args: {
       })
     }
     // On real device the XCUITest runner sandbox prevents writing to host-chosen paths,
-    // so the runner redirects to its own temp directory. The host reads the actual path
-    // from the ready frame and uses it for command file writes.
+    // so the runner redirects to its own temp directory for local artifacts.
   }
 }
 
@@ -1218,7 +1324,7 @@ const startWrapperProcess = async (args: {
     {
       cwd: args.rootDir,
       detached: true,
-      stdio: ["pipe", "ignore", "pipe"],
+      stdio: ["ignore", "ignore", "pipe"],
     },
   )
 
@@ -1260,7 +1366,7 @@ const buildPreflightWarnings = (): ReadonlyArray<string> => [
 ]
 
 const buildLiveWarnings = (): ReadonlyArray<string> => [
-  "Real-device runner control uses the same honest XCUITest boundary seam as simulator: bootstrap manifest plus file-mailbox ingress plus stdout-framed mixed-log egress.",
+  "Real-device runner control uses the honest XCUITest boundary seam for device sessions: bootstrap manifest plus HTTP POST ingress plus stdout-framed mixed-log ready egress.",
   "Device reconnects are surfaced explicitly in session health; Probe does not claim transparent recovery of real-device runner state.",
 ]
 
@@ -1691,6 +1797,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               ensureDirectory(observerControlDirectory),
               ensureDirectory(runtimeControlDirectory),
             ])
+            const runnerPort = await allocateFreeTcpPort()
 
             const installedAppsResult = await runCommand({
               command: "/usr/bin/xcrun",
@@ -1797,6 +1904,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               sourcePath: preflight.xctestrunPath,
               destinationPath: join(dirname(preflight.xctestrunPath), "device-injected.xctestrun"),
               bootstrapManifest,
+              runnerPort,
             })
 
             const startedAt = Date.now()
@@ -1844,28 +1952,8 @@ export const RealDeviceHarnessLive = Layer.succeed(
               expectedDeviceUdid: preflight.device.identifier,
             })
 
-            // Send stdin probe through the wrapper's stdin pipe.
-            // The wrapper forwards all stdin lines to xcodebuild, and the runner
-            // reads the probe from stdin after emitting the ready frame.
-            if (wrapper.process.stdin) {
-              wrapper.process.stdin.write(`${JSON.stringify({ kind: "stdin-probe", payload: "probe-daemon-session" })}\n`)
-            }
-
-            const stdinProbe = await waitForFreshJson<RunnerStdinProbeResultFrame>({
-              path: join(observerControlDirectory, "stdout-stdin-probe-result.json"),
-              timeoutMs: runnerReadyTimeoutMs,
-              minMtimeMs: startedAt,
-              isRunning: isWrapperRunning,
-              decode: decodeRunnerStdinProbeResultFrame,
-              invalidCode: "runner-stdin-probe-frame-invalid",
-              invalidReason: "The runner stdin-probe frame drifted from the validated host↔runner contract",
-              invalidNextStep: "Align the host and runner stdin-probe schemas before retrying the session open.",
-              commandDescription: "runner stdout stdin-probe-result",
-              logPath: sessionLogPath,
-            })
-
-            const wrapperStdin = wrapper.process.stdin
             const isDeviceSession = ready.bootstrapSource === "device-bootstrap-manifest"
+            const deviceRunnerPort = ready.runnerPort ?? runnerPort
 
             const sendCommand = async (
               sequence: number,
@@ -1874,42 +1962,44 @@ export const RealDeviceHarnessLive = Layer.succeed(
             ): Promise<RunnerCommandResult> => {
               const commandStartedAt = Date.now()
               const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
-              const stdoutResponsePath = join(
-                observerControlDirectory,
-                `stdout-response-${String(sequence).padStart(3, "0")}.json`,
-              )
+              const responseFrame = isDeviceSession
+                ? await sendRunnerHttpCommand({
+                    port: deviceRunnerPort,
+                    commandFrame,
+                    action,
+                    payload,
+                  })
+                : await (async () => {
+                    const stdoutResponsePath = join(
+                      observerControlDirectory,
+                      `stdout-response-${String(sequence).padStart(3, "0")}.json`,
+                    )
+                    const commandPath = join(ready.controlDirectoryPath, `command-${String(sequence).padStart(3, "0")}.json`)
+                    await writeFile(commandPath, commandFrame, "utf8")
 
-              if (isDeviceSession && wrapperStdin) {
-                // Real device: send command via stdin pipe through the wrapper to xcodebuild
-                wrapperStdin.write(`${JSON.stringify(commandFrame)}\n`)
-              } else {
-                // Simulator: write command to file-mailbox
-                const commandPath = join(ready.controlDirectoryPath, `command-${String(sequence).padStart(3, "0")}.json`)
-                await writeFile(commandPath, commandFrame, "utf8")
-              }
-
-              const stdoutResponse = await waitForFreshJson<RunnerResponseFrame>({
-                path: stdoutResponsePath,
-                timeoutMs: resolveCommandTimeoutMs(action, payload),
-                minMtimeMs: commandStartedAt,
-                isRunning: isWrapperRunning,
-                decode: decodeRunnerResponseFrame,
-                invalidCode: "runner-response-frame-invalid",
-                invalidReason: "The runner response frame drifted from the validated host↔runner contract",
-                invalidNextStep: "Align the host and runner response schemas before retrying the command.",
-                commandDescription: `runner stdout ${action}`,
-                logPath: sessionLogPath,
-              })
+                    return await waitForFreshJson<RunnerResponseFrame>({
+                      path: stdoutResponsePath,
+                      timeoutMs: resolveCommandTimeoutMs(action, payload),
+                      minMtimeMs: commandStartedAt,
+                      isRunning: isWrapperRunning,
+                      decode: decodeRunnerResponseFrame,
+                      invalidCode: "runner-response-frame-invalid",
+                      invalidReason: "The runner response frame drifted from the validated host↔runner contract",
+                      invalidNextStep: "Align the host and runner response schemas before retrying the command.",
+                      commandDescription: `runner stdout ${action}`,
+                      logPath: sessionLogPath,
+                    })
+                  })()
 
               return {
-                ok: stdoutResponse.ok,
-                action: stdoutResponse.action,
-                error: stdoutResponse.error ?? null,
-                payload: stdoutResponse.payload ?? null,
-                snapshotPayloadPath: stdoutResponse.snapshotPayloadPath ?? null,
-                handledMs: stdoutResponse.handledMs,
-                statusLabel: stdoutResponse.statusLabel,
-                snapshotNodeCount: stdoutResponse.snapshotNodeCount ?? null,
+                ok: responseFrame.ok,
+                action: responseFrame.action,
+                error: responseFrame.error ?? null,
+                payload: responseFrame.payload ?? null,
+                snapshotPayloadPath: responseFrame.snapshotPayloadPath ?? null,
+                handledMs: responseFrame.handledMs,
+                statusLabel: responseFrame.statusLabel,
+                snapshotNodeCount: responseFrame.snapshotNodeCount ?? null,
                 hostRttMs: Date.now() - commandStartedAt,
               }
             }
@@ -1975,7 +2065,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               stdoutEventsPath,
               resultBundlePath,
               wrapperStderrPath,
-              stdinProbeStatus: stdinProbe.status,
+              stdinProbeStatus: "not-required-http",
               installedAppsJsonPath,
               launchJsonPath,
               nextSequence: 2,

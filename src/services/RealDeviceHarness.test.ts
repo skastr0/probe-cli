@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import { injectBootstrapJsonIntoXctestrunPlist } from "./RealDeviceHarness"
+import {
+  injectBootstrapJsonIntoXctestrunPlist,
+  injectEnvironmentVariablesIntoXctestrunPlist,
+} from "./RealDeviceHarness"
 
 describe("injectBootstrapJsonIntoXctestrunPlist", () => {
   test("injects PROBE_BOOTSTRAP_JSON into every non-metadata test target", () => {
@@ -81,5 +84,33 @@ describe("injectBootstrapJsonIntoXctestrunPlist", () => {
 
     expect(updated).toContain("<dict>\n  <key>PROBE_BOOTSTRAP_JSON</key>")
     expect(updated).toContain("session-2")
+  })
+
+  test("injects multiple runner environment variables into each test target", () => {
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>ProbeRunnerUITests</key>
+  <dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>EXISTING_FLAG</key>
+      <string>1</string>
+    </dict>
+  </dict>
+</dict>
+</plist>
+`
+
+    const updated = injectEnvironmentVariablesIntoXctestrunPlist(plist, {
+      PROBE_BOOTSTRAP_JSON: JSON.stringify({ sessionIdentifier: "session-3" }),
+      PROBE_RUNNER_PORT: "43123",
+    })
+
+    expect(updated).toContain("<key>EXISTING_FLAG</key>")
+    expect(updated).toContain("<key>PROBE_BOOTSTRAP_JSON</key>")
+    expect(updated).toContain("session-3")
+    expect(updated).toContain("<key>PROBE_RUNNER_PORT</key>")
+    expect(updated).toContain("43123")
   })
 })

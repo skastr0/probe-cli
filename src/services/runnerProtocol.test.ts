@@ -8,6 +8,7 @@ import {
   decodeRunnerResponseFrame,
   decodeRunnerStdinProbeResultFrame,
   encodeRunnerCommandFrame,
+  RUNNER_HTTP_COMMAND_INGRESS,
   RUNNER_TRANSPORT_CONTRACT,
 } from "./runnerProtocol"
 
@@ -86,5 +87,30 @@ describe("runner protocol", () => {
     delete broken.sessionIdentifier
 
     expect(() => decodeRunnerReadyFrame(broken)).toThrow(/Invalid runner ready frame:.*sessionIdentifier/)
+  })
+
+  test("decodes the device-ready extension Probe uses for HTTP control", () => {
+    const ready = decodeRunnerReadyFrame({
+      kind: "ready",
+      attachLatencyMs: 12,
+      bootstrapPath: "env:PROBE_BOOTSTRAP_JSON",
+      bootstrapSource: "device-bootstrap-manifest",
+      controlDirectoryPath: "/private/var/mobile/Containers/Data/Application/example/tmp/probe-runtime-session-1",
+      currentDirectoryPath: "/",
+      egressTransport: "stdout-jsonl-mixed-log",
+      homeDirectoryPath: "/private/var/mobile/Containers/Data/Application/example",
+      ingressTransport: RUNNER_HTTP_COMMAND_INGRESS,
+      initialStatusLabel: "",
+      processIdentifier: 4402,
+      recordedAt: "2026-04-11T00:00:00.000Z",
+      runnerPort: 43123,
+      runnerTransportContract: RUNNER_TRANSPORT_CONTRACT,
+      sessionIdentifier: "session-1",
+      simulatorUdid: "device-1",
+    })
+
+    expect(ready.bootstrapSource).toBe("device-bootstrap-manifest")
+    expect(ready.ingressTransport).toBe(RUNNER_HTTP_COMMAND_INGRESS)
+    expect(ready.runnerPort).toBe(43123)
   })
 })

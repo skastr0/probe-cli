@@ -695,12 +695,12 @@ const buildRealDeviceCapabilities = (args: {
     area: "runner",
     status: args.liveRunner ? "supported" : "degraded",
     summary: args.liveRunner
-      ? "The real-device runner is live over the same bootstrap-manifest + file-mailbox + stdout-JSONL transport used on simulator."
+      ? "The real-device runner is live over a device-specific bootstrap-manifest + HTTP POST + stdout-ready transport."
       : "The real-device runner transport is not established in this slice; Probe only keeps preflight state and explicit integration points alive.",
     details: args.liveRunner
       ? [
-          "Command ingress uses the host-side file mailbox shared with the XCUITest boundary.",
-          "Runner events are parsed from stdout JSONL frames embedded in the mixed xcodebuild/XCTest log stream.",
+          "Command ingress uses the runner-local HTTP listener reported in the ready frame.",
+          "Ready-state events are still parsed from stdout JSONL frames embedded in the mixed xcodebuild/XCTest log stream.",
         ]
       : [
           "The Simulator bootstrap-manifest transport is not claimed for real devices.",
@@ -765,7 +765,7 @@ const buildRealDeviceWarnings = (opened: OpenedRealDeviceSession): ReadonlyArray
     daemonOwnedCleanupWarning,
   ]
 
-  if (opened.mode === "live" && opened.stdinProbeStatus !== "received") {
+  if (opened.mode === "live" && opened.commandIngress === "file-mailbox" && opened.stdinProbeStatus !== "received") {
     warnings.push(
       `Runner stdin probe reported ${opened.stdinProbeStatus}; the daemon continues on the proven file-mailbox contract instead of pretending stdin works.`,
     )
@@ -2666,7 +2666,7 @@ export const SessionRegistryLive = Layer.scoped(
                       eventEgress: opened.eventEgress,
                       stdinProbeStatus: opened.stdinProbeStatus,
                       note:
-                        "The current real-device slice reuses the validated XCUITest boundary seam: device bootstrap manifest plus file-backed command ingress plus stdout-framed event egress.",
+                        "The current real-device slice uses a device bootstrap manifest plus runner-local HTTP ingress, while stdout remains the canonical ready-frame observation seam and diagnostics stream.",
                     },
                     capabilities: [...buildRealDeviceCapabilities({
                       connection: opened.connection,
@@ -2690,7 +2690,7 @@ export const SessionRegistryLive = Layer.scoped(
                       connectionStatus: opened.connection.status,
                       lastCheckedAt: opened.connection.checkedAt,
                       note:
-                        "The real-device runner is live over the same file-mailbox + stdout-JSONL mixed-log transport validated on simulator.",
+                        "The real-device runner is live over HTTP POST command ingress with stdout-JSONL mixed-log observation for readiness and diagnostics.",
                     },
                     healthCheck,
                     debugger: debuggerState,

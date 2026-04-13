@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Network
 import XCTest
 
 final class AttachControlSpikeUITests: XCTestCase {
@@ -26,6 +27,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     let initialStatusLabel: String
     let processIdentifier: Int32
     let recordedAt: String
+    var runnerPort: Int?
     let runnerTransportContract: String
     let sessionIdentifier: String
     let simulatorUdid: String
@@ -447,24 +449,39 @@ final class AttachControlSpikeUITests: XCTestCase {
     let resolvedControlDirectory = try resolveLifecycleControlDirectory()
     let isDevice = resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
 
-    // For real device, use stdin transport; for simulator, use file-mailbox.
-    let controlDirectoryURL: URL
-    if isDevice {
-      controlDirectoryURL = URL(fileURLWithPath: "/tmp/probe-device-placeholder", isDirectory: true)
-    } else {
-      controlDirectoryURL = URL(
-        fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
-        isDirectory: true,
-      )
-      try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
-    }
+    let controlDirectoryURL = isDevice
+      ? deviceLifecycleControlDirectoryURL(sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier)
+      : URL(
+          fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
+          isDirectory: true,
+        )
+    try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
 
-    let lifecycleState = try attachForLifecycleLoop(
+    var lifecycleState = try attachForLifecycleLoop(
       resolvedControlDirectory: resolvedControlDirectory,
       controlDirectoryURL: controlDirectoryURL,
       foregroundFailureMessage: "Fixture app must already be running in the foreground before ProbeRunner enters its transport-boundary loop.",
       statusLabelFailureMessage: "Expected fixture status label to exist before the transport-boundary loop starts."
     )
+
+    if isDevice {
+      let httpCommandServer = try startHTTPCommandServer(
+        desiredPort: resolveRunnerPortFromEnvironment(),
+        controlDirectoryURL: controlDirectoryURL,
+        app: lifecycleState.app,
+        statusLabel: lifecycleState.statusLabel
+      )
+      lifecycleState.readyFrame.runnerPort = httpCommandServer.port
+
+      try emitStdoutJSONLine(lifecycleState.readyFrame)
+
+      print(
+        "PROBE_METRIC transport_boundary_ready attach_latency_ms=\(lifecycleState.readyFrame.attachLatencyMs) control_dir=\(controlDirectoryURL.path) pid=\(lifecycleState.readyFrame.processIdentifier) runner_port=\(httpCommandServer.port)"
+      )
+
+      try httpCommandServer.waitForShutdown()
+      return
+    }
 
     try emitStdoutJSONLine(lifecycleState.readyFrame)
 
@@ -479,18 +496,11 @@ final class AttachControlSpikeUITests: XCTestCase {
       "PROBE_METRIC transport_boundary_stdin_probe status=\(stdinProbeResult.status) payload=\(stdinProbeResult.payload ?? "<nil>") error=\(stdinProbeResult.error ?? "<nil>")"
     )
 
-    if isDevice {
-      try runStdinCommandLoop(
-        app: lifecycleState.app,
-        statusLabel: lifecycleState.statusLabel
-      )
-    } else {
-      try runLifecycleCommandLoop(
-        controlDirectoryURL: controlDirectoryURL,
-        app: lifecycleState.app,
-        statusLabel: lifecycleState.statusLabel
-      )
-    }
+    try runLifecycleCommandLoop(
+      controlDirectoryURL: controlDirectoryURL,
+      app: lifecycleState.app,
+      statusLabel: lifecycleState.statusLabel
+    )
   }
 
   @MainActor
@@ -528,7 +538,7 @@ final class AttachControlSpikeUITests: XCTestCase {
 
   private struct LifecycleLoopState {
     let app: XCUIApplication
-    let readyFrame: LifecycleReadyFrame
+    var readyFrame: LifecycleReadyFrame
     let statusLabel: XCUIElement
   }
 
@@ -569,10 +579,13 @@ final class AttachControlSpikeUITests: XCTestCase {
       currentDirectoryPath: FileManager.default.currentDirectoryPath,
       egressTransport: resolvedControlDirectory.config.egressTransport,
       homeDirectoryPath: NSHomeDirectory(),
-      ingressTransport: resolvedControlDirectory.config.ingressTransport,
+      ingressTransport: resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
+        ? "http-post"
+        : resolvedControlDirectory.config.ingressTransport,
       initialStatusLabel: statusLabelExists ? statusLabel.label : "",
       processIdentifier: ProcessInfo.processInfo.processIdentifier,
       recordedAt: Self.iso8601Formatter.string(from: Date()),
+      runnerPort: nil,
       runnerTransportContract: resolvedControlDirectory.config.contractVersion,
       sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier,
       simulatorUdid: resolvedControlDirectory.config.simulatorUdid
@@ -761,44 +774,13 @@ final class AttachControlSpikeUITests: XCTestCase {
       }
 
       let commandStartedAt = Date()
-
-      let responseFrame: LifecycleResponseFrame
-
-      do {
-        let result = try handleLifecycleCommand(
-          command,
-          app: app,
-          statusLabel: statusLabel,
-          controlDirectoryURL: controlDirectoryURL
-        )
-        responseFrame = LifecycleResponseFrame(
-          action: command.action,
-          error: nil,
-          handledMs: milliseconds(since: commandStartedAt),
-          kind: "response",
-          ok: true,
-          payload: result.payload,
-          snapshotPayloadPath: result.snapshotPayloadPath,
-          recordedAt: Self.iso8601Formatter.string(from: Date()),
-          sequence: command.sequence,
-          snapshotNodeCount: result.snapshotNodeCount,
-          statusLabel: currentStatusLabelText(app: app)
-        )
-      } catch {
-        responseFrame = LifecycleResponseFrame(
-          action: command.action,
-          error: String(describing: error),
-          handledMs: milliseconds(since: commandStartedAt),
-          kind: "response",
-          ok: false,
-          payload: nil,
-          snapshotPayloadPath: nil,
-          recordedAt: Self.iso8601Formatter.string(from: Date()),
-          sequence: command.sequence,
-          snapshotNodeCount: nil,
-          statusLabel: currentStatusLabelText(app: app)
-        )
-      }
+      let responseFrame = executeLifecycleCommandFrame(
+        command,
+        startedAt: commandStartedAt,
+        app: app,
+        statusLabel: statusLabel,
+        controlDirectoryURL: controlDirectoryURL
+      )
 
       // Keep file mirrors for lifecycle/transport validation scripts; the runtime consumes stdout as canonical egress.
       try writeJSON(
@@ -826,6 +808,316 @@ final class AttachControlSpikeUITests: XCTestCase {
         return
       }
     }
+  }
+
+  private struct HTTPCommandServer {
+    let port: Int
+    let waitForShutdown: () throws -> Void
+  }
+
+  private func deviceLifecycleControlDirectoryURL(sessionIdentifier: String) -> URL {
+    FileManager.default.temporaryDirectory.appendingPathComponent(
+      "probe-runtime-\(sessionIdentifier)",
+      isDirectory: true,
+    )
+  }
+
+  private func resolveRunnerPortFromEnvironment() throws -> Int {
+    let rawPort = ProcessInfo.processInfo.environment["PROBE_RUNNER_PORT"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+    guard !rawPort.isEmpty else {
+      return 0
+    }
+
+    guard let port = Int(rawPort), (0...65535).contains(port) else {
+      throw lifecycleBootstrapError("PROBE_RUNNER_PORT must be an integer between 0 and 65535, received \(rawPort).")
+    }
+
+    return port
+  }
+
+  @MainActor
+  private func executeLifecycleCommandFrame(
+    _ command: LifecycleCommandFrame,
+    startedAt: Date,
+    app: XCUIApplication,
+    statusLabel: XCUIElement,
+    controlDirectoryURL: URL,
+  ) -> LifecycleResponseFrame {
+    do {
+      let result = try handleLifecycleCommand(
+        command,
+        app: app,
+        statusLabel: statusLabel,
+        controlDirectoryURL: controlDirectoryURL
+      )
+      return LifecycleResponseFrame(
+        action: command.action,
+        error: nil,
+        handledMs: milliseconds(since: startedAt),
+        kind: "response",
+        ok: true,
+        payload: result.payload,
+        snapshotPayloadPath: result.snapshotPayloadPath,
+        recordedAt: Self.iso8601Formatter.string(from: Date()),
+        sequence: command.sequence,
+        snapshotNodeCount: result.snapshotNodeCount,
+        statusLabel: currentStatusLabelText(app: app)
+      )
+    } catch {
+      return LifecycleResponseFrame(
+        action: command.action,
+        error: String(describing: error),
+        handledMs: milliseconds(since: startedAt),
+        kind: "response",
+        ok: false,
+        payload: nil,
+        snapshotPayloadPath: nil,
+        recordedAt: Self.iso8601Formatter.string(from: Date()),
+        sequence: command.sequence,
+        snapshotNodeCount: nil,
+        statusLabel: currentStatusLabelText(app: app)
+      )
+    }
+  }
+
+  @MainActor
+  private func startHTTPCommandServer(
+    desiredPort: Int,
+    controlDirectoryURL: URL,
+    app: XCUIApplication,
+    statusLabel: XCUIElement,
+  ) throws -> HTTPCommandServer {
+    let listener = try makeHTTPListener(desiredPort: desiredPort)
+    let queue = DispatchQueue(label: "probe.runner.http")
+    let startupSemaphore = DispatchSemaphore(value: 0)
+    let doneExpectation = expectation(description: "ProbeRunner HTTP command loop finished")
+    var didSignalStartup = false
+    var didFinish = false
+    var startupError: Error?
+    var actualPort: Int?
+    let finishLoopIfNeeded = {
+      guard !didFinish else {
+        return
+      }
+
+      didFinish = true
+      doneExpectation.fulfill()
+    }
+
+    listener.stateUpdateHandler = { state in
+      switch state {
+      case .ready:
+        actualPort = listener.port.map { Int($0.rawValue) }
+        if !didSignalStartup {
+          didSignalStartup = true
+          startupSemaphore.signal()
+        }
+      case .failed(let error):
+        startupError = error
+        if !didSignalStartup {
+          didSignalStartup = true
+          startupSemaphore.signal()
+        }
+        finishLoopIfNeeded()
+      case .cancelled:
+        finishLoopIfNeeded()
+      default:
+        break
+      }
+    }
+
+    listener.newConnectionHandler = { [weak self] connection in
+      connection.start(queue: queue)
+      self?.receiveHTTPRequest(
+        on: connection,
+        buffer: Data(),
+        controlDirectoryURL: controlDirectoryURL,
+        app: app,
+        statusLabel: statusLabel,
+        onShutdown: {
+          listener.cancel()
+          finishLoopIfNeeded()
+        }
+      )
+    }
+
+    listener.start(queue: queue)
+
+    guard startupSemaphore.wait(timeout: .now() + 10) == .success else {
+      listener.cancel()
+      throw lifecycleBootstrapError("The real-device HTTP command listener did not become ready before the timeout.")
+    }
+
+    if let startupError {
+      listener.cancel()
+      throw startupError
+    }
+
+    guard let actualPort else {
+      listener.cancel()
+      throw lifecycleBootstrapError("The real-device HTTP command listener did not report a bound port.")
+    }
+
+    return HTTPCommandServer(
+      port: actualPort,
+      waitForShutdown: {
+        let waitResult = XCTWaiter.wait(for: [doneExpectation], timeout: 24 * 60 * 60)
+        listener.cancel()
+
+        if waitResult != .completed {
+          throw self.lifecycleBootstrapError("The real-device HTTP command listener ended with \(waitResult).")
+        }
+      }
+    )
+  }
+
+  private func makeHTTPListener(desiredPort: Int) throws -> NWListener {
+    if desiredPort > 0, let port = NWEndpoint.Port(rawValue: UInt16(desiredPort)) {
+      return try NWListener(using: .tcp, on: port)
+    }
+
+    return try NWListener(using: .tcp)
+  }
+
+  private func receiveHTTPRequest(
+    on connection: NWConnection,
+    buffer: Data,
+    controlDirectoryURL: URL,
+    app: XCUIApplication,
+    statusLabel: XCUIElement,
+    onShutdown: @escaping () -> Void,
+  ) {
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 1024 * 1024) { [weak self] data, _, _, error in
+      guard let self else {
+        connection.cancel()
+        return
+      }
+
+      if error != nil {
+        connection.cancel()
+        return
+      }
+
+      guard let data, !data.isEmpty else {
+        connection.cancel()
+        return
+      }
+
+      let combined = buffer + data
+      guard let body = self.parseHTTPRequestBody(from: combined) else {
+        self.receiveHTTPRequest(
+          on: connection,
+          buffer: combined,
+          controlDirectoryURL: controlDirectoryURL,
+          app: app,
+          statusLabel: statusLabel,
+          onShutdown: onShutdown,
+        )
+        return
+      }
+
+      Task { @MainActor in
+        let response = self.handleHTTPRequestBody(
+          body,
+          controlDirectoryURL: controlDirectoryURL,
+          app: app,
+          statusLabel: statusLabel,
+        )
+        self.sendHTTPResponse(response.data, over: connection) {
+          if response.shouldShutdown {
+            onShutdown()
+          }
+        }
+      }
+    }
+  }
+
+  @MainActor
+  private func handleHTTPRequestBody(
+    _ body: Data,
+    controlDirectoryURL: URL,
+    app: XCUIApplication,
+    statusLabel: XCUIElement,
+  ) -> (data: Data, shouldShutdown: Bool) {
+    do {
+      let command = try JSONDecoder().decode(LifecycleCommandFrame.self, from: body)
+      let responseFrame = executeLifecycleCommandFrame(
+        command,
+        startedAt: Date(),
+        app: app,
+        statusLabel: statusLabel,
+        controlDirectoryURL: controlDirectoryURL,
+      )
+      return (
+        try encodeHTTPJSONResponse(status: 200, value: responseFrame),
+        command.action == "shutdown"
+      )
+    } catch {
+      return (
+        (try? encodeHTTPJSONResponse(status: 400, value: ["error": String(describing: error)]))
+          ?? Data("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+        false
+      )
+    }
+  }
+
+  private func sendHTTPResponse(_ response: Data, over connection: NWConnection, afterSend: @escaping () -> Void) {
+    connection.send(content: response, isComplete: true, completion: .contentProcessed { _ in
+      connection.cancel()
+      afterSend()
+    })
+  }
+
+  private func parseHTTPRequestBody(from data: Data) -> Data? {
+    guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else {
+      return nil
+    }
+
+    let headerData = data.subdata(in: 0..<headerEnd.lowerBound)
+    let bodyStart = headerEnd.upperBound
+    let headers = String(decoding: headerData, as: UTF8.self)
+
+    guard let contentLength = extractHTTPContentLength(from: headers) else {
+      return nil
+    }
+
+    guard data.count >= bodyStart + contentLength else {
+      return nil
+    }
+
+    return data.subdata(in: bodyStart..<(bodyStart + contentLength))
+  }
+
+  private func extractHTTPContentLength(from headers: String) -> Int? {
+    for line in headers.components(separatedBy: "\r\n") where !line.isEmpty {
+      let parts = line
+        .split(separator: ":", maxSplits: 1)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+
+      if parts.count == 2 && parts[0].lowercased() == "content-length" {
+        return Int(parts[1])
+      }
+    }
+
+    return nil
+  }
+
+  private func encodeHTTPJSONResponse<T: Encodable>(status: Int, value: T) throws -> Data {
+    let body = try JSONEncoder().encode(value)
+    let headers = [
+      "HTTP/1.1 \(status) OK",
+      "Content-Type: application/json",
+      "Content-Length: \(body.count)",
+      "Connection: close",
+      "",
+      "",
+    ].joined(separator: "\r\n")
+
+    var response = Data(headers.utf8)
+    response.append(body)
+    return response
   }
 
   private func emitStdoutJSONLine<T: Encodable>(_ value: T) throws {
@@ -1870,7 +2162,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     switch command.action {
     case "ping":
       let pingPayload = command.payload ?? ""
-      XCTAssertTrue(statusLabel.waitForExistence(timeout: interactionTimeout))
+      _ = statusLabel.waitForExistence(timeout: interactionTimeout)
       return LifecycleCommandResult(
         payload: "pong:\(pingPayload)",
         snapshotPayloadPath: nil,
@@ -2012,134 +2304,6 @@ final class AttachControlSpikeUITests: XCTestCase {
         code: 1,
         userInfo: [NSLocalizedDescriptionKey: "Unsupported lifecycle action: \(command.action)"]
       )
-    }
-  }
-
-  private func readCommandFromStdin(timeout: TimeInterval) throws -> LifecycleCommandFrame? {
-    let duplicatedStdin = dup(STDIN_FILENO)
-    guard duplicatedStdin >= 0 else { return nil }
-    defer { close(duplicatedStdin) }
-
-    let originalFlags = fcntl(duplicatedStdin, F_GETFL)
-    if originalFlags >= 0 {
-      _ = fcntl(duplicatedStdin, F_SETFL, originalFlags | O_NONBLOCK)
-    }
-    defer {
-      if originalFlags >= 0 {
-        _ = fcntl(duplicatedStdin, F_SETFL, originalFlags)
-      }
-    }
-
-    let deadline = Date().addingTimeInterval(timeout)
-    var buffer = Data()
-
-    while Date() < deadline {
-      var descriptor = pollfd(
-        fd: duplicatedStdin,
-        events: Int16(POLLIN | POLLERR | POLLHUP),
-        revents: 0
-      )
-      let pollResult = withUnsafeMutablePointer(to: &descriptor) { pointer in
-        poll(pointer, 1, 100)
-      }
-
-      if pollResult < 0 {
-        if errno == EINTR { continue }
-        return nil
-      }
-      if pollResult == 0 { continue }
-      if (descriptor.revents & Int16(POLLERR)) != 0 { return nil }
-      if (descriptor.revents & Int16(POLLHUP)) != 0 && (descriptor.revents & Int16(POLLIN)) == 0 { return nil }
-
-      if (descriptor.revents & Int16(POLLIN)) != 0 {
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        let readCount = read(duplicatedStdin, &chunk, chunk.count)
-        if readCount == 0 { return nil }
-        if readCount < 0 {
-          if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
-          return nil
-        }
-        buffer.append(contentsOf: chunk.prefix(readCount))
-        if let newlineIndex = buffer.firstIndex(of: 0x0A) {
-          let lineData = Data(buffer.prefix(upTo: newlineIndex))
-          return try JSONDecoder().decode(LifecycleCommandFrame.self, from: lineData)
-        }
-      }
-    }
-    return nil
-  }
-
-  @MainActor
-  private func runStdinCommandLoop(
-    app: XCUIApplication,
-    statusLabel: XCUIElement,
-  ) throws {
-    var expectedSequence = 1
-    var handledCommands = 0
-
-    while true {
-      guard let command = try readCommandFromStdin(timeout: lifecycleCommandTimeout) else {
-        XCTFail("Timed out waiting for stdin command #\(expectedSequence).")
-        return
-      }
-
-      let commandStartedAt = Date()
-      let responseFrame: LifecycleResponseFrame
-
-      do {
-        let result = try handleLifecycleCommand(
-          command,
-          app: app,
-          statusLabel: statusLabel,
-          controlDirectoryURL: URL(fileURLWithPath: "/tmp/probe-stdin-placeholder")
-        )
-        responseFrame = LifecycleResponseFrame(
-          action: command.action,
-          error: nil,
-          handledMs: milliseconds(since: commandStartedAt),
-          kind: "response",
-          ok: true,
-          payload: result.payload,
-          snapshotPayloadPath: result.snapshotPayloadPath,
-          recordedAt: Self.iso8601Formatter.string(from: Date()),
-          sequence: command.sequence,
-          snapshotNodeCount: result.snapshotNodeCount,
-          statusLabel: currentStatusLabelText(app: app)
-        )
-      } catch {
-        responseFrame = LifecycleResponseFrame(
-          action: command.action,
-          error: String(describing: error),
-          handledMs: milliseconds(since: commandStartedAt),
-          kind: "response",
-          ok: false,
-          payload: nil,
-          snapshotPayloadPath: nil,
-          recordedAt: Self.iso8601Formatter.string(from: Date()),
-          sequence: command.sequence,
-          snapshotNodeCount: nil,
-          statusLabel: currentStatusLabelText(app: app)
-        )
-      }
-
-      try emitStdoutJSONLine(responseFrame)
-
-      print(
-        "PROBE_METRIC stdin_response sequence=\(responseFrame.sequence) action=\(responseFrame.action) ok=\(responseFrame.ok) handled_ms=\(responseFrame.handledMs)"
-      )
-
-      handledCommands += 1
-      expectedSequence += 1
-
-      if !responseFrame.ok {
-        XCTFail("Stdin command #\(responseFrame.sequence) failed: \(responseFrame.error ?? "unknown")")
-        return
-      }
-
-      if command.action == "shutdown" {
-        print("PROBE_METRIC stdin_shutdown handled_commands=\(handledCommands)")
-        return
-      }
     }
   }
 

@@ -77,7 +77,7 @@ export const RealDeviceLiveTransportContract = Schema.Struct({
   bootstrapSource: Schema.Literal("device-bootstrap-manifest"),
   bootstrapPath: Schema.String,
   sessionIdentifier: Schema.String,
-  commandIngress: Schema.Literal("file-mailbox"),
+  commandIngress: Schema.Literal("file-mailbox", "http-post"),
   eventEgress: Schema.Literal("stdout-jsonl-mixed-log"),
   stdinProbeStatus: Schema.String,
   note: Schema.String,

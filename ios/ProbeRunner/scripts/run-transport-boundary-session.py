@@ -8,8 +8,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,15 +20,32 @@ def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def strip_legacy_stdin_probe_args(argv: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    skip_next = False
+
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+
+        if arg == "--stdin-probe-payload":
+            skip_next = True
+            continue
+
+        cleaned.append(arg)
+
+    return cleaned
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--control-dir", required=True)
     parser.add_argument("--destination")
     parser.add_argument("--log-path", required=True)
     parser.add_argument("--stdout-events-path", required=True)
-    parser.add_argument("--stdin-probe-payload", required=False, default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+    args = parser.parse_args(strip_legacy_stdin_probe_args(sys.argv[1:]))
 
     command = list(args.command)
     if command and command[0] == "--":
@@ -58,30 +73,13 @@ def main() -> int:
 
     process = subprocess.Popen(
         command,
-        stdin=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         env=os.environ.copy(),
     )
-
-    def forward_stdin() -> None:
-        """Forward host stdin lines to xcodebuild stdin."""
-        try:
-            for line in sys.stdin:
-                if process.poll() is not None:
-                    break
-                try:
-                    process.stdin.write(line)
-                    process.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    break
-        except Exception:
-            pass
-
-    stdin_thread = threading.Thread(target=forward_stdin, daemon=True)
-    stdin_thread.start()
 
     def forward_signal(signum: int, _frame: object) -> None:
         if process.poll() is None:
@@ -100,9 +98,6 @@ def main() -> int:
 
     if process.stdout is None:
         raise SystemExit("xcodebuild stdout pipe was not created")
-
-    if process.stdin is None:
-        raise SystemExit("xcodebuild stdin pipe was not created")
 
     with (
         log_path.open("w", encoding="utf-8") as log_file,
@@ -131,7 +126,6 @@ def main() -> int:
             kind = event.get("kind")
             if kind == "ready":
                 write_json(ready_path, event)
-                # Stdin probe is now sent by the host through the forwarded stdin pipe.
             elif kind == "stdin-probe-result":
                 write_json(stdin_probe_path, event)
             elif kind == "response":

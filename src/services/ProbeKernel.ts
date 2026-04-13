@@ -119,7 +119,7 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
   {
     area: "real-device",
     status: "degraded",
-    summary: "Probe can now open a live real-device runner session through explicit CoreDevice/DDI/signing checks plus the same bootstrap-manifest + file-mailbox + stdout transport used on simulator.",
+    summary: "Probe can now open a live real-device runner session through explicit CoreDevice/DDI/signing checks plus a bootstrap-manifest + HTTP POST + stdout-ready transport.",
     details: [
       "session open supports --target device with optional --device-id selection.",
       "Real-device opens still fail closed when pairing, Developer Mode, signing, or target-app install prerequisites are missing.",
@@ -129,7 +129,7 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
     area: "runner",
     status: "degraded",
     summary:
-      "Runner control is real and still uses the honest XCUITest transport seam: bootstrap manifest plus file-mailbox ingress plus stdout mixed-log egress on simulator and real device.",
+      "Runner control is real and uses an honest XCUITest transport seam: simulator sessions stay on file-mailbox + stdout mixed-log egress, while real-device sessions use HTTP POST + stdout-ready observation.",
     details: [],
   },
   {
@@ -173,7 +173,7 @@ const workspaceKnownWalls: ReadonlyArray<KnownWall> = [
   },
   {
     key: "runner-transport",
-    summary: "The runner still relies on the validated bootstrap-manifest plus file-mailbox ingress plus stdout mixed-log egress seam on simulator and the current live device path.",
+    summary: "The runner still relies on validated bootstrap-manifest seams: simulator sessions use file-mailbox ingress plus stdout mixed-log egress, while real-device sessions use HTTP POST ingress plus stdout mixed-log readiness.",
     details: [
       "xcodebuild stdin is not treated as a supported host-to-runner transport in this slice.",
       "Daemon restarts and runner transport loss fail closed instead of pretending the live bridge was recovered.",
@@ -192,7 +192,7 @@ const workspaceKnownWalls: ReadonlyArray<KnownWall> = [
     summary: "Simulator and real-device sessions can target arbitrary bundle ids, but the app must already be installed and Probe still depends on the XCUITest host app + runner project for its control surface.",
     details: [
       "Simulator session open supports Probe's fixture build/install flow or attach-to-running for an installed app that is already running.",
-      "Real-device session open verifies the requested bundle id is installed, launches it with devicectl, then attaches the XCUITest runner over the validated transport seam.",
+      "Real-device session open verifies the requested bundle id is installed, launches it with devicectl, then attaches the XCUITest runner over the validated HTTP transport seam.",
     ],
   },
 ]
