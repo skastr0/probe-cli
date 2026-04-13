@@ -205,15 +205,15 @@ const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
       schema: "thread-state",
       required: true,
       budget: {
-        maxBytes: 2 * mib,
-        maxRows: 8_000,
+        maxBytes: 6 * mib,
+        maxRows: 20_000,
       },
     }, {
       schema: "cpu-state",
       required: true,
       budget: {
-        maxBytes: 2 * mib,
-        maxRows: 8_000,
+        maxBytes: 6 * mib,
+        maxRows: 20_000,
       },
     }],
     maxRecordingTimeLimitMs: 10_000,

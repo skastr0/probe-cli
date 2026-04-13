@@ -622,8 +622,8 @@ describe("PerfService", () => {
             exportCalls++
             throw new ExportBudgetExceededError({
               kind: "rows",
-              limit: 8000,
-              observed: 8001,
+              limit: 20_000,
+              observed: 20_001,
             })
           },
         },
@@ -688,8 +688,8 @@ describe("PerfService", () => {
 
       // Verify system trace uses the reduced budgets
       expect(commandRunner.stats.budgets).toEqual([
-        { schema: "thread-state", maxBytes: 2 * mib, maxRows: 8_000 },
-        { schema: "cpu-state", maxBytes: 2 * mib, maxRows: 8_000 },
+        { schema: "thread-state", maxBytes: 6 * mib, maxRows: 20_000 },
+        { schema: "cpu-state", maxBytes: 6 * mib, maxRows: 20_000 },
       ])
       expect(result.template).toBe("system-trace")
       expect(result.artifacts.exports).toHaveLength(2)
