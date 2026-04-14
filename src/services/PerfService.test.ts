@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Either } from "effect"
-import { EnvironmentError } from "../domain/errors"
+import { ArtifactNotFoundError, EnvironmentError } from "../domain/errors"
 import type { ArtifactRecord } from "../domain/output"
 import { createPerfService, ExportBudgetExceededError } from "./PerfService"
 
@@ -108,6 +108,24 @@ const swiftActorExecutionXml = `<?xml version="1.0"?>
   </node>
 </trace-query-result>`
 
+const signpostIntervalsXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="os-signpost-interval">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>name</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>subsystem</mnemonic></col>
+      <col><mnemonic>category</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.000.000">0</start-time><duration fmt="10.00 ms">10000000</duration><name fmt="loadData">loadData</name><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><subsystem fmt="dev.probe.fixture">dev.probe.fixture</subsystem><category fmt="startup">startup</category></row>
+    <row><start-time fmt="00:00.015.000">15000000</start-time><duration fmt="20.00 ms">20000000</duration><name fmt="loadData">loadData</name><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><subsystem fmt="dev.probe.fixture">dev.probe.fixture</subsystem><category fmt="startup">startup</category></row>
+    <row><start-time fmt="00:00.050.000">50000000</start-time><duration fmt="5.00 ms">5000000</duration><name fmt="renderFrame">renderFrame</name><thread fmt="Render Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><subsystem fmt="dev.probe.fixture">dev.probe.fixture</subsystem><category fmt="render">render</category></row>
+  </node>
+</trace-query-result>`
+
 const metalDriverIntervalsXml = `<?xml version="1.0"?>
 <trace-query-result>
   <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
@@ -170,6 +188,17 @@ const createArtifactStore = () => {
           artifacts.push(record)
           return record
         }),
+      getArtifact: (sessionId: string, artifactKey: string) => {
+        const artifact = artifacts.find((entry) => entry.key === artifactKey)
+
+        return artifact
+          ? Effect.succeed(artifact)
+          : Effect.fail(new ArtifactNotFoundError({
+              sessionId,
+              artifactKey,
+              nextStep: "none",
+            }))
+      },
     },
   }
 }
@@ -215,9 +244,9 @@ const createSessionHealth = (
     bootstrapSource: "simulator-bootstrap-manifest",
     bootstrapPath: "/tmp/bootstrap.json",
     sessionIdentifier: "session-1",
-    commandIngress: "file-mailbox",
+    commandIngress: "http-post",
     eventEgress: "stdout-jsonl-mixed-log",
-    stdinProbeStatus: "timeout",
+    stdinProbeStatus: "not-required-http",
     note: "test transport",
   },
   runner: {
@@ -233,7 +262,7 @@ const createSessionHealth = (
     stdoutEventsPath: "/tmp/stdout.ndjson",
     resultBundlePath: "/tmp/result.xcresult",
     wrapperStderrPath: "/tmp/wrapper.stderr.log",
-    stdinProbeStatus: "timeout",
+    stdinProbeStatus: "not-required-http",
   },
   healthCheck: {
     checkedAt: "2026-04-10T00:00:00.000Z",
@@ -278,11 +307,26 @@ const createCommandRunner = (options: {
     readonly budget: { readonly maxBytes: number; readonly maxRows: number }
   }) => Promise<void> | void
   readonly recordDelayMs?: number
+  readonly onStartRecording?: (args: {
+    readonly command: string
+    readonly commandArgs: ReadonlyArray<string>
+    readonly startupNotificationKey: string
+    readonly startupTimeoutMs: number
+    readonly timeoutMs: number
+    readonly gracePeriodMs?: number
+  }) => Promise<void> | void
+  readonly stopRecordingResult?: {
+    readonly stdout: string
+    readonly stderr: string
+    readonly exitCode: number | null
+    readonly wasRunning: boolean
+  }
 }) => {
   const stats = {
     captureCalls: 0,
     exportCalls: 0,
     budgets: [] as Array<{ schema: string; maxBytes: number; maxRows: number }>,
+    startRecordingCalls: 0,
   }
 
   return {
@@ -302,7 +346,7 @@ const createCommandRunner = (options: {
 
         if (args.commandArgs[0] === "xctrace" && args.commandArgs[1] === "list") {
           return {
-            stdout: "Time Profiler\nSystem Trace\nMetal System Trace\nSwift Concurrency\nHangs\n",
+            stdout: "Time Profiler\nSystem Trace\nMetal System Trace\nSwift Concurrency\nHangs\nLogging\n",
             stderr: "",
             exitCode: 0,
           }
@@ -381,6 +425,35 @@ const createCommandRunner = (options: {
           exitCode: 0,
           bytesWritten: Buffer.byteLength(xml, "utf8"),
           rowCount: (xml.match(/<row>/g) ?? []).length,
+        }
+      },
+      startRecording: async (args: {
+        readonly command: string
+        readonly commandArgs: ReadonlyArray<string>
+        readonly startupNotificationKey: string
+        readonly startupTimeoutMs: number
+        readonly timeoutMs: number
+        readonly gracePeriodMs?: number
+      }) => {
+        stats.startRecordingCalls += 1
+
+        const outputIndex = args.commandArgs.indexOf("--output")
+        const outputPath = args.commandArgs[outputIndex + 1]
+
+        if (!outputPath) {
+          throw new Error("Missing --output path in startRecording stub")
+        }
+
+        await mkdir(outputPath, { recursive: true })
+        await options.onStartRecording?.(args)
+
+        return {
+          stop: async () => options.stopRecordingResult ?? {
+            stdout: "",
+            stderr: "",
+            exitCode: 0,
+            wasRunning: true,
+          },
         }
       },
     },
@@ -893,6 +966,128 @@ describe("PerfService", () => {
           expect(result.left.reason).toContain("sample-type")
         }
       }
+    })
+  })
+
+  test("records a trace around a bounded flow and returns the flow report", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const events: Array<string> = []
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+        runFlow: () =>
+          Effect.sync(() => {
+            events.push("run-flow")
+            return {
+              contract: "probe.session-flow/report-v1",
+              executedAt: "2026-04-14T00:00:00.000Z",
+              sessionId: "session-1",
+              summary: "bounded flow passed",
+              verdict: "passed",
+              executedSteps: [],
+              failedStep: null,
+              retries: 0,
+              artifacts: [],
+              finalSnapshotId: null,
+              warnings: [],
+            } as const
+          }),
+      }
+      const commandRunner = createCommandRunner({
+        exports: {},
+        onStartRecording: async () => {
+          events.push("start-recording")
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.recordAroundFlow({
+          sessionId: "session-1",
+          template: "logging",
+          flow: {
+            contract: "probe.session-flow/v1",
+            steps: [{ kind: "sleep", durationMs: 250 }],
+          },
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.startRecordingCalls).toBe(1)
+      expect(events).toEqual(["start-recording", "run-flow"])
+      expect(result.template).toBe("logging")
+      expect(result.flow.verdict).toBe("passed")
+      expect(result.artifacts.trace.kind).toBe("directory")
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
+        "logging-trace",
+        "logging-toc",
+      ])
+    })
+  })
+
+  test("summarizes signpost intervals by interval name", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const tracePath = join(root, "traces", "logging.trace")
+
+      await mkdir(tracePath, { recursive: true })
+      await Effect.runPromise(
+        artifactStore.service.registerArtifact("session-1", {
+          key: "logging-trace",
+          label: "logging-trace",
+          kind: "directory",
+          summary: "logging trace",
+          absolutePath: tracePath,
+          relativePath: "traces/logging.trace",
+          external: false,
+          createdAt: "2026-04-14T00:00:00.000Z",
+        }),
+      )
+
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const commandRunner = createCommandRunner({
+        exports: {
+          "os-signpost-interval": signpostIntervalsXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.summarizeBySignpost({
+          sessionId: "session-1",
+          artifactKey: "logging-trace",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.groupBy).toBe("signpost")
+      expect(result.totalIntervals).toBe(3)
+      expect(result.groups).toHaveLength(2)
+      expect(result.groups[0]).toMatchObject({
+        intervalName: "loadData",
+        count: 2,
+        minDurationNs: 10_000_000,
+        maxDurationNs: 20_000_000,
+        wallTimeNs: 30_000_000,
+      })
+      expect(result.groups[1]).toMatchObject({
+        intervalName: "renderFrame",
+        count: 1,
+        avgDurationNs: 5_000_000,
+      })
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toContain("signpost-intervals")
     })
   })
 })

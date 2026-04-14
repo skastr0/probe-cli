@@ -1,15 +1,20 @@
 import { spawn } from "node:child_process"
 import { createWriteStream } from "node:fs"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
-import { basename, join, relative } from "node:path"
+import { basename, dirname, join, relative } from "node:path"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { Context, Effect, Fiber, Layer } from "effect"
+import type { FlowContract, FlowResult } from "../domain/action"
 import {
+  PerfAroundFlowResult,
   PerfRecordResult,
+  PerfSignpostSummaryResult,
   PerfTemplate,
+  analyzeSignpostIntervalTable,
   analyzeHangsTables,
   analyzeMetalSystemTraceTables,
+  summarizeSignpostIntervalsTable,
   analyzeSystemTraceTables,
   analyzeSwiftConcurrencyTables,
   analyzeTimeProfilerTable,
@@ -21,10 +26,12 @@ import {
 import type { ArtifactRecord } from "../domain/output"
 import { isLiveRunnerDetails, type SessionHealth } from "../domain/session"
 import {
+  ArtifactNotFoundError,
   ChildProcessError,
   EnvironmentError,
   SessionNotFoundError,
   UnsupportedCapabilityError,
+  UserInputError,
 } from "../domain/errors"
 import { ArtifactStore } from "./ArtifactStore"
 import { SessionRegistry } from "./SessionRegistry"
@@ -38,6 +45,7 @@ const recordingOverheadMs = 240_000
 const recordingGracePeriodMs = 60_000
 const runnerKeepaliveIntervalMs = 10_000
 const maxPerfTimeLimitMs = 5 * 60_000
+const recordingStartupTimeoutMs = 30_000
 const mib = 1024 * 1024
 const maxExportFileSizeBytes = 8 * mib
 const rowTag = "<row>"
@@ -99,6 +107,14 @@ interface TemplateExportSpec {
 interface StreamedCommandResult extends CommandResult {
   readonly bytesWritten: number
   readonly rowCount: number
+}
+
+interface BackgroundRecordingStopResult extends CommandResult {
+  readonly wasRunning: boolean
+}
+
+interface BackgroundRecordingHandle {
+  readonly stop: () => Promise<BackgroundRecordingStopResult>
 }
 
 export class ExportBudgetExceededError extends Error {
@@ -308,6 +324,20 @@ const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
       taskLifetimeTable: tables["swift-task-lifetime"],
       actorExecutionTable: tables["swift-actor-execution"],
     }),
+  },
+  logging: {
+    slug: "logging",
+    displayName: "Logging",
+    xctraceTemplateName: "Logging",
+    exportSchemas: [{
+      schema: "os-signpost-interval",
+      required: true,
+      budget: {
+        maxBytes: 4 * mib,
+        maxRows: 20_000,
+      },
+    }],
+    analyze: (tables) => analyzeSignpostIntervalTable(tables["os-signpost-interval"]),
   },
 }
 
@@ -583,6 +613,148 @@ const runCommandToFile = (args: {
     })
   })
 
+const liveStartRecording = async (args: {
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly startupNotificationKey: string
+  readonly startupTimeoutMs: number
+  readonly timeoutMs: number
+  readonly gracePeriodMs?: number
+}): Promise<BackgroundRecordingHandle> => {
+  const startupWait = runCommand({
+    command: "notifyutil",
+    commandArgs: ["-1", args.startupNotificationKey],
+    timeoutMs: args.startupTimeoutMs,
+    gracePeriodMs: 1_000,
+  })
+
+  const child = spawn(args.command, [...args.commandArgs], {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+
+  let stdout = ""
+  let stderr = ""
+  let timedOut = false
+
+  const timeout = setTimeout(() => {
+    timedOut = true
+    stopChildProcess(child, args.gracePeriodMs)
+  }, args.timeoutMs)
+
+  child.stdout?.setEncoding("utf8")
+  child.stderr?.setEncoding("utf8")
+  child.stdout?.on("data", (chunk) => {
+    stdout += chunk
+  })
+  child.stderr?.on("data", (chunk) => {
+    stderr += chunk
+  })
+
+  const exitPromise = new Promise<CommandResult>((resolve, reject) => {
+    child.once("error", (error) => {
+      clearTimeout(timeout)
+      reject(
+        new ChildProcessError({
+          code: "command-spawn-failed",
+          command: `${args.command} ${args.commandArgs.join(" ")}`,
+          reason: error instanceof Error ? error.message : String(error),
+          nextStep: "Verify the local toolchain installation and retry the command.",
+          exitCode: null,
+          stderrExcerpt: stderr.trim(),
+        }),
+      )
+    })
+
+    child.once("close", (code) => {
+      clearTimeout(timeout)
+
+      if (timedOut) {
+        reject(
+          new ChildProcessError({
+            code: "command-timeout",
+            command: `${args.command} ${args.commandArgs.join(" ")}`,
+            reason: `${args.command} exceeded the ${args.timeoutMs} ms timeout window.`,
+            nextStep: "Reduce the trace duration or inspect host load, then retry.",
+            exitCode: code,
+            stderrExcerpt: stderr.trim() || stdout.trim(),
+          }),
+        )
+        return
+      }
+
+      resolve({
+        stdout,
+        stderr,
+        exitCode: code,
+      })
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+
+    startupWait.then(() => {
+      if (!settled) {
+        settled = true
+        resolve()
+      }
+    }).catch((error) => {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    })
+
+    exitPromise.then((result) => {
+      if (!settled) {
+        settled = true
+        reject(
+          new ChildProcessError({
+            code: "command-failed",
+            command: `${args.command} ${args.commandArgs.join(" ")}`,
+            reason: `${args.command} exited before signaling that recording started.`,
+            nextStep: "Inspect stderr and retry the profiling command.",
+            exitCode: result.exitCode,
+            stderrExcerpt: result.stderr.trim() || result.stdout.trim(),
+          }),
+        )
+      }
+    }).catch((error) => {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    })
+  }).catch(async (error) => {
+    stopChildProcess(child, args.gracePeriodMs)
+
+    try {
+      await exitPromise
+    } catch {
+      // Ignore cleanup errors and surface the startup failure.
+    }
+
+    throw error
+  })
+
+  return {
+    stop: async () => {
+      const wasRunning = child.exitCode === null
+
+      if (wasRunning) {
+        child.kill("SIGINT")
+      }
+
+      const result = await exitPromise
+      return {
+        ...result,
+        wasRunning,
+      }
+    },
+  }
+}
+
 const parseTemplateNames = (stdout: string): ReadonlyArray<string> =>
   stdout
     .split(/\r?\n/)
@@ -689,6 +861,32 @@ export class PerfService extends Context.Tag("@probe/PerfService")<
       | UnsupportedCapabilityError
       | ChildProcessError
     >
+    readonly recordAroundFlow: (args: {
+      readonly sessionId: string
+      readonly template: typeof PerfTemplate.Type
+      readonly flow: FlowContract
+      readonly emitProgress: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      typeof PerfAroundFlowResult.Type,
+      | UserInputError
+      | EnvironmentError
+      | SessionNotFoundError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+    >
+    readonly summarizeBySignpost: (args: {
+      readonly sessionId: string
+      readonly artifactKey: string
+      readonly emitProgress: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      typeof PerfSignpostSummaryResult.Type,
+      | ArtifactNotFoundError
+      | UserInputError
+      | EnvironmentError
+      | SessionNotFoundError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+    >
   }
 >() {}
 
@@ -708,6 +906,14 @@ interface PerfCommandRunner {
     readonly outputPath: string
     readonly budget: ExportBudget
   }) => Promise<StreamedCommandResult>
+  readonly startRecording?: (args: {
+    readonly command: string
+    readonly commandArgs: ReadonlyArray<string>
+    readonly startupNotificationKey: string
+    readonly startupTimeoutMs: number
+    readonly timeoutMs: number
+    readonly gracePeriodMs?: number
+  }) => Promise<BackgroundRecordingHandle>
 }
 
 interface PerfArtifactStoreAccess {
@@ -715,16 +921,28 @@ interface PerfArtifactStoreAccess {
     sessionId: string,
     record: ArtifactRecord,
   ) => Effect.Effect<ArtifactRecord, EnvironmentError>
+  readonly getArtifact?: (
+    sessionId: string,
+    artifactKey: string,
+  ) => Effect.Effect<ArtifactRecord, EnvironmentError | ArtifactNotFoundError>
 }
 
 interface PerfSessionRegistryAccess {
   readonly getSessionHealth: (sessionId: string) => Effect.Effect<SessionHealth, SessionNotFoundError | EnvironmentError>
   readonly sendRunnerKeepalive: (sessionId: string) => Effect.Effect<void, SessionNotFoundError | EnvironmentError>
+  readonly runFlow?: (params: {
+    readonly sessionId: string
+    readonly flow: FlowContract
+  }) => Effect.Effect<
+    FlowResult,
+    SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+  >
 }
 
 const liveCommandRunner: PerfCommandRunner = {
   capture: runCommand,
   exportToFile: runCommandToFile,
+  startRecording: liveStartRecording,
 }
 
 export const createPerfService = (dependencies: {
@@ -733,6 +951,208 @@ export const createPerfService = (dependencies: {
   readonly commandRunner?: PerfCommandRunner
 }) => {
   const commandRunner = dependencies.commandRunner ?? liveCommandRunner
+  const startRecordingCommand = commandRunner.startRecording ?? liveStartRecording
+
+  const resolveRecordingContext = ({
+    sessionId,
+    template,
+    emitProgress,
+    progressStage,
+    capabilityPrefix,
+  }: {
+    readonly sessionId: string
+    readonly template: PerfTemplate
+    readonly emitProgress: (stage: string, message: string) => void
+    readonly progressStage: string
+    readonly capabilityPrefix: string
+  }) =>
+    Effect.gen(function* () {
+      const spec = templateSpecs[template]
+      const sessionBeforeRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
+
+      if (!isLiveRunnerDetails(sessionBeforeRecord.runner)) {
+        return yield* new UnsupportedCapabilityError({
+          code: "perf-session-real-device-runner",
+          capability: `${capabilityPrefix}.template.${template}`,
+          reason: "The current session does not expose a live runner-backed target pid for perf recording.",
+          nextStep: "Retry on a simulator-backed runner session, or wait for the real-device runner/perf seam to be validated.",
+          details: [],
+          wall: false,
+        })
+      }
+
+      const runnerDetails = sessionBeforeRecord.runner
+
+      if (
+        !sessionBeforeRecord.healthCheck.wrapperRunning
+        || (sessionBeforeRecord.state !== "ready" && sessionBeforeRecord.state !== "degraded")
+      ) {
+        return yield* new EnvironmentError({
+          code: "perf-session-not-ready",
+          reason: `Session ${sessionId} is ${sessionBeforeRecord.state} and cannot safely anchor a profiling request.`,
+          nextStep: "Reopen a healthy session, then retry the profiling command.",
+          details: [],
+        })
+      }
+
+      emitProgress(progressStage, `Checking xctrace template availability for ${spec.displayName}.`)
+
+      const templateList = yield* Effect.tryPromise({
+        try: () =>
+          commandRunner.capture({
+            command: "xcrun",
+            commandArgs: ["xctrace", "list", "templates"],
+            timeoutMs: defaultCommandOverheadMs,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-template-list",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Verify the local Xcode toolchain and retry template discovery.",
+                details: [],
+              }),
+      })
+
+      const availableTemplates = new Set(parseTemplateNames(templateList.stdout))
+
+      if (!availableTemplates.has(spec.xctraceTemplateName)) {
+        return yield* new UnsupportedCapabilityError({
+          code: "perf-template-unavailable",
+          capability: `${capabilityPrefix}.template.${template}`,
+          reason: `The local xctrace installation does not expose the ${spec.xctraceTemplateName} template required for ${spec.displayName}.`,
+          nextStep: "Run `xcrun xctrace list templates`, then choose a supported template or update Xcode.",
+          details: [],
+          wall: false,
+        })
+      }
+
+      const xctraceVersionResult = yield* Effect.tryPromise({
+        try: () =>
+          commandRunner.capture({
+            command: "xcrun",
+            commandArgs: ["xctrace", "version"],
+            timeoutMs: defaultCommandOverheadMs,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-xctrace-version",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Verify xctrace is installed and retry the profiling command.",
+                details: [],
+              }),
+      })
+
+      return {
+        spec,
+        sessionBeforeRecord,
+        runnerDetails,
+        xctraceVersion: xctraceVersionResult.stdout.trim(),
+      } as const
+    })
+
+  const startRunnerKeepalive = ({
+    sessionId,
+    emitProgress,
+    progressStage,
+  }: {
+    readonly sessionId: string
+    readonly emitProgress: (stage: string, message: string) => void
+    readonly progressStage: string
+  }) =>
+    Effect.gen(function* () {
+      yield* Effect.sleep(runnerKeepaliveIntervalMs)
+      yield* dependencies.sessionRegistry.sendRunnerKeepalive(sessionId)
+    }).pipe(
+      Effect.catchAll((error) =>
+        Effect.sync(() => {
+          emitProgress(progressStage, `Runner keepalive failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      ),
+      Effect.forever,
+      Effect.fork,
+    )
+
+  const exportTocArtifact = ({
+    sessionId,
+    artifactRoot,
+    tracePath,
+    tocPath,
+    artifactKey,
+    artifactLabel,
+    artifactSummary,
+    emitProgress,
+  }: {
+    readonly sessionId: string
+    readonly artifactRoot: string
+    readonly tracePath: string
+    readonly tocPath: string
+    readonly artifactKey: string
+    readonly artifactLabel: string
+    readonly artifactSummary: string
+    readonly emitProgress: (stage: string, message: string) => void
+  }) =>
+    Effect.gen(function* () {
+      emitProgress("perf.export", `Exporting TOC for ${basename(tracePath)}.`)
+
+      const tocResult = yield* Effect.tryPromise({
+        try: () =>
+          commandRunner.capture({
+            command: "xcrun",
+            commandArgs: ["xctrace", "export", "--input", tracePath, "--toc"],
+            timeoutMs: defaultCommandOverheadMs,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-export-toc",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the saved trace bundle and retry the TOC export.",
+                details: [],
+              }),
+      })
+
+      yield* Effect.tryPromise({
+        try: () => writeFile(tocPath, tocResult.stdout, "utf8"),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-write-toc",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Check write access to the session traces directory and retry the profiling command.",
+            details: [],
+          }),
+      })
+
+      const tocArtifact = yield* dependencies.artifactStore.registerArtifact(
+        sessionId,
+        createArtifactRecord({
+          artifactRoot,
+          key: artifactKey,
+          label: artifactLabel,
+          kind: "xml",
+          absolutePath: tocPath,
+          summary: artifactSummary,
+        }),
+      )
+
+      return {
+        tocXml: tocResult.stdout,
+        tocArtifact,
+      } as const
+    })
+
+  const artifactRootFromArtifact = (artifact: ArtifactRecord): string => {
+    if (artifact.relativePath !== null && artifact.relativePath.length > 0 && artifact.absolutePath.endsWith(artifact.relativePath)) {
+      const root = artifact.absolutePath.slice(0, artifact.absolutePath.length - artifact.relativePath.length)
+      return root.endsWith("/") ? root.slice(0, -1) : root
+    }
+
+    return dirname(dirname(artifact.absolutePath))
+  }
 
   const record = ({ sessionId, template, timeLimit, emitProgress }: {
     readonly sessionId: string
@@ -1155,8 +1575,417 @@ export const createPerfService = (dependencies: {
       } satisfies typeof PerfRecordResult.Type
     })
 
+  const recordAroundFlow = ({ sessionId, template, flow, emitProgress }: {
+    readonly sessionId: string
+    readonly template: PerfTemplate
+    readonly flow: FlowContract
+    readonly emitProgress: (stage: string, message: string) => void
+  }) =>
+    Effect.gen(function* () {
+      const runFlow = dependencies.sessionRegistry.runFlow
+
+      if (!runFlow) {
+        return yield* new EnvironmentError({
+          code: "perf-around-flow-unavailable",
+          reason: "The current PerfService wiring does not expose session flow execution.",
+          nextStep: "Provide SessionRegistry.runFlow when constructing PerfService and retry the perf around request.",
+          details: [],
+        })
+      }
+
+      const { spec, sessionBeforeRecord, runnerDetails, xctraceVersion } = yield* resolveRecordingContext({
+        sessionId,
+        template,
+        emitProgress,
+        progressStage: "perf.around",
+        capabilityPrefix: "perf.around",
+      })
+      const recordingTimeLimitMs = spec.maxRecordingTimeLimitMs ?? maxPerfTimeLimitMs
+      const recordingTimeLimit = formatTimeLimitMs(recordingTimeLimitMs)
+      const tracesDirectory = join(sessionBeforeRecord.artifactRoot, "traces")
+      const baseName = `${timestampForFile()}-${spec.slug}-around`
+      const tracePath = join(tracesDirectory, `${baseName}.trace`)
+      const tocPath = join(tracesDirectory, `${baseName}.toc.xml`)
+
+      yield* Effect.tryPromise({
+        try: () => ensureDirectory(tracesDirectory),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-traces-directory",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Check the session artifact root permissions and retry the profiling command.",
+            details: [],
+          }),
+      })
+
+      const startupNotificationKey = `dev.probe.perf.${sessionId}.${Date.now()}.${Math.random().toString(16).slice(2)}`
+      emitProgress(
+        "perf.around",
+        `Starting ${spec.displayName} recording for pid ${runnerDetails.targetProcessId} on device ${sessionBeforeRecord.target.deviceId}.`,
+      )
+
+      const recordingHandle = yield* Effect.tryPromise({
+        try: () =>
+          startRecordingCommand({
+            command: "xcrun",
+            commandArgs: [
+              "xctrace",
+              "record",
+              "--template",
+              spec.xctraceTemplateName,
+              "--device",
+              sessionBeforeRecord.target.deviceId,
+              "--attach",
+              String(runnerDetails.targetProcessId),
+              "--time-limit",
+              recordingTimeLimit,
+              "--output",
+              tracePath,
+              "--run-name",
+              baseName,
+              "--notify-tracing-started",
+              startupNotificationKey,
+              "--no-prompt",
+            ],
+            startupNotificationKey,
+            startupTimeoutMs: recordingStartupTimeoutMs,
+            timeoutMs: recordingTimeLimitMs + recordingOverheadMs,
+            gracePeriodMs: recordingGracePeriodMs,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-record-command",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect xctrace stderr and retry the profiling command.",
+                details: [],
+              }),
+      })
+
+      emitProgress("perf.around", `Recording started; executing ${flow.steps.length} flow step(s).`)
+      const keepaliveFiber = yield* startRunnerKeepalive({
+        sessionId,
+        emitProgress,
+        progressStage: "perf.around",
+      })
+      const flowExit = yield* Effect.either(runFlow({
+        sessionId,
+        flow,
+      }))
+      emitProgress("perf.around", `Stopping ${spec.displayName} recording after the bounded flow completed.`)
+
+      const stopResult = yield* Effect.tryPromise({
+        try: () => recordingHandle.stop(),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-record-command",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect xctrace stderr and retry the profiling command.",
+                details: [],
+              }),
+      }).pipe(
+        Effect.ensuring(Fiber.interrupt(keepaliveFiber)),
+      )
+
+      if (!stopResult.wasRunning) {
+        return yield* new EnvironmentError({
+          code: "perf-around-recording-ended-early",
+          reason: `${spec.displayName} recording ended before the flow completed.`,
+          nextStep: `Keep the bounded flow under ${recordingTimeLimit}, or choose a lighter template and retry the perf around request.`,
+          details: stopResult.stderr.trim().length > 0
+            ? [stopResult.stderr.trim()]
+            : [],
+        })
+      }
+
+      if (flowExit._tag === "Left") {
+        return yield* flowExit.left
+      }
+
+      const traceExists = yield* Effect.tryPromise({
+        try: () => fileExists(tracePath),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-trace-stat",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the traces directory and retry the profiling command.",
+            details: [],
+          }),
+      })
+
+      if (!traceExists) {
+        return yield* new EnvironmentError({
+          code: "perf-trace-missing",
+          reason: `xctrace completed without creating the expected trace bundle at ${tracePath}.`,
+          nextStep: "Inspect the xctrace output and retry the profiling command.",
+          details: [],
+        })
+      }
+
+      const traceArtifact = yield* dependencies.artifactStore.registerArtifact(
+        sessionId,
+        createArtifactRecord({
+          artifactRoot: sessionBeforeRecord.artifactRoot,
+          key: `${baseName}-trace`,
+          label: `${spec.slug}-trace`,
+          kind: "directory",
+          absolutePath: tracePath,
+          summary: `${spec.displayName} raw .trace bundle recorded around a bounded flow.`,
+        }),
+      )
+
+      emitProgress("perf.around", `Refreshing session health after recording ${spec.displayName}.`)
+      const sessionAfterRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
+      const { tocArtifact } = yield* exportTocArtifact({
+        sessionId,
+        artifactRoot: sessionBeforeRecord.artifactRoot,
+        tracePath,
+        tocPath,
+        artifactKey: `${baseName}-toc`,
+        artifactLabel: `${spec.slug}-toc`,
+        artifactSummary: `${spec.displayName} TOC export for bounded-flow recording.`,
+        emitProgress,
+      })
+
+      return {
+        sessionId,
+        template,
+        templateName: spec.displayName,
+        recordedAt: nowIso(),
+        xctraceVersion,
+        session: {
+          state: sessionAfterRecord.state,
+          healthCheck: sessionAfterRecord.healthCheck,
+        },
+        flow: flowExit.right,
+        diagnoses: buildPostRecordSessionDiagnoses({
+          before: sessionBeforeRecord,
+          after: sessionAfterRecord,
+        }),
+        artifacts: {
+          trace: traceArtifact,
+          toc: tocArtifact,
+        },
+      } satisfies typeof PerfAroundFlowResult.Type
+    })
+
+  const summarizeBySignpost = ({ sessionId, artifactKey, emitProgress }: {
+    readonly sessionId: string
+    readonly artifactKey: string
+    readonly emitProgress: (stage: string, message: string) => void
+  }) =>
+    Effect.gen(function* () {
+      const getArtifact = dependencies.artifactStore.getArtifact
+
+      if (!getArtifact) {
+        return yield* new EnvironmentError({
+          code: "perf-artifact-lookup-unavailable",
+          reason: "The current PerfService wiring does not expose artifact lookup.",
+          nextStep: "Provide ArtifactStore.getArtifact when constructing PerfService and retry the perf summarize request.",
+          details: [],
+        })
+      }
+
+      const traceArtifact = yield* getArtifact(sessionId, artifactKey)
+
+      if (traceArtifact.kind !== "directory" || !traceArtifact.absolutePath.endsWith(".trace")) {
+        return yield* new UserInputError({
+          code: "perf-summarize-artifact-not-trace",
+          reason: `Artifact ${artifactKey} is not a .trace bundle.`,
+          nextStep: "Pass the perf trace artifact key and retry the summarize command.",
+          details: [],
+        })
+      }
+
+      const xctraceVersionResult = yield* Effect.tryPromise({
+        try: () =>
+          commandRunner.capture({
+            command: "xcrun",
+            commandArgs: ["xctrace", "version"],
+            timeoutMs: defaultCommandOverheadMs,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-xctrace-version",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Verify xctrace is installed and retry the profiling command.",
+                details: [],
+              }),
+      })
+
+      const tracePath = traceArtifact.absolutePath
+      const tracesDirectory = dirname(tracePath)
+      const artifactRoot = artifactRootFromArtifact(traceArtifact)
+      const traceBaseName = basename(tracePath).replace(/\.trace$/, "")
+      const summaryBase = `${timestampForFile()}-${traceBaseName}-signpost`
+      const tocPath = join(tracesDirectory, `${summaryBase}.toc.xml`)
+      const { tocXml, tocArtifact } = yield* exportTocArtifact({
+        sessionId,
+        artifactRoot,
+        tracePath,
+        tocPath,
+        artifactKey: `${summaryBase}-toc`,
+        artifactLabel: "signpost-toc",
+        artifactSummary: `TOC export used for signpost summary of ${basename(tracePath)}.`,
+        emitProgress,
+      })
+
+      const runNumber = parseFirstRunNumber(tocXml)
+
+      if (!runNumber) {
+        return yield* new EnvironmentError({
+          code: "perf-run-number-missing",
+          reason: `Could not resolve a run number from ${basename(tocPath)}.`,
+          nextStep: "Inspect the TOC export and retry the profiling command.",
+          details: [],
+        })
+      }
+
+      const availableSchemas = parseAvailableSchemaNames(tocXml)
+
+      if (availableSchemas.size > 0 && !availableSchemas.has("os-signpost-interval")) {
+        return yield* new UnsupportedCapabilityError({
+          code: "perf-signpost-schema-missing",
+          capability: "perf.summarize.group-by.signpost",
+          reason: `The trace ${artifactKey} does not expose the os-signpost-interval schema required for signpost grouping.`,
+          nextStep: "Record with the Logging template or choose a trace that captured os_signpost intervals, then retry the summarize command.",
+          details: [...availableSchemas].sort(),
+          wall: false,
+        })
+      }
+
+      const schema = "os-signpost-interval"
+      const exportPath = join(tracesDirectory, `${summaryBase}.${schema}.xml`)
+      const budget = {
+        maxBytes: 4 * mib,
+        maxRows: 20_000,
+      } satisfies ExportBudget
+
+      emitProgress(
+        "perf.export",
+        `Exporting ${schema} rows for signpost summary (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
+      )
+
+      const exportResult = yield* Effect.tryPromise({
+        try: () =>
+          commandRunner.exportToFile({
+            command: "xcrun",
+            commandArgs: [
+              "xctrace",
+              "export",
+              "--input",
+              tracePath,
+              "--xpath",
+              `/trace-toc/run[@number=\"${runNumber}\"]/data/table[@schema=\"${schema}\"]`,
+            ],
+            timeoutMs: defaultCommandOverheadMs,
+            outputPath: exportPath,
+            budget,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : error instanceof ExportBudgetExceededError
+              ? buildExportBudgetError({ templateName: "Signpost summary", schema, error })
+              : new EnvironmentError({
+                  code: "perf-export-schema",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: `Inspect the TOC export and retry the ${schema} export.`,
+                  details: [],
+                }),
+      })
+
+      const exportArtifact = yield* dependencies.artifactStore.registerArtifact(
+        sessionId,
+        createArtifactRecord({
+          artifactRoot,
+          key: `${summaryBase}-${schema}`,
+          label: "signpost-intervals",
+          kind: "xml",
+          absolutePath: exportPath,
+          summary: `${schema} export for signpost summary (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
+        }),
+      )
+
+      let maybeOversized: EnvironmentError | undefined
+      try {
+        const { statSync } = require("node:fs")
+        const stats = statSync(exportPath)
+
+        if (stats.size > maxExportFileSizeBytes) {
+          maybeOversized = new EnvironmentError({
+            code: "perf-export-file-too-large",
+            reason: `${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
+            nextStep: "Inspect the saved .trace directly or use a narrower recording window before retrying the summarize command.",
+            details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
+          })
+        }
+      } catch {
+        // Let downstream readFile fail with a better typed error.
+      }
+
+      if (maybeOversized !== undefined) {
+        return yield* Effect.fail(maybeOversized)
+      }
+
+      const exportXml = yield* Effect.tryPromise({
+        try: () => readFile(exportPath, "utf8"),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-read-schema-export",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: `Inspect the saved ${schema} export XML and retry the summarize command.`,
+            details: [],
+          }),
+      })
+
+      const parsedTable = yield* Effect.try({
+        try: () => parsePerfTableExport(exportXml),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-parse-export",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: `Inspect the saved ${schema} export XML and retry the summarize command.`,
+            details: [],
+          }),
+      })
+
+      const groups = yield* Effect.try({
+        try: () => summarizeSignpostIntervalsTable(parsedTable),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-analyze-export-contract",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the saved signpost export and align Probe's supported xctrace contract before retrying.",
+            details: [schema],
+          }),
+      })
+
+      return {
+        sessionId,
+        artifactKey,
+        groupBy: "signpost",
+        generatedAt: nowIso(),
+        xctraceVersion: xctraceVersionResult.stdout.trim(),
+        totalIntervals: groups.reduce((total, group) => total + group.count, 0),
+        groups,
+        artifacts: {
+          trace: traceArtifact,
+          toc: tocArtifact,
+          export: exportArtifact,
+        },
+      } satisfies typeof PerfSignpostSummaryResult.Type
+    })
+
   return PerfService.of({
     record,
+    recordAroundFlow,
+    summarizeBySignpost,
   })
 }
 

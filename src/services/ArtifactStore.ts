@@ -1,5 +1,5 @@
 import { Context, Effect, Layer } from "effect"
-import { access, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { access, copyFile, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, extname, join, relative } from "node:path"
 import net from "node:net"
@@ -200,6 +200,14 @@ export class ArtifactStore extends Context.Tag("@probe/ArtifactStore")<
       readonly label: string
       readonly format: "json" | "text"
       readonly content: string
+      readonly summary: string
+    }) => Effect.Effect<ArtifactRecord, EnvironmentError>
+    readonly writeDerivedFile: (args: {
+      readonly sessionId: string
+      readonly label: string
+      readonly kind: ArtifactKind
+      readonly sourceAbsolutePath: string
+      readonly sourceFileName: string
       readonly summary: string
     }) => Effect.Effect<ArtifactRecord, EnvironmentError>
     readonly removeDaemonMetadata: () => Effect.Effect<void>
@@ -538,6 +546,39 @@ export const ArtifactStoreLive = Layer.effect(
           catch: (error) =>
             new EnvironmentError({
               code: "derived-output-write",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Check write access to the session outputs directory and retry.",
+              details: [],
+            }),
+        }),
+      writeDerivedFile: ({ sessionId, label, kind, sourceAbsolutePath, sourceFileName, summary }) =>
+        Effect.tryPromise({
+          try: async () => {
+            const extension = extname(sourceFileName) || extname(sourceAbsolutePath)
+            const root = join(sessionsRoot, sessionId)
+            const outputsDirectory = join(root, "outputs")
+            await ensureDirectory(outputsDirectory)
+
+            const fileName = `${timestampForFile()}-${label}${extension}`
+            const absolutePath = join(outputsDirectory, fileName)
+            await copyFile(sourceAbsolutePath, absolutePath)
+
+            const record = createArtifactRecord(
+              probeRoot,
+              `derived-${fileName}`,
+              label,
+              kind,
+              absolutePath,
+              summary,
+            )
+
+            const existing = await Effect.runPromise(readArtifactIndex(sessionId))
+            await Effect.runPromise(writeArtifactIndex(sessionId, [...existing, record]))
+            return record
+          },
+          catch: (error) =>
+            new EnvironmentError({
+              code: "derived-file-write",
               reason: error instanceof Error ? error.message : String(error),
               nextStep: "Check write access to the session outputs directory and retry.",
               details: [],
