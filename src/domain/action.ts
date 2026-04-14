@@ -6,6 +6,8 @@ const NullableBoolean = Schema.Union(Schema.Boolean, Schema.Null)
 const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
 const OptionalNullableBoolean = Schema.optional(NullableBoolean)
 const OptionalNullableString = Schema.optional(NullableString)
+const NullableFlowExecutionProfile = Schema.Union(Schema.Literal("verified", "fast"), Schema.Null)
+const NullableFlowTransportLane = Schema.Union(Schema.Literal("host-single", "runner-single"), Schema.Null)
 
 const PositiveIntegerSchema = Schema.Number.pipe(Schema.int())
 
@@ -551,6 +553,9 @@ export const FlowStepResultSchema = Schema.Struct({
   retryCount: Schema.Number,
   retryReasons: Schema.Array(Schema.String),
   artifacts: Schema.Array(ArtifactRecord),
+  executionProfile: NullableFlowExecutionProfile,
+  transportLane: NullableFlowTransportLane,
+  handledMs: NullableNumber,
   warnings: Schema.Array(Schema.String),
 })
 export type FlowStepResult = typeof FlowStepResultSchema.Type
@@ -1343,6 +1348,23 @@ export const isRunnerUiRecordedSessionAction = (
   || action.kind === "type"
   || action.kind === "scroll"
 
+const buildSemanticRunnerLocator = (
+  selector: SemanticSelector,
+  ordinal: number | null,
+): RunnerActionLocator => ({
+  kind: "semantic",
+  identifier: selector.identifier,
+  label: selector.label,
+  value: selector.value,
+  placeholder: selector.placeholder,
+  type: selector.type,
+  section: selector.section,
+  interactive: selector.interactive,
+  ordinal,
+  x: null,
+  y: null,
+})
+
 const buildRunnerLocator = (
   snapshot: StoredSnapshotArtifact,
   resolved: ResolvedSnapshotTarget,
@@ -1351,19 +1373,10 @@ const buildRunnerLocator = (
   const matches = semanticMatches(snapshot, semantic)
   const matchIndex = matches.findIndex((entry) => entry.ref === resolved.ref)
 
-  return {
-    kind: "semantic",
-    identifier: semantic.identifier,
-    label: semantic.label,
-    value: semantic.value,
-    placeholder: semantic.placeholder,
-    type: semantic.type,
-    section: semantic.section,
-    interactive: semantic.interactive,
-    ordinal: matches.length > 1 && matchIndex >= 0 ? matchIndex + 1 : null,
-    x: null,
-    y: null,
-  }
+  return buildSemanticRunnerLocator(
+    semantic,
+    matches.length > 1 && matchIndex >= 0 ? matchIndex + 1 : null,
+  )
 }
 
 const buildPointRunnerLocator = (resolved: ResolvedPointTarget): RunnerActionLocator => ({
@@ -1380,23 +1393,39 @@ const buildPointRunnerLocator = (resolved: ResolvedPointTarget): RunnerActionLoc
   y: resolved.y,
 })
 
-export const buildRunnerUiActionPayload = (
-  action: RunnerUiActionSource,
-  resolved: ResolvedActionTarget,
-  snapshot: StoredSnapshotArtifact | null,
-): RunnerUiActionPayload => {
-  const locator = resolved.kind === "point"
-    ? buildPointRunnerLocator(resolved)
-    : resolved.kind === "snapshot"
-      ? snapshot === null
-        ? (() => {
-            throw new Error("Snapshot-backed selectors require a current snapshot to build a runner locator.")
-          })()
-        : buildRunnerLocator(snapshot, resolved)
-      : (() => {
-          throw new Error("Absence selectors cannot drive runner UI actions.")
-        })()
+export const buildDirectRunnerLocator = (selector: ActionSelector): RunnerActionLocator => {
+  switch (selector.kind) {
+    case "semantic":
+      return buildSemanticRunnerLocator(selector, null)
+    case "point":
+      return {
+        kind: "point",
+        identifier: null,
+        label: null,
+        value: null,
+        placeholder: null,
+        type: null,
+        section: null,
+        interactive: null,
+        ordinal: null,
+        x: selector.x,
+        y: selector.y,
+      }
+    case "ref":
+      if (selector.fallback === null) {
+        throw new Error("Ref selectors require a semantic fallback before they can drive direct runner UI actions.")
+      }
 
+      return buildSemanticRunnerLocator(selector.fallback, null)
+    case "absence":
+      throw new Error("Absence selectors cannot drive runner UI actions.")
+  }
+}
+
+const buildRunnerUiActionPayloadWithLocator = (
+  action: RunnerUiActionSource,
+  locator: RunnerActionLocator,
+): RunnerUiActionPayload => {
   switch (action.kind) {
     case "tap":
       return {
@@ -1450,6 +1479,31 @@ export const buildRunnerUiActionPayload = (
       }
   }
 }
+
+export const buildRunnerUiActionPayload = (
+  action: RunnerUiActionSource,
+  resolved: ResolvedActionTarget,
+  snapshot: StoredSnapshotArtifact | null,
+): RunnerUiActionPayload => {
+  const locator = resolved.kind === "point"
+    ? buildPointRunnerLocator(resolved)
+    : resolved.kind === "snapshot"
+      ? snapshot === null
+        ? (() => {
+            throw new Error("Snapshot-backed selectors require a current snapshot to build a runner locator.")
+          })()
+        : buildRunnerLocator(snapshot, resolved)
+      : (() => {
+          throw new Error("Absence selectors cannot drive runner UI actions.")
+        })()
+
+  return buildRunnerUiActionPayloadWithLocator(action, locator)
+}
+
+export const buildDirectRunnerUiActionPayload = (
+  action: RunnerUiActionSource,
+  selector: ActionSelector,
+): RunnerUiActionPayload => buildRunnerUiActionPayloadWithLocator(action, buildDirectRunnerLocator(selector))
 
 export const flowStepToSessionAction = (step: FlowSessionActionStep): SessionAction => {
   switch (step.kind) {
