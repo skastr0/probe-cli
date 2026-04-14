@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test"
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
+import { tmpdir } from "node:os"
+import { dirname, join } from "node:path"
 import { Effect, Either, ManagedRuntime } from "effect"
 import { EnvironmentError, UserInputError } from "../domain/errors"
 import { decodeRunnerCommandFrame } from "./runnerProtocol"
 import {
   buildProbeRunnerForSimulator,
   createHttpRunnerCommandSender,
+  ensureSimulatorRunnerPrepared,
   extractPidFromLaunchctlList,
   isInstalledAppListMatch,
   resolveAttachTargetProcessId,
@@ -20,6 +24,21 @@ const simulatorUdid = "SIM-123"
 const bundleId = "com.example.notes"
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const withTempProjectRoot = async <T>(run: (args: { readonly projectRoot: string; readonly tempRoot: string }) => Promise<T>) => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "probe-simulator-harness-"))
+  const projectRoot = join(tempRoot, "project-root")
+
+  await mkdir(join(projectRoot, "ios", "ProbeFixture", "ProbeFixture.xcodeproj"), { recursive: true })
+  await mkdir(join(projectRoot, "ios", "ProbeRunner", "scripts"), { recursive: true })
+  await writeFile(join(projectRoot, "ios", "ProbeRunner", "scripts", "run-transport-boundary-session.py"), "#!/usr/bin/env python3\n", "utf8")
+
+  try {
+    return await run({ projectRoot, tempRoot })
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true })
+  }
+}
 
 const expectTaggedError = async <TError extends EnvironmentError | UserInputError>(args: {
   readonly effect: Promise<unknown>
@@ -222,24 +241,25 @@ describe("SimulatorHarness helpers", () => {
   })
 
   test("build-and-install mode rejects non-default bundle identifiers before touching host tools", async () => {
-    const result = await simulatorHarnessRuntime.runPromise(
-      Effect.either(
-        Effect.gen(function* () {
-          const harness = yield* SimulatorHarness
+    const result = await withTempProjectRoot(async ({ projectRoot, tempRoot }) =>
+      await simulatorHarnessRuntime.runPromise(
+        Effect.either(
+          Effect.gen(function* () {
+            const harness = yield* SimulatorHarness
 
-          return yield* harness.openSession({
-            rootDir: "/tmp/probe-cli-test",
-            sessionId: "session-1",
-            artifactRoot: "/tmp/probe-cli-test/artifacts",
-            runnerDirectory: "/tmp/probe-cli-test/runner",
-            logsDirectory: "/tmp/probe-cli-test/logs",
-            bundleId,
-            sessionMode: "build-and-install",
-            simulatorUdid: null,
-          })
-        }),
-      ),
-    )
+            return yield* harness.openSession({
+              projectRoot,
+              sessionId: "session-1",
+              artifactRoot: join(tempRoot, "artifacts"),
+              runnerDirectory: join(tempRoot, "runner"),
+              logsDirectory: join(tempRoot, "logs"),
+              bundleId,
+              sessionMode: "build-and-install",
+              simulatorUdid: null,
+            })
+          }),
+        ),
+      ))
 
     expect(Either.isLeft(result)).toBe(true)
 
@@ -252,6 +272,79 @@ describe("SimulatorHarness helpers", () => {
     expect(error.code).toBe("simulator-session-mode-bundle-mismatch")
 
     expect(error.reason).toContain(bundleId)
+  })
+
+  test("ensureSimulatorRunnerPrepared skips build when cached artifacts are valid", async () => {
+    await withTempProjectRoot(async ({ projectRoot, tempRoot }) => {
+      const derivedDataPath = join(tempRoot, "runner-cache", "simulator", simulatorUdid)
+      const buildProductsPath = join(derivedDataPath, "Build", "Products")
+      const xctestrunPath = join(buildProductsPath, "ProbeRunner_iphonesimulator.xctestrun")
+      const targetAppPath = join(buildProductsPath, "Debug-iphonesimulator", "ProbeFixture.app")
+      const buildLogPath = join(tempRoot, "logs", "build-for-testing.log")
+      let buildCalls = 0
+
+      await mkdir(dirname(xctestrunPath), { recursive: true })
+      await mkdir(targetAppPath, { recursive: true })
+      await mkdir(dirname(buildLogPath), { recursive: true })
+      await writeFile(xctestrunPath, `built from ${projectRoot}\n`, "utf8")
+
+      const prepared = await ensureSimulatorRunnerPrepared(
+        {
+          projectPath: join(projectRoot, "ios", "ProbeFixture", "ProbeFixture.xcodeproj"),
+          projectRoot,
+          simulatorUdid,
+          derivedDataPath,
+          buildLogPath,
+        },
+        {
+          buildRunner: async () => {
+            buildCalls += 1
+          },
+        },
+      )
+
+      expect(buildCalls).toBe(0)
+      expect(prepared.cacheHit).toBe(true)
+      expect(prepared.xctestrunPath).toBe(xctestrunPath)
+      expect(prepared.targetAppPath).toBe(targetAppPath)
+      expect(await readFile(buildLogPath, "utf8")).toContain("Reused cached simulator runner build")
+    })
+  })
+
+  test("ensureSimulatorRunnerPrepared builds when cached artifacts are missing", async () => {
+    await withTempProjectRoot(async ({ projectRoot, tempRoot }) => {
+      const derivedDataPath = join(tempRoot, "runner-cache", "simulator", simulatorUdid)
+      const buildProductsPath = join(derivedDataPath, "Build", "Products")
+      const xctestrunPath = join(buildProductsPath, "ProbeRunner_iphonesimulator.xctestrun")
+      const targetAppPath = join(buildProductsPath, "Debug-iphonesimulator", "ProbeFixture.app")
+      const buildLogPath = join(tempRoot, "logs", "build-for-testing.log")
+      let buildCalls = 0
+
+      const prepared = await ensureSimulatorRunnerPrepared(
+        {
+          projectPath: join(projectRoot, "ios", "ProbeFixture", "ProbeFixture.xcodeproj"),
+          projectRoot,
+          simulatorUdid,
+          derivedDataPath,
+          buildLogPath,
+        },
+        {
+          buildRunner: async () => {
+            buildCalls += 1
+            await mkdir(dirname(xctestrunPath), { recursive: true })
+            await mkdir(targetAppPath, { recursive: true })
+            await mkdir(dirname(buildLogPath), { recursive: true })
+            await writeFile(xctestrunPath, `built from ${projectRoot}\n`, "utf8")
+            await writeFile(buildLogPath, "fresh build\n", "utf8")
+          },
+        },
+      )
+
+      expect(buildCalls).toBe(1)
+      expect(prepared.cacheHit).toBe(false)
+      expect(prepared.xctestrunPath).toBe(xctestrunPath)
+      expect(prepared.targetAppPath).toBe(targetAppPath)
+    })
   })
 
   test("createHttpRunnerCommandSender handles 12 sequential HTTP actions without timing out", async () => {

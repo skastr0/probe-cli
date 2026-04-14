@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process"
-import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
@@ -22,6 +22,11 @@ import {
   type RunnerResponseFrame,
 } from "./runnerProtocol"
 import { injectEnvironmentVariablesIntoXctestrunPlist } from "./RealDeviceHarness"
+import {
+  probeRunnerSimulatorDerivedRootPath,
+  resolveProbeFixtureProjectPath,
+  resolveProbeRunnerWrapperScriptPath,
+} from "./ProjectRoot"
 
 const defaultTestBundleId = "dev.probe.fixture"
 const observerFramePollIntervalMs = 50
@@ -31,7 +36,6 @@ const recordVideoTimeoutBufferMs = 30_000
 const maxRecordVideoDurationMs = 120_000
 const defaultRecordVideoDurationMs = 10_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
-const simulatorRunnerBuildCacheRoot = ".probe/simulator-runner-builds"
 const runnerPortEnvKey = "PROBE_RUNNER_PORT"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
 const runnerCommandIngress = RUNNER_HTTP_COMMAND_INGRESS
@@ -161,6 +165,19 @@ const ensureDirectory = async (path: string): Promise<void> => {
   await mkdir(path, { recursive: true })
 }
 
+const assertPackagedProbePathExists = async (path: string, description: string): Promise<void> => {
+  if (await fileExists(path)) {
+    return
+  }
+
+  throw new EnvironmentError({
+    code: "probe-package-artifact-missing",
+    reason: `Probe could not find the packaged ${description} at ${path}.`,
+    nextStep: "Reinstall probe-cli so the packaged ios/ runner sources are restored, then retry the session open.",
+    details: [],
+  })
+}
+
 const findFirstMatchingPath = async (directory: string, predicate: (name: string) => boolean): Promise<string | null> => {
   try {
     const entries = await readdir(directory)
@@ -170,6 +187,9 @@ const findFirstMatchingPath = async (directory: string, predicate: (name: string
     return null
   }
 }
+
+const resolveSimulatorTargetAppPath = (derivedDataPath: string): string =>
+  join(derivedDataPath, "Build", "Products", "Debug-iphonesimulator", "ProbeFixture.app")
 
 const allocateFreeTcpPort = async (): Promise<number> =>
   await new Promise((resolve, reject) => {
@@ -982,13 +1002,110 @@ export const buildProbeRunnerForSimulator = async (
   })
 }
 
-const resolveSimulatorRunnerDerivedDataPath = (rootDir: string, simulatorUdid: string): string =>
+const resolveSimulatorRunnerDerivedDataPath = (simulatorUdid: string): string =>
   join(
-    rootDir,
-    simulatorRunnerBuildCacheRoot,
+    probeRunnerSimulatorDerivedRootPath,
     sanitizeFileComponent(simulatorUdid, "simulator"),
-    "derived-data",
   )
+
+export const xctestrunReferencesProjectRoot = async (xctestrunPath: string, projectRoot: string): Promise<boolean> => {
+  try {
+    const contents = await readFile(xctestrunPath, "utf8")
+    const candidateRoots = new Set<string>([projectRoot])
+
+    try {
+      candidateRoots.add(await realpath(projectRoot))
+    } catch {
+      // ignore
+    }
+
+    for (const root of candidateRoots) {
+      if (contents.includes(root)) {
+        return true
+      }
+    }
+
+    return false
+  } catch {
+    return false
+  }
+}
+
+const evaluateExistingSimulatorRunnerBuild = async (args: {
+  readonly derivedDataPath: string
+  readonly projectRoot: string
+}): Promise<{
+  readonly cacheHit: boolean
+  readonly xctestrunPath: string | null
+  readonly targetAppPath: string
+}> => {
+  const buildProductsPath = join(args.derivedDataPath, "Build", "Products")
+  const xctestrunPath = await findFirstMatchingPath(buildProductsPath, (name) => name.endsWith(".xctestrun"))
+  const targetAppPath = resolveSimulatorTargetAppPath(args.derivedDataPath)
+
+  if (!xctestrunPath || !(await fileExists(targetAppPath))) {
+    return {
+      cacheHit: false,
+      xctestrunPath,
+      targetAppPath,
+    }
+  }
+
+  return {
+    cacheHit: await xctestrunReferencesProjectRoot(xctestrunPath, args.projectRoot),
+    xctestrunPath,
+    targetAppPath,
+  }
+}
+
+export const ensureSimulatorRunnerPrepared = async (
+  args: {
+    readonly projectPath: string
+    readonly projectRoot: string
+    readonly simulatorUdid: string
+    readonly derivedDataPath: string
+    readonly buildLogPath: string
+  },
+  commands: {
+    readonly buildRunner?: typeof buildProbeRunnerForSimulator
+  } = {},
+): Promise<{
+  readonly cacheHit: boolean
+  readonly xctestrunPath: string
+  readonly targetAppPath: string
+}> => {
+  const existing = await evaluateExistingSimulatorRunnerBuild({
+    derivedDataPath: args.derivedDataPath,
+    projectRoot: args.projectRoot,
+  })
+
+  if (existing.cacheHit && existing.xctestrunPath) {
+    await writeFile(
+      args.buildLogPath,
+      `Reused cached simulator runner build from ${args.derivedDataPath}.\n`,
+      "utf8",
+    )
+
+    return {
+      cacheHit: true,
+      xctestrunPath: existing.xctestrunPath,
+      targetAppPath: existing.targetAppPath,
+    }
+  }
+
+  await (commands.buildRunner ?? buildProbeRunnerForSimulator)({
+    projectPath: args.projectPath,
+    simulatorUdid: args.simulatorUdid,
+    derivedDataPath: args.derivedDataPath,
+    buildLogPath: args.buildLogPath,
+  })
+
+  return {
+    cacheHit: false,
+    xctestrunPath: await resolveRunnerXctestrunPath(args.derivedDataPath),
+    targetAppPath: resolveSimulatorTargetAppPath(args.derivedDataPath),
+  }
+}
 
 const assertReadyTransportContract = (args: {
   readonly ready: ReadyFrame
@@ -1088,7 +1205,7 @@ const assertReadyTransportContract = (args: {
 }
 
 const startWrapperProcess = async (args: {
-  readonly rootDir: string
+  readonly projectRoot: string
   readonly xctestrunPath: string
   readonly destination: string
   readonly observerControlDirectory: string
@@ -1104,13 +1221,7 @@ const startWrapperProcess = async (args: {
   await ensureDirectory(dirname(args.wrapperStderrPath))
   await writeFile(args.wrapperStderrPath, "", "utf8")
 
-  const wrapperScript = join(
-    args.rootDir,
-    "ios",
-    "ProbeRunner",
-    "scripts",
-    "run-transport-boundary-session.py",
-  )
+  const wrapperScript = resolveProbeRunnerWrapperScriptPath(args.projectRoot)
 
   const child = spawn(
     "/usr/bin/python3",
@@ -1135,7 +1246,7 @@ const startWrapperProcess = async (args: {
       "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
     ],
     {
-      cwd: args.rootDir,
+      cwd: args.projectRoot,
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
     },
@@ -1180,7 +1291,7 @@ export class SimulatorHarness extends Context.Tag("@probe/SimulatorHarness")<
   SimulatorHarness,
   {
     readonly openSession: (args: {
-      readonly rootDir: string
+      readonly projectRoot: string
       readonly sessionId: string
       readonly artifactRoot: string
       readonly runnerDirectory: string
@@ -1242,7 +1353,8 @@ export const SimulatorHarnessLive = Layer.succeed(
               })
             }
 
-            const projectPath = join(args.rootDir, "ios", "ProbeFixture", "ProbeFixture.xcodeproj")
+            const projectPath = resolveProbeFixtureProjectPath(args.projectRoot)
+            const wrapperScriptPath = resolveProbeRunnerWrapperScriptPath(args.projectRoot)
             const buildLogPath = join(args.logsDirectory, "build-for-testing.log")
             const sessionLogPath = join(args.logsDirectory, "xcodebuild-session.log")
             const wrapperStderrPath = join(args.logsDirectory, "runner-wrapper.stderr.log")
@@ -1256,6 +1368,8 @@ export const SimulatorHarnessLive = Layer.succeed(
               ensureDirectory(args.logsDirectory),
               ensureDirectory(observerControlDirectory),
               ensureDirectory(runtimeControlDirectory),
+              assertPackagedProbePathExists(projectPath, "ProbeFixture Xcode project"),
+              assertPackagedProbePathExists(wrapperScriptPath, "ProbeRunner wrapper script"),
             ])
 
             const listResult = await runCommand({
@@ -1292,10 +1406,11 @@ export const SimulatorHarnessLive = Layer.succeed(
               commandArgs: ["simctl", "bootstatus", selected.device.udid, "-b"],
             })
 
-            const derivedDataPath = resolveSimulatorRunnerDerivedDataPath(args.rootDir, selected.device.udid)
+            const derivedDataPath = resolveSimulatorRunnerDerivedDataPath(selected.device.udid)
 
-            await buildProbeRunnerForSimulator({
+            const preparedRunner = await ensureSimulatorRunnerPrepared({
               projectPath,
+              projectRoot: args.projectRoot,
               simulatorUdid: selected.device.udid,
               derivedDataPath,
               buildLogPath,
@@ -1307,13 +1422,7 @@ export const SimulatorHarnessLive = Layer.succeed(
                   bundleId: args.bundleId,
                 })
               : await (async () => {
-                  const targetAppPath = join(
-                    derivedDataPath,
-                    "Build",
-                    "Products",
-                    "Debug-iphonesimulator",
-                    "ProbeFixture.app",
-                  )
+                  const targetAppPath = preparedRunner.targetAppPath
 
                   if (!(await fileExists(targetAppPath))) {
                     throw new EnvironmentError({
@@ -1353,16 +1462,15 @@ export const SimulatorHarnessLive = Layer.succeed(
             })
 
             const runnerPort = await allocateFreeTcpPort()
-            const runnerXctestrunPath = await resolveRunnerXctestrunPath(derivedDataPath)
             const injectedXctestrunPath = await injectRunnerPortIntoXctestrun({
-              sourcePath: runnerXctestrunPath,
-              destinationPath: join(dirname(runnerXctestrunPath), "simulator-injected.xctestrun"),
+              sourcePath: preparedRunner.xctestrunPath,
+              destinationPath: join(dirname(preparedRunner.xctestrunPath), "simulator-injected.xctestrun"),
               runnerPort,
             })
 
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
-              rootDir: args.rootDir,
+              projectRoot: args.projectRoot,
               xctestrunPath: injectedXctestrunPath,
               destination: `platform=iOS Simulator,id=${selected.device.udid}`,
               observerControlDirectory,

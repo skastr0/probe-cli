@@ -26,14 +26,14 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const openParams = {
   bundleId: "dev.probe.fixture",
   simulatorUdid: null,
-  rootDir: "/tmp/probe-cli-test",
+  projectRoot: "/tmp/probe-cli-test",
   emitProgress: () => undefined,
 } as const
 
 const deviceOpenParams = {
   bundleId: "dev.probe.fixture",
   deviceId: null,
-  rootDir: "/tmp/probe-cli-test",
+  projectRoot: "/tmp/probe-cli-test",
   emitProgress: () => undefined,
 } as const
 
@@ -67,8 +67,11 @@ const withProbeFfmpegPath = async <T>(ffmpegPath: string | undefined, run: () =>
   }
 }
 
-const createFakeFfmpegExecutable = async (root: string): Promise<string> => {
+const createFakeFfmpegExecutable = async (
+  root: string,
+): Promise<{ readonly executablePath: string; readonly argsLogPath: string }> => {
   const executablePath = join(root, "fake-ffmpeg")
+  const argsLogPath = join(root, "fake-ffmpeg.args")
 
   await writeFile(
     executablePath,
@@ -79,6 +82,7 @@ const createFakeFfmpegExecutable = async (root: string): Promise<string> => {
       "  exit 0",
       "fi",
       'output=""',
+      `printf '%s\n' "$@" > "${argsLogPath}"`,
       'for arg in "$@"; do',
       '  output="$arg"',
       "done",
@@ -89,7 +93,10 @@ const createFakeFfmpegExecutable = async (root: string): Promise<string> => {
     "utf8",
   )
   await chmod(executablePath, 0o755)
-  return executablePath
+  return {
+    executablePath,
+    argsLogPath,
+  }
 }
 
 const waitFor = async <T>(
@@ -2382,9 +2389,9 @@ describe("SessionRegistry", () => {
     })
   })
 
-  test("records simulator video as a remuxed mp4 artifact without runner stitching", async () => {
+  test("records simulator video as a normalized mp4 artifact without runner stitching", async () => {
     await withTempRoot(async (root) => {
-      const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
+      const { executablePath: fakeFfmpegPath, argsLogPath } = await createFakeFfmpegExecutable(root)
 
       await withProbeFfmpegPath(fakeFfmpegPath, async () => {
         const runnerCommands: Array<FakeHarnessRunnerCommand> = []
@@ -2409,6 +2416,9 @@ describe("SessionRegistry", () => {
           expect(result.artifact.absolutePath).toContain("/video/")
           expect(result.summary).toContain("MP4 video artifact")
           expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake mp4 data")
+          expect((await readFile(argsLogPath, "utf8")).split(/\r?\n/).filter(Boolean)).toEqual(
+            expect.arrayContaining(["-vf", "fps=30", "-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+          )
           expect(runnerCommands.some((command) => command.action === "recordVideo")).toBe(false)
 
           await runtime.runPromise(registry.closeSession(session.sessionId))
@@ -2828,7 +2838,7 @@ describe("SessionRegistry", () => {
 
   test("runs multi-step flows and reports structured evidence", async () => {
     await withTempRoot(async (root) => {
-      const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
+      const { executablePath: fakeFfmpegPath } = await createFakeFfmpegExecutable(root)
       const runnerCommands: Array<{ readonly action: string; readonly payload: string | null }> = []
 
       await withProbeFfmpegPath(fakeFfmpegPath, async () => {
@@ -3225,7 +3235,7 @@ describe("SessionRegistry", () => {
 
   test("records screenshot and video artifact refs in replay reports", async () => {
     await withTempRoot(async (root) => {
-      const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
+      const { executablePath: fakeFfmpegPath } = await createFakeFfmpegExecutable(root)
 
       await withProbeFfmpegPath(fakeFfmpegPath, async () => {
         const runtime = makeRuntime(root, createFakeHarness())

@@ -12,6 +12,7 @@ import { isLiveRunnerDetails, type SessionHealth } from "../../domain/session"
 import type { SessionSnapshotResult } from "../../domain/snapshot"
 import { probeRuntime } from "../../runtime"
 import { PerfService } from "../../services/PerfService"
+import { findProjectRoot } from "../../services/ProjectRoot"
 import { SessionRegistry } from "../../services/SessionRegistry"
 
 const resultsDirectory = join(process.cwd(), "knowledge", "session-surface-coexistence")
@@ -455,7 +456,7 @@ const main = async () => {
       services.sessionRegistry.openSimulatorSession({
         bundleId: "dev.probe.fixture",
         simulatorUdid: null,
-        rootDir: process.cwd(),
+        projectRoot: findProjectRoot(),
         emitProgress: () => undefined,
       }),
     )

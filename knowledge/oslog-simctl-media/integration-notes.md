@@ -1,6 +1,6 @@
 # OSLog, simctl, and media integration notes
 
-Last updated: 2026-04-09
+Last updated: 2026-04-14
 
 ## Observed facts
 - Apple positions the unified logging seam as a mix of **live tools** (Console, `log stream`, Xcode) and **after-the-fact diagnostics** (crash reports, jetsam reports, transferred device logs).
@@ -10,6 +10,7 @@ Last updated: 2026-04-09
   - readiness is signaled on stderr
   - stopping is signal-driven
   - output finalization happens after stop is requested
+- Local 2026-04-14 session artifacts showed that `simctl io recordVideo` can preserve a very high frame cadence when Probe copy-remuxes the resulting QuickTime file (`ffprobe` on Probe artifacts showed ~111fps for a 5s clip and ~124fps / 2483 frames for a 20s clip).
 - Apple's device-log docs point to **Console.app** and **Xcode Devices and Simulators** for connected-device access, while sampled local `devicectl` help exposes **sysdiagnose** capture but not a dedicated live log-streaming subcommand.
 
 ## Inference
@@ -23,6 +24,7 @@ Last updated: 2026-04-09
 - Probe should model `simctl io screenshot` as a short-lived artifact command and `simctl io recordVideo` as a scoped session child with explicit start/stop control.
 - Probe should favor artifact-file outputs for screenshots and recordings, even though `screenshot -` can write to stdout, because the project's architecture is artifact-first and binary stdout payloads are a poor fit for token-efficient command replies.
 - If Probe needs to know that recording actually began before returning success, it should wait for the documented `Recording started` stderr message.
+- Probe should delivery-normalize simulator recordings before returning MP4 artifacts. Copy-remuxing the simulator QuickTime output preserves the raw high frame cadence and can produce visibly slow playback in consumers that cannot present the encoded frame rate.
 
 ### Connected-device limitations
 - Based on the sampled public sources, Probe should treat **connected-device live log streaming** as a capability that may require a GUI-side Apple tool rather than a stable public CLI surface.

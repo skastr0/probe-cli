@@ -23,6 +23,11 @@ import {
   type RunnerReadyFrame,
   type RunnerResponseFrame,
 } from "./runnerProtocol"
+import {
+  probeRunnerDeviceDerivedRootPath,
+  resolveProbeFixtureProjectPath,
+  resolveProbeRunnerWrapperScriptPath,
+} from "./ProjectRoot"
 
 const runnerScheme = "ProbeRunner"
 const commandPollIntervalMs = 50
@@ -44,6 +49,21 @@ const deviceInterruptionAttachLatencyThresholdMs = 30_000
 const maxInterruptionEvidenceLines = 3
 const commonDeviceInterruptionNextStep =
   "Unlock the device, dismiss any passcode/trust/Developer Mode prompt, then retry. If the device disconnected while you fixed it, reconnect it first."
+
+const assertPackagedProbePathExists = async (path: string, description: string): Promise<void> => {
+  if (await fileExists(path)) {
+    return
+  }
+
+  throw new EnvironmentError({
+    code: "probe-package-artifact-missing",
+    reason: `Probe could not find the packaged ${description} at ${path}.`,
+    nextStep: "Reinstall probe-cli so the packaged ios/ runner sources are restored, then retry the session open.",
+    details: [],
+  })
+}
+
+const resolveRealDeviceRunnerDerivedDataPath = (): string => probeRunnerDeviceDerivedRootPath
 
 interface DeviceInterruptionPattern {
   readonly signal: DeviceInterruptionSignal
@@ -603,6 +623,39 @@ const formatCommandFailure = (command: string, result: CommandResult): string =>
   return tail.length > 0
     ? `${command} exited with ${result.exitCode ?? "unknown"}: ${tail}`
     : `${command} exited with ${result.exitCode ?? "unknown"}.`
+}
+
+export const buildRealDeviceBuildForTestingCommandArgs = (args: {
+  readonly projectPath: string
+  readonly derivedDataPath: string
+  readonly developmentTeam: string
+}): ReadonlyArray<string> => [
+  "-project",
+  args.projectPath,
+  "-scheme",
+  runnerScheme,
+  "-destination",
+  "generic/platform=iOS",
+  "-derivedDataPath",
+  args.derivedDataPath,
+  "-allowProvisioningUpdates",
+  "-allowProvisioningDeviceRegistration",
+  `DEVELOPMENT_TEAM=${args.developmentTeam}`,
+  "build-for-testing",
+]
+
+const inferBuildForTestingNextStep = (result: CommandResult): string => {
+  const combined = `${result.stdout}\n${result.stderr}`
+
+  if (/No Accounts:/i.test(combined)) {
+    return "Open Xcode > Settings > Accounts, sign in to an Apple Developer account for the configured team, then retry the real-device session open."
+  }
+
+  if (/No profiles for /i.test(combined)) {
+    return "Ensure Xcode can create or download development provisioning profiles for the Probe runner bundle ids, then retry the real-device session open."
+  }
+
+  return "Fix the reported signing/provisioning issue, ensure the device is registered for development signing if needed, then retry the session open."
 }
 
 const captureDeviceDiagnosticBundle = async (args: {
@@ -1844,7 +1897,7 @@ const assertReadyTransportContract = (args: {
 }
 
 const startWrapperProcess = async (args: {
-  readonly rootDir: string
+  readonly projectRoot: string
   readonly xctestrunPath: string
   readonly destination: string
   readonly observerControlDirectory: string
@@ -1861,13 +1914,7 @@ const startWrapperProcess = async (args: {
   await ensureDirectory(dirname(args.wrapperStderrPath))
   await writeFile(args.wrapperStderrPath, "", "utf8")
 
-  const wrapperScript = join(
-    args.rootDir,
-    "ios",
-    "ProbeRunner",
-    "scripts",
-    "run-transport-boundary-session.py",
-  )
+  const wrapperScript = resolveProbeRunnerWrapperScriptPath(args.projectRoot)
 
   const child = spawn(
     "/usr/bin/python3",
@@ -1892,7 +1939,7 @@ const startWrapperProcess = async (args: {
       "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
     ],
     {
-      cwd: args.rootDir,
+      cwd: args.projectRoot,
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
     },
@@ -1941,7 +1988,7 @@ const buildLiveWarnings = (): ReadonlyArray<string> => [
 ]
 
 const performPreflight = async (args: {
-  readonly rootDir: string
+  readonly projectRoot: string
   readonly sessionId: string
   readonly artifactRoot: string
   readonly runnerDirectory: string
@@ -1949,10 +1996,9 @@ const performPreflight = async (args: {
   readonly bundleId: string
   readonly requestedDeviceId: string | null
 }): Promise<PreflightContext> => {
-  const projectPath = join(args.rootDir, "ios", "ProbeFixture", "ProbeFixture.xcodeproj")
+  const projectPath = resolveProbeFixtureProjectPath(args.projectRoot)
   const metaDirectory = join(args.artifactRoot, "meta")
   const deviceLogsDirectory = join(args.logsDirectory, "device-preflight")
-  const deviceRunnerDirectory = join(args.runnerDirectory, "device-preflight")
   const preferredDdiJsonPath = join(metaDirectory, "preferred-ddi.json")
   const devicesJsonPath = join(metaDirectory, "devices.json")
   const ddiServicesJsonPath = join(metaDirectory, "ddi-services.json")
@@ -1961,12 +2007,12 @@ const performPreflight = async (args: {
   const devicesLogPath = join(deviceLogsDirectory, "devicectl-list-devices.log")
   const ddiServicesLogPath = join(deviceLogsDirectory, "devicectl-device-info-ddi-services.log")
   const buildLogPath = join(deviceLogsDirectory, "xcodebuild-build-for-testing-device.log")
-  const derivedDataPath = join(deviceRunnerDirectory, "derived-data")
+  const derivedDataPath = resolveRealDeviceRunnerDerivedDataPath()
 
   await Promise.all([
+    assertPackagedProbePathExists(projectPath, "ProbeFixture Xcode project"),
     ensureDirectory(metaDirectory),
     ensureDirectory(deviceLogsDirectory),
-    ensureDirectory(deviceRunnerDirectory),
   ])
 
   const preferredDdiResult = await runCommand({
@@ -2066,25 +2112,18 @@ const performPreflight = async (args: {
   } else {
     const buildResult = await runCommand({
       command: "/usr/bin/xcodebuild",
-      commandArgs: [
-        "-project",
+      commandArgs: buildRealDeviceBuildForTestingCommandArgs({
         projectPath,
-        "-scheme",
-        runnerScheme,
-        "-destination",
-        "generic/platform=iOS",
-        "-derivedDataPath",
         derivedDataPath,
-        `DEVELOPMENT_TEAM=${developmentTeam}`,
-        "build-for-testing",
-      ],
+        developmentTeam,
+      }),
     })
     await writeCommandLog(buildLogPath, buildResult)
 
     if (buildResult.exitCode !== 0) {
       issues.push({
         summary: "The Probe runner could not complete a signed iPhoneOS build-for-testing preflight.",
-        nextStep: "Fix the reported signing/provisioning issue, ensure the device is registered for development signing if needed, then retry the session open.",
+        nextStep: inferBuildForTestingNextStep(buildResult),
         details: [
           formatCommandFailure("xcodebuild build-for-testing -destination generic/platform=iOS", buildResult),
           `build log: ${buildLogPath}`,
@@ -2151,7 +2190,7 @@ const performPreflight = async (args: {
     ...(selectedDevice ? [`xcrun devicectl device info apps --device ${selectedDevice.identifier} --bundle-id ${args.bundleId} --json-output <path>`] : []),
     ...(selectedDevice ? [`xcrun devicectl device process launch --device ${selectedDevice.identifier} --terminate-existing ${args.bundleId} --json-output <path>`] : []),
     ...(buildCompleted ? [
-      `xcodebuild build-for-testing -destination generic/platform=iOS DEVELOPMENT_TEAM=${developmentTeam}`,
+      `xcodebuild build-for-testing -destination generic/platform=iOS -allowProvisioningUpdates -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM=${developmentTeam}`,
       `xcodebuild test-without-building -destination platform=iOS,id=<udid> DEVELOPMENT_TEAM=${developmentTeam}`,
     ] : []),
   ] as const
@@ -2280,7 +2319,7 @@ export class RealDeviceHarness extends Context.Tag("@probe/RealDeviceHarness")<
   RealDeviceHarness,
   {
     readonly openPreflightSession: (args: {
-      readonly rootDir: string
+      readonly projectRoot: string
       readonly sessionId: string
       readonly artifactRoot: string
       readonly runnerDirectory: string
@@ -2289,7 +2328,7 @@ export class RealDeviceHarness extends Context.Tag("@probe/RealDeviceHarness")<
       readonly requestedDeviceId: string | null
     }) => Effect.Effect<OpenedRealDevicePreflightSession, EnvironmentError | UserInputError>
     readonly openLiveSession: (args: {
-      readonly rootDir: string
+      readonly projectRoot: string
       readonly sessionId: string
       readonly artifactRoot: string
       readonly runnerDirectory: string
@@ -2353,6 +2392,10 @@ export const RealDeviceHarnessLive = Layer.succeed(
       return Effect.tryPromise({
         try: async () => {
           try {
+            await assertPackagedProbePathExists(
+              resolveProbeRunnerWrapperScriptPath(args.projectRoot),
+              "ProbeRunner wrapper script",
+            )
             const preflight = await performPreflight(args)
             const liveLogsDirectory = join(args.logsDirectory, "device-live")
             const installedAppsJsonPath = join(preflight.metaDirectory, "installed-apps.json")
@@ -2525,7 +2568,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
-              rootDir: args.rootDir,
+              projectRoot: args.projectRoot,
               xctestrunPath: injectedXctestrunPath,
               destination,
               observerControlDirectory,

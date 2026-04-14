@@ -95,6 +95,7 @@ const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
 const maxVideoDurationMs = 120_000
 const defaultVideoDurationMs = 10_000
 const videoCaptureFps = 10
+const simulatorVideoDeliveryFps = 30
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
 const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
@@ -1164,7 +1165,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
     readonly openDeviceSession: (params: {
       readonly bundleId: string
       readonly deviceId: string | null
-      readonly rootDir: string
+      readonly projectRoot: string
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
       SessionHealth,
@@ -1174,7 +1175,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
       readonly bundleId: string
       readonly sessionMode?: SimulatorSessionMode
       readonly simulatorUdid: string | null
-      readonly rootDir: string
+      readonly projectRoot: string
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
       SessionHealth,
@@ -2599,13 +2600,17 @@ export const SessionRegistryLive = Layer.scoped(
                 "-y",
                 "-i",
                 movPath,
-                "-c",
-                "copy",
+                "-vf",
+                `fps=${simulatorVideoDeliveryFps}`,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
                 "-movflags",
                 "+faststart",
                 absolutePath,
               ],
-              timeoutMs: args.durationMs + 30_000,
+              timeoutMs: args.durationMs + 60_000,
             }),
           catch: (error) =>
             new EnvironmentError({
@@ -2642,7 +2647,8 @@ export const SessionRegistryLive = Layer.scoped(
           label: args.artifactLabel,
           kind: "mp4",
           absolutePath,
-          summary: `Native simulator video captured over simctl and remuxed to MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
+          summary:
+            `Native simulator video captured over simctl and normalized to ${simulatorVideoDeliveryFps} fps MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -3571,7 +3577,7 @@ export const SessionRegistryLive = Layer.scoped(
             .map((record) => toSessionListEntry(record.health))
             .sort((left, right) => left.openedAt.localeCompare(right.openedAt))
         }),
-      openDeviceSession: ({ bundleId, deviceId, rootDir, emitProgress }) =>
+      openDeviceSession: ({ bundleId, deviceId, projectRoot, emitProgress }) =>
         Effect.gen(function* () {
           const reservation = yield* reserveOpeningSession({
             platform: "device",
@@ -3611,7 +3617,7 @@ export const SessionRegistryLive = Layer.scoped(
                 emitProgress("device.resolve", "Resolving a concrete real-device target through CoreDevice.")
 
                 const opened = yield* realDeviceHarness.openLiveSession({
-                  rootDir,
+                  projectRoot,
                   sessionId: opening.sessionId,
                   artifactRoot: layout.root,
                   runnerDirectory: layout.runnerDirectory,
@@ -3877,7 +3883,7 @@ export const SessionRegistryLive = Layer.scoped(
             (opening, exit) => finalizeOpeningSession(opening.sessionId, exit._tag === "Failure"),
           )
         }),
-      openSimulatorSession: ({ bundleId, sessionMode, simulatorUdid, rootDir, emitProgress }) =>
+      openSimulatorSession: ({ bundleId, sessionMode, simulatorUdid, projectRoot, emitProgress }) =>
         Effect.gen(function* () {
           const reservation = yield* reserveOpeningSession({
             platform: "simulator",
@@ -3917,7 +3923,7 @@ export const SessionRegistryLive = Layer.scoped(
                 emitProgress("simulator.resolve", "Resolving a concrete Simulator target.")
 
                 const opened = yield* simulatorHarness.openSession({
-                  rootDir,
+                  projectRoot,
                   sessionId: opening.sessionId,
                   artifactRoot: layout.root,
                   runnerDirectory: layout.runnerDirectory,

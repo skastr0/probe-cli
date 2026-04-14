@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
+  buildRealDeviceBuildForTestingCommandArgs,
   buildRunnerHttpArtifactUrls,
   buildRunnerHttpCommandUrls,
   detectRealDeviceInterruption,
@@ -196,6 +197,29 @@ describe("extractDeviceCandidate", () => {
         "iPhone (2)",
       ],
     })
+  })
+})
+
+describe("buildRealDeviceBuildForTestingCommandArgs", () => {
+  test("allows provisioning updates and device registration during real-device preflight builds", () => {
+    expect(buildRealDeviceBuildForTestingCommandArgs({
+      projectPath: "/tmp/ProbeFixture.xcodeproj",
+      derivedDataPath: "/tmp/probe-derived-data",
+      developmentTeam: "4452968868",
+    })).toEqual([
+      "-project",
+      "/tmp/ProbeFixture.xcodeproj",
+      "-scheme",
+      "ProbeRunner",
+      "-destination",
+      "generic/platform=iOS",
+      "-derivedDataPath",
+      "/tmp/probe-derived-data",
+      "-allowProvisioningUpdates",
+      "-allowProvisioningDeviceRegistration",
+      "DEVELOPMENT_TEAM=4452968868",
+      "build-for-testing",
+    ])
   })
 })
 
