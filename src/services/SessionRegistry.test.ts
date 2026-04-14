@@ -3,9 +3,16 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { Effect, Either, Layer, ManagedRuntime } from "effect"
-import type { ActionRecordingScript, ReplayReport } from "../domain/action"
+import type { ActionRecordingScript, FlowContract, ReplayReport } from "../domain/action"
 import type { SessionDebuggerDetails } from "../domain/debug"
-import { EnvironmentError, SessionConflictError, SessionNotFoundError, UserInputError } from "../domain/errors"
+import {
+  ArtifactNotFoundError,
+  DeviceInterruptionError,
+  EnvironmentError,
+  SessionConflictError,
+  SessionNotFoundError,
+  UserInputError,
+} from "../domain/errors"
 import { PROBE_PROTOCOL_VERSION } from "../rpc/protocol"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
@@ -302,8 +309,34 @@ const createTestArtifactStore = (
             details: [],
           }),
       }),
-    getArtifact: () => Effect.die("unused in SessionRegistry tests") as never,
+    getArtifact: (sessionId: string, artifactKey: string) =>
+      Effect.tryPromise({
+        try: async () => {
+          const artifacts = await readJson<Array<any>>(join(sessionsRoot, sessionId, "meta", "artifact-index.json"), [])
+          const artifact = artifacts.find((entry) => entry.key === artifactKey)
+
+          if (!artifact) {
+            throw new ArtifactNotFoundError({
+              sessionId,
+              artifactKey,
+              nextStep: "Register the artifact in the test fixture before drilling it.",
+            })
+          }
+
+          return artifact
+        },
+        catch: (error) =>
+          error instanceof ArtifactNotFoundError
+            ? error
+            : new EnvironmentError({
+                code: "test-artifact-get",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the test artifact store root.",
+                details: [],
+              }),
+      }),
     writeDerivedOutput: () => Effect.die("unused in SessionRegistry tests") as never,
+    writeDerivedFile: () => Effect.die("unused in SessionRegistry tests") as never,
     removeDaemonMetadata: () =>
       Effect.tryPromise({
         try: () => rm(daemonMetadataPath, { force: true }),
@@ -377,6 +410,17 @@ interface FakeHarnessUiActionInterceptResult {
   readonly error?: string | null
 }
 
+interface FakeHarnessSnapshotIntercept {
+  readonly callIndex: number
+  readonly statusLabel: string
+  readonly inputValue: string
+}
+
+interface FakeHarnessSnapshotInterceptResult {
+  readonly statusLabel?: string
+  readonly inputValue?: string
+}
+
 interface FakeHarnessRunnerCommand {
   readonly sequence: number
   readonly action: string
@@ -396,6 +440,9 @@ const createFakeHarness = (options?: {
   readonly captureOpenArgs?: (args: FakeHarnessOpenArgs) => void
   readonly captureSessionControl?: (control: FakeHarnessSessionControl) => void
   readonly captureRunnerCommand?: (command: FakeHarnessRunnerCommand) => void
+  readonly interceptSnapshot?: (
+    snapshot: FakeHarnessSnapshotIntercept,
+  ) => FakeHarnessSnapshotInterceptResult | null | undefined
   readonly interceptUiAction?: (
     action: FakeHarnessUiActionIntercept,
   ) => FakeHarnessUiActionInterceptResult | null | undefined
@@ -482,6 +529,7 @@ const createFakeHarness = (options?: {
           let statusLabel = "Ready for attach/control validation"
           let inputValue = ""
           let uiActionCallCount = 0
+          let snapshotCallCount = 0
 
           const buildSnapshotPayload = () => ({
             capturedAt: "2026-04-10T00:00:00.000Z",
@@ -669,7 +717,7 @@ const createFakeHarness = (options?: {
             bootstrapSource: "simulator-bootstrap-manifest",
             runnerTransportContract: "probe.runner.transport/hybrid-v1",
             sessionIdentifier: args.sessionId,
-            commandIngress: "file-mailbox",
+            commandIngress: "http-post",
             eventEgress: "stdout-jsonl-mixed-log",
             runtimeControlDirectory,
             observerControlDirectory,
@@ -678,7 +726,7 @@ const createFakeHarness = (options?: {
             stdoutEventsPath,
             resultBundlePath,
             wrapperStderrPath,
-            stdinProbeStatus: "timeout",
+            stdinProbeStatus: "not-required-http",
             initialPingRttMs: 5,
             nextSequence: 2,
             sendCommand: async (_sequence, action, payload) => {
@@ -689,6 +737,21 @@ const createFakeHarness = (options?: {
               })
 
               if (action === "snapshot") {
+                snapshotCallCount += 1
+                const snapshotIntercept = options?.interceptSnapshot?.({
+                  callIndex: snapshotCallCount,
+                  statusLabel,
+                  inputValue,
+                })
+
+                if (snapshotIntercept?.statusLabel !== undefined) {
+                  statusLabel = snapshotIntercept.statusLabel
+                }
+
+                if (snapshotIntercept?.inputValue !== undefined) {
+                  inputValue = snapshotIntercept.inputValue
+                }
+
                 const snapshotPayloadPath = join(runtimeControlDirectory, `snapshot-${String(_sequence).padStart(3, "0")}.json`)
                 await writeFile(
                   snapshotPayloadPath,
@@ -837,6 +900,22 @@ const createFakeHarness = (options?: {
             details: [],
           }),
       }),
+    captureSimulatorDiagnosticBundle: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          const absolutePath = join(args.diagnosticsDirectory, `${args.fileStem}.tar.gz`)
+          await mkdir(dirname(absolutePath), { recursive: true })
+          await writeFile(absolutePath, "fake simulator diagnostic bundle\n", "utf8")
+          return { absolutePath }
+        },
+        catch: (error) =>
+          new EnvironmentError({
+            code: "fake-harness-diagnostic-capture",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the fake harness diagnostic path.",
+            details: [],
+          }),
+      }),
     recordSimulatorVideo: (args) =>
       Effect.tryPromise({
         try: async () => {
@@ -863,8 +942,10 @@ const createFakeHarness = (options?: {
 const createFakeRealDeviceHarness = (options?: {
   readonly failWith?: Error
   readonly connectionStates?: ReadonlyArray<"connected" | "disconnected">
+  readonly pingStatusLabels?: ReadonlyArray<string>
 }) => {
   let connectionIndex = 0
+  let pingStatusLabelIndex = 0
   let running = true
   let resolveExit!: (value: { readonly code: number | null; readonly signal: string | null }) => void
   const waitForExit = new Promise<{ readonly code: number | null; readonly signal: string | null }>((resolve) => {
@@ -1087,22 +1168,52 @@ const createFakeRealDeviceHarness = (options?: {
             launchJsonPath,
             nextSequence: 2,
             initialPingRttMs: 18,
-            sendCommand: async (sequence, action) => ({
-              ok: true,
-              action,
-              error: null,
-              payload: action === "ping" ? "pong" : null,
-              snapshotPayloadPath: null,
-              handledMs: 5,
-              statusLabel: `ok-${sequence}`,
-              snapshotNodeCount: null,
-              hostRttMs: 7,
-            }),
+            sendCommand: async (sequence, action) => {
+              const configuredPingStatusLabel = action === "ping"
+                ? options?.pingStatusLabels?.[Math.min(
+                    pingStatusLabelIndex,
+                    Math.max((options?.pingStatusLabels?.length ?? 1) - 1, 0),
+                  )] ?? null
+                : null
+
+              if (action === "ping") {
+                pingStatusLabelIndex += 1
+              }
+
+              return {
+                ok: true,
+                action,
+                error: null,
+                payload: action === "ping" ? "pong" : null,
+                snapshotPayloadPath: null,
+                handledMs: 5,
+                statusLabel: configuredPingStatusLabel ?? `ok-${sequence}`,
+                snapshotNodeCount: null,
+                hostRttMs: 7,
+              }
+            },
             isWrapperRunning: () => running,
             waitForExit,
           }
         },
-        catch: (error) => error as EnvironmentError,
+        catch: (error) => error as DeviceInterruptionError | EnvironmentError,
+      }),
+    captureDeviceDiagnosticBundle: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          const extension = args.kind === "sysdiagnose" ? ".tar.gz" : ".zip"
+          const absolutePath = join(args.diagnosticsDirectory, `${args.fileStem}${extension}`)
+          await mkdir(dirname(absolutePath), { recursive: true })
+          await writeFile(absolutePath, `fake ${args.kind} bundle\n`, "utf8")
+          return { absolutePath }
+        },
+        catch: (error) =>
+          new EnvironmentError({
+            code: "fake-real-device-diagnostic-capture",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the fake real-device diagnostic path.",
+            details: [],
+          }),
       }),
   })
 }
@@ -2013,6 +2124,221 @@ describe("SessionRegistry", () => {
     })
   })
 
+  test("writes log marks under logs/marks and appends them to log output", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness())
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const markResult = await runtime.runPromise(registry.markLog({
+          sessionId: session.sessionId,
+          label: "before-submit",
+        }))
+
+        expect(markResult.artifact.absolutePath).toContain("/logs/marks/")
+
+        const marker = JSON.parse(await readFile(markResult.artifact.absolutePath, "utf8")) as {
+          readonly timestamp: string
+          readonly label: string
+          readonly sessionId: string
+        }
+
+        expect(marker.sessionId).toBe(session.sessionId)
+        expect(marker.label).toBe("before-submit")
+        expect(typeof marker.timestamp).toBe("string")
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        const stdoutEventsArtifact = health.artifacts.find((artifact) => artifact.key === "stdout-events")
+
+        expect(stdoutEventsArtifact).toBeDefined()
+
+        const stdoutEventsContent = await readFile(stdoutEventsArtifact!.absolutePath, "utf8")
+        expect(stdoutEventsContent).toContain('"kind":"probe.log.mark"')
+        expect(stdoutEventsContent).toContain('"label":"before-submit"')
+        expect(stdoutEventsContent).toContain(`"timestamp":"${marker.timestamp}"`)
+
+        const result = await runtime.runPromise(
+          registry.getSessionLogs({
+            sessionId: session.sessionId,
+            source: "runner",
+            lineCount: 10,
+            match: null,
+            outputMode: "auto",
+            captureSeconds: 2,
+            predicate: null,
+            process: null,
+            subsystem: null,
+            category: null,
+          }),
+        )
+
+        expect(result.result.kind).toBe("inline")
+
+        if (result.result.kind === "inline") {
+          expect(result.result.content).toContain("probe log markers:")
+          expect(result.result.content).toContain("before-submit")
+          expect(result.result.content).toContain(marker.timestamp)
+        }
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("captures bounded simulator log windows as ndjson artifacts", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness())
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.captureLogWindow({
+          sessionId: session.sessionId,
+          captureSeconds: 3,
+        }))
+
+        expect(result.artifact.kind).toBe("ndjson")
+        expect(result.artifact.absolutePath).toContain("/logs/streams/")
+        expect(result.summary).toContain("3s")
+        expect(await readFile(result.artifact.absolutePath, "utf8")).toContain("fixture log beta")
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(health.artifacts.some((artifact) => artifact.key.startsWith("simulator-log-capture-"))).toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("reports simulator log capture as available before a capture artifact exists", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness())
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const report = await runtime.runPromise(registry.getLogDoctorReport(session.sessionId))
+        const simulatorSource = report.sources.find((source) => source.source === "simulator")
+
+        expect(simulatorSource?.available).toBe(true)
+        expect(simulatorSource?.artifactKey).toBeNull()
+        expect(simulatorSource?.artifactPath).toBeNull()
+        expect(simulatorSource?.reason).toContain("bounded simulator live capture")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("reports simulator live capture as unavailable for device sessions", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness(), {
+        realDeviceHarness: createFakeRealDeviceHarness(),
+      })
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openDeviceSession(deviceOpenParams))
+        const report = await runtime.runPromise(registry.getLogDoctorReport(session.sessionId))
+        const simulatorSource = report.sources.find((source) => source.source === "simulator")
+
+        expect(simulatorSource?.available).toBe(false)
+        expect(simulatorSource?.reason).toContain("only available for simulator sessions")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("captures simulator diagnostic bundles as binary session artifacts", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness())
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.captureDiagnosticBundle({
+          sessionId: session.sessionId,
+          target: "simulator",
+          kind: null,
+        }))
+
+        expect(result.artifact.kind).toBe("binary")
+        expect(result.artifact.label).toBe("simulator-diagnostic")
+        expect(result.artifact.absolutePath).toContain("/diagnostics/")
+        expect(result.artifact.absolutePath.endsWith(".tar.gz")).toBe(true)
+        expect(result.summary).toContain("simctl diagnose")
+        expect(await readFile(result.artifact.absolutePath, "utf8")).toContain("fake simulator diagnostic bundle")
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(health.artifacts.some((artifact) => artifact.label === "simulator-diagnostic")).toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("captures device sysdiagnose bundles as binary session artifacts", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness(), {
+        realDeviceHarness: createFakeRealDeviceHarness(),
+      })
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openDeviceSession(deviceOpenParams))
+        const result = await runtime.runPromise(registry.captureDiagnosticBundle({
+          sessionId: session.sessionId,
+          target: "device",
+          kind: "sysdiagnose",
+        }))
+
+        expect(result.artifact.kind).toBe("binary")
+        expect(result.artifact.label).toBe("device-sysdiagnose")
+        expect(result.artifact.absolutePath).toContain("/diagnostics/")
+        expect(result.artifact.absolutePath.endsWith(".tar.gz")).toBe(true)
+        expect(result.summary).toContain("sysdiagnose")
+        expect(await readFile(result.artifact.absolutePath, "utf8")).toContain("fake sysdiagnose bundle")
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(health.artifacts.some((artifact) => artifact.label === "device-sysdiagnose")).toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
   test("captures screenshots as png artifacts even when inline output is requested", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
@@ -2039,6 +2365,8 @@ describe("SessionRegistry", () => {
         expect(result.artifact.kind).toBe("png")
         expect(result.artifact.absolutePath).toContain("/screenshots/")
         expect(result.summary).toContain("binary image payloads")
+        expect(result.retryCount).toBe(0)
+        expect(result.retryReasons).toEqual([])
 
         const screenshotBytes = await readFile(result.artifact.absolutePath)
         expect(screenshotBytes.byteLength).toBeGreaterThan(0)
@@ -2154,6 +2482,8 @@ describe("SessionRegistry", () => {
         expect(first.artifact.kind).toBe("json")
         expect(first.artifact.absolutePath).toContain("/snapshots/")
         expect(first.preview?.kind).toBe("interactive")
+        expect(first.retryCount).toBe(0)
+        expect(first.retryReasons).toEqual([])
         expect(second.previousSnapshotId).toBe(first.snapshotId)
         expect(second.diff.kind).toBe("unchanged")
 
@@ -2259,6 +2589,9 @@ describe("SessionRegistry", () => {
               },
               expectation: {
                 exists: true,
+                visible: null,
+                hidden: null,
+                text: null,
                 label: "Input applied: delta",
                 value: null,
                 type: "staticText",
@@ -2296,7 +2629,7 @@ describe("SessionRegistry", () => {
         const replayScript: ActionRecordingScript = {
           ...exportedScript,
           steps: exportedScript.steps.map((step, stepIndex) =>
-            stepIndex === 1 && "target" in step
+            stepIndex === 1 && step.kind === "tap"
               ? {
                   ...step,
                   target: {
@@ -2321,6 +2654,10 @@ describe("SessionRegistry", () => {
         expect(replayed.stepCount).toBe(3)
         expect(replayed.semanticFallbackCount).toBeGreaterThanOrEqual(1)
 
+        const replayReport = JSON.parse(await readFile(replayed.artifact.absolutePath, "utf8")) as ReplayReport
+        expect(replayReport.steps[1]?.outcome).toBe("semantic-fallback")
+        expect(replayReport.steps[1]?.summary).toContain("semantic fallback succeeded")
+
         const afterReplay = await runtime.runPromise(
           registry.captureSnapshot({
             sessionId: secondSession.sessionId,
@@ -2330,6 +2667,411 @@ describe("SessionRegistry", () => {
         expect(afterReplay.statusLabel).toBe("Input applied: delta")
 
         await runtime.runPromise(registry.closeSession(secondSession.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("retries tap actions and reports retry metadata", async () => {
+    await withTempRoot(async (root) => {
+      let tapAttempts = 0
+      const runtime = makeRuntime(root, createFakeHarness({
+        interceptUiAction: ({ kind, identifier }) => {
+          if (kind === "tap" && identifier === "fixture.form.applyButton") {
+            tapAttempts += 1
+
+            if (tapAttempts <= 2) {
+              return {
+                ok: false,
+                error: "Expected fixture.form.applyButton to be hittable before tap.",
+              }
+            }
+          }
+
+          return null
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.performAction({
+          sessionId: session.sessionId,
+          action: {
+            kind: "tap",
+            target: {
+              kind: "semantic",
+              identifier: "fixture.form.applyButton",
+              label: null,
+              value: null,
+              placeholder: null,
+              type: "button",
+              section: null,
+              interactive: true,
+            },
+          },
+        }))
+
+        expect(result.retryCount).toBe(2)
+        expect(result.retryReasons).toHaveLength(2)
+        expect(result.retryReasons.every((reason) => reason.includes("not-hittable"))).toBe(true)
+        expect(result.action).toBe("tap")
+        expect(result.latestSnapshotId).not.toBeNull()
+        expect(result.verdict).toBeNull()
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("returns structured assert results with verdict and snapshot refs", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness())
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.performAction({
+          sessionId: session.sessionId,
+          action: {
+            kind: "assert",
+            target: {
+              kind: "semantic",
+              identifier: "fixture.status.label",
+              label: null,
+              value: null,
+              placeholder: null,
+              type: "staticText",
+              section: null,
+              interactive: false,
+            },
+            expectation: {
+              exists: true,
+              visible: null,
+              hidden: null,
+              text: "Ready for attach/control validation",
+              label: null,
+              value: null,
+              type: "staticText",
+              enabled: null,
+              selected: null,
+              focused: null,
+              interactive: false,
+            },
+          },
+        }))
+
+        expect(result.action).toBe("assert")
+        expect(result.verdict).toBe("passed")
+        expect(result.latestSnapshotId).not.toBeNull()
+        expect(result.retryCount).toBe(0)
+        expect(result.polledCount).toBe(1)
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("waits for text conditions and reports polling metadata", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness({
+        interceptSnapshot: ({ callIndex }) =>
+          callIndex >= 3
+            ? { statusLabel: "Wait condition satisfied" }
+            : null,
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.performAction({
+          sessionId: session.sessionId,
+          action: {
+            kind: "wait",
+            target: {
+              kind: "semantic",
+              identifier: "fixture.status.label",
+              label: null,
+              value: null,
+              placeholder: null,
+              type: "staticText",
+              section: null,
+              interactive: false,
+            },
+            timeoutMs: 1_000,
+            condition: "text",
+            text: "Wait condition satisfied",
+          },
+        }))
+
+        expect(result.action).toBe("wait")
+        expect(result.verdict).toBe("passed")
+        expect(result.retryCount).toBeGreaterThan(0)
+        expect(result.polledCount).toBeGreaterThan(1)
+        expect(result.waitedMs).not.toBeNull()
+        expect(result.latestSnapshotId).not.toBeNull()
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("runs multi-step flows and reports structured evidence", async () => {
+    await withTempRoot(async (root) => {
+      const fakeFfmpegPath = await createFakeFfmpegExecutable(root)
+      const runnerCommands: Array<{ readonly action: string; readonly payload: string | null }> = []
+
+      await withProbeFfmpegPath(fakeFfmpegPath, async () => {
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push({
+              action: command.action,
+              payload: command.payload,
+            })
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const flow: FlowContract = {
+            contract: "probe.session-flow/v1",
+            steps: [
+              { kind: "snapshot" },
+              {
+                kind: "scroll",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.form.applyButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+                direction: "down",
+                steps: 1,
+              },
+              {
+                kind: "press",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.form.applyButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+                durationMs: 100,
+              },
+              {
+                kind: "type",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.form.input",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "textField",
+                  section: null,
+                  interactive: true,
+                },
+                text: "delta",
+                replace: true,
+              },
+              {
+                kind: "tap",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.form.applyButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+                retryPolicy: {
+                  maxAttempts: 2,
+                  backoffMs: 1,
+                  refreshSnapshotBetweenAttempts: true,
+                  retryOn: ["not-found", "not-hittable"],
+                },
+              },
+              {
+                kind: "wait",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.status.label",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "staticText",
+                  section: null,
+                  interactive: false,
+                },
+                timeoutMs: 1_000,
+                condition: "text",
+                text: "Input applied: delta",
+              },
+              {
+                kind: "assert",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.status.label",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "staticText",
+                  section: null,
+                  interactive: false,
+                },
+                expectation: {
+                  exists: true,
+                  visible: null,
+                  hidden: null,
+                  text: null,
+                  label: "Input applied: delta",
+                  value: null,
+                  type: "staticText",
+                  enabled: null,
+                  selected: null,
+                  focused: null,
+                  interactive: false,
+                },
+              },
+              { kind: "screenshot", label: "after-apply" },
+              { kind: "logMark", label: "after-apply" },
+              { kind: "sleep", durationMs: 10 },
+              { kind: "video", durationMs: 1_000 },
+            ],
+          }
+
+          const result = await runtime.runPromise(registry.runFlow({
+            sessionId: session.sessionId,
+            flow,
+          }))
+
+          expect(result.verdict).toBe("passed")
+          expect(result.failedStep).toBeNull()
+          expect(result.executedSteps.map((step) => step.kind)).toEqual([
+            "snapshot",
+            "scroll",
+            "press",
+            "type",
+            "tap",
+            "wait",
+            "assert",
+            "screenshot",
+            "logMark",
+            "sleep",
+            "video",
+          ])
+          expect(result.executedSteps.every((step) => step.index >= 1)).toBe(true)
+          expect(result.executedSteps.every((step) => step.verdict === "passed")).toBe(true)
+          expect(result.finalSnapshotId).not.toBeNull()
+          expect(result.artifacts.some((artifact) => artifact.kind === "png")).toBe(true)
+          expect(result.artifacts.some((artifact) => artifact.label === "log-mark")).toBe(true)
+          expect(result.artifacts.some((artifact) => artifact.kind === "mp4")).toBe(true)
+          expect(result.executedSteps[0]?.artifacts[0]?.kind).toBe("json")
+          expect(runnerCommands.some((command) => command.action === "uiAction")).toBe(true)
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
+  test("continues past tolerated flow failures and stops on the first blocking failure", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness({
+        interceptUiAction: ({ kind, identifier }) => {
+          if (kind === "tap" && identifier === "fixture.problem.offscreenButton") {
+            return {
+              ok: false,
+              error: "Expected fixture.problem.offscreenButton to be hittable before tap.",
+            }
+          }
+
+          return null
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v1",
+            steps: [
+              {
+                kind: "tap",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.problem.offscreenButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+                continueOnError: true,
+              },
+              {
+                kind: "logMark",
+                label: "after-tolerated-failure",
+              },
+              {
+                kind: "tap",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.problem.offscreenButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+              },
+              {
+                kind: "sleep",
+                durationMs: 10,
+              },
+            ],
+          },
+        }))
+
+        expect(result.verdict).toBe("failed")
+        expect(result.failedStep?.index).toBe(3)
+        expect(result.executedSteps).toHaveLength(3)
+        expect(result.executedSteps[0]?.verdict).toBe("failed")
+        expect(result.executedSteps[0]?.warnings.some((warning) => warning.includes("continueOnError"))).toBe(true)
+        expect(result.executedSteps[1]?.kind).toBe("logMark")
+        expect(result.executedSteps[2]?.kind).toBe("tap")
+        expect(result.executedSteps[2]?.retryCount).toBe(2)
+        expect(result.retries).toBe(4)
       } finally {
         await runtime.dispose()
       }
@@ -2363,6 +3105,18 @@ describe("SessionRegistry", () => {
         }))
 
         const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const baseline = await runtime.runPromise(
+          registry.captureSnapshot({
+            sessionId: session.sessionId,
+            outputMode: "inline",
+          }),
+        )
+        const applyButtonRef = baseline.preview?.nodes.find((node) => node.identifier === "fixture.form.applyButton")?.ref
+
+        if (!applyButtonRef) {
+          throw new Error("Expected baseline snapshot to expose fixture.form.applyButton.")
+        }
+
         const replayScript: ActionRecordingScript = {
           contract: "probe.action-recording/script-v1",
           recordedAt: "2026-04-10T00:00:00.000Z",
@@ -2391,7 +3145,7 @@ describe("SessionRegistry", () => {
             {
               kind: "tap",
               target: {
-                preferredRef: null,
+                preferredRef: applyButtonRef,
                 fallback: {
                   kind: "semantic",
                   identifier: "fixture.form.applyButton",
@@ -2423,6 +3177,9 @@ describe("SessionRegistry", () => {
               },
               expectation: {
                 exists: true,
+                visible: null,
+                hidden: null,
+                text: null,
                 label: "Input applied: delta",
                 value: null,
                 type: "staticText",
@@ -2447,6 +3204,8 @@ describe("SessionRegistry", () => {
         expect(report.status).toBe("succeeded")
         expect(report.failure).toBeNull()
         expect(report.steps[1]?.attempts).toBe(3)
+        expect(report.steps[1]?.outcome).toBe("retry-succeeded")
+        expect(report.steps[1]?.summary).toContain("retry succeeded")
         expect(report.warnings.some((warning) => warning.includes("Offscreen targets must already be hittable"))).toBe(true)
 
         const afterReplay = await runtime.runPromise(
@@ -2495,12 +3254,15 @@ describe("SessionRegistry", () => {
 
           expect(replayed.stepCount).toBe(2)
 
-          const report = JSON.parse(await readFile(replayed.artifact.absolutePath, "utf8")) as ReplayReport
-          expect(report.status).toBe("succeeded")
-          expect(report.steps[0]?.artifact?.kind).toBe("png")
-          expect(report.steps[0]?.artifact?.absolutePath).toContain("/screenshots/step-001-screenshot.png")
-          expect(report.steps[1]?.artifact?.kind).toBe("mp4")
-          expect(report.steps[1]?.artifact?.absolutePath).toContain("/video/step-002-video.mp4")
+        const report = JSON.parse(await readFile(replayed.artifact.absolutePath, "utf8")) as ReplayReport
+        expect(report.status).toBe("succeeded")
+        expect(report.steps[0]?.outcome).toBe("no-retry")
+        expect(report.steps[0]?.summary).toContain("no retry needed")
+        expect(report.steps[0]?.artifact?.kind).toBe("png")
+        expect(report.steps[0]?.artifact?.absolutePath).toContain("/screenshots/step-001-screenshot.png")
+        expect(report.steps[1]?.outcome).toBe("no-retry")
+        expect(report.steps[1]?.artifact?.kind).toBe("mp4")
+        expect(report.steps[1]?.artifact?.absolutePath).toContain("/video/step-002-video.mp4")
         } finally {
           await runtime.dispose()
         }
@@ -2585,8 +3347,10 @@ describe("SessionRegistry", () => {
         const reportPath = reportDetail.replace("replay report artifact: ", "")
         const report = JSON.parse(await readFile(reportPath, "utf8")) as ReplayReport
         expect(report.status).toBe("failed")
+        expect(report.steps[0]?.outcome).toBe("retry-exhausted")
         expect(report.failure?.index).toBe(1)
         expect(report.failure?.attempts).toBe(3)
+        expect(report.failure?.reason).toContain("retry exhausted")
         expect(report.failure?.reason).toContain("hittable")
         expect(report.warnings.some((warning) => warning.includes("Offscreen targets must already be hittable"))).toBe(true)
 
@@ -2642,6 +3406,46 @@ describe("SessionRegistry", () => {
 
         expect(closedMetadata.activeSessions).toBe(0)
         expect(closedMetadata.sessions).toEqual([])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("lists active sessions with compact introspection fields", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness())
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const initial = await runtime.runPromise(registry.listActiveSessions())
+        expect(initial).toEqual([])
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const listed = await runtime.runPromise(registry.listActiveSessions())
+
+        expect(listed).toEqual([
+          {
+            id: session.sessionId,
+            target: {
+              platform: session.target.platform,
+              deviceId: session.target.deviceId,
+              deviceName: session.target.deviceName,
+              runtime: session.target.runtime,
+            },
+            bundleId: session.target.bundleId,
+            state: session.state,
+            openedAt: session.openedAt,
+          },
+        ])
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+
+        const afterClose = await runtime.runPromise(registry.listActiveSessions())
+        expect(afterClose).toEqual([])
       } finally {
         await runtime.dispose()
       }
@@ -2711,6 +3515,64 @@ describe("SessionRegistry", () => {
         expect(thirdHealth.warnings.some((warning) => warning.includes("currently disconnected"))).toBe(false)
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("surfaces a focused warning when session health sees a device passcode prompt", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness(), {
+        realDeviceHarness: createFakeRealDeviceHarness({
+          pingStatusLabels: ["Type device passcode"],
+        }),
+      })
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openDeviceSession(deviceOpenParams))
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+
+        expect(health.state).toBe("degraded")
+        expect(health.resources.runner).toBe("degraded")
+        expect(health.warnings.some((warning) => warning.includes("passcode prompt"))).toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("surfaces a typed device interruption error during real-device session open", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness(), {
+        realDeviceHarness: createFakeRealDeviceHarness({
+          failWith: new DeviceInterruptionError({
+            code: "device-interruption-passcode-required",
+            signal: "passcode-required",
+            reason: "The real device appears to be blocked by a passcode prompt.",
+            nextStep: "Unlock the device, dismiss the passcode prompt, then retry the Probe session.",
+            details: [],
+          }),
+        }),
+      })
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const result = await runtime.runPromise(Effect.either(registry.openDeviceSession(deviceOpenParams)))
+        expect(Either.isLeft(result)).toBe(true)
+
+        if (Either.isLeft(result)) {
+          expect(result.left).toBeInstanceOf(DeviceInterruptionError)
+        }
       } finally {
         await runtime.dispose()
       }

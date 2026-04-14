@@ -2,19 +2,31 @@ import { readFile } from "node:fs/promises"
 import { Effect } from "effect"
 import {
   decodeActionRecordingScript,
+  decodeFlowContract,
   decodeSessionAction,
   type ActionRecordingScript,
+  type FlowContract,
+  type FlowResult,
   type SessionActionResult,
   type SessionRecordingExportResult,
   type SessionReplayResult,
 } from "../../domain/action"
 import { UserInputError } from "../../domain/errors"
-import type { OutputMode, SessionLogSource } from "../../domain/output"
+import type {
+  OutputMode,
+  SessionResultAttachmentsResult,
+  SessionLogDoctorReport,
+  SessionLogSource,
+  SessionResultSummaryResult,
+  SessionScreenshotResult,
+  SummaryArtifactResult,
+} from "../../domain/output"
 import {
   isLiveRunnerDetails,
   isLiveRunnerTransport,
   type SimulatorSessionMode,
   type SessionHealth,
+  type SessionListEntry,
 } from "../../domain/session"
 import type { SessionSnapshotResult } from "../../domain/snapshot"
 import { DaemonClient } from "../../services/DaemonClient"
@@ -22,8 +34,36 @@ import { invalidOption, optionalOption, requireOption, unknownSubcommand } from 
 
 const defaultTestBundleId = "dev.probe.fixture"
 
+export interface SessionCommandDependencies {
+  readonly readStdinText?: () => Effect.Effect<string, UserInputError>
+}
+
 const inferSimulatorSessionMode = (bundleId: string): SimulatorSessionMode =>
   bundleId === defaultTestBundleId ? "build-and-install" : "attach-to-running"
+
+const formatSessionListTarget = (target: SessionListEntry["target"]): string => {
+  const runtimeSuffix = target.runtime ? ` @ ${target.runtime}` : ""
+  return `${target.deviceName} (${target.deviceId}) [${target.platform}${runtimeSuffix}]`
+}
+
+const formatSessionList = (sessions: ReadonlyArray<SessionListEntry>): string => {
+  if (sessions.length === 0) {
+    return "no active sessions"
+  }
+
+  return sessions.map((session) => [
+    `session id: ${session.id}`,
+    `state: ${session.state}`,
+    `bundle id: ${session.bundleId}`,
+    `target: ${formatSessionListTarget(session.target)}`,
+    `opened at: ${session.openedAt}`,
+  ].join("\n")).join("\n\n")
+}
+
+const printSessionHealth = (health: SessionHealth, asJson: boolean) =>
+  Effect.sync(() => {
+    console.log(asJson ? JSON.stringify(health, null, 2) : formatSessionHealth(health))
+  })
 
 const formatSessionHealth = (health: SessionHealth): string => {
   const capabilityLines = health.capabilities.map(
@@ -66,6 +106,8 @@ const formatSessionHealth = (health: SessionHealth): string => {
     `bundle id: ${health.target.bundleId}`,
     `target: ${health.target.deviceName} (${health.target.deviceId}) [${health.target.platform}]`,
     `connection: ${health.connection.status} - ${health.connection.summary}`,
+    `opened at: ${health.openedAt}`,
+    `last activity: ${health.updatedAt}`,
     `artifact root: ${health.artifactRoot}`,
     ...transportLines,
     ...runnerLines,
@@ -103,6 +145,8 @@ const formatSnapshot = (result: SessionSnapshotResult): string => {
     `snapshot id: ${result.snapshotId}`,
     `captured at: ${result.capturedAt}`,
     `artifact: ${result.artifact.absolutePath}`,
+    `retries: ${result.retryCount}`,
+    `retry reasons: ${result.retryReasons.length > 0 ? result.retryReasons.join(" | ") : "none"}`,
     `nodes: ${result.metrics.nodeCount}`,
     `interactive nodes: ${result.metrics.interactiveNodeCount}`,
     `weak identity nodes: ${result.metrics.weakIdentityNodeCount}`,
@@ -125,9 +169,14 @@ const formatActionResult = (result: SessionActionResult): string => {
     `action: ${result.action}`,
     `resolved by: ${result.resolvedBy}`,
     `matched ref: ${result.matchedRef ?? "n/a"}`,
+    `verdict: ${result.verdict ?? "n/a"}`,
     `status label: ${result.statusLabel ?? "n/a"}`,
     `latest snapshot: ${result.latestSnapshotId ?? "n/a"}`,
     `recorded steps: ${result.recordingLength}`,
+    `retries: ${result.retryCount}`,
+    `retry reasons: ${result.retryReasons.length > 0 ? result.retryReasons.join(" | ") : "none"}`,
+    `waited ms: ${result.waitedMs ?? "n/a"}`,
+    `polls: ${result.polledCount ?? "n/a"}`,
   ].join("\n")
 }
 
@@ -149,6 +198,86 @@ const formatReplayResult = (result: SessionReplayResult): string => {
     `artifact: ${result.artifact.absolutePath}`,
   ].join("\n")
 }
+
+const formatFlowResult = (result: FlowResult): string => {
+  return [
+    result.summary,
+    `verdict: ${result.verdict}`,
+    `executed steps: ${result.executedSteps.length}`,
+    `failed step: ${result.failedStep?.index ?? "n/a"}`,
+    `retries: ${result.retries}`,
+    `final snapshot: ${result.finalSnapshotId ?? "n/a"}`,
+    `artifacts: ${result.artifacts.length}`,
+    `warnings: ${result.warnings.length}`,
+  ].join("\n")
+}
+
+const formatSummaryArtifactResult = (result: SummaryArtifactResult): string => {
+  return [
+    result.summary,
+    `artifact: ${result.artifact.absolutePath}`,
+  ].join("\n")
+}
+
+const formatSessionResultReport = (result: SessionResultSummaryResult | SessionResultAttachmentsResult): string => {
+  return [
+    result.summary,
+    `artifact: ${result.artifact.absolutePath}`,
+  ].join("\n")
+}
+
+const formatScreenshotResult = (result: SessionScreenshotResult): string => {
+  return [
+    result.summary,
+    `artifact: ${result.artifact.absolutePath}`,
+    `retries: ${result.retryCount}`,
+    `retry reasons: ${result.retryReasons.length > 0 ? result.retryReasons.join(" | ") : "none"}`,
+  ].join("\n")
+}
+
+const formatLogDoctorReport = (report: SessionLogDoctorReport): string => {
+  const sourceLines = report.sources.map((source) => [
+    `- ${source.source}: ${source.available ? "available" : "unavailable"}`,
+    `  reason: ${source.reason}`,
+    `  artifact: ${source.artifactPath ?? "n/a"}`,
+  ].join("\n"))
+
+  return [
+    report.summary,
+    `session id: ${report.sessionId}`,
+    `target platform: ${report.targetPlatform}`,
+    "",
+    "sources:",
+    ...sourceLines,
+  ].join("\n")
+}
+
+const runSessionResultCommand = (args: {
+  readonly sessionId: string
+  readonly view: "summary" | "attachments"
+  readonly asJson: boolean
+}) =>
+  Effect.gen(function* () {
+    const client = yield* DaemonClient
+    const result = yield* (args.view === "summary"
+      ? client.getSessionResultSummary({
+          sessionId: args.sessionId,
+          onEvent: eventPrinter(!args.asJson),
+        })
+      : client.getSessionResultAttachments({
+          sessionId: args.sessionId,
+          onEvent: eventPrinter(!args.asJson),
+        }))
+
+    yield* Effect.sync(() => {
+      if (args.asJson) {
+        process.stdout.write(`${JSON.stringify(result.report, null, 2)}\n`)
+        return
+      }
+
+      console.log(formatSessionResultReport(result))
+    })
+  })
 
 const parseOutputMode = (args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
@@ -240,6 +369,107 @@ const readJsonFile = <T>(path: string, label: string, decode: (value: unknown) =
     })
   })
 
+const decodeInlineJson = <T>(raw: string, label: string, decode: (value: unknown) => T) =>
+  Effect.try({
+    try: () => decode(JSON.parse(raw) as unknown),
+    catch: (error) =>
+      new UserInputError({
+        code: "session-json-inline-parse",
+        reason: `Could not parse inline ${label} JSON: ${error instanceof Error ? error.message : String(error)}.`,
+        nextStep: `Validate the inline ${label} JSON shape and retry the command.`,
+        details: [],
+      }),
+  })
+
+const defaultReadStdinText = () =>
+  Effect.tryPromise({
+    try: async () => {
+      const chunks: Array<string> = []
+
+      for await (const chunk of process.stdin) {
+        chunks.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"))
+      }
+
+      return chunks.join("")
+    },
+    catch: (error) =>
+      new UserInputError({
+        code: "session-stdin-read",
+        reason: `Could not read flow JSON from stdin: ${error instanceof Error ? error.message : String(error)}.`,
+        nextStep: "Pipe valid flow JSON to stdin and retry the command.",
+        details: [],
+      }),
+  })
+
+const parseActionInvocation = (args: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const filePath = yield* optionalOption(args, "--file")
+    const explicitInlineJson = yield* optionalOption(args, "--input-json")
+    let inlineJson = explicitInlineJson
+    let outputAsJson = args.includes("--output-json")
+
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] !== "--json") {
+        continue
+      }
+
+      const next = args[index + 1]
+
+      if (typeof next === "string" && !next.startsWith("--")) {
+        inlineJson = next
+        index += 1
+        continue
+      }
+
+      outputAsJson = true
+    }
+
+    if ((filePath === null && inlineJson === null) || (filePath !== null && inlineJson !== null)) {
+      return yield* invalidOption(
+        filePath !== null ? "--json" : "--file",
+        "provide exactly one of --file <path> or --json/--input-json <payload>.",
+        "Pass either --file <action.json> or --json <action-json> and retry the command.",
+      )
+    }
+
+    const action = filePath !== null
+      ? yield* readJsonFile(filePath, "action", decodeSessionAction)
+      : yield* decodeInlineJson(inlineJson!, "action", decodeSessionAction)
+
+    return {
+      action,
+      outputAsJson,
+    }
+  })
+
+const parseFlowInvocation = (
+  args: ReadonlyArray<string>,
+  deps?: SessionCommandDependencies,
+) =>
+  Effect.gen(function* () {
+    const filePath = yield* optionalOption(args, "--file")
+    const useStdin = args.includes("--stdin")
+
+    if ((filePath === null && !useStdin) || (filePath !== null && useStdin)) {
+      return yield* invalidOption(
+        filePath !== null ? "--stdin" : "--file",
+        "provide exactly one of --file <path> or --stdin.",
+        "Pass either --file <flow.json> or --stdin and retry the command.",
+      )
+    }
+
+    const flow = filePath !== null
+      ? yield* readJsonFile<FlowContract>(filePath, "flow", decodeFlowContract)
+      : yield* (deps?.readStdinText ?? defaultReadStdinText)().pipe(
+          Effect.flatMap((raw) => decodeInlineJson(raw, "flow", decodeFlowContract)),
+        )
+
+    return {
+      flow,
+      outputAsJson: args.includes("--json"),
+    }
+  })
+
 const parseSessionOpenTarget = (args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const explicitTarget = yield* optionalOption(args, "--target")
@@ -279,12 +509,24 @@ const parseSessionOpenTarget = (args: ReadonlyArray<string>) =>
     } as const
   })
 
-export const runSessionCommand = (args: ReadonlyArray<string>) =>
+export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCommandDependencies) =>
   Effect.gen(function* () {
     const [subcommand, ...rest] = args
     const asJson = rest.includes("--json")
 
     switch (subcommand) {
+      case "list": {
+        const client = yield* DaemonClient
+        const sessions = yield* client.listSessions({
+          onEvent: eventPrinter(!asJson),
+        })
+
+        yield* Effect.sync(() => {
+          console.log(asJson ? JSON.stringify(sessions, null, 2) : formatSessionList(sessions))
+        })
+        return
+      }
+
       case "open": {
         const bundleId = (yield* optionalOption(rest, "--bundle-id")) ?? defaultTestBundleId
         const openTarget = yield* parseSessionOpenTarget(rest)
@@ -301,9 +543,19 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
           onEvent: eventPrinter(!asJson),
         })
 
-        yield* Effect.sync(() => {
-          console.log(asJson ? JSON.stringify(health, null, 2) : formatSessionHealth(health))
+        yield* printSessionHealth(health, asJson)
+        return
+      }
+
+      case "show": {
+        const sessionId = yield* requireOption(rest, "--session-id")
+        const client = yield* DaemonClient
+        const health = yield* client.showSession({
+          sessionId,
+          onEvent: eventPrinter(!asJson),
         })
+
+        yield* printSessionHealth(health, asJson)
         return
       }
 
@@ -315,58 +567,112 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
           onEvent: eventPrinter(!asJson),
         })
 
-        yield* Effect.sync(() => {
-          console.log(asJson ? JSON.stringify(health, null, 2) : formatSessionHealth(health))
-        })
+        yield* printSessionHealth(health, asJson)
         return
       }
 
       case "logs": {
-        const sessionId = yield* requireOption(rest, "--session-id")
-        const source = yield* parseLogSource(rest)
-        const lineCount = yield* parsePositiveIntegerOption(rest, "--lines", 80)
-        const captureSeconds = yield* parsePositiveIntegerOption(rest, "--seconds", 2)
-        const match = yield* optionalOption(rest, "--match")
-        const predicate = yield* optionalOption(rest, "--predicate")
-        const process = yield* optionalOption(rest, "--process")
-        const subsystem = yield* optionalOption(rest, "--subsystem")
-        const category = yield* optionalOption(rest, "--category")
-        const outputMode = yield* parseOutputMode(rest)
-        const client = yield* DaemonClient
-        const result = yield* client.getSessionLogs({
-          sessionId,
-          source,
-          lineCount,
-          match,
-          outputMode,
-          captureSeconds,
-          predicate,
-          process,
-          subsystem,
-          category,
-          onEvent: eventPrinter(!asJson),
-        })
+        const [logsSubcommand, ...logsRest] = rest
 
-        yield* Effect.sync(() => {
-          if (asJson) {
-            console.log(JSON.stringify(result, null, 2))
+        switch (logsSubcommand) {
+          case "mark": {
+            const sessionId = yield* requireOption(logsRest, "--session-id")
+            const label = yield* requireOption(logsRest, "--label")
+            const client = yield* DaemonClient
+            const result = yield* client.markSessionLog({
+              sessionId,
+              label,
+              onEvent: eventPrinter(!asJson),
+            })
+
+            yield* Effect.sync(() => {
+              console.log(asJson ? JSON.stringify(result, null, 2) : formatSummaryArtifactResult(result))
+            })
             return
           }
 
-          console.log(result.result.summary)
-          console.log(`source: ${result.sourceArtifact.absolutePath}`)
+          case "capture": {
+            const sessionId = yield* requireOption(logsRest, "--session-id")
+            const captureSeconds = yield* parsePositiveIntegerOption(logsRest, "--seconds", 2)
+            const client = yield* DaemonClient
+            const result = yield* client.captureLogWindow({
+              sessionId,
+              captureSeconds,
+              onEvent: eventPrinter(!asJson),
+            })
 
-          if (result.result.kind === "inline") {
-            if (result.result.content.length > 0) {
-              console.log("")
-              console.log(result.result.content)
+            yield* Effect.sync(() => {
+              console.log(asJson ? JSON.stringify(result, null, 2) : formatSummaryArtifactResult(result))
+            })
+            return
+          }
+
+          case "doctor": {
+            const sessionId = yield* requireOption(logsRest, "--session-id")
+            const client = yield* DaemonClient
+            const result = yield* client.getLogDoctorReport({
+              sessionId,
+              onEvent: eventPrinter(!asJson),
+            })
+
+            yield* Effect.sync(() => {
+              console.log(asJson ? JSON.stringify(result, null, 2) : formatLogDoctorReport(result))
+            })
+            return
+          }
+
+          default: {
+            if (typeof logsSubcommand === "string" && !logsSubcommand.startsWith("--")) {
+              return yield* unknownSubcommand("session logs", logsSubcommand)
             }
+
+            const sessionId = yield* requireOption(rest, "--session-id")
+            const source = yield* parseLogSource(rest)
+            const lineCount = yield* parsePositiveIntegerOption(rest, "--lines", 80)
+            const captureSeconds = yield* parsePositiveIntegerOption(rest, "--seconds", 2)
+            const match = yield* optionalOption(rest, "--match")
+            const predicate = yield* optionalOption(rest, "--predicate")
+            const process = yield* optionalOption(rest, "--process")
+            const subsystem = yield* optionalOption(rest, "--subsystem")
+            const category = yield* optionalOption(rest, "--category")
+            const outputMode = yield* parseOutputMode(rest)
+            const client = yield* DaemonClient
+            const result = yield* client.getSessionLogs({
+              sessionId,
+              source,
+              lineCount,
+              match,
+              outputMode,
+              captureSeconds,
+              predicate,
+              process,
+              subsystem,
+              category,
+              onEvent: eventPrinter(!asJson),
+            })
+
+            yield* Effect.sync(() => {
+              if (asJson) {
+                console.log(JSON.stringify(result, null, 2))
+                return
+              }
+
+              console.log(result.result.summary)
+              console.log(`source: ${result.sourceArtifact.absolutePath}`)
+
+              if (result.result.kind === "inline") {
+                if (result.result.content.length > 0) {
+                  console.log("")
+                  console.log(result.result.content)
+                }
+                return
+              }
+
+              console.log(`artifact: ${result.result.artifact.absolutePath}`)
+            })
             return
           }
-
-          console.log(`artifact: ${result.result.artifact.absolutePath}`)
-        })
-        return
+        }
       }
 
       case "snapshot": {
@@ -385,19 +691,34 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
         return
       }
 
-      case "action": {
+      case "run": {
         const sessionId = yield* requireOption(rest, "--session-id")
-        const filePath = yield* requireOption(rest, "--file")
-        const action = yield* readJsonFile(filePath, "action", decodeSessionAction)
+        const parsed = yield* parseFlowInvocation(rest, deps)
         const client = yield* DaemonClient
-        const result = yield* client.performSessionAction({
+        const result = yield* client.runSessionFlow({
           sessionId,
-          action,
-          onEvent: eventPrinter(!asJson),
+          flow: parsed.flow,
+          onEvent: eventPrinter(!parsed.outputAsJson),
         })
 
         yield* Effect.sync(() => {
-          console.log(asJson ? JSON.stringify(result, null, 2) : formatActionResult(result))
+          console.log(parsed.outputAsJson ? JSON.stringify(result, null, 2) : formatFlowResult(result))
+        })
+        return
+      }
+
+      case "action": {
+        const sessionId = yield* requireOption(rest, "--session-id")
+        const parsed = yield* parseActionInvocation(rest)
+        const client = yield* DaemonClient
+        const result = yield* client.performSessionAction({
+          sessionId,
+          action: parsed.action,
+          onEvent: eventPrinter(!parsed.outputAsJson),
+        })
+
+        yield* Effect.sync(() => {
+          console.log(parsed.outputAsJson ? JSON.stringify(result, null, 2) : formatActionResult(result))
         })
         return
       }
@@ -445,6 +766,35 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
         return
       }
 
+      case "result": {
+        const [resultSubcommand, ...resultRest] = rest
+
+        switch (resultSubcommand) {
+          case "summary": {
+            const sessionId = yield* requireOption(resultRest, "--session-id")
+            yield* runSessionResultCommand({
+              sessionId,
+              view: "summary",
+              asJson,
+            })
+            return
+          }
+
+          case "attachments": {
+            const sessionId = yield* requireOption(resultRest, "--session-id")
+            yield* runSessionResultCommand({
+              sessionId,
+              view: "attachments",
+              asJson,
+            })
+            return
+          }
+
+          default:
+            return yield* unknownSubcommand("session result", resultSubcommand)
+        }
+      }
+
       case "screenshot": {
         const sessionId = yield* requireOption(rest, "--session-id")
         const label = yield* optionalOption(rest, "--label")
@@ -463,8 +813,7 @@ export const runSessionCommand = (args: ReadonlyArray<string>) =>
             return
           }
 
-          console.log(result.summary)
-          console.log(result.artifact.absolutePath)
+          console.log(formatScreenshotResult(result))
         })
         return
       }

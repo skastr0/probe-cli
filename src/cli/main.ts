@@ -9,31 +9,46 @@ import { runDoctorCommand } from "./commands/doctor"
 import { runPerfCommand } from "./commands/perf"
 import { runServeCommand } from "./commands/serve"
 import { runSessionCommand } from "./commands/session"
+import { runValidateCommand } from "./commands/validate"
 
 const helpText = `Probe control plane
 
 Usage:
   probe doctor [--json]
+  probe doctor accessibility --session-id <id> [--json]
+  probe doctor commerce --bundle-id <bundle-id> [--mode local-storekit|sandbox|testflight] [--config <path>] [--provider revenuecat] [--json]
   probe serve
+  probe validate accessibility --session-id <id> [--scope current-screen] [--json]
+  probe validate commerce --session-id <id> --mode local-storekit|sandbox|testflight [--plan <commerce-plan.json>] [--provider revenuecat] [--json]
+  probe session list [--json]
   probe session open [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--json]
+  probe session show --session-id <id> [--json]
   probe session health --session-id <id> [--json]
   probe session logs --session-id <id> [--source runner|build|wrapper|stdout|simulator] [--lines 80] [--match <text>] [--seconds 2] [--predicate <expr>] [--process <name>] [--subsystem <name>] [--category <name>] [--output auto|inline|artifact] [--json]
+  probe session logs mark --session-id <id> --label <label> [--json]
+  probe session logs capture --session-id <id> [--seconds 3] [--json]
+  probe session logs doctor --session-id <id> [--json]
   probe session snapshot --session-id <id> [--output auto|inline|artifact] [--json]
-  probe session action --session-id <id> --file <action.json> [--json]
+  probe session run --session-id <id> (--file <flow.json> | --stdin) [--json]
+  probe session action --session-id <id> (--file <action.json> | --json <action-json>) [--output-json]
   probe session recording export --session-id <id> [--label <name>] [--json]
   probe session replay --session-id <id> --file <recording.json> [--json]
+  probe session result summary --session-id <id> [--json]
+  probe session result attachments --session-id <id> [--json]
   probe session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--json]
   probe session video --session-id <id> --duration <duration> [--json]
   probe session close --session-id <id> [--json]
   probe perf record --session-id <id> --template ${perfTemplateChoiceText} [--time-limit <duration>] [--json]
-  probe drill --session-id <id> --artifact <key> [--json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact] [--json]
+  probe perf around --session-id <id> --file <flow.json> --template ${perfTemplateChoiceText} [--json]
+  probe perf summarize --session-id <id> --artifact <trace-key> --group-by signpost [--json]
+  probe drill --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact] [--json]
 
 Notes:
   - serve runs the long-lived daemon over the local Unix socket
   - session commands are thin clients that talk to the daemon
   - on simulator, omit --bundle-id to use Probe's built-in fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app
   - perf templates: ${perfTemplateChoiceText}
-  - perf recording defaults to 60s for metal-system-trace and 3s for time-profiler, system-trace, hangs, and swift-concurrency
+  - perf recording defaults to 60s for metal-system-trace and 3s for time-profiler, system-trace, hangs, swift-concurrency, and logging
 `
 
 const print = (text: string) =>
@@ -70,6 +85,11 @@ const runCli = (args: ReadonlyArray<string>) =>
 
       case "serve": {
         yield* runServeCommand
+        return
+      }
+
+      case "validate": {
+        yield* runValidateCommand(rest)
         return
       }
 

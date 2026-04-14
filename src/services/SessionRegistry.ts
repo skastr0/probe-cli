@@ -1,22 +1,33 @@
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
+import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { join, relative } from "node:path"
-import { Context, Effect, Layer, Ref } from "effect"
+import { Context, Effect, Either, Layer, Ref } from "effect"
 import {
   buildRecordedSessionAction,
   buildRunnerUiActionPayload,
   describeRecordedActionTarget,
   describeSnapshotNode,
   evaluateAssertion,
+  flowStepToSessionAction,
+  isFlowSessionActionStep,
+  isRunnerUiSessionAction,
+  isRunnerUiRecordedSessionAction,
   resolveActionSelectorInSnapshot,
   resolveRecordedActionTargetInSnapshot,
+  validateFlowContract,
   validateSessionAction,
   type ActionRecordingScript,
-  type AssertAction,
+  type FlowContract,
+  type FlowFailedStep,
+  type FlowResult,
+  type FlowStep,
+  type FlowStepResult,
   type RecordedSessionAction,
   type ReplayReport,
   type ReplayStepReport,
+  type RetryPolicy,
+  type RetryReasonCode,
   type SessionAction,
   type SessionActionResult,
   type SessionRecordingExportResult,
@@ -33,18 +44,31 @@ import {
 import {
   ArtifactNotFoundError,
   ChildProcessError,
+  DeviceInterruptionError,
   EnvironmentError,
   SessionConflictError,
   SessionNotFoundError,
   UnsupportedCapabilityError,
   UserInputError,
 } from "../domain/errors"
-import type { ArtifactRecord, DrillResult, OutputMode, SessionLogSource, SessionLogsResult, SummaryArtifactResult } from "../domain/output"
-import { summarizeContent } from "../domain/output"
+import type { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
+import type {
+  ArtifactRecord,
+  DrillResult,
+  OutputMode,
+  SessionLogDoctorReport,
+  SessionLogMarker,
+  SessionLogSource,
+  SessionLogsResult,
+  SessionScreenshotResult,
+  SummaryArtifactResult,
+} from "../domain/output"
+import { appendSessionLogMarkers, summarizeContent } from "../domain/output"
 import {
   SessionHealth,
   type SessionConnectionDetails,
   type SessionHealthCheck,
+  type SessionListEntry,
   type SessionResourceState,
   type SessionResourceStates,
   type SimulatorSessionMode,
@@ -53,7 +77,12 @@ import { buildSessionSnapshotResult, buildSnapshotArtifact, decodeRunnerSnapshot
 import { ArtifactStore, type DaemonSessionMetadata } from "./ArtifactStore"
 import { type LldbBridgeHandle, type LldbBridgeResponseFrame, LldbBridgeFactory } from "./LldbBridge"
 import { OutputPolicy } from "./OutputPolicy"
-import { type OpenedRealDeviceSession, RealDeviceHarness } from "./RealDeviceHarness"
+import {
+  buildRealDeviceInterruptionWarning,
+  detectRealDeviceInterruption,
+  type OpenedRealDeviceSession,
+  RealDeviceHarness,
+} from "./RealDeviceHarness"
 import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
@@ -285,12 +314,250 @@ const buildReplayWarnings = (semanticFallbackCount: number): ReadonlyArray<strin
 
 const dedupeStrings = (values: ReadonlyArray<string>): Array<string> => [...new Set(values)]
 
+const defaultReadOnlyRetryPolicy: RetryPolicy = {
+  maxAttempts: 3,
+  backoffMs: 250,
+  refreshSnapshotBetweenAttempts: true,
+  retryOn: ["not-found", "not-hittable", "runner-timeout", "transient-transport", "assertion-failed"],
+}
+
+const defaultMutationRetryPolicy: RetryPolicy = {
+  maxAttempts: 3,
+  backoffMs: 250,
+  refreshSnapshotBetweenAttempts: true,
+  retryOn: ["not-found", "not-hittable"],
+}
+
+const defaultAssertRetryPolicy: RetryPolicy = {
+  maxAttempts: 1,
+  backoffMs: 250,
+  refreshSnapshotBetweenAttempts: true,
+  retryOn: ["not-found", "assertion-failed"],
+}
+
+const waitPollIntervalMs = 200
+
+const defaultWaitRetryPolicy = (timeoutMs: number): RetryPolicy => ({
+  maxAttempts: Math.max(1, Math.floor(timeoutMs / waitPollIntervalMs) + 1),
+  backoffMs: waitPollIntervalMs,
+  refreshSnapshotBetweenAttempts: true,
+  retryOn: ["not-found", "assertion-failed"],
+})
+
+type SessionActionError =
+  | SessionNotFoundError
+  | UserInputError
+  | UnsupportedCapabilityError
+  | EnvironmentError
+  | ChildProcessError
+
+interface RetryAttemptMetadata {
+  readonly retryCount: number
+  readonly retryReasons: Array<string>
+}
+
+type RetryAttemptOutcome<T, E extends SessionActionError> =
+  | {
+      readonly ok: true
+      readonly value: T
+      readonly retry: RetryAttemptMetadata
+    }
+  | {
+      readonly ok: false
+      readonly error: E
+      readonly retry: RetryAttemptMetadata
+    }
+
+type ActionExecutionOutcome =
+  | {
+      readonly ok: true
+      readonly result: SessionActionResult
+    }
+  | {
+      readonly ok: false
+      readonly error: SessionActionError
+      readonly retry: RetryAttemptMetadata
+    }
+
+const emptyRetryAttemptMetadata = (): RetryAttemptMetadata => ({
+  retryCount: 0,
+  retryReasons: [],
+})
+
+const classifyRetryableFailure = (error: SessionActionError): { readonly code: RetryReasonCode; readonly reason: string } | null => {
+  if (error instanceof EnvironmentError) {
+    switch (error.code) {
+      case "session-action-target-not-found":
+        return { code: "not-found", reason: error.reason }
+      case "session-assert-failed":
+        return { code: "assertion-failed", reason: error.reason }
+      case "session-action-failed":
+        return {
+          code: isHittabilityFailure(error.reason) ? "not-hittable" : "transient-transport",
+          reason: error.reason,
+        }
+      case "session-snapshot-failed":
+      case "session-snapshot-payload-missing":
+      case "session-snapshot-read":
+      case "session-snapshot-parse":
+      case "session-snapshot-write":
+      case "session-screenshot-failed":
+      case "session-screenshot-payload-missing":
+      case "session-screenshot-artifact-write":
+        return {
+          code: /timeout/i.test(error.reason) ? "runner-timeout" : "transient-transport",
+          reason: error.reason,
+        }
+      default:
+        if (error.code.startsWith("session-runner-")) {
+          return {
+            code: /timeout/i.test(error.reason) ? "runner-timeout" : "transient-transport",
+            reason: error.reason,
+          }
+        }
+
+        return null
+    }
+  }
+
+  if (error instanceof ChildProcessError) {
+    return {
+      code: /timeout/i.test(error.reason) ? "runner-timeout" : "transient-transport",
+      reason: error.reason,
+    }
+  }
+
+  return null
+}
+
+const attemptWithRetry = <T, E extends SessionActionError>(args: {
+  readonly policy: RetryPolicy
+  readonly run: () => Effect.Effect<T, E>
+}) =>
+  Effect.gen(function* () {
+    const retryReasons: Array<string> = []
+    let attempt = 0
+
+    while (true) {
+      attempt += 1
+      const result = (yield* Effect.either(args.run())) as { _tag: "Right"; right: T } | { _tag: "Left"; left: E }
+
+      if (result._tag === "Right") {
+        return {
+          ok: true as const,
+          value: result.right,
+          retry: {
+            retryCount: attempt - 1,
+            retryReasons,
+          },
+        }
+      }
+
+      const retryable = classifyRetryableFailure(result.left)
+      const shouldRetry = retryable !== null
+        && args.policy.retryOn.includes(retryable.code)
+        && attempt < args.policy.maxAttempts
+
+      if (!shouldRetry) {
+        return {
+          ok: false as const,
+          error: result.left,
+          retry: {
+            retryCount: attempt - 1,
+            retryReasons,
+          },
+        }
+      }
+
+      retryReasons.push(`${retryable.code}: ${retryable.reason}`)
+
+      if (args.policy.backoffMs > 0) {
+        yield* Effect.sleep(args.policy.backoffMs)
+      }
+    }
+  })
+
+const runWithRetry = <T, E extends SessionActionError>(args: {
+  readonly policy: RetryPolicy
+  readonly run: () => Effect.Effect<T, E>
+}) =>
+  attemptWithRetry(args).pipe(
+    Effect.flatMap((result) => result.ok ? Effect.succeed({ value: result.value, retry: result.retry }) : Effect.fail(result.error)),
+  )
+
 const buildReplayResultSummary = (args: {
   readonly stepCount: number
   readonly retriedStepCount: number
   readonly semanticFallbackCount: number
 }): string =>
-  `Replayed ${args.stepCount} steps with ${args.retriedStepCount} retried steps and ${args.semanticFallbackCount} semantic fallback recoveries. ${selectorDriftContractWarning} ${offscreenHittabilityWarning}`
+  `Replayed ${args.stepCount} steps with ${args.retriedStepCount} retried steps and ${args.semanticFallbackCount} semantic fallback recoveries. Replay report steps are labeled as no retry needed, retry succeeded, semantic fallback succeeded, or retry exhausted. ${selectorDriftContractWarning} ${offscreenHittabilityWarning}`
+
+const classifyReplayStepOutcome = (args: {
+  readonly attempts: number
+  readonly resolvedBy: ReplayStepReport["resolvedBy"]
+  readonly exhausted?: boolean
+}): ReplayStepReport["outcome"] => {
+  if (args.exhausted) {
+    return "retry-exhausted"
+  }
+
+  if (args.resolvedBy === "semantic") {
+    return "semantic-fallback"
+  }
+
+  return args.attempts > 1 ? "retry-succeeded" : "no-retry"
+}
+
+const withReplayStepOutcomeLabel = (args: {
+  readonly outcome: ReplayStepReport["outcome"]
+  readonly summary: string
+}): string => {
+  const label = (() => {
+    switch (args.outcome) {
+      case "no-retry":
+        return "no retry needed"
+      case "retry-succeeded":
+        return "retry succeeded"
+      case "semantic-fallback":
+        return "semantic fallback succeeded"
+      case "retry-exhausted":
+        return "retry exhausted"
+    }
+  })()
+
+  return `${label}: ${args.summary}`
+}
+
+const buildReplayStepReport = (args: {
+  readonly index: number
+  readonly kind: ReplayStepReport["kind"]
+  readonly attempts: number
+  readonly resolvedBy: ReplayStepReport["resolvedBy"]
+  readonly matchedRef: string | null
+  readonly artifact: ArtifactRecord | null
+  readonly summary: string
+  readonly exhausted?: boolean
+}): ReplayStepReport => {
+  const outcome = classifyReplayStepOutcome({
+    attempts: args.attempts,
+    resolvedBy: args.resolvedBy,
+    exhausted: args.exhausted,
+  })
+
+  return {
+    index: args.index,
+    kind: args.kind,
+    attempts: args.attempts,
+    outcome,
+    resolvedBy: args.resolvedBy,
+    matchedRef: args.matchedRef,
+    artifact: args.artifact,
+    summary: withReplayStepOutcomeLabel({
+      outcome,
+      summary: args.summary,
+    }),
+  }
+}
 
 const buildReplayArtifactSummary = (args: {
   readonly status: "succeeded" | "failed"
@@ -486,6 +753,69 @@ const selectBufferedLogLines = (args: {
   }
 }
 
+const isSessionLogMarkerRecord = (value: unknown): value is SessionLogMarker =>
+  typeof value === "object"
+  && value !== null
+  && typeof (value as { readonly timestamp?: unknown }).timestamp === "string"
+  && typeof (value as { readonly label?: unknown }).label === "string"
+  && typeof (value as { readonly sessionId?: unknown }).sessionId === "string"
+
+const readSessionLogMarkers = (artifactRoot: string): Effect.Effect<ReadonlyArray<SessionLogMarker>> =>
+  Effect.tryPromise({
+    try: async () => {
+      const marksDirectory = join(artifactRoot, "logs", "marks")
+
+      let entries: Array<string>
+
+      try {
+        entries = await readdir(marksDirectory)
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+          return []
+        }
+
+        throw error
+      }
+
+      const markers: Array<SessionLogMarker> = []
+
+      for (const entry of entries.filter((candidate) => candidate.endsWith(".json")).sort()) {
+        try {
+          const raw = await readFile(join(marksDirectory, entry), "utf8")
+          const parsed = JSON.parse(raw) as unknown
+
+          if (isSessionLogMarkerRecord(parsed)) {
+            markers.push(parsed)
+          }
+        } catch {
+          continue
+        }
+      }
+
+      return markers.sort((left, right) => left.timestamp.localeCompare(right.timestamp))
+    },
+    catch: (error) =>
+      new EnvironmentError({
+        code: "session-log-mark-read",
+        reason: error instanceof Error ? error.message : String(error),
+        nextStep: "Inspect the session log marks directory and retry the logs request.",
+        details: [],
+      }),
+  }).pipe(Effect.catchAll(() => Effect.succeed([])))
+
+const resolveWritableLogStreamArtifact = (artifacts: ReadonlyArray<ArtifactRecord>): ArtifactRecord | null =>
+  artifacts.find((artifact) => artifact.key === "stdout-events")
+  ?? artifacts.find((artifact) => artifact.key === "wrapper-stderr")
+  ?? null
+
+const buildSessionLogMarkStreamEntry = (marker: SessionLogMarker): string =>
+  `${JSON.stringify({
+    kind: "probe.log.mark",
+    timestamp: marker.timestamp,
+    label: marker.label,
+    sessionId: marker.sessionId,
+  })}\n`
+
 const resolveLogArtifactKey = (source: Exclude<SessionLogSource, "simulator">): string => {
   switch (source) {
     case "runner":
@@ -543,6 +873,39 @@ const describeScreenshotOffloadReason = (mode: OutputMode): string => {
     case "auto":
       return "binary image payloads are always artifact-backed"
   }
+}
+
+const resolveDeviceDiagnosticCaptureMode = (kind: DiagnosticCaptureKind | null): "diagnose" | "sysdiagnose" =>
+  kind ?? "diagnose"
+
+const describeDiagnosticCapture = (args: {
+  readonly target: DiagnosticCaptureTarget
+  readonly kind: DiagnosticCaptureKind | null
+}): {
+  readonly artifactKeyPrefix: string
+  readonly artifactLabel: string
+  readonly summary: string
+} => {
+  if (args.target === "simulator") {
+    return {
+      artifactKeyPrefix: "diagnostic-simulator",
+      artifactLabel: "simulator-diagnostic",
+      summary: "Simulator diagnostic bundle captured via xcrun simctl diagnose.",
+    }
+  }
+
+  const mode = resolveDeviceDiagnosticCaptureMode(args.kind)
+  return mode === "sysdiagnose"
+    ? {
+        artifactKeyPrefix: "diagnostic-device-sysdiagnose",
+        artifactLabel: "device-sysdiagnose",
+        summary: "Device sysdiagnose bundle captured via xcrun devicectl device sysdiagnose.",
+      }
+    : {
+        artifactKeyPrefix: "diagnostic-device",
+        artifactLabel: "device-diagnostic",
+        summary: "Device diagnostic bundle captured via xcrun devicectl diagnose.",
+      }
 }
 
 const pausedProcessStates = new Set(["stopped", "crashed", "suspended"])
@@ -639,7 +1002,7 @@ const buildSimulatorCapabilities = (): ReadonlyArray<CapabilityReport> => [
     area: "runner",
     status: "degraded",
     summary:
-      "Runner control works, but the contract is still the honest transport-boundary seam: simulator bootstrap manifest plus file-backed command ingress plus stdout-framed mixed-log egress.",
+      "Runner control works through the honest transport-boundary seam: simulator bootstrap manifest plus HTTP POST command ingress plus stdout-framed mixed-log readiness/diagnostics.",
     details: [
       "xcodebuild stdin is not treated as a usable host-to-runner transport in this slice.",
       "The same runner transport is used for both Probe's built-in fixture app and attach-to-running simulator sessions.",
@@ -757,20 +1120,14 @@ const buildRealDeviceCapabilities = (args: {
   },
 ]
 
-const buildSimulatorWarnings = (opened: OpenedSimulatorSession): ReadonlyArray<string> => {
+const buildSimulatorWarnings = (_opened: OpenedSimulatorSession): ReadonlyArray<string> => {
   const warnings = [
-    "Runner command ingress currently uses the validated file-backed mailbox rather than xcodebuild stdin.",
+    "Runner command ingress now uses the validated HTTP POST listener seam rather than xcodebuild stdin.",
     daemonOwnedCleanupWarning,
     nonRecoverableSessionWarning,
     selectorDriftContractWarning,
     offscreenHittabilityWarning,
   ]
-
-  if (opened.stdinProbeStatus !== "received") {
-    warnings.push(
-      `Runner stdin probe reported ${opened.stdinProbeStatus}; the daemon continues on the proven file-mailbox contract instead of pretending stdin works.`,
-    )
-  }
 
   return warnings
 }
@@ -780,12 +1137,6 @@ const buildRealDeviceWarnings = (opened: OpenedRealDeviceSession): ReadonlyArray
     ...opened.warnings,
     daemonOwnedCleanupWarning,
   ]
-
-  if (opened.mode === "live" && opened.commandIngress === "file-mailbox" && opened.stdinProbeStatus !== "received") {
-    warnings.push(
-      `Runner stdin probe reported ${opened.stdinProbeStatus}; the daemon continues on the proven file-mailbox contract instead of pretending stdin works.`,
-    )
-  }
 
   return dedupeStrings(warnings)
 }
@@ -809,6 +1160,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
   {
     readonly getSessionTtlMs: () => number
     readonly getActiveSessionCount: () => Effect.Effect<number>
+    readonly listActiveSessions: () => Effect.Effect<ReadonlyArray<SessionListEntry>>
     readonly openDeviceSession: (params: {
       readonly bundleId: string
       readonly deviceId: string | null
@@ -816,7 +1168,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
       SessionHealth,
-      SessionConflictError | EnvironmentError | UserInputError | UnsupportedCapabilityError | ChildProcessError
+      SessionConflictError | DeviceInterruptionError | EnvironmentError | UserInputError | UnsupportedCapabilityError | ChildProcessError
     >
     readonly openSimulatorSession: (params: {
       readonly bundleId: string
@@ -850,12 +1202,38 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
       | EnvironmentError
       | ChildProcessError
     >
+    readonly markLog: (params: {
+      readonly sessionId: string
+      readonly label: string
+    }) => Effect.Effect<
+      SummaryArtifactResult,
+      SessionNotFoundError | UserInputError | EnvironmentError
+    >
+    readonly captureLogWindow: (params: {
+      readonly sessionId: string
+      readonly captureSeconds: number
+    }) => Effect.Effect<
+      SummaryArtifactResult,
+      SessionNotFoundError | ArtifactNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+    >
+    readonly captureDiagnosticBundle: (params: {
+      readonly sessionId: string
+      readonly target: DiagnosticCaptureTarget
+      readonly kind: DiagnosticCaptureKind | null
+    }) => Effect.Effect<
+      SummaryArtifactResult,
+      SessionNotFoundError | UserInputError | EnvironmentError | ChildProcessError
+    >
+    readonly getLogDoctorReport: (sessionId: string) => Effect.Effect<
+      SessionLogDoctorReport,
+      SessionNotFoundError | EnvironmentError
+    >
     readonly captureScreenshot: (params: {
       readonly sessionId: string
       readonly label: string | null
       readonly outputMode: OutputMode
     }) => Effect.Effect<
-      SummaryArtifactResult,
+      SessionScreenshotResult,
       SessionNotFoundError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
     >
     readonly recordVideo: (params: {
@@ -877,6 +1255,13 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
       readonly action: SessionAction
     }) => Effect.Effect<
       SessionActionResult,
+      SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+    >
+    readonly runFlow: (params: {
+      readonly sessionId: string
+      readonly flow: FlowContract
+    }) => Effect.Effect<
+      FlowResult,
       SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
     >
     readonly exportRecording: (params: {
@@ -1076,6 +1461,473 @@ export const SessionRegistryLive = Layer.scoped(
 
         yield* persistHealth(sessionId, record.health)
         yield* syncDaemonMetadata
+      })
+
+    const buildActionResultMetadata = (
+      retry: RetryAttemptMetadata,
+      verdict: SessionActionResult["verdict"] = null,
+      waitedMs: number | null = null,
+      polledCount: number | null = null,
+    ) => ({
+      retryCount: retry.retryCount,
+      retryReasons: retry.retryReasons,
+      verdict,
+      waitedMs,
+      polledCount,
+    })
+
+    const persistActionFailure = (sessionId: string, record: ActiveSessionRecord, kind: SessionAction["kind"]) =>
+      Effect.gen(function* () {
+        updateHealthCheck(record, kind, false)
+        yield* persistHealth(sessionId, record.health)
+        yield* syncDaemonMetadata
+      })
+
+    const executeSessionAction = (args: {
+      readonly sessionId: string
+      readonly action: SessionAction
+      readonly recordAction: boolean
+    }) =>
+      Effect.gen(function* () {
+        const record = yield* requireSessionRecord(args.sessionId)
+
+        if (!isRunnerBackedRecord(record)) {
+          return yield* new UnsupportedCapabilityError({
+            code: "session-action-real-device-runner",
+            capability: "session.action",
+            reason: "This session does not currently expose a live runner for UI actions.",
+            nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+            details: [],
+            wall: false,
+          })
+        }
+
+        const validationError = validateSessionAction(args.action)
+
+        if (validationError) {
+          return yield* new UserInputError({
+            code: "session-action-invalid",
+            reason: validationError,
+            nextStep: "Fix the action payload and retry the session action request.",
+            details: [],
+          })
+        }
+
+        if (args.action.kind === "screenshot") {
+          const fileStem = `${timestampForFile()}-screenshot`
+          const captureResult = yield* attemptWithRetry({
+            policy: args.action.retryPolicy ?? defaultReadOnlyRetryPolicy,
+            run: () => captureScreenshotArtifact({
+              sessionId: args.sessionId,
+              record,
+              fileStem,
+              artifactKey: `screenshot-${fileStem}`,
+              artifactLabel: "screenshot",
+              summary: `Screenshot captured for session ${args.sessionId}.`,
+            }),
+          })
+
+          if (!captureResult.ok) {
+            yield* persistActionFailure(args.sessionId, record, args.action.kind)
+            return {
+              ok: false,
+              error: captureResult.error,
+              retry: captureResult.retry,
+            } satisfies ActionExecutionOutcome
+          }
+
+          if (args.recordAction) {
+            appendRecordedAction(record, buildRecordedSessionAction(args.action, null))
+          }
+
+          updateHealthCheck(record, args.action.kind, true)
+          yield* refreshSessionArtifacts(args.sessionId, record)
+
+          return {
+            ok: true,
+            result: {
+              summary: `Captured screenshot artifact ${captureResult.value.artifact.absolutePath}.`,
+              action: args.action.kind,
+              matchedRef: null,
+              resolvedBy: "none",
+              statusLabel: captureResult.value.statusLabel,
+              latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+              artifact: captureResult.value.artifact,
+              recordingLength: record.recording.steps.length,
+              ...buildActionResultMetadata(captureResult.retry),
+            } satisfies SessionActionResult,
+          } satisfies ActionExecutionOutcome
+        }
+
+        if (args.action.kind === "video") {
+          const durationMs = normalizeVideoDurationMs(args.action.durationMs)
+          const normalizedAction: SessionAction = { kind: "video", durationMs }
+          const fileStem = `${timestampForFile()}-video`
+          const captureResult = yield* Effect.either(captureVideoArtifact({
+            sessionId: args.sessionId,
+            record,
+            durationMs,
+            fileStem,
+            artifactKey: `video-${fileStem}`,
+            artifactLabel: "video",
+          }))
+
+          if (captureResult._tag === "Left") {
+            yield* persistActionFailure(args.sessionId, record, args.action.kind)
+            return {
+              ok: false,
+              error: captureResult.left,
+              retry: emptyRetryAttemptMetadata(),
+            } satisfies ActionExecutionOutcome
+          }
+
+          if (args.recordAction) {
+            appendRecordedAction(record, buildRecordedSessionAction(normalizedAction, null))
+          }
+
+          updateHealthCheck(record, args.action.kind, true)
+          yield* refreshSessionArtifacts(args.sessionId, record)
+
+          const modeSummary = describeVideoArtifactLabel(captureResult.right.mode)
+          const clampNote = durationMs !== args.action.durationMs
+            ? ` Requested duration ${args.action.durationMs}ms was clamped to ${durationMs}ms.`
+            : ""
+
+          return {
+            ok: true,
+            result: {
+              summary: `Captured ${modeSummary} at ${captureResult.right.artifact.absolutePath}.${clampNote}`,
+              action: args.action.kind,
+              matchedRef: null,
+              resolvedBy: "none",
+              statusLabel: captureResult.right.statusLabel,
+              latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+              artifact: captureResult.right.artifact,
+              recordingLength: record.recording.steps.length,
+              ...buildActionResultMetadata(emptyRetryAttemptMetadata()),
+            } satisfies SessionActionResult,
+          } satisfies ActionExecutionOutcome
+        }
+
+        if (args.action.kind === "assert") {
+          const action = args.action
+          const retryPolicy = action.retryPolicy ?? defaultAssertRetryPolicy
+          let cachedSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } | null = null
+          const result = yield* attemptWithRetry({
+            policy: retryPolicy,
+            run: () =>
+              Effect.gen(function* () {
+                const snapshot = retryPolicy.refreshSnapshotBetweenAttempts || cachedSnapshot === null
+                  ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
+                  : cachedSnapshot
+
+                cachedSnapshot = snapshot
+
+                const resolution = resolveActionSelectorInSnapshot(snapshot.artifact, action.target)
+                const evaluation = evaluateAssertion(resolution, action.expectation)
+
+                if (!evaluation.ok) {
+                  return yield* new EnvironmentError({
+                    code: "session-assert-failed",
+                    reason: evaluation.summary,
+                    nextStep: "Inspect the latest snapshot artifact and retry when the app is in the expected state.",
+                    details: [],
+                  })
+                }
+
+                return { snapshot, resolution, evaluation }
+              }),
+          })
+
+          if (!result.ok) {
+            yield* persistActionFailure(args.sessionId, record, args.action.kind)
+            return {
+              ok: false,
+              error: result.error,
+              retry: result.retry,
+            } satisfies ActionExecutionOutcome
+          }
+
+          if (args.recordAction) {
+            appendRecordedAction(record, buildRecordedSessionAction(action, result.value.resolution.target))
+          }
+
+          updateHealthCheck(record, args.action.kind, true)
+          yield* persistHealth(args.sessionId, record.health)
+          yield* syncDaemonMetadata
+
+          const summary = result.value.evaluation.resolvedBy === "semantic"
+            && action.target.kind === "ref"
+            && action.target.fallback !== null
+            && result.value.resolution.target?.kind === "snapshot"
+            ? `Assertion passed for ${describeSnapshotNode(result.value.resolution.target.node)} (${result.value.resolution.target.ref}) after semantic selector-drift recovery.`
+            : result.value.evaluation.summary
+
+          return {
+            ok: true,
+            result: {
+              summary,
+              action: args.action.kind,
+              matchedRef: result.value.evaluation.matchedRef,
+              resolvedBy: result.value.evaluation.resolvedBy,
+              statusLabel: result.value.snapshot.artifact.statusLabel,
+              latestSnapshotId: result.value.snapshot.artifact.snapshotId,
+              artifact: null,
+              recordingLength: record.recording.steps.length,
+              ...buildActionResultMetadata(result.retry, "passed", null, result.retry.retryCount + 1),
+            } satisfies SessionActionResult,
+          } satisfies ActionExecutionOutcome
+        }
+
+        if (args.action.kind === "wait") {
+          const action = args.action
+
+          if (action.condition === "duration") {
+            yield* Effect.sleep(action.timeoutMs)
+            updateHealthCheck(record, args.action.kind, true)
+            yield* persistHealth(args.sessionId, record.health)
+            yield* syncDaemonMetadata
+
+            return {
+              ok: true,
+              result: {
+                summary: `Waited ${action.timeoutMs}ms before continuing.`,
+                action: args.action.kind,
+                matchedRef: null,
+                resolvedBy: "none",
+                statusLabel: record.snapshotState.latest?.statusLabel ?? null,
+                latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                artifact: null,
+                recordingLength: record.recording.steps.length,
+                ...buildActionResultMetadata(emptyRetryAttemptMetadata(), "passed", action.timeoutMs, 1),
+              } satisfies SessionActionResult,
+            } satisfies ActionExecutionOutcome
+          }
+
+          if (action.target === null) {
+            return yield* new UserInputError({
+              code: "session-action-invalid",
+              reason: "Wait actions require a selector or target unless condition is duration.",
+              nextStep: "Fix the wait payload and retry the session action request.",
+              details: [],
+            })
+          }
+
+          const waitTarget = action.target
+
+          if (waitTarget.kind === "point") {
+            return yield* new UserInputError({
+              code: "session-action-invalid",
+              reason: "Point selectors cannot be used with wait actions. Use ref, semantic, or absence selectors instead.",
+              nextStep: "Fix the wait payload and retry the session action request.",
+              details: [],
+            })
+          }
+
+          const retryPolicy = action.retryPolicy ?? defaultWaitRetryPolicy(action.timeoutMs)
+          const startedAt = Date.now()
+          const retryReasons: Array<string> = []
+          let attempts = 0
+          let lastSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } | null = null
+          let lastEvaluation: ReturnType<typeof evaluateAssertion> | null = null
+
+          while (attempts < retryPolicy.maxAttempts) {
+            attempts += 1
+
+            const snapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } = retryPolicy.refreshSnapshotBetweenAttempts || lastSnapshot === null
+              ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
+              : lastSnapshot
+
+            lastSnapshot = snapshot
+
+            const selector = action.condition === "absence" && waitTarget.kind !== "absence"
+              ? { kind: "absence", negate: waitTarget } as const
+              : waitTarget
+            const resolution = resolveActionSelectorInSnapshot(snapshot.artifact, selector)
+            const expectation: Parameters<typeof evaluateAssertion>[1] = {
+              exists: true,
+              visible: null,
+              hidden: null,
+              text: action.condition === "text" ? action.text : null,
+              label: null,
+              value: null,
+              type: null,
+              enabled: null,
+              selected: null,
+              focused: null,
+              interactive: null,
+            }
+            const evaluation = evaluateAssertion(resolution, expectation)
+            lastEvaluation = evaluation
+
+            if (evaluation.ok) {
+              updateHealthCheck(record, args.action.kind, true)
+              yield* persistHealth(args.sessionId, record.health)
+              yield* syncDaemonMetadata
+
+              const waitedMs = Date.now() - startedAt
+
+              return {
+                ok: true,
+                result: {
+                  summary: `Wait condition ${action.condition} passed after ${waitedMs}ms across ${attempts} poll(s).`,
+                  action: args.action.kind,
+                  matchedRef: evaluation.matchedRef,
+                  resolvedBy: evaluation.resolvedBy,
+                  statusLabel: snapshot.artifact.statusLabel,
+                  latestSnapshotId: snapshot.artifact.snapshotId,
+                  artifact: null,
+                  recordingLength: record.recording.steps.length,
+                  ...buildActionResultMetadata({ retryCount: attempts - 1, retryReasons }, "passed", waitedMs, attempts),
+                } satisfies SessionActionResult,
+              } satisfies ActionExecutionOutcome
+            }
+
+            const elapsedMs = Date.now() - startedAt
+            const remainingMs = action.timeoutMs - elapsedMs
+            const retryCode: RetryReasonCode = resolution.outcome === "not-found" ? "not-found" : "assertion-failed"
+
+            if (attempts >= retryPolicy.maxAttempts || remainingMs <= 0 || !retryPolicy.retryOn.includes(retryCode)) {
+              break
+            }
+
+            retryReasons.push(`${retryCode}: ${evaluation.summary}`)
+            yield* Effect.sleep(Math.min(retryPolicy.backoffMs, remainingMs))
+          }
+
+          yield* persistActionFailure(args.sessionId, record, args.action.kind)
+          return {
+            ok: false,
+            error: new EnvironmentError({
+              code: "session-wait-timeout",
+              reason: lastEvaluation?.summary ?? "Wait condition did not become true before timeout.",
+              nextStep: "Inspect the latest snapshot artifact, adjust the wait condition, and retry once the app stabilizes.",
+              details: lastSnapshot === null ? [] : [`latest snapshot: ${lastSnapshot.artifact.snapshotId}`],
+            }),
+            retry: {
+              retryCount: Math.max(0, attempts - 1),
+              retryReasons,
+            },
+          } satisfies ActionExecutionOutcome
+        }
+
+        if (!isRunnerUiSessionAction(args.action)) {
+          return yield* new UserInputError({
+            code: "session-action-invalid",
+            reason: "Unsupported runner-backed action kind.",
+            nextStep: "Use tap, press, swipe, type, or scroll for runner UI actions.",
+            details: [],
+          })
+        }
+
+        const action = args.action
+        const retryPolicy = action.retryPolicy ?? defaultMutationRetryPolicy
+        let cachedPreSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } | null = null
+        const actionResult = yield* attemptWithRetry({
+          policy: retryPolicy,
+          run: () =>
+            Effect.gen(function* () {
+              const preSnapshot = action.target.kind === "point"
+                ? null
+                : retryPolicy.refreshSnapshotBetweenAttempts || cachedPreSnapshot === null
+                  ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
+                  : cachedPreSnapshot
+
+              if (preSnapshot !== null) {
+                cachedPreSnapshot = preSnapshot
+              }
+
+              const resolution = resolveActionSelectorInSnapshot(preSnapshot?.artifact ?? null, action.target)
+
+              if (resolution.outcome !== "matched") {
+                return yield* new EnvironmentError({
+                  code: "session-action-target-not-found",
+                  reason: resolution.reason,
+                  nextStep: "Capture a fresh snapshot, refine the selector, and retry the action.",
+                  details: [],
+                })
+              }
+
+              const resolvedTarget = resolution.target!
+
+              if (resolvedTarget.kind === "absence") {
+                return yield* new EnvironmentError({
+                  code: "session-action-target-not-found",
+                  reason: "Absence selectors can only be used with assert actions.",
+                  nextStep: "Use a ref, semantic, or point selector for runner UI actions, or move the absence check into an assert.",
+                  details: [],
+                })
+              }
+
+              const response = yield* sendRunnerCommand(
+                args.sessionId,
+                record,
+                "uiAction",
+                JSON.stringify(buildRunnerUiActionPayload(action, resolvedTarget, preSnapshot?.artifact ?? null)),
+              )
+              record.nextSequence += 1
+
+              if (!response.ok) {
+                const failureReason = response.error
+                  ?? response.payload
+                  ?? `Runner ${action.kind} failed with status ${response.statusLabel}.`
+
+                return yield* new EnvironmentError({
+                  code: "session-action-failed",
+                  reason: failureReason,
+                  nextStep: withOffscreenNextStep(
+                    "Inspect the latest snapshot + runner log artifacts, then retry the action.",
+                    failureReason,
+                  ),
+                  details: [],
+                })
+              }
+
+              const postSnapshot = yield* captureSnapshotArtifactInternal(args.sessionId, record)
+
+              return { postSnapshot, resolvedTarget }
+            }),
+        })
+
+        if (!actionResult.ok) {
+          yield* persistActionFailure(args.sessionId, record, args.action.kind)
+          return {
+            ok: false,
+            error: actionResult.error,
+            retry: actionResult.retry,
+          } satisfies ActionExecutionOutcome
+        }
+
+        if (args.recordAction) {
+          appendRecordedAction(record, buildRecordedSessionAction(action, actionResult.value.resolvedTarget))
+        }
+
+        updateHealthCheck(record, args.action.kind, true)
+        yield* persistHealth(args.sessionId, record.health)
+        yield* syncDaemonMetadata
+
+        const summary = actionResult.value.resolvedTarget.kind === "snapshot"
+          ? actionResult.value.resolvedTarget.resolvedBy === "semantic"
+              && action.target.kind === "ref"
+              && action.target.fallback !== null
+            ? `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)} after semantic selector-drift recovery; captured ${actionResult.value.postSnapshot.artifact.snapshotId}.`
+            : `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)}; captured ${actionResult.value.postSnapshot.artifact.snapshotId}.`
+          : `Executed ${action.kind} at point(${actionResult.value.resolvedTarget.x}, ${actionResult.value.resolvedTarget.y}) in interaction-root coordinates; captured ${actionResult.value.postSnapshot.artifact.snapshotId}.`
+
+        return {
+          ok: true,
+          result: {
+            summary,
+            action: args.action.kind,
+            matchedRef: actionResult.value.resolvedTarget.kind === "snapshot" ? actionResult.value.resolvedTarget.ref : null,
+            resolvedBy: actionResult.value.resolvedTarget.resolvedBy,
+            statusLabel: actionResult.value.postSnapshot.artifact.statusLabel,
+            latestSnapshotId: actionResult.value.postSnapshot.artifact.snapshotId,
+            artifact: null,
+            recordingLength: record.recording.steps.length,
+            ...buildActionResultMetadata(actionResult.retry),
+          } satisfies SessionActionResult,
+        } satisfies ActionExecutionOutcome
       })
 
     const validateLogRequest = (args: {
@@ -2433,6 +3285,19 @@ export const SessionRegistryLive = Layer.scoped(
       record.recording.steps.push(action)
     }
 
+    const toSessionListEntry = (health: SessionHealth): SessionListEntry => ({
+      id: health.sessionId,
+      target: {
+        platform: health.target.platform,
+        deviceId: health.target.deviceId,
+        deviceName: health.target.deviceName,
+        runtime: health.target.runtime,
+      },
+      bundleId: health.target.bundleId,
+      state: health.state,
+      openedAt: health.openedAt,
+    })
+
     const syncDaemonMetadata =
       Effect.gen(function* () {
         const sessions = yield* Ref.get(sessionsRef)
@@ -2690,13 +3555,21 @@ export const SessionRegistryLive = Layer.scoped(
       }).pipe(Effect.catchAll(() => Effect.succeed(undefined))),
     )
 
-    return SessionRegistry.of({
+    const registry = SessionRegistry.of({
       getSessionTtlMs: () => defaultSessionTtlMs,
       getActiveSessionCount: () =>
         Effect.gen(function* () {
           const sessions = yield* Ref.get(sessionsRef)
           const opening = yield* Ref.get(openingRef)
           return sessions.size + (opening ? 1 : 0)
+        }),
+      listActiveSessions: () =>
+        Effect.gen(function* () {
+          const sessions = yield* Ref.get(sessionsRef)
+
+          return [...sessions.values()]
+            .map((record) => toSessionListEntry(record.health))
+            .sort((left, right) => left.openedAt.localeCompare(right.openedAt))
         }),
       openDeviceSession: ({ bundleId, deviceId, rootDir, emitProgress }) =>
         Effect.gen(function* () {
@@ -3151,7 +4024,7 @@ export const SessionRegistryLive = Layer.scoped(
                       eventEgress: opened.eventEgress,
                       stdinProbeStatus: opened.stdinProbeStatus,
                       note:
-                        "The current vertical slice uses the transport seam validated by the runner boundary spikes: simulator bootstrap manifest plus file-backed command ingress plus stdout-framed event egress.",
+                        "The current vertical slice uses the transport seam validated by the runner boundary spikes: simulator bootstrap manifest plus HTTP POST command ingress plus stdout-framed readiness/diagnostic egress.",
                     },
                     capabilities: [...buildSimulatorCapabilities()],
                     runner: {
@@ -3298,6 +4171,9 @@ export const SessionRegistryLive = Layer.scoped(
 
             const deviceDisconnectedWarning =
               `Selected device ${record.health.target.deviceName} (${record.health.target.deviceId}) is currently disconnected. Probe keeps the session degraded instead of claiming transparent recovery.`
+            const liveRunnerDetails = record.health.runner.kind === "real-device-live"
+              ? record.health.runner
+              : null
             const runnerDetails = record.health.runner.kind === "real-device-live"
               ? {
                   ...record.health.runner,
@@ -3348,30 +4224,118 @@ export const SessionRegistryLive = Layer.scoped(
               "Continue or detach the debugger before retrying session health, then retry.",
             )
 
-            const response = yield* sendRunnerCommand(sessionId, record, "ping", "health-check")
-            record.nextSequence += 1
+            const pingAttempt = yield* Effect.either(
+              Effect.tryPromise({
+                try: () => record.sendRunnerCommand(record.nextSequence, "ping", "health-check"),
+                catch: (error) =>
+                  new EnvironmentError({
+                    code: "device-session-health-ping",
+                    reason: error instanceof Error ? error.message : String(error),
+                    nextStep: "Inspect the runner artifacts, unlock the device if it is blocked, then retry session health or reopen the session.",
+                    details: [],
+                  }),
+              }),
+            )
 
-            const warnings = response.ok
-              ? connection.status === "connected"
-                ? [...record.baseWarnings]
-                : composeWarnings(record, [deviceDisconnectedWarning])
-              : composeWarnings(record, [
-                  `Runner ping reported ${response.statusLabel}. ${nonRecoverableSessionWarning}`,
+            const interruption = yield* Effect.tryPromise({
+              try: () => detectRealDeviceInterruption({
+                targetBundleId: record.health.target.bundleId,
+                device: {
+                  identifier: record.health.target.deviceId,
+                  name: record.health.target.deviceName,
+                },
+                statusLabel: Either.isRight(pingAttempt) ? pingAttempt.right.statusLabel : null,
+                logPath: liveRunnerDetails?.logPath ?? null,
+                wrapperStderrPath: liveRunnerDetails?.wrapperStderrPath ?? null,
+              }),
+              catch: (error) =>
+                new EnvironmentError({
+                  code: "device-session-health-interruption-detect",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: "Inspect the saved device session artifacts and retry the health request.",
+                  details: [],
+                }),
+            })
+            const interruptionWarning = interruption
+              ? buildRealDeviceInterruptionWarning(interruption)
+              : null
+
+            if (Either.isLeft(pingAttempt)) {
+              if (!interruption || interruption.evidenceKind !== "direct") {
+                yield* markSessionRunnerFailed({
+                  sessionId,
+                  record,
+                  lastCommand: "ping",
+                  reason: pingAttempt.left.reason,
+                  wrapperRunning: record.isRunnerRunning(),
+                })
+                return yield* pingAttempt.left
+              }
+
+              const nextHealth: SessionHealth = {
+                ...record.health,
+                updatedAt: nowIso(),
+                expiresAt: expiresAtIso(),
+                connection,
+                resources: setRunnerResourceState(record.health.resources, "degraded"),
+                capabilities: [...buildRealDeviceCapabilities({
+                  connection,
+                  integrationPoints: record.integrationPoints,
+                  liveRunner: false,
+                })],
+                runner: runnerDetails,
+                healthCheck: {
+                  checkedAt: nowIso(),
+                  wrapperRunning: record.isRunnerRunning(),
+                  pingRttMs: null,
+                  lastCommand: "ping",
+                  lastOk: false,
+                },
+                warnings: composeWarnings(record, [
+                  ...(interruptionWarning ? [interruptionWarning] : []),
                   ...(connection.status === "connected" ? [] : [deviceDisconnectedWarning]),
-                ])
+                ]),
+                artifacts: [...(yield* refreshArtifacts(sessionId))],
+              }
+
+              record.health = {
+                ...nextHealth,
+                state: deriveSessionPhase(nextHealth),
+              }
+
+              yield* persistHealth(sessionId, record.health)
+              yield* syncDaemonMetadata
+              return record.health
+            }
+
+            const response = pingAttempt.right
+            record.nextSequence += 1
+            const interruptionIsActive = interruption?.evidenceKind === "direct"
+            const warningExtras = [
+              ...(interruptionWarning ? [interruptionWarning] : []),
+              ...(connection.status === "connected" ? [] : [deviceDisconnectedWarning]),
+              ...(!response.ok && !interruptionIsActive
+                ? [`Runner ping reported ${response.statusLabel}. ${nonRecoverableSessionWarning}`]
+                : []),
+            ]
+            const warnings = warningExtras.length === 0
+              ? [...record.baseWarnings]
+              : composeWarnings(record, warningExtras)
 
             const nextHealth: SessionHealth = {
               ...record.health,
               updatedAt: nowIso(),
               expiresAt: expiresAtIso(),
               connection,
-              resources: response.ok
-                ? record.health.resources
-                : setRunnerResourceState(record.health.resources, "failed"),
+              resources: interruptionIsActive
+                ? setRunnerResourceState(record.health.resources, "degraded")
+                : response.ok
+                  ? record.health.resources
+                  : setRunnerResourceState(record.health.resources, "failed"),
               capabilities: [...buildRealDeviceCapabilities({
                 connection,
                 integrationPoints: record.integrationPoints,
-                liveRunner: response.ok && connection.status === "connected",
+                liveRunner: response.ok && connection.status === "connected" && !interruptionIsActive,
               })],
               runner: runnerDetails,
               healthCheck: {
@@ -3549,19 +4513,24 @@ export const SessionRegistryLive = Layer.scoped(
               }),
           })
 
+          const markers = yield* readSessionLogMarkers(record.health.artifactRoot)
           const excerpt = selectBufferedLogLines({
             content: rawContent,
             lineCount,
             match,
             sourceLabel: sourceArtifact.label,
           })
+          const content = appendSessionLogMarkers(excerpt.content, markers)
+          const summary = markers.length > 0
+            ? `${excerpt.summary}; included ${markers.length} log marker${markers.length === 1 ? "" : "s"}.`
+            : excerpt.summary
 
           const result = yield* renderLogResult({
             sessionId,
             artifactRoot: record.health.artifactRoot,
             source,
-            content: excerpt.content,
-            summary: excerpt.summary,
+            content,
+            summary,
             outputMode,
           })
 
@@ -3572,226 +4541,711 @@ export const SessionRegistryLive = Layer.scoped(
             result,
           } satisfies SessionLogsResult
         }),
-      captureSnapshot: ({ sessionId, outputMode }) =>
+      markLog: ({ sessionId, label }) =>
         Effect.gen(function* () {
+          const trimmedLabel = label.trim()
+
+          if (trimmedLabel.length === 0) {
+            return yield* new UserInputError({
+              code: "session-log-mark-label",
+              reason: "Expected a non-empty log mark label.",
+              nextStep: "Pass --label <text> and retry the log mark request.",
+              details: [],
+            })
+          }
+
           const record = yield* requireSessionRecord(sessionId)
-          const captured = yield* captureSnapshotArtifactInternal(sessionId, record)
-          return buildSessionSnapshotResult({
-            artifact: captured.artifact,
-            artifactRecord: captured.artifactRecord,
-            outputMode,
+          const marksDirectory = join(record.health.artifactRoot, "logs", "marks")
+          const timestamp = nowIso()
+          const fileStem = `${timestampForFile()}-${sanitizeFileComponent(trimmedLabel, "mark")}`
+          const marker: SessionLogMarker = {
+            timestamp,
+            label: trimmedLabel,
+            sessionId,
+          }
+          const absolutePath = join(marksDirectory, `${fileStem}.json`)
+
+          yield* Effect.tryPromise({
+            try: async () => {
+              await mkdir(marksDirectory, { recursive: true })
+              await writeFile(
+                absolutePath,
+                `${JSON.stringify(marker, null, 2)}\n`,
+                "utf8",
+              )
+            },
+            catch: (error) =>
+              new EnvironmentError({
+                code: "session-log-mark-write",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the session log marker directory permissions and retry.",
+                details: [],
+              }),
           })
+
+          const writableLogStream = resolveWritableLogStreamArtifact(record.health.artifacts)
+
+          if (writableLogStream === null) {
+            return yield* new EnvironmentError({
+              code: "session-log-mark-stream-missing",
+              reason: "Probe could not find a writable stdout-events or wrapper-stderr artifact for this session.",
+              nextStep: "Inspect the session artifact list and reopen the session if the runner log stream is missing.",
+              details: [],
+            })
+          }
+
+          yield* Effect.tryPromise({
+            try: () => appendFile(writableLogStream.absolutePath, buildSessionLogMarkStreamEntry(marker), "utf8"),
+            catch: (error) =>
+              new EnvironmentError({
+                code: "session-log-mark-stream-write",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: `Inspect the ${writableLogStream.key} artifact path and retry the log mark request.`,
+                details: [],
+              }),
+          })
+
+          const artifact = createArtifactRecord({
+            artifactRoot: record.health.artifactRoot,
+            key: `log-mark-${fileStem}`,
+            label: "log-mark",
+            kind: "json",
+            absolutePath,
+            summary: `Log mark '${trimmedLabel}' recorded at ${timestamp} for session ${sessionId}.`,
+          })
+
+          yield* artifactStore.registerArtifact(sessionId, artifact)
+          yield* refreshSessionArtifacts(sessionId, record)
+
+          return {
+            kind: "summary+artifact",
+            summary: `Recorded log mark '${trimmedLabel}' and appended it to ${writableLogStream.label}.`,
+            artifact,
+          } satisfies SummaryArtifactResult
         }),
-      performAction: ({ sessionId, action }) =>
+      captureLogWindow: ({ sessionId, captureSeconds }) =>
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
 
-          if (!isRunnerBackedRecord(record)) {
+          if (record.health.target.platform !== "simulator") {
             return yield* new UnsupportedCapabilityError({
-              code: "session-action-real-device-runner",
-              capability: "session.action",
-              reason: "This session does not currently expose a live runner for UI actions.",
-              nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+              code: "session-log-window-real-device",
+              capability: "session.logs.capture",
+              reason: "Bounded live log-window capture is currently only supported for simulator sessions.",
+              nextStep: "Inspect the saved device log artifacts, or retry this command against a simulator session.",
               details: [],
               wall: false,
             })
           }
 
-          const validationError = validateSessionAction(action)
-
-          if (validationError) {
+          if (!Number.isInteger(captureSeconds) || captureSeconds <= 0 || captureSeconds > maxSessionLogCaptureSeconds) {
             return yield* new UserInputError({
-              code: "session-action-invalid",
-              reason: validationError,
-              nextStep: "Fix the action payload and retry the session action request.",
+              code: "session-log-window-seconds",
+              reason: `Expected capture seconds between 1 and ${maxSessionLogCaptureSeconds}, received ${captureSeconds}.`,
+              nextStep: `Pass --seconds <1-${maxSessionLogCaptureSeconds}> and retry the log capture request.`,
               details: [],
             })
           }
 
-          const persistActionFailure = (kind: SessionAction["kind"]) =>
-            Effect.gen(function* () {
-              updateHealthCheck(record, kind, false)
-              yield* persistHealth(sessionId, record.health)
-              yield* syncDaemonMetadata
-            })
+          const capture = yield* simulatorHarness.captureSimulatorLogStream({
+            simulatorUdid: record.health.target.deviceId,
+            logsDirectory: join(record.health.artifactRoot, "logs"),
+            captureSeconds,
+            predicate: null,
+          })
+          const artifact = createArtifactRecord({
+            artifactRoot: record.health.artifactRoot,
+            key: `simulator-log-capture-${timestampForFile()}`,
+            label: "simulator-log-capture",
+            kind: "ndjson",
+            absolutePath: capture.absolutePath,
+            summary: `Bounded simulator unified log capture over ${captureSeconds}s with no extra predicate.`,
+          })
 
-          if (action.kind === "screenshot") {
-            const fileStem = `${timestampForFile()}-screenshot`
-            const captureResult = yield* Effect.either(captureScreenshotArtifact({
-              sessionId,
-              record,
-              fileStem,
-              artifactKey: `screenshot-${fileStem}`,
-              artifactLabel: "screenshot",
-              summary: `Screenshot captured for session ${sessionId}.`,
-            }))
-
-            if (captureResult._tag === "Left") {
-              yield* persistActionFailure(action.kind)
-              return yield* captureResult.left
-            }
-
-            appendRecordedAction(record, buildRecordedSessionAction(action, null))
-            updateHealthCheck(record, action.kind, true)
-            yield* refreshSessionArtifacts(sessionId, record)
-            yield* persistHealth(sessionId, record.health)
-            yield* syncDaemonMetadata
-
-            return {
-              summary: `Captured screenshot artifact ${captureResult.right.artifact.absolutePath}.`,
-              action: action.kind,
-              matchedRef: null,
-              resolvedBy: "none",
-              statusLabel: captureResult.right.statusLabel,
-              latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-              artifact: captureResult.right.artifact,
-              recordingLength: record.recording.steps.length,
-            } satisfies SessionActionResult
-          }
-
-          if (action.kind === "video") {
-            const durationMs = normalizeVideoDurationMs(action.durationMs)
-            const normalizedAction: SessionAction = { kind: "video", durationMs }
-            const fileStem = `${timestampForFile()}-video`
-            const captureResult = yield* Effect.either(captureVideoArtifact({
-              sessionId,
-              record,
-              durationMs,
-              fileStem,
-              artifactKey: `video-${fileStem}`,
-              artifactLabel: "video",
-            }))
-
-            if (captureResult._tag === "Left") {
-              yield* persistActionFailure(action.kind)
-              return yield* captureResult.left
-            }
-
-            appendRecordedAction(record, buildRecordedSessionAction(normalizedAction, null))
-            updateHealthCheck(record, action.kind, true)
-            yield* refreshSessionArtifacts(sessionId, record)
-            yield* persistHealth(sessionId, record.health)
-            yield* syncDaemonMetadata
-
-            const modeSummary = describeVideoArtifactLabel(captureResult.right.mode)
-            const clampNote = durationMs !== action.durationMs
-              ? ` Requested duration ${action.durationMs}ms was clamped to ${durationMs}ms.`
-              : ""
-
-            return {
-              summary: `Captured ${modeSummary} at ${captureResult.right.artifact.absolutePath}.${clampNote}`,
-              action: action.kind,
-              matchedRef: null,
-              resolvedBy: "none",
-              statusLabel: captureResult.right.statusLabel,
-              latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-              artifact: captureResult.right.artifact,
-              recordingLength: record.recording.steps.length,
-            } satisfies SessionActionResult
-          }
-
-          const preSnapshot = yield* captureSnapshotArtifactInternal(sessionId, record)
-          const resolution = resolveActionSelectorInSnapshot(preSnapshot.artifact, action.target)
-
-          if (action.kind === "assert") {
-            const evaluation = evaluateAssertion(resolution, action.expectation)
-            updateHealthCheck(record, action.kind, evaluation.ok)
-            yield* persistHealth(sessionId, record.health)
-            yield* syncDaemonMetadata
-
-            if (!evaluation.ok) {
-              return yield* new EnvironmentError({
-                code: "session-assert-failed",
-                reason: evaluation.summary,
-                nextStep: "Inspect the latest snapshot artifact and retry when the app is in the expected state.",
-                details: [],
-              })
-            }
-
-            appendRecordedAction(record, buildRecordedSessionAction(action, resolution.target))
-
-            const summary = evaluation.resolvedBy === "semantic"
-              && action.target.kind === "ref"
-              && action.target.fallback !== null
-              && resolution.target !== null
-              ? `Assertion passed for ${describeSnapshotNode(resolution.target.node)} (${resolution.target.ref}) after semantic selector-drift recovery.`
-              : evaluation.summary
-
-            return {
-              summary,
-              action: action.kind,
-              matchedRef: evaluation.matchedRef,
-              resolvedBy: evaluation.resolvedBy,
-              statusLabel: preSnapshot.artifact.statusLabel,
-              latestSnapshotId: preSnapshot.artifact.snapshotId,
-              artifact: null,
-              recordingLength: record.recording.steps.length,
-            } satisfies SessionActionResult
-          }
-
-          if (resolution.outcome !== "matched") {
-            updateHealthCheck(record, action.kind, false)
-            yield* persistHealth(sessionId, record.health)
-            yield* syncDaemonMetadata
-            return yield* new EnvironmentError({
-              code: "session-action-target-not-found",
-              reason: resolution.reason,
-              nextStep: "Capture a fresh snapshot, refine the selector, and retry the action.",
-              details: [],
-            })
-          }
-
-          const resolvedTarget = resolution.target!
-
-          const response = yield* sendRunnerCommand(
-            sessionId,
-            record,
-            "uiAction",
-            JSON.stringify(buildRunnerUiActionPayload(action, resolvedTarget, preSnapshot.artifact)),
-          )
-          record.nextSequence += 1
-
-          if (!response.ok) {
-            const failureReason = response.error
-              ?? response.payload
-              ?? `Runner ${action.kind} failed with status ${response.statusLabel}.`
-
-            updateHealthCheck(record, action.kind, false)
-            yield* persistHealth(sessionId, record.health)
-            yield* syncDaemonMetadata
-            return yield* new EnvironmentError({
-              code: "session-action-failed",
-              reason: failureReason,
-              nextStep: withOffscreenNextStep(
-                "Inspect the latest snapshot + runner log artifacts, then retry the action.",
-                failureReason,
-              ),
-              details: [],
-            })
-          }
-
-          const postSnapshot = yield* captureSnapshotArtifactInternal(sessionId, record)
-          appendRecordedAction(record, buildRecordedSessionAction(action, resolvedTarget))
-          updateHealthCheck(record, action.kind, true)
-          yield* persistHealth(sessionId, record.health)
-          yield* syncDaemonMetadata
-
-          const summary = resolvedTarget.resolvedBy === "semantic"
-            && action.target.kind === "ref"
-            && action.target.fallback !== null
-            ? `Executed ${action.kind} on ${describeSnapshotNode(resolvedTarget.node)} after semantic selector-drift recovery; captured ${postSnapshot.artifact.snapshotId}.`
-            : `Executed ${action.kind} on ${describeSnapshotNode(resolvedTarget.node)}; captured ${postSnapshot.artifact.snapshotId}.`
+          yield* artifactStore.registerArtifact(sessionId, artifact)
+          yield* refreshSessionArtifacts(sessionId, record)
 
           return {
+            kind: "summary+artifact",
+            summary: `Captured a ${captureSeconds}s simulator log window.`,
+            artifact,
+          } satisfies SummaryArtifactResult
+        }),
+      captureDiagnosticBundle: ({ sessionId, target, kind }) =>
+        Effect.gen(function* () {
+          const record = yield* requireSessionRecord(sessionId)
+
+          if (record.health.target.platform !== target) {
+            return yield* new UserInputError({
+              code: "session-diagnostic-target-mismatch",
+              reason: `Session ${sessionId} targets ${record.health.target.platform}, not ${target}.`,
+              nextStep: `Retry with --target ${record.health.target.platform}, or use a session id for a ${target} session.`,
+              details: [],
+            })
+          }
+
+          if (target === "simulator" && kind !== null) {
+            return yield* new UserInputError({
+              code: "session-diagnostic-kind-invalid",
+              reason: "Simulator diagnostic capture does not accept --kind.",
+              nextStep: "Omit --kind when capturing a simulator diagnostic bundle.",
+              details: [],
+            })
+          }
+
+          const diagnosticsDirectory = join(record.health.artifactRoot, "diagnostics")
+          const captureDescription = describeDiagnosticCapture({ target, kind })
+          const fileStem = `${timestampForFile()}-${captureDescription.artifactLabel}`
+          const capture = yield* Effect.either(
+            target === "simulator"
+              ? simulatorHarness.captureSimulatorDiagnosticBundle({
+                  simulatorUdid: record.health.target.deviceId,
+                  diagnosticsDirectory,
+                  fileStem,
+                })
+              : realDeviceHarness.captureDeviceDiagnosticBundle({
+                  deviceId: record.health.target.deviceId,
+                  diagnosticsDirectory,
+                  fileStem,
+                  kind: resolveDeviceDiagnosticCaptureMode(kind),
+                }),
+          )
+
+          if (capture._tag === "Left") {
+            updateHealthCheck(record, "diagnostic-capture", false)
+            yield* persistRecordHealth(sessionId, record)
+            return yield* capture.left
+          }
+
+          const artifact = createArtifactRecord({
+            artifactRoot: record.health.artifactRoot,
+            key: `${captureDescription.artifactKeyPrefix}-${fileStem}`,
+            label: captureDescription.artifactLabel,
+            kind: "binary",
+            absolutePath: capture.right.absolutePath,
+            summary: captureDescription.summary,
+          })
+
+          yield* artifactStore.registerArtifact(sessionId, artifact)
+          updateHealthCheck(record, "diagnostic-capture", true)
+          yield* refreshSessionArtifacts(sessionId, record)
+
+          return {
+            kind: "summary+artifact",
+            summary: captureDescription.summary,
+            artifact,
+          } satisfies SummaryArtifactResult
+        }),
+      getLogDoctorReport: (sessionId) =>
+        Effect.gen(function* () {
+          const record = yield* requireSessionRecord(sessionId)
+          const artifacts = yield* refreshArtifacts(sessionId)
+          const latestSimulatorCapture = [...artifacts]
+            .filter((artifact) => artifact.label === "simulator-log-capture")
+            .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null
+          const resolveSourceArtifact = (source: SessionLogSource): ArtifactRecord | null => {
+            if (source === "simulator") {
+              return latestSimulatorCapture
+            }
+
+            return artifacts.find((artifact) => artifact.key === resolveLogArtifactKey(source)) ?? null
+          }
+
+          const describeSourceAvailability = (source: SessionLogSource, artifact: ArtifactRecord | null) => {
+            if (source === "simulator") {
+              if (record.health.target.platform !== "simulator") {
+                return {
+                  available: false,
+                  reason: "Bounded simulator live capture is only available for simulator sessions.",
+                }
+              }
+
+              return {
+                available: true,
+                reason: artifact
+                  ? `Available via bounded simulator live capture; latest artifact is ${artifact.key}.`
+                  : "Available via bounded simulator live capture; no capture artifact has been recorded yet.",
+              }
+            }
+
+            if (artifact) {
+              return {
+                available: true,
+                reason: `Available via artifact ${artifact.key}.`,
+              }
+            }
+
+            return {
+              available: false,
+              reason: `No ${source} log artifact is currently registered for this session.`,
+            }
+          }
+
+          const sources = (["runner", "build", "wrapper", "stdout", "simulator"] as const).map((source) => {
+            const artifact = resolveSourceArtifact(source)
+            const availability = describeSourceAvailability(source, artifact)
+
+            return {
+              source,
+              available: availability.available,
+              reason: availability.reason,
+              artifactKey: artifact?.key ?? null,
+              artifactPath: artifact?.absolutePath ?? null,
+            }
+          })
+
+          return {
+            sessionId,
+            targetPlatform: record.health.target.platform,
+            summary: record.health.target.platform === "simulator"
+              ? "Simulator log doctor reports artifact-backed runner/build/wrapper/stdout sources plus bounded live simulator capture."
+              : "Real-device log doctor reports artifact-backed build/runner/wrapper/stdout sources; bounded live simulator capture is unavailable.",
+            sources,
+          } satisfies SessionLogDoctorReport
+        }),
+      captureSnapshot: ({ sessionId, outputMode }) =>
+        Effect.gen(function* () {
+          const record = yield* requireSessionRecord(sessionId)
+          const captured = yield* (runWithRetry({
+            policy: defaultReadOnlyRetryPolicy,
+            run: () => captureSnapshotArtifactInternal(sessionId, record),
+          }) as Effect.Effect<
+            { readonly value: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord }; readonly retry: RetryAttemptMetadata },
+            UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+          >)
+          return buildSessionSnapshotResult({
+            artifact: captured.value.artifact,
+            artifactRecord: captured.value.artifactRecord,
+            outputMode,
+            retry: captured.retry,
+          })
+        }),
+      performAction: ({ sessionId, action }) =>
+        Effect.gen(function* () {
+          const outcome = yield* executeSessionAction({
+            sessionId,
+            action,
+            recordAction: true,
+          })
+
+          if (!outcome.ok) {
+            return yield* outcome.error
+          }
+
+          return outcome.result
+        }),
+      runFlow: ({ sessionId, flow }) =>
+        Effect.gen(function* () {
+          const validationError = validateFlowContract(flow)
+
+          if (validationError !== null) {
+            return yield* new UserInputError({
+              code: "session-flow-invalid",
+              reason: validationError,
+              nextStep: "Fix the flow contract and retry the flow request.",
+              details: [],
+            })
+          }
+
+          const record = yield* requireSessionRecord(sessionId)
+          yield* refreshSessionArtifacts(sessionId, record)
+
+          const diffArtifacts = (before: ReadonlyArray<ArtifactRecord>, after: ReadonlyArray<ArtifactRecord>) => {
+            const knownKeys = new Set(before.map((artifact) => artifact.key))
+            return after.filter((artifact) => !knownKeys.has(artifact.key))
+          }
+
+          const failureVerdict = (error: SessionActionError | SessionNotFoundError): FlowResult["verdict"] =>
+            error instanceof EnvironmentError && error.code === "session-wait-timeout" ? "timed-out" : "failed"
+
+          const failureWarnings = (args: {
+            readonly error: SessionActionError | SessionNotFoundError
+            readonly continued: boolean
+          }): Array<string> => {
+            const warnings: Array<string> = []
+
+            if ("nextStep" in args.error && typeof args.error.nextStep === "string") {
+              warnings.push(args.error.nextStep)
+            }
+
+            if ("details" in args.error && Array.isArray(args.error.details)) {
+              warnings.push(...args.error.details)
+            }
+
+            if (args.continued) {
+              warnings.push("Step failed but flow continued because continueOnError was enabled.")
+            }
+
+            return dedupeStrings(warnings)
+          }
+
+          const errorSummary = (error: SessionActionError | SessionNotFoundError): string =>
+            error instanceof SessionNotFoundError
+              ? `Session ${error.sessionId} was not found.`
+              : error.reason
+
+          const successWarnings = (args: {
+            readonly step: FlowStep
+            readonly baseWarnings: ReadonlyArray<string>
+            readonly resolvedBy?: SessionActionResult["resolvedBy"]
+          }) => {
+            const warnings = [...args.baseWarnings]
+
+            if (
+              args.resolvedBy === "semantic"
+              && isFlowSessionActionStep(args.step)
+              && "target" in args.step
+              && args.step.target !== null
+              && args.step.target.kind === "ref"
+              && args.step.target.fallback !== null
+            ) {
+              warnings.push(selectorDriftContractWarning)
+            }
+
+            return dedupeStrings(warnings)
+          }
+
+          const toFailedStep = (step: FlowStepResult): FlowFailedStep => ({
+            index: step.index,
+            kind: step.kind,
+            summary: step.summary,
+            verdict: step.verdict,
+          })
+
+          const mergeVerdict = (current: FlowResult["verdict"], next: FlowResult["verdict"]): FlowResult["verdict"] => {
+            if (current === "timed-out" || next === "timed-out") {
+              return "timed-out"
+            }
+
+            if (current === "failed" || next === "failed") {
+              return "failed"
+            }
+
+            return "passed"
+          }
+
+          const executedSteps: Array<FlowStepResult> = []
+          const createdArtifacts: Array<ArtifactRecord> = []
+          let failedStep: FlowFailedStep | null = null
+          let overallVerdict: FlowResult["verdict"] = "passed"
+          let totalRetries = 0
+          let stoppedEarly = false
+
+          for (const [stepIndex, step] of flow.steps.entries()) {
+            const beforeArtifacts = [...record.health.artifacts]
+            const continueOnError = step.continueOnError === true
+            let stepResult: FlowStepResult
+
+            if (step.kind === "snapshot") {
+              const captured = yield* attemptWithRetry({
+                policy: defaultReadOnlyRetryPolicy,
+                run: () => captureSnapshotArtifactInternal(sessionId, record),
+              })
+
+              if (captured.ok) {
+                const snapshotResult = buildSessionSnapshotResult({
+                  artifact: captured.value.artifact,
+                  artifactRecord: captured.value.artifactRecord,
+                  outputMode: step.output ?? "artifact",
+                  retry: captured.retry,
+                })
+
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: snapshotResult.summary,
+                  verdict: "passed",
+                  matchedRef: null,
+                  latestSnapshotId: snapshotResult.snapshotId,
+                  retryCount: captured.retry.retryCount,
+                  retryReasons: captured.retry.retryReasons,
+                  artifacts: [],
+                  warnings: successWarnings({
+                    step,
+                    baseWarnings: snapshotResult.warnings,
+                  }),
+                }
+              } else {
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: captured.error.reason,
+                  verdict: failureVerdict(captured.error),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: captured.retry.retryCount,
+                  retryReasons: captured.retry.retryReasons,
+                  artifacts: [],
+                  warnings: failureWarnings({
+                    error: captured.error,
+                    continued: continueOnError,
+                  }),
+                }
+              }
+            } else if (step.kind === "screenshot") {
+              const labelStem = sanitizeFileComponent(step.label ?? null, "screenshot")
+              const fileStem = `${timestampForFile()}-${labelStem}`
+              const captured = yield* attemptWithRetry({
+                policy: step.retryPolicy ?? defaultReadOnlyRetryPolicy,
+                run: () => captureScreenshotArtifact({
+                  sessionId,
+                  record,
+                  fileStem,
+                  artifactKey: `screenshot-${fileStem}`,
+                  artifactLabel: step.label ?? "screenshot",
+                  summary: `Screenshot captured for session ${sessionId}.`,
+                }),
+              })
+
+              if (captured.ok) {
+                updateHealthCheck(record, step.kind, true)
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: `Captured screenshot artifact ${captured.value.artifact.absolutePath}.`,
+                  verdict: "passed",
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: captured.retry.retryCount,
+                  retryReasons: captured.retry.retryReasons,
+                  artifacts: [],
+                  warnings: successWarnings({
+                    step,
+                    baseWarnings: [],
+                  }),
+                }
+              } else {
+                updateHealthCheck(record, step.kind, false)
+                yield* persistRecordHealth(sessionId, record)
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: captured.error.reason,
+                  verdict: failureVerdict(captured.error),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: captured.retry.retryCount,
+                  retryReasons: captured.retry.retryReasons,
+                  artifacts: [],
+                  warnings: failureWarnings({
+                    error: captured.error,
+                    continued: continueOnError,
+                  }),
+                }
+              }
+            } else if (step.kind === "video") {
+              const durationMs = normalizeVideoDurationMs(step.durationMs)
+              const fileStem = `${timestampForFile()}-video`
+              const captured = yield* Effect.either(captureVideoArtifact({
+                sessionId,
+                record,
+                durationMs,
+                fileStem,
+                artifactKey: `video-${fileStem}`,
+                artifactLabel: "video",
+              }))
+
+              if (captured._tag === "Right") {
+                updateHealthCheck(record, step.kind, true)
+                const modeSummary = describeVideoArtifactLabel(captured.right.mode)
+                const clampNote = durationMs !== step.durationMs
+                  ? ` Requested duration ${step.durationMs}ms was clamped to ${durationMs}ms.`
+                  : ""
+
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: `Captured ${modeSummary} at ${captured.right.artifact.absolutePath}.${clampNote}`,
+                  verdict: "passed",
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: 0,
+                  retryReasons: [],
+                  artifacts: [],
+                  warnings: successWarnings({
+                    step,
+                    baseWarnings: [],
+                  }),
+                }
+              } else {
+                updateHealthCheck(record, step.kind, false)
+                yield* persistRecordHealth(sessionId, record)
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: captured.left.reason,
+                  verdict: failureVerdict(captured.left),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: 0,
+                  retryReasons: [],
+                  artifacts: [],
+                  warnings: failureWarnings({
+                    error: captured.left,
+                    continued: continueOnError,
+                  }),
+                }
+              }
+            } else if (step.kind === "logMark") {
+              const marked = yield* Effect.either(registry.markLog({
+                sessionId,
+                label: step.label,
+              }))
+
+              if (marked._tag === "Right") {
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: marked.right.summary,
+                  verdict: "passed",
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: 0,
+                  retryReasons: [],
+                  artifacts: [],
+                  warnings: successWarnings({
+                    step,
+                    baseWarnings: [],
+                  }),
+                }
+              } else {
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: errorSummary(marked.left),
+                  verdict: failureVerdict(marked.left),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: 0,
+                  retryReasons: [],
+                  artifacts: [],
+                  warnings: failureWarnings({
+                    error: marked.left,
+                    continued: continueOnError,
+                  }),
+                }
+              }
+            } else if (step.kind === "sleep") {
+              yield* Effect.sleep(step.durationMs)
+              stepResult = {
+                index: stepIndex + 1,
+                kind: step.kind,
+                summary: `Slept for ${step.durationMs}ms.`,
+                verdict: "passed",
+                matchedRef: null,
+                latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                retryCount: 0,
+                retryReasons: [],
+                artifacts: [],
+                warnings: [],
+              }
+            } else {
+              const actionEffect = yield* Effect.either(executeSessionAction({
+                sessionId,
+                action: flowStepToSessionAction(step),
+                recordAction: false,
+              }))
+
+              if (actionEffect._tag === "Left") {
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: errorSummary(actionEffect.left),
+                  verdict: failureVerdict(actionEffect.left),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: 0,
+                  retryReasons: [],
+                  artifacts: [],
+                  warnings: failureWarnings({
+                    error: actionEffect.left,
+                    continued: continueOnError,
+                  }),
+                }
+              } else if (!actionEffect.right.ok) {
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: actionEffect.right.error.reason,
+                  verdict: failureVerdict(actionEffect.right.error),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: actionEffect.right.retry.retryCount,
+                  retryReasons: actionEffect.right.retry.retryReasons,
+                  artifacts: [],
+                  warnings: failureWarnings({
+                    error: actionEffect.right.error,
+                    continued: continueOnError,
+                  }),
+                }
+              } else {
+                const actionResult = actionEffect.right.result
+                stepResult = {
+                  index: stepIndex + 1,
+                  kind: step.kind,
+                  summary: actionResult.summary,
+                  verdict: actionResult.verdict ?? "passed",
+                  matchedRef: actionResult.matchedRef,
+                  latestSnapshotId: actionResult.latestSnapshotId,
+                  retryCount: actionResult.retryCount,
+                  retryReasons: actionResult.retryReasons,
+                  artifacts: [],
+                  warnings: successWarnings({
+                    step,
+                    baseWarnings: [],
+                    resolvedBy: actionResult.resolvedBy,
+                  }),
+                }
+              }
+            }
+
+            yield* refreshSessionArtifacts(sessionId, record)
+
+            const artifacts = diffArtifacts(beforeArtifacts, record.health.artifacts)
+            stepResult = {
+              ...stepResult,
+              artifacts,
+            }
+
+            executedSteps.push(stepResult)
+            createdArtifacts.push(...artifacts)
+            totalRetries += stepResult.retryCount
+
+            if (stepResult.verdict !== "passed") {
+              overallVerdict = mergeVerdict(overallVerdict, stepResult.verdict)
+              failedStep = toFailedStep(stepResult)
+
+              if (!continueOnError) {
+                stoppedEarly = true
+                break
+              }
+            }
+          }
+
+          const dedupedArtifacts = createdArtifacts.filter((artifact, index, all) =>
+            all.findIndex((candidate) => candidate.key === artifact.key) === index,
+          )
+          const overallWarnings = dedupeStrings(executedSteps.flatMap((step) => step.warnings))
+          const failedStepCount = executedSteps.filter((step) => step.verdict !== "passed").length
+          const summary = failedStep === null
+            ? `Executed ${executedSteps.length} flow step(s) successfully with ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
+            : stoppedEarly
+              ? `Flow ${overallVerdict === "timed-out" ? "timed out" : "failed"} at step ${failedStep.index} after ${executedSteps.length} executed step(s) and ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
+              : `Executed ${executedSteps.length} flow step(s) with ${failedStepCount} failed step(s), continuing past failures where continueOnError was enabled.`
+
+          return {
+            contract: "probe.session-flow/report-v1",
+            executedAt: nowIso(),
+            sessionId,
             summary,
-            action: action.kind,
-            matchedRef: resolvedTarget.ref,
-            resolvedBy: resolvedTarget.resolvedBy,
-            statusLabel: postSnapshot.artifact.statusLabel,
-            latestSnapshotId: postSnapshot.artifact.snapshotId,
-            artifact: null,
-            recordingLength: record.recording.steps.length,
-          } satisfies SessionActionResult
+            verdict: overallVerdict,
+            executedSteps,
+            failedStep,
+            retries: totalRetries,
+            artifacts: dedupedArtifacts,
+            finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+            warnings: overallWarnings,
+          } satisfies FlowResult
         }),
       exportRecording: ({ sessionId, label }) =>
         Effect.gen(function* () {
@@ -3878,9 +5332,13 @@ export const SessionRegistryLive = Layer.scoped(
             let attempt = 0
             let succeeded = false
             let lastFailure = "unknown replay failure"
+            let lastResolvedBy: ReplayStepReport["resolvedBy"] = "none"
+            let lastMatchedRef: string | null = null
 
             while (attempt < defaultReplayAttemptLimit && !succeeded) {
               attempt += 1
+              lastResolvedBy = "none"
+              lastMatchedRef = null
 
               if (step.kind === "screenshot") {
                 const fileStem = `step-${String(index + 1).padStart(3, "0")}-screenshot`
@@ -3902,7 +5360,7 @@ export const SessionRegistryLive = Layer.scoped(
                   retriedStepCount += 1
                 }
 
-                reports.push({
+                reports.push(buildReplayStepReport({
                   index: index + 1,
                   kind: step.kind,
                   attempts: attempt,
@@ -3910,7 +5368,7 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: null,
                   artifact: capture.right.artifact,
                   summary: `Captured replay screenshot artifact ${capture.right.artifact.absolutePath}.`,
-                })
+                }))
                 succeeded = true
                 continue
               }
@@ -3941,7 +5399,7 @@ export const SessionRegistryLive = Layer.scoped(
                   ? ` Requested duration ${step.durationMs}ms was clamped to ${durationMs}ms.`
                   : ""
 
-                reports.push({
+                reports.push(buildReplayStepReport({
                   index: index + 1,
                   kind: step.kind,
                   attempts: attempt,
@@ -3949,17 +5407,32 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: null,
                   artifact: capture.right.artifact,
                   summary: `Captured replay ${modeSummary} artifact ${capture.right.artifact.absolutePath}.${clampNote}`,
-                })
+                }))
                 succeeded = true
                 continue
               }
 
-              const preSnapshot = yield* captureSnapshotArtifactInternal(sessionId, record)
-              finalSnapshotId = preSnapshot.artifact.snapshotId
-              const resolution = resolveRecordedActionTargetInSnapshot(preSnapshot.artifact, step.target)
+              if (step.kind === "wait") {
+                lastFailure = "Wait replay steps are not supported in replay yet. Re-run the wait before replay, or remove it from the recording."
+                continue
+              }
+
+              const recordedTarget = step.target
+
+              const preSnapshot = step.kind === "assert" || !(recordedTarget.preferredRef === null && recordedTarget.fallback?.kind === "point")
+                ? yield* captureSnapshotArtifactInternal(sessionId, record)
+                : null
+
+              if (preSnapshot !== null) {
+                finalSnapshotId = preSnapshot.artifact.snapshotId
+              }
+
+              const resolution = resolveRecordedActionTargetInSnapshot(preSnapshot?.artifact ?? null, recordedTarget)
 
               if (step.kind === "assert") {
                 const evaluation = evaluateAssertion(resolution, step.expectation)
+                lastResolvedBy = evaluation.resolvedBy
+                lastMatchedRef = evaluation.matchedRef
 
                 if (!evaluation.ok) {
                   lastFailure = evaluation.summary
@@ -3970,15 +5443,15 @@ export const SessionRegistryLive = Layer.scoped(
                   retriedStepCount += 1
                 }
 
-                if (evaluation.resolvedBy === "semantic" && step.target.preferredRef !== null) {
+                if (evaluation.resolvedBy === "semantic" && recordedTarget.preferredRef !== null) {
                   semanticFallbackCount += 1
                 }
 
-                const summary = evaluation.resolvedBy === "semantic" && step.target.preferredRef !== null && resolution.target !== null
+                const summary = evaluation.resolvedBy === "semantic" && recordedTarget.preferredRef !== null && resolution.target?.kind === "snapshot"
                   ? `Assertion passed for ${describeSnapshotNode(resolution.target.node)} (${resolution.target.ref}) after semantic selector-drift recovery.`
                   : evaluation.summary
 
-                reports.push({
+                reports.push(buildReplayStepReport({
                   index: index + 1,
                   kind: step.kind,
                   attempts: attempt,
@@ -3986,8 +5459,13 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: evaluation.matchedRef,
                   artifact: null,
                   summary,
-                })
+                }))
                 succeeded = true
+                continue
+              }
+
+              if (!isRunnerUiRecordedSessionAction(step)) {
+                lastFailure = "Unsupported replay step kind."
                 continue
               }
 
@@ -3997,6 +5475,13 @@ export const SessionRegistryLive = Layer.scoped(
               }
 
               const resolvedTarget = resolution.target!
+              lastResolvedBy = resolvedTarget.resolvedBy
+              lastMatchedRef = resolvedTarget.kind === "snapshot" ? resolvedTarget.ref : null
+
+              if (resolvedTarget.kind === "absence") {
+                lastFailure = "Absence selectors can only be used with assert replay steps."
+                continue
+              }
 
               const response = yield* sendRunnerCommand(
                 sessionId,
@@ -4006,7 +5491,7 @@ export const SessionRegistryLive = Layer.scoped(
                   buildRunnerUiActionPayload(
                     step,
                     resolvedTarget,
-                    preSnapshot.artifact,
+                    preSnapshot?.artifact ?? null,
                   ),
                 ),
               )
@@ -4024,27 +5509,39 @@ export const SessionRegistryLive = Layer.scoped(
                 retriedStepCount += 1
               }
 
-              if (resolvedTarget.resolvedBy === "semantic" && step.target.preferredRef !== null) {
+              if (resolvedTarget.resolvedBy === "semantic" && recordedTarget.preferredRef !== null) {
                 semanticFallbackCount += 1
               }
 
-              const summary = resolvedTarget.resolvedBy === "semantic" && step.target.preferredRef !== null
-                ? `Executed ${step.kind} on ${describeRecordedActionTarget(step.target)} after semantic selector-drift recovery; captured ${postSnapshot.artifact.snapshotId}.`
-                : `Executed ${step.kind} on ${describeRecordedActionTarget(step.target)}; captured ${postSnapshot.artifact.snapshotId}.`
+              const summary = resolvedTarget.kind === "snapshot"
+                ? resolvedTarget.resolvedBy === "semantic" && recordedTarget.preferredRef !== null
+                  ? `Executed ${step.kind} on ${describeRecordedActionTarget(recordedTarget)} after semantic selector-drift recovery; captured ${postSnapshot.artifact.snapshotId}.`
+                  : `Executed ${step.kind} on ${describeRecordedActionTarget(recordedTarget)}; captured ${postSnapshot.artifact.snapshotId}.`
+                : `Executed ${step.kind} at point(${resolvedTarget.x}, ${resolvedTarget.y}) in interaction-root coordinates; captured ${postSnapshot.artifact.snapshotId}.`
 
-                reports.push({
+                reports.push(buildReplayStepReport({
                   index: index + 1,
                   kind: step.kind,
                   attempts: attempt,
                   resolvedBy: resolvedTarget.resolvedBy,
-                  matchedRef: resolvedTarget.ref,
+                  matchedRef: resolvedTarget.kind === "snapshot" ? resolvedTarget.ref : null,
                   artifact: null,
                   summary,
-                })
+                }))
                 succeeded = true
             }
 
             if (!succeeded) {
+              const failedStepReport = buildReplayStepReport({
+                index: index + 1,
+                kind: step.kind,
+                attempts: attempt,
+                resolvedBy: lastResolvedBy,
+                matchedRef: lastMatchedRef,
+                artifact: null,
+                summary: lastFailure,
+                exhausted: true,
+              })
               const warnings = buildReplayWarnings(semanticFallbackCount)
               const report: ReplayReport = {
                 contract: "probe.action-replay/report-v1",
@@ -4060,9 +5557,9 @@ export const SessionRegistryLive = Layer.scoped(
                   index: index + 1,
                   kind: step.kind,
                   attempts: attempt,
-                  reason: lastFailure,
+                  reason: failedStepReport.summary,
                 },
-                steps: reports,
+                steps: [...reports, failedStepReport],
               }
               const artifact = yield* writeReplayReportArtifact({
                 sessionId,
@@ -4144,14 +5641,20 @@ export const SessionRegistryLive = Layer.scoped(
 
           const labelStem = sanitizeFileComponent(label, "screenshot")
           const fileStem = `${timestampForFile()}-${labelStem}`
-          const capture = yield* Effect.either(captureScreenshotArtifact({
-            sessionId,
-            record,
-            fileStem,
-            artifactKey: `screenshot-${fileStem}`,
-            artifactLabel: label ?? "screenshot",
-            summary: `Screenshot captured for session ${sessionId}.`,
-          }))
+          const capture = yield* Effect.either(runWithRetry({
+            policy: defaultReadOnlyRetryPolicy,
+            run: () => captureScreenshotArtifact({
+              sessionId,
+              record,
+              fileStem,
+              artifactKey: `screenshot-${fileStem}`,
+              artifactLabel: label ?? "screenshot",
+              summary: `Screenshot captured for session ${sessionId}.`,
+            }),
+          }) as Effect.Effect<
+            { readonly value: { readonly artifact: ArtifactRecord; readonly statusLabel: string | null }; readonly retry: RetryAttemptMetadata },
+            UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+          >)
 
           if (capture._tag === "Left") {
             updateHealthCheck(record, "screenshot", false)
@@ -4168,10 +5671,12 @@ export const SessionRegistryLive = Layer.scoped(
           return {
             kind: "summary+artifact",
             summary: inlineBinary
-              ? `Screenshot captured inline at ${capture.right.artifact.absolutePath}.`
+              ? `Screenshot captured inline at ${capture.right.value.artifact.absolutePath}.`
               : `Screenshot captured and returned as an artifact because ${describeScreenshotOffloadReason(outputMode)}.`,
-            artifact: capture.right.artifact,
-          } satisfies SummaryArtifactResult
+            artifact: capture.right.value.artifact,
+            retryCount: capture.right.retry.retryCount,
+            retryReasons: capture.right.retry.retryReasons,
+          } satisfies SessionScreenshotResult
         }),
       recordVideo: ({ sessionId, duration }) =>
         Effect.gen(function* () {
@@ -4413,5 +5918,7 @@ export const SessionRegistryLive = Layer.scoped(
           } satisfies DebugCommandResult
         }),
     })
+
+    return registry
   }),
 )

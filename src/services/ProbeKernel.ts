@@ -1,13 +1,14 @@
 import { spawn } from "node:child_process"
-import { mkdtemp, readFile, rm, unlink } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename } from "node:path"
+import { basename, join } from "node:path"
 import { Context, Effect, Either, Layer } from "effect"
 import { CapabilityReport } from "../domain/capabilities"
 import { DiagnosticReport, KnownWall } from "../domain/diagnostics"
 import {
   ArtifactNotFoundError,
   ChildProcessError,
+  DeviceInterruptionError,
   EnvironmentError,
   SessionConflictError,
   SessionNotFoundError,
@@ -15,33 +16,49 @@ import {
   UserInputError,
 } from "../domain/errors"
 import { perfTemplateChoiceText } from "../domain/perf"
-import type { DrillQuery } from "../domain/output"
-import { isTextArtifactKind, summarizeContent } from "../domain/output"
+import type { ArtifactRecord, DrillQuery, SessionLogMarker } from "../domain/output"
+import { appendSessionLogMarkers, isTextArtifactKind, summarizeContent } from "../domain/output"
 import type { WorkspaceStatus } from "../domain/workspace"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
 import { SessionRegistry } from "./SessionRegistry"
 import { SimulatorHarness } from "./SimulatorHarness"
+import {
+  inspectXcresultAttachments,
+  inspectXcresultSummary,
+  renderXcresultDrill,
+} from "./XcresultIntrospection"
 import { serveRpc } from "../rpc/server"
 import {
   SessionActionResponse,
   ArtifactDrillResponse,
   DaemonPingResponse,
+  PerfAroundResponse,
   PerfRecordResponse,
+  PerfSummarizeResponse,
   PROBE_PROTOCOL_VERSION,
   type RpcProgressEvent,
   type RpcRequest,
   type RpcResponse,
   SessionCloseResponse,
   SessionDebugResponse,
+  SessionDiagnosticCaptureResponse,
   SessionHealthResponse,
+  SessionListResponse,
+  SessionLogsCaptureResponse,
+  SessionLogsDoctorResponse,
+  SessionLogsMarkResponse,
   SessionLogsResponse,
   SessionOpenResponse,
   SessionRecordingExportResponse,
   SessionReplayResponse,
+  SessionResultAttachmentsResponse,
+  SessionResultSummaryResponse,
+  SessionRunResponse,
   SessionSnapshotResponse,
   SessionScreenshotResponse,
+  SessionShowResponse,
   SessionVideoResponse,
 } from "../rpc/protocol"
 
@@ -129,7 +146,7 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
     area: "runner",
     status: "degraded",
     summary:
-      "Runner control is real and uses an honest XCUITest transport seam: simulator sessions stay on file-mailbox + stdout mixed-log egress, while real-device sessions use HTTP POST + stdout-ready observation.",
+      "Runner control is real and uses an honest XCUITest transport seam: simulator and real-device sessions both use HTTP POST command ingress, while stdout remains the ready/diagnostic observation seam.",
     details: [],
   },
   {
@@ -173,7 +190,7 @@ const workspaceKnownWalls: ReadonlyArray<KnownWall> = [
   },
   {
     key: "runner-transport",
-    summary: "The runner still relies on validated bootstrap-manifest seams: simulator sessions use file-mailbox ingress plus stdout mixed-log egress, while real-device sessions use HTTP POST ingress plus stdout mixed-log readiness.",
+    summary: "The runner still relies on validated bootstrap-manifest seams: simulator and real-device sessions use HTTP POST ingress, while stdout mixed-log output remains the ready/diagnostic observation path.",
     details: [
       "xcodebuild stdin is not treated as a supported host-to-runner transport in this slice.",
       "Daemon restarts and runner transport loss fail closed instead of pretending the live bridge was recovered.",
@@ -311,6 +328,7 @@ export class ProbeKernel extends Context.Tag("@probe/ProbeKernel")<
       emit: (event: RpcProgressEvent) => void,
     ) => Effect.Effect<
       RpcResponse,
+      | DeviceInterruptionError
       | EnvironmentError
       | UserInputError
       | UnsupportedCapabilityError
@@ -332,7 +350,183 @@ export const ProbeKernelLive = Layer.effect(
     const simulatorHarness = yield* SimulatorHarness
     const daemonStartedAt = nowIso()
 
-    const renderDrill = (artifactAbsolutePath: string, query: DrillQuery) =>
+    const isRecord = (value: unknown): value is Record<string, unknown> =>
+      typeof value === "object" && value !== null
+
+    const readRecordString = (record: Record<string, unknown>, key: string): string | null =>
+      typeof record[key] === "string" ? (record[key] as string) : null
+
+    const isSessionLogMarkerRecord = (value: unknown): value is SessionLogMarker =>
+      isRecord(value)
+      && typeof value.timestamp === "string"
+      && typeof value.label === "string"
+      && typeof value.sessionId === "string"
+
+    const readSessionLogMarkers = (artifactRoot: string): Effect.Effect<ReadonlyArray<SessionLogMarker>> =>
+      Effect.tryPromise({
+        try: async () => {
+          const marksDirectory = join(artifactRoot, "logs", "marks")
+
+          let entries: Array<string>
+
+          try {
+            entries = await readdir(marksDirectory)
+          } catch (error) {
+            if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+              return []
+            }
+
+            throw error
+          }
+
+          const markers: Array<SessionLogMarker> = []
+
+          for (const entry of entries.filter((candidate) => candidate.endsWith(".json")).sort()) {
+            try {
+              const raw = await readFile(join(marksDirectory, entry), "utf8")
+              const parsed = JSON.parse(raw) as unknown
+
+              if (isSessionLogMarkerRecord(parsed)) {
+                markers.push(parsed)
+              }
+            } catch {
+              continue
+            }
+          }
+
+          return markers.sort((left, right) => left.timestamp.localeCompare(right.timestamp))
+        },
+        catch: (error) =>
+          new EnvironmentError({
+            code: "artifact-drill-log-marks",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the session log marks directory and retry the drill request.",
+            details: [],
+          }),
+      }).pipe(Effect.catchAll(() => Effect.succeed([])))
+
+    const maybeAppendSessionLogMarkersToDrill = (args: {
+      readonly sessionId: string
+      readonly artifact: ArtifactRecord
+      readonly query: DrillQuery
+      readonly rendered: {
+        readonly format: "json" | "text"
+        readonly content: string
+        readonly summary: string
+      }
+    }) =>
+      Effect.gen(function* () {
+        if (args.query.kind !== "text") {
+          return args.rendered
+        }
+
+        const manifest = yield* artifactStore.readSessionManifest(args.sessionId).pipe(Effect.orElseSucceed(() => null))
+
+        if (!isRecord(manifest)) {
+          return args.rendered
+        }
+
+        const artifactRoot = readRecordString(manifest, "artifactRoot")
+
+        if (artifactRoot === null) {
+          return args.rendered
+        }
+
+        const logsRoot = join(artifactRoot, "logs")
+        const isLogArtifact = args.artifact.key === "stdout-events"
+          || (
+            args.artifact.absolutePath.startsWith(logsRoot)
+            && !args.artifact.absolutePath.startsWith(join(logsRoot, "marks"))
+          )
+
+        if (!isLogArtifact) {
+          return args.rendered
+        }
+
+        const markers = yield* readSessionLogMarkers(artifactRoot)
+
+        if (markers.length === 0) {
+          return args.rendered
+        }
+
+        return {
+          ...args.rendered,
+          content: appendSessionLogMarkers(args.rendered.content, markers),
+          summary: `${args.rendered.summary}; included ${markers.length} log marker${markers.length === 1 ? "" : "s"}.`,
+        }
+      })
+
+    const requireSessionResultBundleArtifact = Effect.fn("ProbeKernel.requireSessionResultBundleArtifact")(function* (sessionId: string) {
+      const health = yield* sessionRegistry.getSessionHealth(sessionId)
+      const artifact = health.artifacts.find((candidate) => candidate.key === "result-bundle")
+        ?? health.artifacts.find((candidate) =>
+          candidate.kind === "directory"
+          && candidate.absolutePath === health.runner.resultBundlePath)
+        ?? health.artifacts.find((candidate) =>
+          candidate.kind === "directory"
+          && candidate.absolutePath.endsWith(".xcresult"))
+
+      if (!artifact) {
+        return yield* new UserInputError({
+          code: "session-result-bundle-missing",
+          reason: `Session ${health.sessionId} does not expose a registered xcresult result bundle artifact.`,
+          nextStep: health.runner.resultBundlePath
+            ? `Inspect ${health.runner.resultBundlePath} directly, or reopen the session so Probe can register the result bundle artifact and retry.`
+            : "Open a runner-backed session that produces a result bundle, then retry the result command.",
+          details: [],
+        })
+      }
+
+      return { health, artifact }
+    })
+
+    const inspectSessionResultReport = <T>(args: {
+      readonly sessionId: string
+      readonly label: string
+      readonly inspect: (bundlePath: string, sessionArtifacts: ReadonlyArray<ArtifactRecord>) => Promise<{
+        readonly report: T
+        readonly summary: string
+      }>
+    }): Effect.Effect<
+      { readonly summary: string; readonly artifact: ArtifactRecord; readonly report: T },
+      UserInputError | SessionNotFoundError | EnvironmentError | ChildProcessError
+    > =>
+      Effect.gen(function* () {
+        const { health, artifact } = yield* requireSessionResultBundleArtifact(args.sessionId)
+        const inspected = yield* Effect.tryPromise({
+          try: () => args.inspect(artifact.absolutePath, health.artifacts),
+          catch: (error) =>
+            error instanceof UserInputError || error instanceof EnvironmentError || error instanceof ChildProcessError
+              ? error
+              : new EnvironmentError({
+                  code: "session-result-render",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: "Inspect the xcresult bundle and retry the session result command.",
+                  details: [],
+                }),
+        })
+        const reportArtifact = yield* artifactStore.writeDerivedOutput({
+          sessionId: args.sessionId,
+          label: args.label,
+          format: "json",
+          content: `${JSON.stringify(inspected.report, null, 2)}\n`,
+          summary: inspected.summary,
+        })
+
+        return {
+          summary: inspected.summary,
+          artifact: reportArtifact,
+          report: inspected.report,
+        }
+      })
+
+    const renderDrill = (
+      artifactAbsolutePath: string,
+      query: DrillQuery,
+    ): Effect.Effect<
+      { readonly format: "json" | "text"; readonly content: string; readonly summary: string },
+      UserInputError | EnvironmentError
+    > =>
       Effect.tryPromise({
         try: async () => {
           const raw = await readFile(artifactAbsolutePath, "utf8")
@@ -373,6 +567,17 @@ export const ProbeKernelLive = Layer.effect(
                 summary: `XPath ${query.xpath} from ${basename(artifactAbsolutePath)}`,
               }
             }
+
+            case "xcresult":
+              throw new UserInputError({
+                code: "artifact-drill-query-kind",
+                reason: "xcresult drill queries are not supported for text, json, xml, or ndjson artifacts.",
+                nextStep: "Target a concrete xcresult-aware surface, or use text/json/xml drill options against a file artifact.",
+                details: [],
+              })
+
+            default:
+              return query satisfies never
           }
         },
         catch: (error) =>
@@ -806,6 +1011,30 @@ export const ProbeKernelLive = Layer.effect(
             } satisfies DaemonPingResponse
           }
 
+          case "session.list": {
+            progress("session.list", "Listing active sessions.")
+            const result = yield* sessionRegistry.listActiveSessions()
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionListResponse
+          }
+
+          case "session.show": {
+            progress("session.show", `Loading session ${request.params.sessionId}.`)
+            const result = yield* sessionRegistry.getSessionHealth(request.params.sessionId)
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionShowResponse
+          }
+
           case "session.open": {
             progress(
               "session.open",
@@ -871,6 +1100,67 @@ export const ProbeKernelLive = Layer.effect(
             } satisfies SessionLogsResponse
           }
 
+          case "session.logs.mark": {
+            progress("session.logs.mark", `Recording log marker '${request.params.label}' for session ${request.params.sessionId}.`)
+            const result = yield* sessionRegistry.markLog({
+              sessionId: request.params.sessionId,
+              label: request.params.label,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionLogsMarkResponse
+          }
+
+          case "session.logs.capture": {
+            progress(
+              "session.logs.capture",
+              `Capturing a ${request.params.captureSeconds}s log window for session ${request.params.sessionId}.`,
+            )
+            const result = yield* sessionRegistry.captureLogWindow({
+              sessionId: request.params.sessionId,
+              captureSeconds: request.params.captureSeconds,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionLogsCaptureResponse
+          }
+
+          case "session.logs.doctor": {
+            progress("session.logs.doctor", `Inspecting available log sources for session ${request.params.sessionId}.`)
+            const result = yield* sessionRegistry.getLogDoctorReport(request.params.sessionId)
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionLogsDoctorResponse
+          }
+
+          case "session.diagnostic.capture": {
+            progress("session.diagnostic.capture", `Capturing a diagnostic bundle for session ${request.params.sessionId}.`)
+            const result = yield* sessionRegistry.captureDiagnosticBundle({
+              sessionId: request.params.sessionId,
+              target: request.params.target,
+              kind: request.params.kind,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionDiagnosticCaptureResponse
+          }
+
           case "session.debug": {
             progress(
               "session.debug",
@@ -903,6 +1193,21 @@ export const ProbeKernelLive = Layer.effect(
               method: request.method,
               result,
             } satisfies SessionSnapshotResponse
+          }
+
+          case "session.run": {
+            progress("session.run", `Executing ${request.params.flow.steps.length} flow steps for session ${request.params.sessionId}.`)
+            const result = yield* sessionRegistry.runFlow({
+              sessionId: request.params.sessionId,
+              flow: request.params.flow,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionRunResponse
           }
 
           case "session.action": {
@@ -948,6 +1253,49 @@ export const ProbeKernelLive = Layer.effect(
               method: request.method,
               result,
             } satisfies SessionReplayResponse
+          }
+
+          case "session.result.summary": {
+            progress("session.result.summary", `Inspecting xcresult summary for session ${request.params.sessionId}.`)
+            const result = yield* inspectSessionResultReport({
+              sessionId: request.params.sessionId,
+              label: "result-summary",
+              inspect: (bundlePath, sessionArtifacts) =>
+                inspectXcresultSummary({
+                  bundlePath,
+                  sessionArtifacts,
+                  runCommand: runHostCommand,
+                }),
+            })
+
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionResultSummaryResponse
+          }
+
+          case "session.result.attachments": {
+            progress("session.result.attachments", `Inspecting xcresult attachments for session ${request.params.sessionId}.`)
+            const result = yield* inspectSessionResultReport({
+              sessionId: request.params.sessionId,
+              label: "result-attachments",
+              inspect: (bundlePath) =>
+                inspectXcresultAttachments({
+                  bundlePath,
+                  runCommand: runHostCommand,
+                }),
+            })
+
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies SessionResultAttachmentsResponse
           }
 
           case "session.screenshot": {
@@ -1013,12 +1361,155 @@ export const ProbeKernelLive = Layer.effect(
             } satisfies PerfRecordResponse
           }
 
+          case "perf.around": {
+            progress(
+              "perf.around",
+              `Recording ${request.params.template} around ${request.params.flow.steps.length} flow step(s) for session ${request.params.sessionId}.`,
+            )
+            const result = yield* perfService.recordAroundFlow({
+              sessionId: request.params.sessionId,
+              template: request.params.template,
+              flow: request.params.flow,
+              emitProgress: progress,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies PerfAroundResponse
+          }
+
+          case "perf.summarize": {
+            progress(
+              "perf.summarize",
+              `Summarizing artifact ${request.params.artifactKey} by ${request.params.groupBy} for session ${request.params.sessionId}.`,
+            )
+
+            if (request.params.groupBy !== "signpost") {
+              return yield* new UserInputError({
+                code: "perf-summarize-group-by",
+                reason: `Unsupported perf summarize group-by ${request.params.groupBy}.`,
+                nextStep: "Use --group-by signpost and retry the perf summarize command.",
+                details: [],
+              })
+            }
+
+            const result = yield* perfService.summarizeBySignpost({
+              sessionId: request.params.sessionId,
+              artifactKey: request.params.artifactKey,
+              emitProgress: progress,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies PerfSummarizeResponse
+          }
+
           case "artifact.drill": {
             progress("artifact.drill", `Drilling artifact ${request.params.artifactKey}.`)
             const artifact = yield* artifactStore.getArtifact(
               request.params.sessionId,
               request.params.artifactKey,
             )
+
+            if (request.params.query.kind === "xcresult") {
+              const xcresultQuery = request.params.query
+
+              if (artifact.kind !== "directory" || !artifact.absolutePath.endsWith(".xcresult")) {
+                return yield* new UnsupportedCapabilityError({
+                  code: "xcresult-drill-unsupported",
+                  capability: "artifact.drill.xcresult",
+                  reason: `Artifact ${artifact.key} is not an xcresult bundle, so --xcresult drill views cannot be applied.`,
+                  nextStep: "Choose the result-bundle artifact for the session and retry the xcresult drill request.",
+                  details: [],
+                  wall: false,
+                })
+              }
+
+              const sessionArtifacts = yield* artifactStore.listArtifacts(request.params.sessionId)
+              const rendered = yield* Effect.tryPromise({
+                try: () => renderXcresultDrill({
+                  bundlePath: artifact.absolutePath,
+                  query: xcresultQuery,
+                  sessionArtifacts,
+                  runCommand: runHostCommand,
+                }),
+                catch: (error) =>
+                  error instanceof UserInputError || error instanceof EnvironmentError || error instanceof ChildProcessError
+                    ? error
+                    : new EnvironmentError({
+                        code: "xcresult-drill-render",
+                        reason: error instanceof Error ? error.message : String(error),
+                        nextStep: "Inspect the xcresult bundle and retry the drill request.",
+                        details: [],
+                      }),
+              })
+
+              if (rendered.kind === "artifact-file") {
+                const derived = yield* artifactStore.writeDerivedFile({
+                  sessionId: request.params.sessionId,
+                  label: rendered.label,
+                  kind: rendered.artifactKind,
+                  sourceAbsolutePath: rendered.sourceAbsolutePath,
+                  sourceFileName: rendered.sourceFileName,
+                  summary: rendered.summary,
+                })
+
+                return {
+                  kind: "response",
+                  protocolVersion: PROBE_PROTOCOL_VERSION,
+                  requestId: request.requestId,
+                  method: request.method,
+                  result: {
+                    kind: "summary+artifact",
+                    format: "text",
+                    summary: rendered.summary,
+                    artifact: derived,
+                  },
+                } satisfies ArtifactDrillResponse
+              }
+
+              if (outputPolicy.shouldInline(request.params.outputMode, rendered.content)) {
+                return {
+                  kind: "response",
+                  protocolVersion: PROBE_PROTOCOL_VERSION,
+                  requestId: request.requestId,
+                  method: request.method,
+                  result: {
+                    kind: "inline",
+                    format: rendered.format,
+                    summary: rendered.summary,
+                    content: rendered.content,
+                  },
+                } satisfies ArtifactDrillResponse
+              }
+
+              const derived = yield* artifactStore.writeDerivedOutput({
+                sessionId: request.params.sessionId,
+                label: `drill-${artifact.key}`,
+                format: rendered.format,
+                content: rendered.content,
+                summary: `${rendered.summary} (${summarizeContent(rendered.content)})`,
+              })
+
+              return {
+                kind: "response",
+                protocolVersion: PROBE_PROTOCOL_VERSION,
+                requestId: request.requestId,
+                method: request.method,
+                result: {
+                  kind: "summary+artifact",
+                  format: rendered.format,
+                  summary: `${rendered.summary}; offloaded because ${summarizeContent(rendered.content)} exceeds inline policy.`,
+                  artifact: derived,
+                },
+              } satisfies ArtifactDrillResponse
+            }
 
             if (artifact.kind === "directory") {
               return yield* new UnsupportedCapabilityError({
@@ -1033,19 +1524,29 @@ export const ProbeKernelLive = Layer.effect(
             }
 
             if (!isTextArtifactKind(artifact.kind)) {
-              return yield* new UnsupportedCapabilityError({
-                code: "artifact-drill-binary",
-                capability: "artifact.drill.binary",
-                reason: `Artifact ${artifact.key} has kind ${artifact.kind} and cannot be drilled as text, JSON, or XML.`,
-                nextStep: "Use the artifact path directly, or add a binary-aware drill surface for this artifact kind.",
-                details: [],
-                wall: false,
-              })
+              return {
+                kind: "response",
+                protocolVersion: PROBE_PROTOCOL_VERSION,
+                requestId: request.requestId,
+                method: request.method,
+                result: {
+                  kind: "summary+artifact",
+                  format: "text",
+                  summary: `Artifact ${artifact.key} is binary kind ${artifact.kind}; returning the registered artifact path directly.`,
+                  artifact,
+                },
+              } satisfies ArtifactDrillResponse
             }
 
             const rendered = yield* renderDrill(artifact.absolutePath, request.params.query)
+            const decorated = yield* maybeAppendSessionLogMarkersToDrill({
+              sessionId: request.params.sessionId,
+              artifact,
+              query: request.params.query,
+              rendered,
+            })
 
-            if (outputPolicy.shouldInline(request.params.outputMode, rendered.content)) {
+            if (outputPolicy.shouldInline(request.params.outputMode, decorated.content)) {
               return {
                 kind: "response",
                 protocolVersion: PROBE_PROTOCOL_VERSION,
@@ -1053,9 +1554,9 @@ export const ProbeKernelLive = Layer.effect(
                 method: request.method,
                 result: {
                   kind: "inline",
-                  format: rendered.format,
-                  summary: rendered.summary,
-                  content: rendered.content,
+                  format: decorated.format,
+                  summary: decorated.summary,
+                  content: decorated.content,
                 },
               } satisfies ArtifactDrillResponse
             }
@@ -1063,9 +1564,9 @@ export const ProbeKernelLive = Layer.effect(
             const derived = yield* artifactStore.writeDerivedOutput({
               sessionId: request.params.sessionId,
               label: `drill-${artifact.key}`,
-              format: rendered.format,
-              content: rendered.content,
-              summary: `${rendered.summary} (${summarizeContent(rendered.content)})`,
+              format: decorated.format,
+              content: decorated.content,
+              summary: `${decorated.summary} (${summarizeContent(decorated.content)})`,
             })
 
             return {
@@ -1075,8 +1576,8 @@ export const ProbeKernelLive = Layer.effect(
               method: request.method,
               result: {
                 kind: "summary+artifact",
-                format: rendered.format,
-                summary: `${rendered.summary}; offloaded because ${summarizeContent(rendered.content)} exceeds inline policy.`,
+                format: decorated.format,
+                summary: `${decorated.summary}; offloaded because ${summarizeContent(decorated.content)} exceeds inline policy.`,
                 artifact: derived,
               },
             } satisfies ArtifactDrillResponse
@@ -1107,16 +1608,21 @@ export const ProbeKernelLive = Layer.effect(
             outputThreshold: outputPolicy.getDefaultInlineThreshold(),
             commands: [
               "doctor",
+              "doctor accessibility --session-id <id> [--json]",
+              "doctor capture --target simulator|device --session-id <id> [--kind sysdiagnose] [--json]",
               "serve",
+              "validate accessibility --session-id <id> [--scope current-screen] [--json]",
               "session open [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--json]",
               "session health --session-id <id> [--json]",
               "session logs --session-id <id> [--source runner|build|wrapper|stdout|simulator] [--lines 80] [--match <text>] [--seconds 2] [--output auto|inline|artifact] [--json]",
               "session snapshot --session-id <id> [--output auto|inline|artifact] [--json]",
+              "session result summary --session-id <id> [--json]",
+              "session result attachments --session-id <id> [--json]",
               "session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--json]",
               "session video --session-id <id> --duration <duration> [--json]",
               "session close --session-id <id> [--json]",
               `perf record --session-id <id> --template ${perfTemplateChoiceText} [--time-limit <duration>] [--json]`,
-              "drill --session-id <id> --artifact <key> <query> [--json]",
+              "drill --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact] [--json]",
             ],
             daemon: {
               running: daemonRunning,
@@ -1131,7 +1637,7 @@ export const ProbeKernelLive = Layer.effect(
             knownWalls: [...workspaceKnownWalls],
             notes: [
               "The current control plane is daemon-backed and real for simulator sessions via either Probe's fixture build/install flow or attach-to-running against an installed app.",
-              "Runner command ingress still uses the validated file-backed mailbox because xcodebuild stdin is not proven at this boundary.",
+              "Runner command ingress now uses the validated HTTP POST listener seam because xcodebuild stdin is still not proven at this boundary.",
               "Session snapshots keep the full stable-ref tree artifact-backed and only inline interactive/collapsed previews that stay inside the compact snapshot budget.",
               "Session logs support bounded simulator capture plus tails from existing artifact-backed runner/build/wrapper outputs.",
               "Real-device sessions now open a live runner when CoreDevice/DDI/signing checks pass, but they still fail closed on missing setup or transport loss.",
