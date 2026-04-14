@@ -24,7 +24,7 @@ Last updated: 2026-04-14
 - Probe should model `simctl io screenshot` as a short-lived artifact command and `simctl io recordVideo` as a scoped session child with explicit start/stop control.
 - Probe should favor artifact-file outputs for screenshots and recordings, even though `screenshot -` can write to stdout, because the project's architecture is artifact-first and binary stdout payloads are a poor fit for token-efficient command replies.
 - If Probe needs to know that recording actually began before returning success, it should wait for the documented `Recording started` stderr message.
-- Probe should delivery-normalize simulator recordings before returning MP4 artifacts. Copy-remuxing the simulator QuickTime output preserves the raw high frame cadence and can produce visibly slow playback in consumers that cannot present the encoded frame rate.
+- Probe should delivery-normalize simulator recordings before returning MP4 artifacts, but it should normalize to the **captured simulator frame rate** rather than a hard-coded playback rate. Copy-remuxing the simulator QuickTime output preserves the raw high frame cadence and can produce visibly slow playback in consumers that cannot present the encoded frame rate; probing the source rate and re-encoding to that rate preserves fidelity without forcing an arbitrary cap.
 
 ### Connected-device limitations
 - Based on the sampled public sources, Probe should treat **connected-device live log streaming** as a capability that may require a GUI-side Apple tool rather than a stable public CLI surface.
