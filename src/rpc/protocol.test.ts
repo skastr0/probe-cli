@@ -233,6 +233,22 @@ describe("rpc protocol", () => {
     expect(request.method).toBe("perf.record")
   })
 
+  test("decodes a custom perf record request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-custom-perf",
+      method: "perf.record",
+      params: {
+        sessionId: "session-1",
+        customTemplatePath: "/tmp/GPU Counters.tracetemplate",
+        timeLimit: "3s",
+      },
+    })
+
+    expect(request.method).toBe("perf.record")
+  })
+
   test("decodes a perf around request", () => {
     const request = decodeRpcRequest({
       kind: "request",

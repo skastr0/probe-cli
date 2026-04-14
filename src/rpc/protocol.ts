@@ -327,7 +327,8 @@ export const PerfRecordRequest = Schema.Struct({
   method: Schema.Literal("perf.record"),
   params: Schema.Struct({
     sessionId: Schema.String,
-    template: PerfTemplate,
+    template: Schema.optional(PerfTemplate),
+    customTemplatePath: Schema.optional(Schema.String),
     timeLimit: Schema.String,
   }),
 })

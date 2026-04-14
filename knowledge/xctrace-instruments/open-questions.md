@@ -25,9 +25,12 @@ Updated: 2026-04-10
    - A later community forum reply suggests `tracks/track/details/detail` XPath shapes.
    - Probe still needs direct validation on current traces.
 
-5. **How should Probe provision or discover custom templates that require GUI preconfiguration?**
-   - Apple engineer guidance says `CPU Counters` requires preconfigured recording options and a saved custom template.
-   - The reviewed sources do not establish a Probe-friendly distribution story for those custom templates.
+5. ~~**How should Probe provision or discover custom templates that require GUI preconfiguration?**~~ **RESOLVED (2026-04-14)**
+   - `xctrace record --template` accepts filesystem paths directly — no template registration needed.
+   - User templates are `.tracetemplate` files at `~/Library/Application Support/Instruments/Templates/`.
+   - CPU Counters works without GUI preconfiguration in Guided mode. GUI setup only needed for specific counter selections.
+   - Probe exposes `--custom-template <path>` as a separate CLI flag. TOC-first discovery handles export schemas generically.
+   - Path collision between standard and user template names produces exit 30 — Probe uses path-based resolution exclusively.
 
 6. **Should Probe rely on import workflows as part of the first profiling slice?**
    - `xctrace import` exists now, and Xcode 26.4 adds `--append-run`.

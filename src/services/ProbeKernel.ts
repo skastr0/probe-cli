@@ -22,6 +22,7 @@ import type { WorkspaceStatus } from "../domain/workspace"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
+import { findProjectRoot } from "./ProjectRoot"
 import { SessionRegistry } from "./SessionRegistry"
 import { SimulatorHarness } from "./SimulatorHarness"
 import {
@@ -63,6 +64,7 @@ import {
 } from "../rpc/protocol"
 
 const nowIso = (): string => new Date().toISOString()
+const probeProjectRoot = findProjectRoot()
 
 interface HostCommandResult {
   readonly stdout: string
@@ -153,9 +155,11 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
     area: "perf",
     status: "degraded",
     summary:
-      "Time Profiler, System Trace, Metal System Trace, Hangs, and Swift Concurrency can record/export through the daemon, but Probe still keeps unsupported metric families as explicit walls.",
+      "Built-in perf templates plus user-saved custom .tracetemplate paths can record/export through the daemon, but Probe still keeps unsupported metric families as explicit walls.",
     details: [
       "Current summaries stay inside row-proven exports: time-sample, thread-state, cpu-state, metal-gpu-intervals, potential-hangs, and swift-task-state/task-lifetime.",
+      "Custom templates use --custom-template <path.tracetemplate> after you save a template from Instruments.app; Probe records the trace, TOC, and TOC-discovered schema exports, then expects follow-up drill inspection instead of built-in analysis.",
+      "CPU Counters guided mode works without GUI preconfiguration, but specific counter selections and GPU/other specialized counters still require Instruments.app template setup first.",
       "System Trace uses bounded recording/export budgets and will fail honest when XML size or row volume outruns the current supported summary.",
       "Network-on-Simulator, full reconstructed call stacks, and per-shader GPU attribution remain explicit walls.",
     ],
@@ -1046,14 +1050,14 @@ export const ProbeKernelLive = Layer.effect(
               ? sessionRegistry.openDeviceSession({
                   bundleId: request.params.bundleId,
                   deviceId: request.params.deviceId,
-                  rootDir: process.cwd(),
+                  projectRoot: probeProjectRoot,
                   emitProgress: progress,
                 })
               : sessionRegistry.openSimulatorSession({
                   bundleId: request.params.bundleId,
                   sessionMode: request.params.sessionMode ?? undefined,
                   simulatorUdid: request.params.simulatorUdid,
-                  rootDir: process.cwd(),
+                  projectRoot: probeProjectRoot,
                   emitProgress: progress,
                 }))
             return {
@@ -1342,13 +1346,15 @@ export const ProbeKernelLive = Layer.effect(
           }
 
           case "perf.record": {
+            const templateLabel = request.params.customTemplatePath ?? request.params.template ?? "custom template"
             progress(
               "perf.record",
-              `Recording ${request.params.template} for session ${request.params.sessionId}.`,
+              `Recording ${templateLabel} for session ${request.params.sessionId}.`,
             )
             const result = yield* perfService.record({
               sessionId: request.params.sessionId,
               template: request.params.template,
+              customTemplatePath: request.params.customTemplatePath,
               timeLimit: request.params.timeLimit,
               emitProgress: progress,
             })
@@ -1621,7 +1627,7 @@ export const ProbeKernelLive = Layer.effect(
               "session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--json]",
               "session video --session-id <id> --duration <duration> [--json]",
               "session close --session-id <id> [--json]",
-              `perf record --session-id <id> --template ${perfTemplateChoiceText} [--time-limit <duration>] [--json]`,
+              `perf record --session-id <id> (--template ${perfTemplateChoiceText} | --custom-template <path.tracetemplate>) [--time-limit <duration>] [--json]`,
               "drill --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact] [--json]",
             ],
             daemon: {
@@ -1643,7 +1649,9 @@ export const ProbeKernelLive = Layer.effect(
               "Real-device sessions now open a live runner when CoreDevice/DDI/signing checks pass, but they still fail closed on missing setup or transport loss.",
               "Session screenshots now use native simctl capture on Simulator and runner capture on device; simulator video uses native simctl capture while device video still uses the runner frame loop, with ffmpeg remux/stitching improving the emitted artifact format when available.",
               "On Simulator, omit --bundle-id to use Probe's fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app; on device, the app must already be installed so Probe can launch and attach to it.",
-              "Perf recording defaults to 60s for metal-system-trace and 3s for the other supported perf templates.",
+              "Perf recording defaults to 60s for metal-system-trace and 3s for the other built-in and custom perf templates.",
+              "Custom perf templates must be created and saved in Instruments.app before Probe can reuse them with --custom-template <path.tracetemplate>.",
+              "CPU Counters guided mode works without GUI preconfiguration, but specific counter selections and other GUI-authored templates still require Apple-side setup first.",
               ...(workspaceDiagnostics.startupRecovery?.summary ? [workspaceDiagnostics.startupRecovery.summary] : []),
             ],
           }

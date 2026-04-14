@@ -113,3 +113,24 @@ Legend:
   2. rows observed in the current workload / target mode
 
   because Simulator success alone does not mean a metric family is populated.
+
+### 5. Custom Instruments template workflow
+
+- **Observed:** `xctrace record --template` accepts both template names and filesystem paths. Source: `xcrun xctrace help record`.
+- **Observed:** User-created templates are stored as `.tracetemplate` files (NSKeyedArchiver binary plists) under `~/Library/Application Support/Instruments/Templates/`. Source: empirical verification on macOS.
+- **Observed:** `xctrace list templates` discovers user templates in a separate `== User Templates ==` section. Source: `xcrun xctrace list templates`.
+- **Observed:** Name collisions between standard and user templates produce exit code 30 ("Provided template parameter is ambiguous"). Source: empirical verification.
+- **Observed:** CPU Counters template works without GUI preconfiguration in Guided mode with "CPU Bottlenecks" defaults. Source: empirical recording on macOS.
+- **Inference:** Probe should use path-based resolution (`--custom-template /path/to/file.tracetemplate`) exclusively to avoid name collision errors.
+- **Inference:** TOC-first export discovery works generically for any template, including custom ones. No special schema handling needed.
+
+#### Path from Instruments.app to Probe recording
+
+1. Open Instruments.app
+2. Choose a template or configure custom recording options (e.g., GPU Counters with specific counters)
+3. File → Save As Template...
+4. Save to the default location (automatically goes to `~/Library/Application Support/Instruments/Templates/`)
+5. Note the `.tracetemplate` file path
+6. Use with Probe: `probe perf record --custom-template /path/to/MyTemplate.tracetemplate --session-id <id>`
+7. Probe records the trace, exports TOC and all discovered schemas, persists artifacts under the session root
+8. No built-in Probe analysis — use `probe drill` to inspect individual schema exports

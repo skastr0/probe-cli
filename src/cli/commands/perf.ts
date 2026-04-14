@@ -15,6 +15,9 @@ import {
 import { DaemonClient } from "../../services/DaemonClient"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
+const customTemplateUsageText = "--custom-template <path.tracetemplate>"
+const perfRecordTemplateUsageText = `--template ${perfTemplateChoiceText} or ${customTemplateUsageText}`
+
 const parseTemplate = (value: string) => {
   if (perfTemplateChoices.includes(value as PerfTemplate)) {
     return Effect.succeed(value as PerfTemplate)
@@ -26,6 +29,41 @@ const parseTemplate = (value: string) => {
     `Provide --template ${perfTemplateChoiceText} and retry the command.`,
   )
 }
+
+const resolveRecordTemplateSelection = (args: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const templateOption = yield* optionalOption(args, "--template")
+    const customTemplatePath = yield* optionalOption(args, "--custom-template")
+
+    if (templateOption && customTemplatePath) {
+      return yield* invalidOption(
+        "--custom-template",
+        "cannot be combined with --template.",
+        `Provide ${perfRecordTemplateUsageText} and retry the command.`,
+      )
+    }
+
+    if (templateOption) {
+      return {
+        template: yield* parseTemplate(templateOption),
+        customTemplatePath: undefined,
+      }
+    }
+
+    if (customTemplatePath) {
+      return {
+        template: undefined,
+        customTemplatePath,
+      }
+    }
+
+    return yield* Effect.fail(new UserInputError({
+      code: "missing-option",
+      reason: "Missing required option --template or --custom-template.",
+      nextStep: `Provide ${perfRecordTemplateUsageText} and retry the command.`,
+      details: [],
+    }))
+  })
 
 const parseGroupBy = (value: string) => {
   if (value === "signpost") {
@@ -73,9 +111,13 @@ const formatPerfResult = (result: PerfRecordResult): string => {
       ? `- [${prefix}] ${diagnosis.summary}\n${details}`
       : `- [${prefix}] ${diagnosis.summary}`
   })
+  const templateLabel = result.template === "custom"
+    ? `${result.templateName} (custom)`
+    : `${result.templateName} (${result.template})`
 
   return [
-    `template: ${result.templateName} (${result.template})`,
+    `template: ${templateLabel}`,
+    ...(result.customTemplatePath ? [`template path: ${result.customTemplatePath}`] : []),
     `session: ${result.sessionId}`,
     `session after record: ${result.session.state}`,
     `runner wrapper after record: ${result.session.healthCheck.wrapperRunning ? "running" : "not running"}`,
@@ -151,13 +193,14 @@ export const runPerfCommand = (args: ReadonlyArray<string>) =>
     switch (subcommand) {
       case "record": {
         const sessionId = yield* requireOption(rest, "--session-id")
-        const templateOption = yield* requireOption(rest, "--template")
-        const template = yield* parseTemplate(templateOption)
-        const timeLimit = (yield* optionalOption(rest, "--time-limit")) ?? defaultPerfTimeLimitForTemplate(template)
+        const selection = yield* resolveRecordTemplateSelection(rest)
+        const timeLimit = (yield* optionalOption(rest, "--time-limit"))
+          ?? (selection.template ? defaultPerfTimeLimitForTemplate(selection.template) : "3s")
         const client = yield* DaemonClient
         const result = yield* client.recordPerf({
           sessionId,
-          template,
+          template: selection.template,
+          customTemplatePath: selection.customTemplatePath,
           timeLimit,
           onEvent: asJson
             ? undefined

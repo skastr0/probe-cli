@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { createWriteStream } from "node:fs"
+import { constants, createWriteStream, statSync } from "node:fs"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
 import { Transform } from "node:stream"
@@ -19,6 +19,7 @@ import {
   analyzeSwiftConcurrencyTables,
   analyzeTimeProfilerTable,
   parsePerfTableExport,
+  type CustomTemplateRef,
   type PerfDiagnosis,
   type PerfSummary,
   type ParsedPerfTable,
@@ -48,6 +49,7 @@ const maxPerfTimeLimitMs = 5 * 60_000
 const recordingStartupTimeoutMs = 30_000
 const mib = 1024 * 1024
 const maxExportFileSizeBytes = 8 * mib
+const customTemplateExtension = ".tracetemplate"
 const rowTag = "<row>"
 const rowTagTailLength = rowTag.length - 1
 
@@ -196,8 +198,10 @@ class ExportBudgetTransform extends Transform {
   }
 }
 
+type TemplateSlug = PerfTemplate | "custom"
+
 interface TemplateSpec {
-  readonly slug: PerfTemplate
+  readonly slug: TemplateSlug
   readonly displayName: string
   readonly xctraceTemplateName: string
   readonly exportSchemas: ReadonlyArray<TemplateExportSpec>
@@ -349,6 +353,73 @@ const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
     analyze: (tables) => analyzeSignpostIntervalTable(tables["os-signpost-interval"]),
   },
 }
+
+const defaultCustomTemplateExportBudget = {
+  maxBytes: 4 * mib,
+  maxRows: 20_000,
+} satisfies ExportBudget
+
+const customTemplateNameFromPath = (templatePath: string): string =>
+  basename(templatePath).replace(/\.tracetemplate$/i, "")
+
+const buildCustomTemplateRef = (templatePath: string): CustomTemplateRef => ({
+  path: templatePath,
+  name: customTemplateNameFromPath(templatePath),
+})
+
+const buildCustomTemplateSpec = (templatePath: string): TemplateSpec => ({
+  slug: "custom",
+  displayName: customTemplateNameFromPath(templatePath),
+  xctraceTemplateName: templatePath,
+  exportSchemas: [],
+  maxRecordingTimeLimitMs: 120_000,
+  analyze: () => ({
+    summary: {
+      headline: "Custom template recording completed. No built-in summary available.",
+      metrics: [],
+    },
+    diagnoses: [{
+      code: "custom-template-no-analysis",
+      severity: "info" as const,
+      summary: "Custom templates do not have built-in Probe analysis. Use `probe drill` to inspect the trace artifacts.",
+      details: ["Exported schemas are available from the TOC artifact."],
+      wall: true,
+    }],
+  }),
+})
+
+const validateCustomTemplatePath = (templatePath: string) =>
+  Effect.gen(function* () {
+    if (!templatePath.toLowerCase().endsWith(customTemplateExtension)) {
+      return yield* new UserInputError({
+        code: "perf-custom-template-extension",
+        reason: `Custom template path ${templatePath} must end with ${customTemplateExtension}.`,
+        nextStep: "Save the template from Instruments.app as a .tracetemplate file and retry with --custom-template.",
+        details: [],
+      })
+    }
+
+    yield* Effect.tryPromise({
+      try: () => access(templatePath, constants.R_OK),
+      catch: (error) =>
+        new UserInputError({
+          code: "perf-custom-template-read",
+          reason: `Custom template path ${templatePath} is not readable: ${error instanceof Error ? error.message : String(error)}.`,
+          nextStep: "Verify the .tracetemplate file exists, is readable, and points to a template saved from Instruments.app, then retry.",
+          details: [],
+        }),
+    })
+
+    return buildCustomTemplateRef(templatePath)
+  })
+
+const buildDynamicExportSpecs = (availableSchemas: ReadonlySet<string>): ReadonlyArray<TemplateExportSpec> =>
+  [...availableSchemas]
+    .sort((left, right) => left.localeCompare(right))
+    .map((schema) => ({
+      schema,
+      budget: defaultCustomTemplateExportBudget,
+    }))
 
 const parseTimeLimitMs = (timeLimit: string): number | null => {
   const match = timeLimit.match(/^(\d+)(ms|s|m|h)$/)
@@ -860,11 +931,13 @@ export class PerfService extends Context.Tag("@probe/PerfService")<
   {
     readonly record: (args: {
       readonly sessionId: string
-      readonly template: typeof PerfTemplate.Type
+      readonly template?: typeof PerfTemplate.Type
+      readonly customTemplatePath?: string
       readonly timeLimit: string
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
       typeof PerfRecordResult.Type,
+      | UserInputError
       | EnvironmentError
       | SessionNotFoundError
       | UnsupportedCapabilityError
@@ -1163,14 +1236,66 @@ export const createPerfService = (dependencies: {
     return dirname(dirname(artifact.absolutePath))
   }
 
-  const record = ({ sessionId, template, timeLimit, emitProgress }: {
+  const resolveRecordTemplateSelection = ({
+    template,
+    customTemplatePath,
+  }: {
+    readonly template?: PerfTemplate
+    readonly customTemplatePath?: string
+  }) =>
+    Effect.gen(function* () {
+      const hasBuiltInTemplate = template !== undefined
+      const hasCustomTemplatePath = customTemplatePath !== undefined
+
+      if (hasBuiltInTemplate && hasCustomTemplatePath) {
+        return yield* new UserInputError({
+          code: "perf-record-template-exclusive",
+          reason: "Use either --template or --custom-template, but not both.",
+          nextStep: "Choose a built-in template or pass a single custom .tracetemplate path, then retry.",
+          details: [],
+        })
+      }
+
+      if (!hasBuiltInTemplate && !hasCustomTemplatePath) {
+        return yield* new UserInputError({
+          code: "perf-record-template-missing",
+          reason: "Missing required perf template selection.",
+          nextStep: "Provide either --template <built-in-template> or --custom-template <path.tracetemplate> and retry.",
+          details: [],
+        })
+      }
+
+      if (customTemplatePath !== undefined) {
+        const customTemplate = yield* validateCustomTemplatePath(customTemplatePath)
+
+        return {
+          template: "custom" as const,
+          customTemplate,
+          spec: buildCustomTemplateSpec(customTemplate.path),
+        }
+      }
+
+      return {
+        template: template!,
+        customTemplate: undefined,
+        spec: templateSpecs[template!],
+      }
+    })
+
+  const record = ({ sessionId, template, customTemplatePath, timeLimit, emitProgress }: {
     readonly sessionId: string
-    readonly template: PerfTemplate
+    readonly template?: PerfTemplate
+    readonly customTemplatePath?: string
     readonly timeLimit: string
     readonly emitProgress: (stage: string, message: string) => void
   }) =>
     Effect.gen(function* () {
-      const spec = templateSpecs[template]
+      const resolvedTemplate = yield* resolveRecordTemplateSelection({
+        template,
+        customTemplatePath,
+      })
+      const spec = resolvedTemplate.spec
+      const templateKind = resolvedTemplate.template
       const timeLimitMs = parseTimeLimitMs(timeLimit)
 
       if (timeLimitMs === null) {
@@ -1200,7 +1325,7 @@ export const createPerfService = (dependencies: {
       if (!isLiveRunnerDetails(sessionBeforeRecord.runner)) {
         return yield* new UnsupportedCapabilityError({
           code: "perf-session-real-device-runner",
-          capability: `perf.record.template.${template}`,
+          capability: `perf.record.template.${templateKind}`,
           reason: "The current session does not expose a live runner-backed target pid for perf recording.",
           nextStep: "Retry on a simulator-backed runner session, or wait for the real-device runner/perf seam to be validated.",
           details: [],
@@ -1222,37 +1347,39 @@ export const createPerfService = (dependencies: {
         })
       }
 
-      emitProgress("perf.record", `Checking xctrace template availability for ${spec.displayName}.`)
+      if (templateKind !== "custom") {
+        emitProgress("perf.record", `Checking xctrace template availability for ${spec.displayName}.`)
 
-      const templateList = yield* Effect.tryPromise({
-        try: () =>
-          commandRunner.capture({
-            command: "xcrun",
-            commandArgs: ["xctrace", "list", "templates"],
-            timeoutMs: defaultCommandOverheadMs,
-          }),
-        catch: (error) =>
-          error instanceof ChildProcessError
-            ? error
-            : new EnvironmentError({
-                code: "perf-template-list",
-                reason: error instanceof Error ? error.message : String(error),
-                nextStep: "Verify the local Xcode toolchain and retry template discovery.",
-                details: [],
-              }),
-      })
-
-      const availableTemplates = new Set(parseTemplateNames(templateList.stdout))
-
-      if (!availableTemplates.has(spec.xctraceTemplateName)) {
-        return yield* new UnsupportedCapabilityError({
-          code: "perf-template-unavailable",
-          capability: `perf.record.template.${template}`,
-          reason: `The local xctrace installation does not expose the ${spec.xctraceTemplateName} template required for ${spec.displayName}.`,
-          nextStep: "Run `xcrun xctrace list templates`, then choose a supported template or update Xcode.",
-          details: [],
-          wall: false,
+        const templateList = yield* Effect.tryPromise({
+          try: () =>
+            commandRunner.capture({
+              command: "xcrun",
+              commandArgs: ["xctrace", "list", "templates"],
+              timeoutMs: defaultCommandOverheadMs,
+            }),
+          catch: (error) =>
+            error instanceof ChildProcessError
+              ? error
+              : new EnvironmentError({
+                  code: "perf-template-list",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: "Verify the local Xcode toolchain and retry template discovery.",
+                  details: [],
+                }),
         })
+
+        const availableTemplates = new Set(parseTemplateNames(templateList.stdout))
+
+        if (!availableTemplates.has(spec.xctraceTemplateName)) {
+          return yield* new UnsupportedCapabilityError({
+            code: "perf-template-unavailable",
+            capability: `perf.record.template.${templateKind}`,
+            reason: `The local xctrace installation does not expose the ${spec.xctraceTemplateName} template required for ${spec.displayName}.`,
+            nextStep: "Run `xcrun xctrace list templates`, then choose a supported template or update Xcode.",
+            details: [],
+            wall: false,
+          })
+        }
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
@@ -1379,50 +1506,18 @@ export const createPerfService = (dependencies: {
       emitProgress("perf.record", `Refreshing session health after recording ${spec.displayName}.`)
       const sessionAfterRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
 
-      emitProgress("perf.export", `Exporting TOC for ${basename(tracePath)}.`)
-
-      const tocResult = yield* Effect.tryPromise({
-        try: () =>
-          commandRunner.capture({
-            command: "xcrun",
-            commandArgs: ["xctrace", "export", "--input", tracePath, "--toc"],
-            timeoutMs: defaultCommandOverheadMs,
-          }),
-        catch: (error) =>
-          error instanceof ChildProcessError
-            ? error
-            : new EnvironmentError({
-                code: "perf-export-toc",
-                reason: error instanceof Error ? error.message : String(error),
-                nextStep: "Inspect the saved trace bundle and retry the TOC export.",
-                details: [],
-              }),
-      })
-
-      yield* Effect.tryPromise({
-        try: () => writeFile(tocPath, tocResult.stdout, "utf8"),
-        catch: (error) =>
-          new EnvironmentError({
-            code: "perf-write-toc",
-            reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Check write access to the session traces directory and retry the profiling command.",
-            details: [],
-          }),
-      })
-
-      const tocArtifact = yield* dependencies.artifactStore.registerArtifact(
+      const { tocXml, tocArtifact } = yield* exportTocArtifact({
         sessionId,
-        createArtifactRecord({
-          artifactRoot: sessionBeforeRecord.artifactRoot,
-          key: `${baseName}-toc`,
-          label: `${spec.slug}-toc`,
-          kind: "xml",
-          absolutePath: tocPath,
-          summary: `${spec.displayName} TOC export.`,
-        }),
-      )
+        artifactRoot: sessionBeforeRecord.artifactRoot,
+        tracePath,
+        tocPath,
+        artifactKey: `${baseName}-toc`,
+        artifactLabel: `${spec.slug}-toc`,
+        artifactSummary: `${spec.displayName} TOC export.`,
+        emitProgress,
+      })
 
-      const runNumber = parseFirstRunNumber(tocResult.stdout)
+      const runNumber = parseFirstRunNumber(tocXml)
 
       if (!runNumber) {
         return yield* new EnvironmentError({
@@ -1435,10 +1530,13 @@ export const createPerfService = (dependencies: {
 
       const exportArtifacts: Array<ArtifactRecord> = []
       const parsedTables: Record<string, ParsedPerfTable> = {}
-      const availableSchemas = parseAvailableSchemaNames(tocResult.stdout)
+      const availableSchemas = parseAvailableSchemaNames(tocXml)
       const tocAdvertisesSchemas = availableSchemas.size > 0
+      const exportSpecs = spec.exportSchemas.length > 0
+        ? spec.exportSchemas
+        : buildDynamicExportSpecs(availableSchemas)
 
-      for (const exportSpec of spec.exportSchemas) {
+      for (const exportSpec of exportSpecs) {
         if (tocAdvertisesSchemas && !availableSchemas.has(exportSpec.schema)) {
           if (exportSpec.required) {
             return yield* new EnvironmentError({
@@ -1533,17 +1631,15 @@ export const createPerfService = (dependencies: {
 
         exportArtifacts.push(artifact)
 
-        // Memory amplification check: verify export file size before loading
         let maybeOversized: EnvironmentError | undefined
         try {
-          const { statSync } = require("node:fs")
-          const s = statSync(exportPath)
-          if (s.size > maxExportFileSizeBytes) {
+          const stats = statSync(exportPath)
+          if (stats.size > maxExportFileSizeBytes) {
             maybeOversized = new EnvironmentError({
               code: "perf-export-file-too-large",
-              reason: `${spec.displayName} ${schema} export file (${formatBytes(s.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
+              reason: `${spec.displayName} ${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
               nextStep: "Reduce --time-limit or use a narrower recording window; inspect the saved .trace directly for full data.",
-              details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${s.size}`],
+              details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
             })
           }
         } catch {
@@ -1584,14 +1680,15 @@ export const createPerfService = (dependencies: {
             code: "perf-analyze-export-contract",
             reason: error instanceof Error ? error.message : String(error),
             nextStep: "Inspect the saved schema exports and align Probe's supported xctrace contract before retrying.",
-            details: spec.exportSchemas.map((exportSpec) => exportSpec.schema),
+            details: exportSpecs.map((exportSpec) => exportSpec.schema),
           }),
       })
 
       return {
         sessionId,
-        template,
+        template: templateKind,
         templateName: spec.displayName,
+        customTemplatePath: resolvedTemplate.customTemplate?.path,
         timeLimit,
         recordedAt: nowIso(),
         xctraceVersion: xctraceVersionResult.stdout.trim(),

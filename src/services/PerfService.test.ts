@@ -9,9 +9,12 @@ import {
   ChildProcessError,
   EnvironmentError,
   UnsupportedCapabilityError,
+  UserInputError,
 } from "../domain/errors"
 import type { ArtifactRecord } from "../domain/output"
+import { DaemonClient } from "./DaemonClient"
 import { createPerfService, ExportBudgetExceededError } from "./PerfService"
+import { runPerfCommand } from "../cli/commands/perf"
 
 const mib = 1024 * 1024
 
@@ -34,6 +37,16 @@ const loggingTocWithoutSignpostSchemaXml = `<?xml version="1.0"?>
   <run number="1">
     <data>
       <table schema="thread-state"/>
+    </data>
+  </run>
+</trace-toc>`
+
+const customTemplateTocXml = `<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <data>
+      <table schema="custom-main"/>
+      <table schema="custom-secondary"/>
     </data>
   </run>
 </trace-toc>`
@@ -234,6 +247,16 @@ const metalEncoderListXml = `<?xml version="1.0"?>
 
 const loadPerfFixture = (name: string) =>
   readFileSync(join(import.meta.dir, "..", "test-fixtures", "perf", name), "utf8")
+
+const buildGenericPerfExportXml = (schema: string) => `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="${schema}">
+      <col><mnemonic>value</mnemonic></col>
+    </schema>
+    <row><value fmt="example">example</value></row>
+  </node>
+</trace-query-result>`
 
 const withTempRoot = async <T>(run: (root: string) => Promise<T>) => {
   const root = await mkdtemp(join(tmpdir(), "probe-cli-perf-service-"))
@@ -529,6 +552,34 @@ const createCommandRunner = (options: {
   }
 }
 
+const neverReachedDaemonClient = DaemonClient.of({
+  ping: () => Effect.die("unexpected daemon client call"),
+  listSessions: () => Effect.die("unexpected daemon client call"),
+  openSession: () => Effect.die("unexpected daemon client call"),
+  showSession: () => Effect.die("unexpected daemon client call"),
+  getSessionHealth: () => Effect.die("unexpected daemon client call"),
+  closeSession: () => Effect.die("unexpected daemon client call"),
+  getSessionLogs: () => Effect.die("unexpected daemon client call"),
+  markSessionLog: () => Effect.die("unexpected daemon client call"),
+  captureLogWindow: () => Effect.die("unexpected daemon client call"),
+  getLogDoctorReport: () => Effect.die("unexpected daemon client call"),
+  captureDiagnosticBundle: () => Effect.die("unexpected daemon client call"),
+  runSessionDebugCommand: () => Effect.die("unexpected daemon client call"),
+  captureScreenshot: () => Effect.die("unexpected daemon client call"),
+  recordVideo: () => Effect.die("unexpected daemon client call"),
+  captureSnapshot: () => Effect.die("unexpected daemon client call"),
+  performSessionAction: () => Effect.die("unexpected daemon client call"),
+  runSessionFlow: () => Effect.die("unexpected daemon client call"),
+  exportSessionRecording: () => Effect.die("unexpected daemon client call"),
+  replaySessionRecording: () => Effect.die("unexpected daemon client call"),
+  getSessionResultSummary: () => Effect.die("unexpected daemon client call"),
+  getSessionResultAttachments: () => Effect.die("unexpected daemon client call"),
+  recordPerf: () => Effect.die("unexpected daemon client call"),
+  recordPerfAroundFlow: () => Effect.die("unexpected daemon client call"),
+  summarizePerfBySignpost: () => Effect.die("unexpected daemon client call"),
+  drillArtifact: () => Effect.die("unexpected daemon client call"),
+})
+
 describe("PerfService", () => {
   test("records a trace and reports a failed post-record session honestly", async () => {
     await withTempRoot(async (root) => {
@@ -658,6 +709,166 @@ describe("PerfService", () => {
       expect(keepaliveCalls).toBeGreaterThanOrEqual(1)
     })
   }, 20_000)
+
+  test("rejects nonexistent custom template paths before recording starts", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const commandRunner = createCommandRunner({ exports: {} })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.record({
+            sessionId: "session-1",
+            customTemplatePath: join(root, "missing.tracetemplate"),
+            timeLimit: "3s",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(commandRunner.stats.captureCalls).toBe(0)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(UserInputError)
+
+        if (result.left instanceof UserInputError) {
+          expect(result.left.code).toBe("perf-custom-template-read")
+          expect(result.left.reason).toContain("missing.tracetemplate")
+        }
+      }
+    })
+  })
+
+  test("rejects custom template paths with the wrong extension", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const commandRunner = createCommandRunner({ exports: {} })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+      const wrongPath = join(root, "custom-template.txt")
+
+      await writeFile(wrongPath, "not a template", "utf8")
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.record({
+            sessionId: "session-1",
+            customTemplatePath: wrongPath,
+            timeLimit: "3s",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(commandRunner.stats.captureCalls).toBe(0)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(UserInputError)
+
+        if (result.left instanceof UserInputError) {
+          expect(result.left.code).toBe("perf-custom-template-extension")
+          expect(result.left.reason).toContain(".tracetemplate")
+        }
+      }
+    })
+  })
+
+  test("records custom templates with TOC-discovered exports and minimal analysis", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const templatePath = join(root, "GPU Counters.tracetemplate")
+
+      await writeFile(templatePath, "custom-template", "utf8")
+
+      const commandRunner = createCommandRunner({
+        tocXml: customTemplateTocXml,
+        exports: {
+          "custom-main": buildGenericPerfExportXml("custom-main"),
+          "custom-secondary": buildGenericPerfExportXml("custom-secondary"),
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          customTemplatePath: templatePath,
+          timeLimit: "3s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.template).toBe("custom")
+      expect(result.templateName).toBe("GPU Counters")
+      expect(result.customTemplatePath).toBe(templatePath)
+      expect(result.summary.headline).toBe("Custom template recording completed. No built-in summary available.")
+      expect(result.diagnoses).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ code: "custom-template-no-analysis", wall: true }),
+        ]),
+      )
+      expect(result.artifacts.exports).toHaveLength(2)
+      expect(commandRunner.stats.budgets).toEqual([
+        { schema: "custom-main", maxBytes: 4 * mib, maxRows: 20_000 },
+        { schema: "custom-secondary", maxBytes: 4 * mib, maxRows: 20_000 },
+      ])
+    })
+  })
+
+  test("rejects mutually exclusive perf record template flags", async () => {
+    const result = await Effect.runPromise(
+      Effect.either(
+        runPerfCommand([
+          "record",
+          "--session-id",
+          "session-1",
+          "--template",
+          "logging",
+          "--custom-template",
+          "/tmp/custom.tracetemplate",
+          "--json",
+        ]).pipe(Effect.provideService(DaemonClient, neverReachedDaemonClient)),
+      ),
+    )
+
+    expect(Either.isLeft(result)).toBe(true)
+
+    if (Either.isLeft(result)) {
+      expect(result.left).toBeInstanceOf(UserInputError)
+
+      if (result.left instanceof UserInputError) {
+        expect(result.left.code).toBe("invalid-option")
+        expect(result.left.reason).toContain("--custom-template")
+        expect(result.left.reason).toContain("cannot be combined with --template")
+      }
+    }
+  })
 
   test("maps export file size overrun into a typed environment failure", async () => {
     await withTempRoot(async (root) => {

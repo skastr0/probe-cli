@@ -15,6 +15,14 @@ const perfTemplateValues = [
 export const PerfTemplate = Schema.Literal(...perfTemplateValues)
 export type PerfTemplate = typeof PerfTemplate.Type
 
+export interface CustomTemplateRef {
+  readonly path: string
+  readonly name: string
+}
+
+export const PerfRecordTemplateKind = Schema.Union(PerfTemplate, Schema.Literal("custom"))
+export type PerfRecordTemplateKind = typeof PerfRecordTemplateKind.Type
+
 export const perfTemplateChoices = [...perfTemplateValues]
 export const perfTemplateChoiceText = perfTemplateChoices.join("|")
 
@@ -68,8 +76,9 @@ export type PerfSessionOutcome = typeof PerfSessionOutcome.Type
 
 export const PerfRecordResult = Schema.Struct({
   sessionId: Schema.String,
-  template: PerfTemplate,
+  template: PerfRecordTemplateKind,
   templateName: Schema.String,
+  customTemplatePath: Schema.optional(Schema.String),
   timeLimit: Schema.String,
   recordedAt: Schema.String,
   xctraceVersion: Schema.String,

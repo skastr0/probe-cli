@@ -417,7 +417,8 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
     >
     readonly recordPerf: (params: {
       readonly sessionId: string
-      readonly template: PerfTemplate
+      readonly template?: PerfTemplate
+      readonly customTemplatePath?: string
       readonly timeLimit: string
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
@@ -836,7 +837,7 @@ export const DaemonClientLive = Layer.effect(
 
           return response.result
         }),
-      recordPerf: ({ sessionId, template, timeLimit, onEvent }) =>
+      recordPerf: ({ sessionId, template, customTemplatePath, timeLimit, onEvent }) =>
         Effect.gen(function* () {
           const options = yield* buildOptions(onEvent)
           const response = yield* sendPerfRecord(options, {
@@ -847,6 +848,7 @@ export const DaemonClientLive = Layer.effect(
             params: {
               sessionId,
               template,
+              customTemplatePath,
               timeLimit,
             },
           })

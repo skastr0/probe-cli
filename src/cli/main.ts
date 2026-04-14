@@ -38,7 +38,7 @@ Usage:
   probe session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--json]
   probe session video --session-id <id> --duration <duration> [--json]
   probe session close --session-id <id> [--json]
-  probe perf record --session-id <id> --template ${perfTemplateChoiceText} [--time-limit <duration>] [--json]
+  probe perf record --session-id <id> (--template ${perfTemplateChoiceText} | --custom-template <path.tracetemplate>) [--time-limit <duration>] [--json]
   probe perf around --session-id <id> --file <flow.json> --template ${perfTemplateChoiceText} [--json]
   probe perf summarize --session-id <id> --artifact <trace-key> --group-by signpost [--json]
   probe drill --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact] [--json]
@@ -47,8 +47,10 @@ Notes:
   - serve runs the long-lived daemon over the local Unix socket
   - session commands are thin clients that talk to the daemon
   - on simulator, omit --bundle-id to use Probe's built-in fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app
-  - perf templates: ${perfTemplateChoiceText}
-  - perf recording defaults to 60s for metal-system-trace and 3s for time-profiler, system-trace, hangs, swift-concurrency, and logging
+  - built-in perf templates: ${perfTemplateChoiceText}
+  - custom perf templates: pass --custom-template <path.tracetemplate> after saving a template from Instruments.app
+  - perf recording defaults to 60s for metal-system-trace and 3s for time-profiler, system-trace, hangs, swift-concurrency, logging, and custom templates
+  - CPU Counters guided mode works without GUI preconfiguration, but specific counter selections and other GUI-authored templates still require Instruments.app setup first
 `
 
 const print = (text: string) =>
