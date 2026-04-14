@@ -2,6 +2,15 @@ import { Schema } from "effect"
 
 const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
 
+export const DeviceInterruptionSignal = Schema.Literal(
+  "device-locked",
+  "passcode-required",
+  "trust-required",
+  "developer-mode-required",
+  "target-foreground-blocked",
+)
+export type DeviceInterruptionSignal = typeof DeviceInterruptionSignal.Type
+
 export class CapabilityNotReadyError extends Schema.TaggedError<CapabilityNotReadyError>()(
   "CapabilityNotReadyError",
   {
@@ -22,6 +31,17 @@ export class EnvironmentError extends Schema.TaggedError<EnvironmentError>()(
   "EnvironmentError",
   {
     code: Schema.String,
+    reason: Schema.String,
+    nextStep: Schema.String,
+    details: Schema.Array(Schema.String),
+  },
+) {}
+
+export class DeviceInterruptionError extends Schema.TaggedError<DeviceInterruptionError>()(
+  "DeviceInterruptionError",
+  {
+    code: Schema.String,
+    signal: DeviceInterruptionSignal,
     reason: Schema.String,
     nextStep: Schema.String,
     details: Schema.Array(Schema.String),
@@ -99,6 +119,7 @@ export type ProbeError =
   | CapabilityNotReadyError
   | UserInputError
   | EnvironmentError
+  | DeviceInterruptionError
   | UnsupportedCapabilityError
   | ChildProcessError
   | DaemonNotRunningError
@@ -142,6 +163,7 @@ export const isProbeError = (value: unknown): value is ProbeError => {
     tag === "CapabilityNotReadyError"
     || tag === "UserInputError"
     || tag === "EnvironmentError"
+    || tag === "DeviceInterruptionError"
     || tag === "UnsupportedCapabilityError"
     || tag === "ChildProcessError"
     || tag === "DaemonNotRunningError"
@@ -189,6 +211,23 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
       }
 
     case "EnvironmentError":
+      return {
+        code: error.code,
+        category: "environment",
+        reason: error.reason,
+        nextStep: error.nextStep,
+        details: [...error.details],
+        capability: null,
+        expectedVersion: null,
+        receivedVersion: null,
+        command: null,
+        exitCode: null,
+        sessionId: null,
+        artifactKey: null,
+        wall: false,
+      }
+
+    case "DeviceInterruptionError":
       return {
         code: error.code,
         category: "environment",

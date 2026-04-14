@@ -3,7 +3,7 @@
   "controlDirectoryPath": "/tmp/probe/contracts/runner/runtime-control",
   "egressTransport": "stdout-jsonl-mixed-log",
   "generatedAt": "2026-04-10T17:27:44.000Z",
-  "ingressTransport": "file-mailbox",
+  "ingressTransport": "http-post",
   "sessionIdentifier": "fixture-session",
   "simulatorUdid": "SIM-UDID-1234",
   "targetBundleId": "dev.probe.fixture"

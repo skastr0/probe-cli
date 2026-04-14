@@ -6,7 +6,6 @@ import {
   decodeRunnerCommandFrame,
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
-  decodeRunnerStdinProbeResultFrame,
   encodeRunnerCommandFrame,
   RUNNER_HTTP_COMMAND_INGRESS,
   RUNNER_TRANSPORT_CONTRACT,
@@ -15,21 +14,31 @@ import {
 const loadFixture = <T>(...segments: Array<string>): T =>
   JSON.parse(readFileSync(join(import.meta.dir, "..", "test-fixtures", ...segments), "utf8")) as T
 
-const transportBoundarySpike = JSON.parse(
-  readFileSync(join(import.meta.dir, "..", "..", "knowledge", "xcuitest-runner", "transport-boundary-spike-results.json"), "utf8"),
-) as {
-  readonly ready: {
-    readonly stdoutReadyEvent: unknown
-  }
-  readonly stdinProbe: unknown
-}
+const makeSimulatorReadyFrame = (): Record<string, unknown> => ({
+  kind: "ready",
+  attachLatencyMs: 21,
+  bootstrapPath: "/tmp/probe-runner-bootstrap/SIM-1.json",
+  bootstrapSource: "simulator-bootstrap-manifest",
+  controlDirectoryPath: "/tmp/probe-runtime/session-1",
+  currentDirectoryPath: "/",
+  egressTransport: "stdout-jsonl-mixed-log",
+  homeDirectoryPath: "/Users/test/Library/Developer/CoreSimulator/Devices/SIM-1/data",
+  ingressTransport: RUNNER_HTTP_COMMAND_INGRESS,
+  initialStatusLabel: "Ready",
+  processIdentifier: 551,
+  recordedAt: "2026-04-14T00:00:00.000Z",
+  runnerPort: 41041,
+  runnerTransportContract: RUNNER_TRANSPORT_CONTRACT,
+  sessionIdentifier: "session-1",
+  simulatorUdid: "SIM-1",
+})
 
 describe("runner protocol", () => {
   test("decodes the bootstrap manifest Probe writes for simulator sessions", () => {
     const manifest = decodeRunnerBootstrapManifest(loadFixture("runner", "bootstrap-manifest.json"))
 
     expect(manifest.contractVersion).toBe(RUNNER_TRANSPORT_CONTRACT)
-    expect(manifest.ingressTransport).toBe("file-mailbox")
+    expect(manifest.ingressTransport).toBe(RUNNER_HTTP_COMMAND_INGRESS)
     expect(manifest.egressTransport).toBe("stdout-jsonl-mixed-log")
     expect(manifest.targetBundleId).toBe("dev.probe.fixture")
   })
@@ -41,14 +50,15 @@ describe("runner protocol", () => {
     expect(() => decodeRunnerBootstrapManifest(broken)).toThrow(/Invalid runner bootstrap manifest:.*targetBundleId/)
   })
 
-  test("decodes a real ready frame from the validated transport-boundary artifact", () => {
-    const ready = decodeRunnerReadyFrame(transportBoundarySpike.ready.stdoutReadyEvent)
+  test("decodes the simulator-ready extension Probe uses for HTTP control", () => {
+    const ready = decodeRunnerReadyFrame(makeSimulatorReadyFrame())
 
     expect(ready.kind).toBe("ready")
     expect(ready.runnerTransportContract).toBe(RUNNER_TRANSPORT_CONTRACT)
     expect(ready.bootstrapSource).toBe("simulator-bootstrap-manifest")
-    expect(ready.ingressTransport).toBe("file-mailbox")
+    expect(ready.ingressTransport).toBe(RUNNER_HTTP_COMMAND_INGRESS)
     expect(ready.egressTransport).toBe("stdout-jsonl-mixed-log")
+    expect(ready.runnerPort).toBe(41041)
   })
 
   test("decodes the snapshot response shape Probe consumes from local runner output", () => {
@@ -60,11 +70,13 @@ describe("runner protocol", () => {
     expect(response.payload).toBe("snapshot-captured")
   })
 
-  test("decodes the stdin probe timeout Probe records for honest transport reporting", () => {
-    const stdinProbe = decodeRunnerStdinProbeResultFrame(transportBoundarySpike.stdinProbe)
+  test("rejects legacy simulator ready frames that still claim file-mailbox ingress", () => {
+    const legacyReadyFrame = {
+      ...makeSimulatorReadyFrame(),
+      ingressTransport: "file-mailbox",
+    }
 
-    expect(stdinProbe.kind).toBe("stdin-probe-result")
-    expect(stdinProbe.status).toBe("timeout")
+    expect(() => decodeRunnerReadyFrame(legacyReadyFrame)).toThrow(/Invalid runner ready frame:.*ingressTransport/)
   })
 
   test("encodes command frames without leaving payload normalization implicit", () => {
@@ -83,7 +95,7 @@ describe("runner protocol", () => {
   })
 
   test("fails with a focused error when a ready frame loses session identity", () => {
-    const broken = structuredClone(transportBoundarySpike.ready.stdoutReadyEvent) as Record<string, unknown>
+    const broken = structuredClone(makeSimulatorReadyFrame())
     delete broken.sessionIdentifier
 
     expect(() => decodeRunnerReadyFrame(broken)).toThrow(/Invalid runner ready frame:.*sessionIdentifier/)
@@ -113,4 +125,5 @@ describe("runner protocol", () => {
     expect(ready.ingressTransport).toBe(RUNNER_HTTP_COMMAND_INGRESS)
     expect(ready.runnerPort).toBe(43123)
   })
+
 })

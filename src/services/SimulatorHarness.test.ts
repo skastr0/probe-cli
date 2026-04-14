@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test"
+import { createServer } from "node:http"
 import { Effect, Either, ManagedRuntime } from "effect"
 import { EnvironmentError, UserInputError } from "../domain/errors"
+import { decodeRunnerCommandFrame } from "./runnerProtocol"
 import {
   buildProbeRunnerForSimulator,
+  createHttpRunnerCommandSender,
   extractPidFromLaunchctlList,
   isInstalledAppListMatch,
   resolveAttachTargetProcessId,
+  type RunnerCommandResult,
   SimulatorHarness,
   SimulatorHarnessLive,
 } from "./SimulatorHarness"
@@ -14,6 +18,8 @@ const simulatorHarnessRuntime = ManagedRuntime.make(SimulatorHarnessLive)
 
 const simulatorUdid = "SIM-123"
 const bundleId = "com.example.notes"
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 const expectTaggedError = async <TError extends EnvironmentError | UserInputError>(args: {
   readonly effect: Promise<unknown>
@@ -246,5 +252,121 @@ describe("SimulatorHarness helpers", () => {
     expect(error.code).toBe("simulator-session-mode-bundle-mismatch")
 
     expect(error.reason).toContain(bundleId)
+  })
+
+  test("createHttpRunnerCommandSender handles 12 sequential HTTP actions without timing out", async () => {
+    const receivedFrames: Array<{ readonly sequence: number; readonly action: string; readonly payload: string | null }> = []
+
+    const server = createServer((request, response) => {
+      const chunks: Array<Buffer> = []
+
+      request.on("data", (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      })
+
+      request.on("end", async () => {
+        const commandFrame = decodeRunnerCommandFrame(JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown)
+        receivedFrames.push({
+          sequence: commandFrame.sequence,
+          action: commandFrame.action,
+          payload: commandFrame.payload ?? null,
+        })
+
+        await sleep(5)
+
+        response.writeHead(200, { "Content-Type": "application/json" })
+        response.end(
+          JSON.stringify({
+            kind: "response",
+            sequence: commandFrame.sequence,
+            ok: true,
+            action: commandFrame.action,
+            error: null,
+            payload: commandFrame.action === "snapshot" ? "snapshot-captured" : "input-applied",
+            snapshotPayloadPath:
+              commandFrame.action === "snapshot" ? `/tmp/snapshot-${String(commandFrame.sequence).padStart(3, "0")}.json` : null,
+            inlinePayload: null,
+            inlinePayloadEncoding: null,
+            handledMs: 5,
+            statusLabel: "ok",
+            snapshotNodeCount: commandFrame.action === "snapshot" ? 94 : null,
+            recordedAt: new Date().toISOString(),
+          }),
+        )
+      })
+    })
+
+    const { commandUrl, closeServer } = await new Promise<{
+      readonly commandUrl: string
+      readonly closeServer: () => Promise<void>
+    }>((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address()
+
+        if (typeof address !== "object" || address === null) {
+          reject(new Error("Expected the sequential HTTP test server to bind to a TCP address."))
+          return
+        }
+
+        resolve({
+          commandUrl: `http://127.0.0.1:${address.port}/command`,
+          closeServer: () =>
+            new Promise((closeResolve, closeReject) => {
+              server.close((error) => {
+                if (error) {
+                  closeReject(error)
+                  return
+                }
+
+                closeResolve()
+              })
+            }),
+        })
+      })
+    })
+
+    try {
+      const sendCommand = createHttpRunnerCommandSender(commandUrl)
+      const results: Array<RunnerCommandResult> = []
+
+      for (let sequence = 1; sequence <= 12; sequence += 1) {
+        const action = sequence % 2 === 0 ? "uiAction" : "snapshot"
+        const payload = action === "uiAction" ? '{"kind":"tap"}' : undefined
+        results.push(await sendCommand(sequence, action, payload))
+      }
+
+      expect(receivedFrames).toHaveLength(12)
+      expect(receivedFrames.map((frame) => frame.sequence)).toEqual(Array.from({ length: 12 }, (_, index) => index + 1))
+      expect(receivedFrames.map((frame) => frame.action)).toEqual([
+        "snapshot",
+        "uiAction",
+        "snapshot",
+        "uiAction",
+        "snapshot",
+        "uiAction",
+        "snapshot",
+        "uiAction",
+        "snapshot",
+        "uiAction",
+        "snapshot",
+        "uiAction",
+      ])
+      expect(results.every((result) => result.ok)).toBe(true)
+      expect(results[0]).toMatchObject({
+        action: "snapshot",
+        payload: "snapshot-captured",
+        snapshotPayloadPath: "/tmp/snapshot-001.json",
+        snapshotNodeCount: 94,
+      })
+      expect(results[11]).toMatchObject({
+        action: "uiAction",
+        payload: "input-applied",
+        snapshotPayloadPath: null,
+        snapshotNodeCount: null,
+      })
+    } finally {
+      await closeServer()
+    }
   })
 })

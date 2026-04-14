@@ -6,11 +6,9 @@ import XCTest
 final class AttachControlSpikeUITests: XCTestCase {
   private let attachTimeout: TimeInterval = 10
   private let interactionTimeout: TimeInterval = 5
-  private let lifecycleCommandTimeout: TimeInterval = 20
   private let defaultVideoDurationMs = 10_000
   private let maxVideoDurationMs = 120_000
   private let videoFrameInterval: TimeInterval = 0.1
-  private let stdinProbeTimeout: TimeInterval = 5
   private let runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
   private let runnerTransportContract = "probe.runner.transport/hybrid-v1"
 
@@ -77,6 +75,7 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private struct RunnerUIActionLocator: Codable {
+    let kind: String
     let identifier: String?
     let label: String?
     let value: String?
@@ -85,6 +84,8 @@ final class AttachControlSpikeUITests: XCTestCase {
     let section: String?
     let interactive: Bool?
     let ordinal: Int?
+    let x: Double?
+    let y: Double?
   }
 
   private struct RunnerUIActionPayload: Codable {
@@ -100,19 +101,6 @@ final class AttachControlSpikeUITests: XCTestCase {
   private struct ResolvedUIActionCandidates {
     let matches: [XCUIElement]
     let sectionMatchCount: Int?
-  }
-
-  private struct StdinProbeCommandFrame: Codable {
-    let kind: String
-    let payload: String?
-  }
-
-  private struct StdinProbeResultFrame: Codable {
-    let kind: String
-    let status: String
-    let payload: String?
-    let error: String?
-    let recordedAt: String
   }
 
   private enum LifecycleBootstrapSource: String {
@@ -428,29 +416,26 @@ final class AttachControlSpikeUITests: XCTestCase {
   @MainActor
   func testCommandLoopLifecycle() throws {
     let resolvedControlDirectory = try resolveLifecycleControlDirectory()
-    let controlDirectoryURL = URL(
-      fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
-      isDirectory: true,
-    )
+    let isDevice = resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
+    let controlDirectoryURL = isDevice
+      ? deviceLifecycleControlDirectoryURL(sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier)
+      : URL(
+          fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
+          isDirectory: true,
+        )
     try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
 
-    let lifecycleState = try attachForLifecycleLoop(
+    var lifecycleState = try attachForLifecycleLoop(
       resolvedControlDirectory: resolvedControlDirectory,
       controlDirectoryURL: controlDirectoryURL,
       foregroundFailureMessage: "Fixture app must already be running in the foreground before ProbeRunner enters its lifecycle loop.",
       statusLabelFailureMessage: "Expected fixture status label to exist before the lifecycle loop starts."
     )
 
-    try emitStdoutJSONLine(lifecycleState.readyFrame)
-
-    print(
-      "PROBE_METRIC lifecycle_ready attach_latency_ms=\(lifecycleState.readyFrame.attachLatencyMs) control_dir=\(controlDirectoryURL.path) pid=\(lifecycleState.readyFrame.processIdentifier)"
-    )
-
-    try runLifecycleCommandLoop(
+    try runHTTPCommandLoop(
+      lifecycleState: &lifecycleState,
       controlDirectoryURL: controlDirectoryURL,
-      app: lifecycleState.app,
-      statusLabel: lifecycleState.statusLabel
+      metricName: "lifecycle_ready"
     )
   }
 
@@ -474,42 +459,10 @@ final class AttachControlSpikeUITests: XCTestCase {
       statusLabelFailureMessage: "Expected fixture status label to exist before the transport-boundary loop starts."
     )
 
-    if isDevice {
-      let httpCommandServer = try startHTTPCommandServer(
-        desiredPort: resolveRunnerPortFromEnvironment(),
-        controlDirectoryURL: controlDirectoryURL,
-        app: lifecycleState.app,
-        statusLabel: lifecycleState.statusLabel
-      )
-      lifecycleState.readyFrame.runnerPort = httpCommandServer.port
-
-      try emitStdoutJSONLine(lifecycleState.readyFrame)
-
-      print(
-        "PROBE_METRIC transport_boundary_ready attach_latency_ms=\(lifecycleState.readyFrame.attachLatencyMs) control_dir=\(controlDirectoryURL.path) pid=\(lifecycleState.readyFrame.processIdentifier) runner_port=\(httpCommandServer.port)"
-      )
-
-      try httpCommandServer.waitForShutdown()
-      return
-    }
-
-    try emitStdoutJSONLine(lifecycleState.readyFrame)
-
-    print(
-      "PROBE_METRIC transport_boundary_ready attach_latency_ms=\(lifecycleState.readyFrame.attachLatencyMs) control_dir=\(controlDirectoryURL.path) pid=\(lifecycleState.readyFrame.processIdentifier)"
-    )
-
-    let stdinProbeResult = probeStdinJSONL(timeout: stdinProbeTimeout)
-    try emitStdoutJSONLine(stdinProbeResult)
-
-    print(
-      "PROBE_METRIC transport_boundary_stdin_probe status=\(stdinProbeResult.status) payload=\(stdinProbeResult.payload ?? "<nil>") error=\(stdinProbeResult.error ?? "<nil>")"
-    )
-
-    try runLifecycleCommandLoop(
+    try runHTTPCommandLoop(
+      lifecycleState: &lifecycleState,
       controlDirectoryURL: controlDirectoryURL,
-      app: lifecycleState.app,
-      statusLabel: lifecycleState.statusLabel
+      metricName: "transport_boundary_ready"
     )
   }
 
@@ -593,9 +546,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       currentDirectoryPath: FileManager.default.currentDirectoryPath,
       egressTransport: resolvedControlDirectory.config.egressTransport,
       homeDirectoryPath: NSHomeDirectory(),
-      ingressTransport: resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
-        ? "http-post"
-        : resolvedControlDirectory.config.ingressTransport,
+      ingressTransport: resolvedControlDirectory.config.ingressTransport,
       initialStatusLabel: statusLabelExists ? statusLabel.label : "",
       processIdentifier: ProcessInfo.processInfo.processIdentifier,
       recordedAt: Self.iso8601Formatter.string(from: Date()),
@@ -605,11 +556,37 @@ final class AttachControlSpikeUITests: XCTestCase {
       simulatorUdid: resolvedControlDirectory.config.simulatorUdid
     )
 
-    // Keep file mirrors for lifecycle/transport validation scripts; the runtime consumes stdout as canonical egress.
+    return LifecycleLoopState(app: app, readyFrame: readyFrame, statusLabel: statusLabel)
+  }
+
+  private func emitLifecycleReadyFrame(_ readyFrame: LifecycleReadyFrame, controlDirectoryURL: URL) throws {
+    // Keep a ready.json mirror for validation scripts; the runtime consumes stdout as canonical readiness.
     // On real device the sandbox may prevent writes, so tolerate failure.
     try? writeJSON(readyFrame, to: controlDirectoryURL.appendingPathComponent("ready.json"))
+    try emitStdoutJSONLine(readyFrame)
+  }
 
-    return LifecycleLoopState(app: app, readyFrame: readyFrame, statusLabel: statusLabel)
+  @MainActor
+  private func runHTTPCommandLoop(
+    lifecycleState: inout LifecycleLoopState,
+    controlDirectoryURL: URL,
+    metricName: String,
+  ) throws {
+    let httpCommandServer = try startHTTPCommandServer(
+      desiredPort: resolveRunnerPortFromEnvironment(),
+      controlDirectoryURL: controlDirectoryURL,
+      app: lifecycleState.app,
+      statusLabel: lifecycleState.statusLabel
+    )
+    lifecycleState.readyFrame.runnerPort = httpCommandServer.port
+
+    try emitLifecycleReadyFrame(lifecycleState.readyFrame, controlDirectoryURL: controlDirectoryURL)
+
+    print(
+      "PROBE_METRIC \(metricName) attach_latency_ms=\(lifecycleState.readyFrame.attachLatencyMs) control_dir=\(controlDirectoryURL.path) pid=\(lifecycleState.readyFrame.processIdentifier) runner_port=\(httpCommandServer.port)"
+    )
+
+    try httpCommandServer.waitForShutdown()
   }
 
   private func resolveLifecycleControlDirectory() throws -> ResolvedLifecycleControlDirectory {
@@ -744,9 +721,9 @@ final class AttachControlSpikeUITests: XCTestCase {
       )
     }
 
-    guard bootstrapConfig.ingressTransport == "file-mailbox" else {
+    guard bootstrapConfig.ingressTransport == "http-post" else {
       throw lifecycleBootstrapError(
-        "Bootstrap manifest \(expectedBootstrapPath) declared ingress \(bootstrapConfig.ingressTransport), expected file-mailbox."
+        "Bootstrap manifest \(expectedBootstrapPath) declared ingress \(bootstrapConfig.ingressTransport), expected http-post."
       )
     }
 
@@ -769,59 +746,6 @@ final class AttachControlSpikeUITests: XCTestCase {
       code: 1,
       userInfo: [NSLocalizedDescriptionKey: message]
     )
-  }
-
-  @MainActor
-  private func runLifecycleCommandLoop(
-    controlDirectoryURL: URL,
-    app: XCUIApplication,
-    statusLabel: XCUIElement,
-  ) throws {
-    var expectedSequence = 1
-    var handledCommands = 0
-
-    while true {
-      let commandURL = lifecycleCommandURL(in: controlDirectoryURL, sequence: expectedSequence)
-      guard let command = try waitForLifecycleCommand(at: commandURL, timeout: lifecycleCommandTimeout) else {
-        XCTFail("Timed out waiting for lifecycle command #\(expectedSequence) at \(commandURL.path).")
-        return
-      }
-
-      let commandStartedAt = Date()
-      let responseFrame = executeLifecycleCommandFrame(
-        command,
-        startedAt: commandStartedAt,
-        app: app,
-        statusLabel: statusLabel,
-        controlDirectoryURL: controlDirectoryURL
-      )
-
-      // Keep file mirrors for lifecycle/transport validation scripts; the runtime consumes stdout as canonical egress.
-      try writeJSON(
-        responseFrame,
-        to: lifecycleResponseURL(in: controlDirectoryURL, sequence: expectedSequence)
-      )
-
-      try emitStdoutJSONLine(responseFrame)
-
-      print(
-        "PROBE_METRIC lifecycle_response sequence=\(responseFrame.sequence) action=\(responseFrame.action) ok=\(responseFrame.ok) handled_ms=\(responseFrame.handledMs) snapshot_nodes=\(responseFrame.snapshotNodeCount ?? -1)"
-      )
-
-      handledCommands += 1
-      expectedSequence += 1
-
-      if !responseFrame.ok {
-        let failureMessage = responseFrame.error ?? "unknown error"
-        XCTFail("Lifecycle command #\(responseFrame.sequence) failed: \(failureMessage)")
-        return
-      }
-
-      if command.action == "shutdown" {
-        print("PROBE_METRIC lifecycle_shutdown handled_commands=\(handledCommands)")
-        return
-      }
-    }
   }
 
   private struct HTTPCommandServer {
@@ -965,7 +889,7 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     guard startupSemaphore.wait(timeout: .now() + 10) == .success else {
       listener.cancel()
-      throw lifecycleBootstrapError("The real-device HTTP command listener did not become ready before the timeout.")
+      throw lifecycleBootstrapError("The runner HTTP command listener did not become ready before the timeout.")
     }
 
     if let startupError {
@@ -975,7 +899,7 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     guard let actualPort else {
       listener.cancel()
-      throw lifecycleBootstrapError("The real-device HTTP command listener did not report a bound port.")
+      throw lifecycleBootstrapError("The runner HTTP command listener did not report a bound port.")
     }
 
     return HTTPCommandServer(
@@ -985,7 +909,7 @@ final class AttachControlSpikeUITests: XCTestCase {
         listener.cancel()
 
         if waitResult != .completed {
-          throw self.lifecycleBootstrapError("The real-device HTTP command listener ended with \(waitResult).")
+          throw self.lifecycleBootstrapError("The runner HTTP command listener ended with \(waitResult).")
         }
       }
     )
@@ -1255,172 +1179,6 @@ final class AttachControlSpikeUITests: XCTestCase {
     let data = try JSONEncoder().encode(value)
     FileHandle.standardOutput.write(data)
     FileHandle.standardOutput.write(Data([0x0A]))
-  }
-
-  private func probeStdinJSONL(timeout: TimeInterval) -> StdinProbeResultFrame {
-    let duplicatedStdin = dup(STDIN_FILENO)
-
-    guard duplicatedStdin >= 0 else {
-      return StdinProbeResultFrame(
-        kind: "stdin-probe-result",
-        status: "dup-failed",
-        payload: nil,
-        error: String(cString: strerror(errno)),
-        recordedAt: Self.iso8601Formatter.string(from: Date())
-      )
-    }
-
-    defer {
-      close(duplicatedStdin)
-    }
-
-    let originalFlags = fcntl(duplicatedStdin, F_GETFL)
-
-    if originalFlags >= 0 {
-      _ = fcntl(duplicatedStdin, F_SETFL, originalFlags | O_NONBLOCK)
-    }
-
-    defer {
-      if originalFlags >= 0 {
-        _ = fcntl(duplicatedStdin, F_SETFL, originalFlags)
-      }
-    }
-
-    let deadline = Date().addingTimeInterval(timeout)
-    var buffer = Data()
-
-    while Date() < deadline {
-      var descriptor = pollfd(
-        fd: duplicatedStdin,
-        events: Int16(POLLIN | POLLERR | POLLHUP),
-        revents: 0
-      )
-
-      let pollResult = withUnsafeMutablePointer(to: &descriptor) { pointer in
-        poll(pointer, 1, 100)
-      }
-
-      if pollResult < 0 {
-        if errno == EINTR {
-          continue
-        }
-
-        return StdinProbeResultFrame(
-          kind: "stdin-probe-result",
-          status: "poll-failed",
-          payload: nil,
-          error: String(cString: strerror(errno)),
-          recordedAt: Self.iso8601Formatter.string(from: Date())
-        )
-      }
-
-      if pollResult == 0 {
-        continue
-      }
-
-      if (descriptor.revents & Int16(POLLERR)) != 0 {
-        return StdinProbeResultFrame(
-          kind: "stdin-probe-result",
-          status: "poll-error",
-          payload: nil,
-          error: "POLLERR",
-          recordedAt: Self.iso8601Formatter.string(from: Date())
-        )
-      }
-
-      if (descriptor.revents & Int16(POLLHUP)) != 0 && (descriptor.revents & Int16(POLLIN)) == 0 {
-        return StdinProbeResultFrame(
-          kind: "stdin-probe-result",
-          status: "eof",
-          payload: nil,
-          error: nil,
-          recordedAt: Self.iso8601Formatter.string(from: Date())
-        )
-      }
-
-      if (descriptor.revents & Int16(POLLIN)) != 0 {
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        let readCount = read(duplicatedStdin, &chunk, chunk.count)
-
-        if readCount == 0 {
-          return StdinProbeResultFrame(
-            kind: "stdin-probe-result",
-            status: "eof",
-            payload: nil,
-            error: nil,
-            recordedAt: Self.iso8601Formatter.string(from: Date())
-          )
-        }
-
-        if readCount < 0 {
-          if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
-            continue
-          }
-
-          return StdinProbeResultFrame(
-            kind: "stdin-probe-result",
-            status: "read-failed",
-            payload: nil,
-            error: String(cString: strerror(errno)),
-            recordedAt: Self.iso8601Formatter.string(from: Date())
-          )
-        }
-
-        buffer.append(contentsOf: chunk.prefix(readCount))
-
-        if let newlineIndex = buffer.firstIndex(of: 0x0A) {
-          let lineData = Data(buffer.prefix(upTo: newlineIndex))
-
-          guard let line = String(data: lineData, encoding: .utf8) else {
-            return StdinProbeResultFrame(
-              kind: "stdin-probe-result",
-              status: "invalid-utf8",
-              payload: nil,
-              error: nil,
-              recordedAt: Self.iso8601Formatter.string(from: Date())
-            )
-          }
-
-          do {
-            let command = try JSONDecoder().decode(StdinProbeCommandFrame.self, from: lineData)
-
-            guard command.kind == "stdin-probe" else {
-              return StdinProbeResultFrame(
-                kind: "stdin-probe-result",
-                status: "unexpected-kind",
-                payload: line,
-                error: command.kind,
-                recordedAt: Self.iso8601Formatter.string(from: Date())
-              )
-            }
-
-            return StdinProbeResultFrame(
-              kind: "stdin-probe-result",
-              status: "received",
-              payload: command.payload,
-              error: nil,
-              recordedAt: Self.iso8601Formatter.string(from: Date())
-            )
-          } catch {
-            return StdinProbeResultFrame(
-              kind: "stdin-probe-result",
-              status: "invalid-json",
-              payload: line,
-              error: String(describing: error),
-              recordedAt: Self.iso8601Formatter.string(from: Date())
-            )
-          }
-        }
-      }
-    }
-
-    return StdinProbeResultFrame(
-      kind: "stdin-probe-result",
-      status: "timeout",
-      payload: nil,
-      error: nil,
-      recordedAt: Self.iso8601Formatter.string(from: Date())
-    )
   }
 
   private func waitForLabel(_ element: XCUIElement, toEqual label: String, timeout: TimeInterval) -> Bool {
@@ -1989,6 +1747,14 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private func describeUIActionLocator(_ locator: RunnerUIActionLocator) -> String {
+    if locator.kind == "point" {
+      guard let x = locator.x, let y = locator.y else {
+        return "interaction-root point"
+      }
+
+      return "point(\(x), \(y))"
+    }
+
     var parts: [String] = []
 
     if let identifier = Self.normalizedText(locator.identifier) {
@@ -2024,6 +1790,23 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
 
     return parts.isEmpty ? "ui target" : parts.joined(separator: ", ")
+  }
+
+  @MainActor
+  private func resolveUIActionCoordinate(
+    locator: RunnerUIActionLocator,
+    app: XCUIApplication,
+  ) throws -> XCUICoordinate {
+    guard locator.kind == "point" else {
+      throw actionError("Expected a point locator, received \(locator.kind).")
+    }
+
+    guard let x = locator.x, let y = locator.y else {
+      throw actionError("Point locator must include x and y coordinates.")
+    }
+
+    let origin = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+    return origin.withOffset(CGVector(dx: x, dy: y))
   }
 
   private func elementType(for typeName: String?) -> XCUIElement.ElementType {
@@ -2066,6 +1849,10 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private func elementMatchesLocator(_ element: XCUIElement, locator: RunnerUIActionLocator) -> Bool {
+    guard locator.kind == "semantic" else {
+      return false
+    }
+
     if let identifier = Self.normalizedText(locator.identifier), Self.normalizedText(element.identifier) != identifier {
       return false
     }
@@ -2098,6 +1885,10 @@ final class AttachControlSpikeUITests: XCTestCase {
     locator: RunnerUIActionLocator,
     app: XCUIApplication,
   ) -> ResolvedUIActionCandidates {
+    guard locator.kind == "semantic" else {
+      return ResolvedUIActionCandidates(matches: [], sectionMatchCount: nil)
+    }
+
     if locator.type == "application" {
       return ResolvedUIActionCandidates(
         matches: elementMatchesLocator(app, locator: locator) ? [app] : [],
@@ -2140,6 +1931,10 @@ final class AttachControlSpikeUITests: XCTestCase {
     locator: RunnerUIActionLocator,
     app: XCUIApplication,
   ) throws -> XCUIElement {
+    guard locator.kind == "semantic" else {
+      throw actionError("Point locators do not resolve to accessibility elements.")
+    }
+
     let resolved = matchingUIActionElements(locator: locator, app: app)
     let matches = resolved.matches
 
@@ -2183,6 +1978,10 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private func clearTextIfNeeded(on element: XCUIElement, locator: RunnerUIActionLocator) {
+    guard locator.kind == "semantic" else {
+      return
+    }
+
     let currentValue = Self.normalizedValue(element.value)
     let placeholder = Self.normalizedText(locator.placeholder)
 
@@ -2209,11 +2008,65 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
   }
 
+  private func performDirectionalGesture(on coordinate: XCUICoordinate, direction: String) throws {
+    switch direction {
+    case "up":
+      coordinate.swipeUp()
+    case "down":
+      coordinate.swipeDown()
+    case "left":
+      coordinate.swipeLeft()
+    case "right":
+      coordinate.swipeRight()
+    default:
+      throw actionError("Unsupported direction \(direction).")
+    }
+  }
+
   @MainActor
   private func performRunnerUIAction(
     _ action: RunnerUIActionPayload,
     app: XCUIApplication,
   ) throws -> String {
+    if action.locator.kind == "point" {
+      let target = try resolveUIActionCoordinate(locator: action.locator, app: app)
+      let targetDescription = describeUIActionLocator(action.locator)
+
+      switch action.kind {
+      case "tap":
+        target.tap()
+        return "tapped \(targetDescription)"
+
+      case "press":
+        let durationMs = action.durationMs ?? 750
+        try requireActionCondition(durationMs > 0, "Press duration must be positive.")
+        target.press(forDuration: Double(durationMs) / 1000.0)
+        return "pressed \(targetDescription)"
+
+      case "swipe":
+        try performDirectionalGesture(on: target, direction: action.direction ?? "")
+        return "swiped \(action.direction ?? "unknown") on \(targetDescription)"
+
+      case "type":
+        target.tap()
+        if let text = action.text, !text.isEmpty {
+          app.typeText(text)
+        }
+        return "typed into \(targetDescription)"
+
+      case "scroll":
+        let steps = action.steps ?? 1
+        try requireActionCondition(steps > 0, "Scroll steps must be positive.")
+        for _ in 0..<steps {
+          try performDirectionalGesture(on: target, direction: action.direction ?? "")
+        }
+        return "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps"
+
+      default:
+        throw actionError("Unsupported UI action \(action.kind).")
+      }
+    }
+
     let target = try resolveUIActionElement(locator: action.locator, app: app)
     let targetDescription = describeUIActionLocator(action.locator)
 
@@ -2451,34 +2304,6 @@ final class AttachControlSpikeUITests: XCTestCase {
         userInfo: [NSLocalizedDescriptionKey: "Unsupported lifecycle action: \(command.action)"]
       )
     }
-  }
-
-  @MainActor
-  private func waitForLifecycleCommand(
-    at url: URL,
-    timeout: TimeInterval,
-  ) throws -> LifecycleCommandFrame? {
-    let deadline = Date().addingTimeInterval(timeout)
-
-    while Date() < deadline {
-      if FileManager.default.fileExists(atPath: url.path) {
-        let data = try Data(contentsOf: url)
-        try? FileManager.default.removeItem(at: url)
-        return try JSONDecoder().decode(LifecycleCommandFrame.self, from: data)
-      }
-
-      RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-    }
-
-    return nil
-  }
-
-  private func lifecycleCommandURL(in controlDirectoryURL: URL, sequence: Int) -> URL {
-    controlDirectoryURL.appendingPathComponent(String(format: "command-%03d.json", sequence))
-  }
-
-  private func lifecycleResponseURL(in controlDirectoryURL: URL, sequence: Int) -> URL {
-    controlDirectoryURL.appendingPathComponent(String(format: "response-%03d.json", sequence))
   }
 
   private func lifecycleSnapshotPayloadURL(in controlDirectoryURL: URL, sequence: Int) -> URL {

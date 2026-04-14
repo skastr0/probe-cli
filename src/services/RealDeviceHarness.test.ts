@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   buildRunnerHttpArtifactUrls,
   buildRunnerHttpCommandUrls,
+  detectRealDeviceInterruption,
   decodeRunnerVideoArtifactManifest,
   extractDeviceCandidate,
   extractDeviceTunnelIp,
@@ -347,6 +348,82 @@ describe("materializeDeviceRunnerVideoArtifacts", () => {
       expect(requestedUrls[1]).toContain("http://127.0.0.1:57873/artifact?")
     } finally {
       globalThis.fetch = originalFetch
+      await rm(tempRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("detectRealDeviceInterruption", () => {
+  test("detects direct passcode evidence from device-side command output", async () => {
+    const interruption = await detectRealDeviceInterruption({
+      targetBundleId: "com.skastr0.ripple",
+      device: {
+        identifier: "00008110-0006293936C0401E",
+        name: "iPhone 13 Pro",
+      },
+      evidenceSources: [{
+        label: "devicectl device process launch",
+        text: "Error: type device passcode before the app can be launched.",
+      }],
+    })
+
+    expect(interruption?.signal).toBe("passcode-required")
+    expect(interruption?.evidenceKind).toBe("direct")
+    expect(interruption?.details).toContain(
+      "devicectl device process launch: Error: type device passcode before the app can be launched.",
+    )
+  })
+
+  test("infers a blocked attach from long foreground waits against the target app", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "probe-real-device-interruption-"))
+    const logPath = join(tempRoot, "xcodebuild-session.log")
+
+    await writeFile(logPath, [
+      "t =     0.04s Wait for com.skastr0.ripple to become Running Foreground",
+      "t =    35.04s Wait for com.skastr0.ripple to become Running Foreground",
+      "t =    35.05s Waiting 5.0s for app to settle",
+      "{\"kind\":\"ready\"}",
+      "",
+    ].join("\n"), "utf8")
+
+    try {
+      const interruption = await detectRealDeviceInterruption({
+        targetBundleId: "com.skastr0.ripple",
+        device: {
+          identifier: "00008110-0006293936C0401E",
+          name: "iPhone 13 Pro",
+        },
+        observedLatencyMs: 45_000,
+        logPath,
+      })
+
+      expect(interruption?.signal).toBe("target-foreground-blocked")
+      expect(interruption?.evidenceKind).toBe("inferred")
+      expect(interruption?.details).toContain("foreground waits: 2")
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("fails closed when attach is slow but there is no interruption evidence", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "probe-real-device-interruption-"))
+    const logPath = join(tempRoot, "xcodebuild-session.log")
+
+    await writeFile(logPath, "t = 0.00s Start Test\nt = 40.00s Runner still preparing\n", "utf8")
+
+    try {
+      const interruption = await detectRealDeviceInterruption({
+        targetBundleId: "com.skastr0.ripple",
+        device: {
+          identifier: "00008110-0006293936C0401E",
+          name: "iPhone 13 Pro",
+        },
+        observedLatencyMs: 45_000,
+        logPath,
+      })
+
+      expect(interruption).toBeNull()
+    } finally {
       await rm(tempRoot, { recursive: true, force: true })
     }
   })

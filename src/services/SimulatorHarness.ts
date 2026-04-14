@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process"
-import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { createServer } from "node:net"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
 import {
@@ -12,19 +13,18 @@ import type { SimulatorSessionMode } from "../domain/session"
 import {
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
-  decodeRunnerStdinProbeResultFrame,
   encodeRunnerCommandFrame,
-  RUNNER_COMMAND_INGRESS,
   RUNNER_EVENT_EGRESS,
+  RUNNER_HTTP_COMMAND_INGRESS,
   RUNNER_TRANSPORT_CONTRACT,
   type RunnerAction,
   type RunnerReadyFrame,
   type RunnerResponseFrame,
-  type RunnerStdinProbeResultFrame,
 } from "./runnerProtocol"
+import { injectEnvironmentVariablesIntoXctestrunPlist } from "./RealDeviceHarness"
 
 const defaultTestBundleId = "dev.probe.fixture"
-const commandPollIntervalMs = 50
+const observerFramePollIntervalMs = 50
 const commandTimeoutMs = 20_000
 const runnerReadyTimeoutMs = 120_000
 const recordVideoTimeoutBufferMs = 30_000
@@ -32,8 +32,9 @@ const maxRecordVideoDurationMs = 120_000
 const defaultRecordVideoDurationMs = 10_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const simulatorRunnerBuildCacheRoot = ".probe/simulator-runner-builds"
+const runnerPortEnvKey = "PROBE_RUNNER_PORT"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
-const runnerCommandIngress = RUNNER_COMMAND_INGRESS
+const runnerCommandIngress = RUNNER_HTTP_COMMAND_INGRESS
 const runnerEventEgress = RUNNER_EVENT_EGRESS
 
 const timestampForFile = (): string => new Date().toISOString().replace(/[:.]/g, "-")
@@ -60,7 +61,6 @@ interface SimctlListPayload {
 
 type ReadyFrame = RunnerReadyFrame
 type ResponseFrame = RunnerResponseFrame
-type StdinProbeResultFrame = RunnerStdinProbeResultFrame
 
 export interface RunnerCommandResult {
   readonly ok: boolean
@@ -161,6 +161,72 @@ const ensureDirectory = async (path: string): Promise<void> => {
   await mkdir(path, { recursive: true })
 }
 
+const findFirstMatchingPath = async (directory: string, predicate: (name: string) => boolean): Promise<string | null> => {
+  try {
+    const entries = await readdir(directory)
+    const match = entries.find(predicate)
+    return match ? join(directory, match) : null
+  } catch {
+    return null
+  }
+}
+
+const allocateFreeTcpPort = async (): Promise<number> =>
+  await new Promise((resolve, reject) => {
+    const server = createServer()
+
+    server.once("error", reject)
+    server.listen({ host: "127.0.0.1", port: 0 }, () => {
+      const address = server.address()
+      const port = typeof address === "object" && address !== null ? address.port : null
+
+      if (!port || port <= 0) {
+        server.close((error) => reject(error ?? new Error("The temporary TCP listener did not report a usable port.")))
+        return
+      }
+
+      server.close((error) => {
+        if (error) {
+          reject(error)
+          return
+        }
+
+        resolve(port)
+      })
+    })
+  })
+
+const resolveRunnerXctestrunPath = async (derivedDataPath: string): Promise<string> => {
+  const buildProductsPath = join(derivedDataPath, "Build", "Products")
+  const xctestrunPath = await findFirstMatchingPath(buildProductsPath, (name) => name.endsWith(".xctestrun"))
+
+  if (!xctestrunPath) {
+    throw new EnvironmentError({
+      code: "runner-xctestrun-missing",
+      reason: `Expected an .xctestrun file under ${buildProductsPath} after the simulator build-for-testing step.`,
+      nextStep: "Inspect the build-for-testing log artifact and the derived-data products layout before retrying.",
+      details: [],
+    })
+  }
+
+  return xctestrunPath
+}
+
+const injectRunnerPortIntoXctestrun = async (args: {
+  readonly sourcePath: string
+  readonly destinationPath: string
+  readonly runnerPort: number
+}): Promise<string> => {
+  const originalXctestrun = await readFile(args.sourcePath, "utf8")
+  const injectedXctestrun = injectEnvironmentVariablesIntoXctestrunPlist(originalXctestrun, {
+    [runnerPortEnvKey]: String(args.runnerPort),
+  })
+
+  await ensureDirectory(dirname(args.destinationPath))
+  await writeFile(args.destinationPath, injectedXctestrun, "utf8")
+  return args.destinationPath
+}
+
 const writeBootstrapManifest = async (args: {
   readonly bootstrapPath: string
   readonly controlDirectoryPath: string
@@ -185,6 +251,39 @@ const writeBootstrapManifest = async (args: {
 
 const removeFileIfExists = async (path: string): Promise<void> => {
   await rm(path, { force: true }).catch(() => undefined)
+}
+
+const findNewestFileInDirectory = async (directory: string): Promise<string | null> => {
+  let entries: ReadonlyArray<string>
+
+  try {
+    entries = await readdir(directory)
+  } catch {
+    return null
+  }
+
+  const files = (await Promise.all(entries.map(async (entry) => {
+    const absolutePath = join(directory, entry)
+    const entryStat = await stat(absolutePath)
+
+    if (entryStat.isDirectory()) {
+      const nested = await findNewestFileInDirectory(absolutePath)
+      return nested ? [nested] : []
+    }
+
+    return [absolutePath]
+  }))).flat()
+
+  if (files.length === 0) {
+    return null
+  }
+
+  const candidates = await Promise.all(files.map(async (absolutePath) => ({
+    absolutePath,
+    mtimeMs: (await stat(absolutePath)).mtimeMs,
+  })))
+
+  return candidates.sort((left, right) => right.mtimeMs - left.mtimeMs)[0]?.absolutePath ?? null
 }
 
 const processExists = (pid: number): boolean => {
@@ -388,7 +487,7 @@ const waitForFreshJson = async <T>(args: {
       })
     }
 
-    await sleep(commandPollIntervalMs)
+    await sleep(observerFramePollIntervalMs)
   }
 
   throw new ChildProcessError({
@@ -401,10 +500,79 @@ const waitForFreshJson = async <T>(args: {
   })
 }
 
+const sendRunnerHttpCommand = async (args: {
+  readonly commandUrl: string
+  readonly commandFrame: string
+  readonly action: RunnerAction
+  readonly payload?: string
+}): Promise<ResponseFrame> => {
+  const controller = new AbortController()
+  const timeoutMs = resolveCommandTimeoutMs(args.action, args.payload)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch(args.commandUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: args.commandFrame,
+      signal: controller.signal,
+    })
+    const responseText = await response.text()
+
+    if (!response.ok) {
+      throw new Error(
+        `Runner HTTP ${args.action} returned ${response.status}: ${responseText.trim() || "<empty-body>"}`,
+      )
+    }
+
+    return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Runner HTTP ${args.action} timed out after ${timeoutMs} ms`)
+    }
+
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+export const createHttpRunnerCommandSender = (commandUrl: string) =>
+  async (
+    sequence: number,
+    action: RunnerAction,
+    payload?: string,
+  ): Promise<RunnerCommandResult> => {
+    const startedAt = Date.now()
+    const response = await sendRunnerHttpCommand({
+      commandUrl,
+      commandFrame: encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null }),
+      action,
+      payload,
+    })
+
+    return {
+      ok: response.ok,
+      action: response.action,
+      error: response.error ?? null,
+      payload: response.payload ?? null,
+      snapshotPayloadPath: response.snapshotPayloadPath ?? null,
+      inlinePayload: response.inlinePayload ?? null,
+      inlinePayloadEncoding: response.inlinePayloadEncoding ?? null,
+      handledMs: response.handledMs,
+      statusLabel: response.statusLabel,
+      snapshotNodeCount: response.snapshotNodeCount ?? null,
+      hostRttMs: Date.now() - startedAt,
+    }
+  }
+
 const runCommand = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly logPath?: string
+  readonly timeoutMs?: number
 }): Promise<{ readonly stdout: string; readonly stderr: string }> =>
   await new Promise<{ readonly stdout: string; readonly stderr: string }>((resolve, reject) => {
     const child = spawn(args.command, [...args.commandArgs], {
@@ -414,6 +582,19 @@ const runCommand = async (args: {
 
     let stdout = ""
     let stderr = ""
+    let timedOut = false
+
+    const timeout = args.timeoutMs
+      ? setTimeout(() => {
+          timedOut = true
+          child.kill("SIGTERM")
+          setTimeout(() => {
+            if (child.exitCode === null) {
+              child.kill("SIGKILL")
+            }
+          }, 2_000)
+        }, args.timeoutMs)
+      : null
 
     child.stdout?.setEncoding("utf8")
     child.stderr?.setEncoding("utf8")
@@ -426,12 +607,32 @@ const runCommand = async (args: {
 
     child.once("error", (error) => reject(error))
     child.once("close", async (code) => {
+      if (timeout) {
+        clearTimeout(timeout)
+      }
+
       if (args.logPath) {
         await ensureDirectory(dirname(args.logPath))
       }
 
       if (args.logPath) {
         await writeFile(args.logPath, `${stdout}${stderr}`, "utf8")
+      }
+
+      if (timedOut) {
+        reject(
+          new ChildProcessError({
+            code: "command-timeout",
+            command: `${args.command} ${args.commandArgs.join(" ")}`,
+            reason: `${args.command} timed out after ${args.timeoutMs ?? 0} ms.`,
+            nextStep: args.logPath
+              ? `Inspect the log at ${args.logPath} and retry.`
+              : `Retry ${args.command} with a longer timeout or inspect the host state.`,
+            exitCode: code,
+            stderrExcerpt: `${stdout}${stderr}`.split(/\r?\n/).slice(-80).join("\n"),
+          }),
+        )
+        return
       }
 
       if (code === 0) {
@@ -517,6 +718,29 @@ const captureSimulatorScreenshotWithSimctl = async (args: {
   if (!(await fileExists(args.absolutePath))) {
     throw new Error(`simctl screenshot completed without creating ${args.absolutePath}.`)
   }
+}
+
+const captureSimulatorDiagnosticBundleWithSimctl = async (args: {
+  readonly simulatorUdid: string
+  readonly diagnosticsDirectory: string
+  readonly fileStem: string
+}): Promise<{ readonly absolutePath: string }> => {
+  const outputDirectory = join(args.diagnosticsDirectory, `${args.fileStem}.simctl-diagnose`)
+
+  await ensureDirectory(outputDirectory)
+  await runCommand({
+    command: "xcrun",
+    commandArgs: ["simctl", "diagnose", "-b", "--output", outputDirectory, "--udid", args.simulatorUdid],
+    timeoutMs: 10 * 60_000,
+  })
+
+  const absolutePath = await findNewestFileInDirectory(outputDirectory)
+
+  if (absolutePath === null) {
+    throw new Error(`simctl diagnose completed without producing an archive under ${outputDirectory}.`)
+  }
+
+  return { absolutePath }
 }
 
 const recordSimulatorVideoWithSimctl = async (args: {
@@ -771,6 +995,7 @@ const assertReadyTransportContract = (args: {
   readonly expectedControlDirectoryPath: string
   readonly expectedSessionIdentifier: string
   readonly simulatorUdid: string
+  readonly expectedRunnerPort: number
 }): void => {
   const expectedBootstrapPath = join(runnerBootstrapRootPath, `${args.simulatorUdid}.json`)
 
@@ -809,6 +1034,16 @@ const assertReadyTransportContract = (args: {
       reason:
         `Expected ingress ${runnerCommandIngress} and egress ${runnerEventEgress}, received ${args.ready.ingressTransport} / ${args.ready.egressTransport}.`,
       nextStep: "Inspect the runner ready frame and align the host/runtime transport seam before retrying.",
+      details: [],
+    })
+  }
+
+  if (args.ready.runnerPort !== args.expectedRunnerPort) {
+    throw new EnvironmentError({
+      code: "runner-port-mismatch",
+      reason:
+        `Expected runner HTTP port ${args.expectedRunnerPort}, received ${String(args.ready.runnerPort ?? null)}.`,
+      nextStep: "Inspect the injected PROBE_RUNNER_PORT value and the simulator runner HTTP listener startup before retrying.",
       details: [],
     })
   }
@@ -854,13 +1089,12 @@ const assertReadyTransportContract = (args: {
 
 const startWrapperProcess = async (args: {
   readonly rootDir: string
-  readonly projectPath: string
+  readonly xctestrunPath: string
+  readonly destination: string
   readonly observerControlDirectory: string
   readonly wrapperStderrPath: string
   readonly logPath: string
   readonly stdoutEventsPath: string
-  readonly derivedDataPath: string
-  readonly simulatorUdid: string
   readonly resultBundlePath: string
 }): Promise<{
   readonly process: ChildProcess
@@ -888,18 +1122,12 @@ const startWrapperProcess = async (args: {
       args.logPath,
       "--stdout-events-path",
       args.stdoutEventsPath,
-      "--stdin-probe-payload",
-      "probe-daemon-session",
       "--",
       "xcodebuild",
-      "-project",
-      args.projectPath,
-      "-scheme",
-      "ProbeRunner",
+      "-xctestrun",
+      args.xctestrunPath,
       "-destination",
-      `platform=iOS Simulator,id=${args.simulatorUdid}`,
-      "-derivedDataPath",
-      args.derivedDataPath,
+      args.destination,
       "-resultBundlePath",
       args.resultBundlePath,
       "CODE_SIGNING_ALLOWED=NO",
@@ -970,6 +1198,11 @@ export class SimulatorHarness extends Context.Tag("@probe/SimulatorHarness")<
     readonly captureSimulatorScreenshot: (args: {
       readonly simulatorUdid: string
       readonly absolutePath: string
+    }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError | ChildProcessError>
+    readonly captureSimulatorDiagnosticBundle: (args: {
+      readonly simulatorUdid: string
+      readonly diagnosticsDirectory: string
+      readonly fileStem: string
     }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError | ChildProcessError>
     readonly recordSimulatorVideo: (args: {
       readonly simulatorUdid: string
@@ -1119,16 +1352,23 @@ export const SimulatorHarnessLive = Layer.succeed(
               targetBundleId: args.bundleId,
             })
 
+            const runnerPort = await allocateFreeTcpPort()
+            const runnerXctestrunPath = await resolveRunnerXctestrunPath(derivedDataPath)
+            const injectedXctestrunPath = await injectRunnerPortIntoXctestrun({
+              sourcePath: runnerXctestrunPath,
+              destinationPath: join(dirname(runnerXctestrunPath), "simulator-injected.xctestrun"),
+              runnerPort,
+            })
+
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
               rootDir: args.rootDir,
-              projectPath,
+              xctestrunPath: injectedXctestrunPath,
+              destination: `platform=iOS Simulator,id=${selected.device.udid}`,
               observerControlDirectory,
               wrapperStderrPath,
               logPath: sessionLogPath,
               stdoutEventsPath,
-              derivedDataPath,
-              simulatorUdid: selected.device.udid,
               resultBundlePath,
             })
             void wrapper.exit.finally(async () => {
@@ -1161,66 +1401,11 @@ export const SimulatorHarnessLive = Layer.succeed(
               expectedControlDirectoryPath: runtimeControlDirectory,
               expectedSessionIdentifier: args.sessionId,
               simulatorUdid: selected.device.udid,
+              expectedRunnerPort: runnerPort,
             })
 
-            const stdinProbe = await waitForFreshJson<StdinProbeResultFrame>({
-              path: join(observerControlDirectory, "stdout-stdin-probe-result.json"),
-              timeoutMs: runnerReadyTimeoutMs,
-              minMtimeMs: startedAt,
-              isRunning: isWrapperRunning,
-              decode: decodeRunnerStdinProbeResultFrame,
-              invalidCode: "runner-stdin-probe-frame-invalid",
-              invalidReason: "The runner stdin probe frame drifted from the validated host↔runner contract",
-              invalidNextStep: "Inspect the saved stdin probe JSON and align the host/runtime transport contract before retrying.",
-              commandDescription: "runner stdin probe wait",
-              logPath: sessionLogPath,
-            })
-
-            const sendCommand = async (
-              sequence: number,
-              action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
-              payload?: string,
-            ): Promise<RunnerCommandResult> => {
-              const startedAt = Date.now()
-              const commandPath = join(ready.controlDirectoryPath, `command-${String(sequence).padStart(3, "0")}.json`)
-              const stdoutResponsePath = join(
-                observerControlDirectory,
-                `stdout-response-${String(sequence).padStart(3, "0")}.json`,
-              )
-
-              await writeFile(
-                commandPath,
-                encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null }),
-                "utf8",
-              )
-
-              const stdoutResponse = await waitForFreshJson<ResponseFrame>({
-                path: stdoutResponsePath,
-                timeoutMs: resolveCommandTimeoutMs(action, payload),
-                minMtimeMs: startedAt,
-                isRunning: isWrapperRunning,
-                decode: decodeRunnerResponseFrame,
-                invalidCode: "runner-response-frame-invalid",
-                invalidReason: `The runner ${action} response drifted from the validated host↔runner contract`,
-                invalidNextStep: "Inspect the saved runner response JSON and align the host/runtime transport contract before retrying.",
-                commandDescription: `runner stdout ${action}`,
-                logPath: sessionLogPath,
-              })
-
-              return {
-                ok: stdoutResponse.ok,
-                action: stdoutResponse.action,
-                error: stdoutResponse.error ?? null,
-                payload: stdoutResponse.payload ?? null,
-                snapshotPayloadPath: stdoutResponse.snapshotPayloadPath ?? null,
-                inlinePayload: stdoutResponse.inlinePayload ?? null,
-                inlinePayloadEncoding: stdoutResponse.inlinePayloadEncoding ?? null,
-                handledMs: stdoutResponse.handledMs,
-                statusLabel: stdoutResponse.statusLabel,
-                snapshotNodeCount: stdoutResponse.snapshotNodeCount ?? null,
-                hostRttMs: Date.now() - startedAt,
-              }
-            }
+            const commandUrl = `http://127.0.0.1:${ready.runnerPort}/command`
+            const sendCommand = createHttpRunnerCommandSender(commandUrl)
 
             const initialPing = await sendCommand(1, "ping", "session-open")
 
@@ -1271,7 +1456,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               stdoutEventsPath,
               resultBundlePath,
               wrapperStderrPath,
-              stdinProbeStatus: stdinProbe.status,
+              stdinProbeStatus: "not-required-http",
               initialPingRttMs: initialPing.hostRttMs,
               nextSequence: 2,
               sendCommand,
@@ -1405,6 +1590,19 @@ export const SimulatorHarnessLive = Layer.succeed(
                 code: "simulator-screenshot-capture",
                 reason: error instanceof Error ? error.message : String(error),
                 nextStep: "Inspect the simctl screenshot command and retry the screenshot request.",
+                details: [],
+              }),
+      }),
+    captureSimulatorDiagnosticBundle: (args) =>
+      Effect.tryPromise({
+        try: () => captureSimulatorDiagnosticBundleWithSimctl(args),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "simulator-diagnostic-capture",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the simctl diagnose command and retry the diagnostic capture.",
                 details: [],
               }),
       }),

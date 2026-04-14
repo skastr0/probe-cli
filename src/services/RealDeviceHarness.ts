@@ -4,6 +4,8 @@ import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
 import {
   ChildProcessError,
+  DeviceInterruptionError,
+  type DeviceInterruptionSignal,
   EnvironmentError,
   UserInputError,
 } from "../domain/errors"
@@ -13,7 +15,6 @@ import {
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
   encodeRunnerCommandFrame,
-  RUNNER_COMMAND_INGRESS,
   RUNNER_EVENT_EGRESS,
   RUNNER_HTTP_COMMAND_INGRESS,
   RUNNER_TRANSPORT_CONTRACT,
@@ -33,13 +34,63 @@ const defaultRecordVideoDurationMs = 10_000
 const runnerArtifactDownloadTimeoutMs = 15_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
-const runnerCommandIngress = RUNNER_COMMAND_INGRESS
-const runnerHttpCommandIngress = RUNNER_HTTP_COMMAND_INGRESS
+const runnerCommandIngress = RUNNER_HTTP_COMMAND_INGRESS
 const runnerEventEgress = RUNNER_EVENT_EGRESS
 const runnerBootstrapEnvKey = "PROBE_BOOTSTRAP_JSON"
 const runnerPortEnvKey = "PROBE_RUNNER_PORT"
 const runnerInjectedBootstrapPath = `env:${runnerBootstrapEnvKey}`
 const xctestrunMetadataKey = "__xctestrun_metadata__"
+const deviceInterruptionAttachLatencyThresholdMs = 30_000
+const maxInterruptionEvidenceLines = 3
+const commonDeviceInterruptionNextStep =
+  "Unlock the device, dismiss any passcode/trust/Developer Mode prompt, then retry. If the device disconnected while you fixed it, reconnect it first."
+
+interface DeviceInterruptionPattern {
+  readonly signal: DeviceInterruptionSignal
+  readonly pattern: RegExp
+  readonly reason: string
+  readonly nextStep: string
+}
+
+export interface RealDeviceInterruptionObservation {
+  readonly signal: DeviceInterruptionSignal
+  readonly evidenceKind: "direct" | "inferred"
+  readonly reason: string
+  readonly nextStep: string
+  readonly details: ReadonlyArray<string>
+}
+
+interface DeviceInterruptionEvidenceSource {
+  readonly label: string
+  readonly text: string
+}
+
+const deviceInterruptionPatterns: ReadonlyArray<DeviceInterruptionPattern> = [
+  {
+    signal: "passcode-required",
+    pattern: /type device passcode|enter passcode|\bpasscode\b/i,
+    reason: "The real device appears to be blocked by a passcode prompt.",
+    nextStep: "Unlock the device, dismiss the passcode prompt, then retry the Probe session.",
+  },
+  {
+    signal: "device-locked",
+    pattern: /device locked|lock screen|locked device/i,
+    reason: "The real device appears to be locked.",
+    nextStep: "Unlock the device, bring the target app back to the foreground if needed, then retry the Probe session.",
+  },
+  {
+    signal: "trust-required",
+    pattern: /trust this (?:computer|device)|confirm trust|device is not trusted/i,
+    reason: "The real device appears to be waiting for a trust confirmation.",
+    nextStep: "Accept the trust prompt on the device, then retry the Probe session.",
+  },
+  {
+    signal: "developer-mode-required",
+    pattern: /developer mode/i,
+    reason: "The real device appears to be waiting for a Developer Mode confirmation.",
+    nextStep: "Confirm or enable Developer Mode on the device, then retry the Probe session.",
+  },
+]
 
 interface CommandResult {
   readonly stdout: string
@@ -99,6 +150,8 @@ interface RunnerVideoArtifactManifest {
   readonly fps: number
   readonly frameCount: number
 }
+
+type DeviceDiagnosticCaptureMode = "diagnose" | "sysdiagnose"
 
 interface PreflightIssue {
   readonly summary: string
@@ -238,6 +291,18 @@ const fileExists = async (path: string): Promise<boolean> => {
   }
 }
 
+const readTextIfExists = async (path: string | null | undefined): Promise<string> => {
+  if (!path || !(await fileExists(path))) {
+    return ""
+  }
+
+  try {
+    return await readFile(path, "utf8")
+  } catch {
+    return ""
+  }
+}
+
 const readLastLines = async (path: string, maxLines: number): Promise<string> => {
   if (!(await fileExists(path))) {
     return ""
@@ -251,9 +316,175 @@ const removeFileIfExists = async (path: string): Promise<void> => {
   await rm(path, { force: true }).catch(() => undefined)
 }
 
+const findNewestFileInDirectory = async (directory: string): Promise<string | null> => {
+  let entries: ReadonlyArray<string>
+
+  try {
+    entries = await readdir(directory)
+  } catch {
+    return null
+  }
+
+  const files = (await Promise.all(entries.map(async (entry) => {
+    const absolutePath = join(directory, entry)
+    const entryStat = await stat(absolutePath)
+
+    if (entryStat.isDirectory()) {
+      const nested = await findNewestFileInDirectory(absolutePath)
+      return nested ? [nested] : []
+    }
+
+    return [absolutePath]
+  }))).flat()
+
+  if (files.length === 0) {
+    return null
+  }
+
+  const candidates = await Promise.all(files.map(async (absolutePath) => ({
+    absolutePath,
+    mtimeMs: (await stat(absolutePath)).mtimeMs,
+  })))
+
+  return candidates.sort((left, right) => right.mtimeMs - left.mtimeMs)[0]?.absolutePath ?? null
+}
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+const collectMatchingEvidenceLines = (args: {
+  readonly text: string
+  readonly pattern: RegExp
+  readonly limit?: number
+}): ReadonlyArray<string> => {
+  if (args.text.trim().length === 0) {
+    return []
+  }
+
+  const lines = args.text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+
+  const matches: Array<string> = []
+  const limit = args.limit ?? maxInterruptionEvidenceLines
+
+  for (const line of lines) {
+    if (args.pattern.test(line)) {
+      matches.push(line)
+
+      if (matches.length >= limit) {
+        break
+      }
+    }
+  }
+
+  return matches
+}
+
+const buildDeviceInterruptionCode = (signal: DeviceInterruptionSignal): string => `device-interruption-${signal}`
+
+export const buildRealDeviceInterruptionWarning = (
+  observation: RealDeviceInterruptionObservation,
+): string => `${observation.reason} ${observation.nextStep}`
+
+export const toDeviceInterruptionError = (
+  observation: RealDeviceInterruptionObservation,
+): DeviceInterruptionError =>
+  new DeviceInterruptionError({
+    code: buildDeviceInterruptionCode(observation.signal),
+    signal: observation.signal,
+    reason: observation.reason,
+    nextStep: observation.nextStep,
+    details: [...observation.details],
+  })
+
+export const detectRealDeviceInterruption = async (args: {
+  readonly targetBundleId: string
+  readonly device: {
+    readonly identifier: string
+    readonly name: string
+  }
+  readonly observedLatencyMs?: number | null
+  readonly statusLabel?: string | null
+  readonly logPath?: string | null
+  readonly wrapperStderrPath?: string | null
+  readonly evidenceSources?: ReadonlyArray<DeviceInterruptionEvidenceSource>
+}): Promise<RealDeviceInterruptionObservation | null> => {
+  const sessionLogText = await readTextIfExists(args.logPath)
+  const wrapperStderrText = await readTextIfExists(args.wrapperStderrPath)
+  const evidenceSources: Array<DeviceInterruptionEvidenceSource> = [
+    ...(args.statusLabel && args.statusLabel.trim().length > 0
+      ? [{ label: "runner status label", text: args.statusLabel }]
+      : []),
+    ...(args.evidenceSources ?? []),
+    ...(sessionLogText.trim().length > 0
+      ? [{ label: "xcodebuild session log", text: sessionLogText }]
+      : []),
+    ...(wrapperStderrText.trim().length > 0
+      ? [{ label: "runner wrapper stderr", text: wrapperStderrText }]
+      : []),
+  ]
+  const deviceDetail = `device: ${args.device.name} (${args.device.identifier})`
+
+  for (const pattern of deviceInterruptionPatterns) {
+    for (const source of evidenceSources) {
+      const matches = collectMatchingEvidenceLines({
+        text: source.text,
+        pattern: pattern.pattern,
+      })
+
+      if (matches.length > 0) {
+        return {
+          signal: pattern.signal,
+          evidenceKind: "direct",
+          reason: pattern.reason,
+          nextStep: pattern.nextStep,
+          details: [
+            deviceDetail,
+            ...matches.map((match) => `${source.label}: ${match}`),
+          ],
+        }
+      }
+    }
+  }
+
+  const observedLatencyMs = args.observedLatencyMs ?? null
+  if (observedLatencyMs === null || observedLatencyMs < deviceInterruptionAttachLatencyThresholdMs) {
+    return null
+  }
+
+  const foregroundWaitPattern = new RegExp(
+    `Wait for ${escapeRegExp(args.targetBundleId)} to become Running Foreground`,
+    "g",
+  )
+  const foregroundWaitCount = sessionLogText.match(foregroundWaitPattern)?.length ?? 0
+
+  if (foregroundWaitCount < 2) {
+    return null
+  }
+
+  return {
+    signal: "target-foreground-blocked",
+    evidenceKind: "inferred",
+    reason:
+      `Real-device attach took ${observedLatencyMs} ms while XCTest kept waiting for ${args.targetBundleId} to reach foreground. The device was likely blocked by the lock screen, a passcode prompt, or a trust/Developer Mode interruption.`,
+    nextStep: commonDeviceInterruptionNextStep,
+    details: [
+      deviceDetail,
+      `attach latency ms: ${observedLatencyMs}`,
+      `foreground waits: ${foregroundWaitCount}`,
+      ...collectMatchingEvidenceLines({
+        text: sessionLogText,
+        pattern: new RegExp(`Wait for ${escapeRegExp(args.targetBundleId)} to become Running Foreground`),
+      }).map((match) => `xcodebuild session log: ${match}`),
+    ],
+  }
+}
+
 const runCommand = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
+  readonly timeoutMs?: number
 }): Promise<CommandResult> =>
   await new Promise((resolve, reject) => {
     const child = spawn(args.command, [...args.commandArgs], {
@@ -263,6 +494,19 @@ const runCommand = async (args: {
 
     let stdout = ""
     let stderr = ""
+    let timedOut = false
+
+    const timeout = args.timeoutMs
+      ? setTimeout(() => {
+          timedOut = true
+          child.kill("SIGTERM")
+          setTimeout(() => {
+            if (child.exitCode === null) {
+              child.kill("SIGKILL")
+            }
+          }, 2_000)
+        }, args.timeoutMs)
+      : null
 
     child.stdout?.setEncoding("utf8")
     child.stderr?.setEncoding("utf8")
@@ -275,6 +519,15 @@ const runCommand = async (args: {
 
     child.once("error", reject)
     child.once("close", (exitCode) => {
+      if (timeout) {
+        clearTimeout(timeout)
+      }
+
+      if (timedOut) {
+        reject(new Error(`${args.command} timed out after ${args.timeoutMs ?? 0} ms.`))
+        return
+      }
+
       resolve({ stdout, stderr, exitCode })
     })
   })
@@ -350,6 +603,106 @@ const formatCommandFailure = (command: string, result: CommandResult): string =>
   return tail.length > 0
     ? `${command} exited with ${result.exitCode ?? "unknown"}: ${tail}`
     : `${command} exited with ${result.exitCode ?? "unknown"}.`
+}
+
+const captureDeviceDiagnosticBundle = async (args: {
+  readonly deviceId: string
+  readonly diagnosticsDirectory: string
+  readonly fileStem: string
+  readonly kind: DeviceDiagnosticCaptureMode
+}): Promise<{ readonly absolutePath: string }> => {
+  await ensureDirectory(args.diagnosticsDirectory)
+
+  if (args.kind === "diagnose") {
+    const absolutePath = join(args.diagnosticsDirectory, `${args.fileStem}.zip`)
+    const jsonOutputPath = join(args.diagnosticsDirectory, `${args.fileStem}.diagnose.json`)
+    const logOutputPath = join(args.diagnosticsDirectory, `${args.fileStem}.diagnose.log`)
+    await removeFileIfExists(absolutePath)
+
+    const result = await runCommand({
+      command: "/usr/bin/xcrun",
+      commandArgs: [
+        "devicectl",
+        "diagnose",
+        "--devices",
+        args.deviceId,
+        "--archive-destination",
+        absolutePath,
+        "--no-finder",
+        "--json-output",
+        jsonOutputPath,
+        "--log-output",
+        logOutputPath,
+      ],
+      timeoutMs: 60 * 60_000,
+    })
+
+    if (result.exitCode !== 0) {
+      throw new EnvironmentError({
+        code: "device-diagnostic-capture",
+        reason: formatCommandFailure("xcrun devicectl diagnose", result),
+        nextStep: "Inspect devicectl diagnose output and retry the device diagnostic capture.",
+        details: [logOutputPath],
+      })
+    }
+
+    if (!(await fileExists(absolutePath))) {
+      throw new EnvironmentError({
+        code: "device-diagnostic-capture",
+        reason: `devicectl diagnose completed without creating ${absolutePath}.`,
+        nextStep: "Inspect the diagnostics directory and retry the device diagnostic capture.",
+        details: [jsonOutputPath, logOutputPath],
+      })
+    }
+
+    return { absolutePath }
+  }
+
+  const destinationDirectory = join(args.diagnosticsDirectory, `${args.fileStem}.sysdiagnose`)
+  const jsonOutputPath = join(args.diagnosticsDirectory, `${args.fileStem}.sysdiagnose.json`)
+  const logOutputPath = join(args.diagnosticsDirectory, `${args.fileStem}.sysdiagnose.log`)
+
+  await ensureDirectory(destinationDirectory)
+
+  const result = await runCommand({
+    command: "/usr/bin/xcrun",
+    commandArgs: [
+      "devicectl",
+      "device",
+      "sysdiagnose",
+      "--device",
+      args.deviceId,
+      "--destination",
+      destinationDirectory,
+      "--json-output",
+      jsonOutputPath,
+      "--log-output",
+      logOutputPath,
+    ],
+    timeoutMs: 60 * 60_000,
+  })
+
+  if (result.exitCode !== 0) {
+    throw new EnvironmentError({
+      code: "device-sysdiagnose-capture",
+      reason: formatCommandFailure("xcrun devicectl device sysdiagnose", result),
+      nextStep: "Inspect devicectl sysdiagnose output and retry the device diagnostic capture.",
+      details: [logOutputPath],
+    })
+  }
+
+  const absolutePath = await findNewestFileInDirectory(destinationDirectory)
+
+  if (absolutePath === null) {
+    throw new EnvironmentError({
+      code: "device-sysdiagnose-capture",
+      reason: `devicectl device sysdiagnose completed without producing a bundle under ${destinationDirectory}.`,
+      nextStep: "Inspect the destination directory and retry the device sysdiagnose capture.",
+      details: [jsonOutputPath, logOutputPath],
+    })
+  }
+
+  return { absolutePath }
 }
 
 export const extractDeviceCandidate = (value: unknown): RealDeviceCandidate | null => {
@@ -1427,11 +1780,11 @@ const assertReadyTransportContract = (args: {
     })
   }
 
-  if (args.ready.ingressTransport !== runnerHttpCommandIngress || args.ready.egressTransport !== runnerEventEgress) {
+  if (args.ready.ingressTransport !== runnerCommandIngress || args.ready.egressTransport !== runnerEventEgress) {
     throw new EnvironmentError({
       code: "runner-transport-shape-mismatch",
       reason:
-        `Expected ${runnerHttpCommandIngress}/${runnerEventEgress}, received ${args.ready.ingressTransport}/${args.ready.egressTransport}.`,
+        `Expected ${runnerCommandIngress}/${runnerEventEgress}, received ${args.ready.ingressTransport}/${args.ready.egressTransport}.`,
       nextStep: "Align the host and runner transport settings before retrying the session open.",
       details: [],
     })
@@ -1943,7 +2296,13 @@ export class RealDeviceHarness extends Context.Tag("@probe/RealDeviceHarness")<
       readonly logsDirectory: string
       readonly bundleId: string
       readonly requestedDeviceId: string | null
-    }) => Effect.Effect<OpenedRealDeviceLiveSession, EnvironmentError | UserInputError | ChildProcessError>
+    }) => Effect.Effect<OpenedRealDeviceLiveSession, DeviceInterruptionError | EnvironmentError | UserInputError | ChildProcessError>
+    readonly captureDeviceDiagnosticBundle: (args: {
+      readonly deviceId: string
+      readonly diagnosticsDirectory: string
+      readonly fileStem: string
+      readonly kind: DeviceDiagnosticCaptureMode
+    }) => Effect.Effect<{ readonly absolutePath: string }, EnvironmentError>
   }
 >() {}
 
@@ -2019,6 +2378,20 @@ export const RealDeviceHarnessLive = Layer.succeed(
             // Use port 0 so the runner's NWListener auto-assigns an available port.
             // The actual port is reported back in the ready frame's runnerPort field.
             const runnerPort = 0
+            const detectInterruption = (overrides?: {
+              readonly observedLatencyMs?: number | null
+              readonly statusLabel?: string | null
+              readonly evidenceSources?: ReadonlyArray<DeviceInterruptionEvidenceSource>
+            }) =>
+              detectRealDeviceInterruption({
+                targetBundleId: args.bundleId,
+                device: preflight.device,
+                observedLatencyMs: overrides?.observedLatencyMs,
+                statusLabel: overrides?.statusLabel,
+                logPath: sessionLogPath,
+                wrapperStderrPath,
+                evidenceSources: overrides?.evidenceSources,
+              })
 
             const installedAppsResult = await runCommand({
               command: "/usr/bin/xcrun",
@@ -2038,6 +2411,17 @@ export const RealDeviceHarnessLive = Layer.succeed(
             await writeCommandLog(installedAppsLogPath, installedAppsResult)
 
             if (installedAppsResult.exitCode !== 0) {
+              const interruption = await detectInterruption({
+                evidenceSources: [{
+                  label: "devicectl device info apps",
+                  text: `${installedAppsResult.stdout}\n${installedAppsResult.stderr}`,
+                }],
+              })
+
+              if (interruption) {
+                throw toDeviceInterruptionError(interruption)
+              }
+
               throw new EnvironmentError({
                 code: "target-app-install-check-failed",
                 reason:
@@ -2086,6 +2470,17 @@ export const RealDeviceHarnessLive = Layer.succeed(
             await writeCommandLog(launchLogPath, launchResult)
 
             if (launchResult.exitCode !== 0) {
+              const interruption = await detectInterruption({
+                evidenceSources: [{
+                  label: "devicectl device process launch",
+                  text: `${launchResult.stdout}\n${launchResult.stderr}`,
+                }],
+              })
+
+              if (interruption) {
+                throw toDeviceInterruptionError(interruption)
+              }
+
               throw new EnvironmentError({
                 code: "target-app-launch-failed",
                 reason: `Probe could not launch ${args.bundleId} on ${preflight.device.name} (${preflight.device.identifier}).`,
@@ -2152,18 +2547,40 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const isWrapperRunning = () => wrapper !== null && wrapper.process.exitCode === null && !wrapper.process.killed
 
-            const ready = await waitForFreshJson<RunnerReadyFrame>({
-              path: join(observerControlDirectory, "stdout-ready.json"),
-              timeoutMs: runnerReadyTimeoutMs,
-              minMtimeMs: startedAt,
-              isRunning: isWrapperRunning,
-              decode: decodeRunnerReadyFrame,
-              invalidCode: "runner-ready-frame-invalid",
-              invalidReason: "The runner ready frame drifted from the validated host↔runner contract",
-              invalidNextStep: "Align the host and runner transport schemas before retrying the session open.",
-              commandDescription: "runner stdout ready",
-              logPath: sessionLogPath,
-            })
+            const ready = await (async () => {
+              try {
+                return await waitForFreshJson<RunnerReadyFrame>({
+                  path: join(observerControlDirectory, "stdout-ready.json"),
+                  timeoutMs: runnerReadyTimeoutMs,
+                  minMtimeMs: startedAt,
+                  isRunning: isWrapperRunning,
+                  decode: decodeRunnerReadyFrame,
+                  invalidCode: "runner-ready-frame-invalid",
+                  invalidReason: "The runner ready frame drifted from the validated host↔runner contract",
+                  invalidNextStep: "Align the host and runner transport schemas before retrying the session open.",
+                  commandDescription: "runner stdout ready",
+                  logPath: sessionLogPath,
+                })
+              } catch (error) {
+                const interruption = await detectInterruption({
+                  observedLatencyMs: Date.now() - startedAt,
+                  evidenceSources: error instanceof ChildProcessError || error instanceof EnvironmentError
+                    ? [{
+                        label: "session-open failure",
+                        text: error instanceof ChildProcessError
+                          ? `${error.reason}\n${error.stderrExcerpt}`
+                          : `${error.reason}\n${error.details.join("\n")}`,
+                      }]
+                    : [],
+                })
+
+                if (interruption) {
+                  throw toDeviceInterruptionError(interruption)
+                }
+
+                throw error
+              }
+            })()
 
             assertReadyTransportContract({
               ready,
@@ -2251,12 +2668,24 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const initialPing = await sendCommand(1, "ping", "session-open")
 
+            const openInterruption = await detectInterruption({
+              observedLatencyMs: ready.attachLatencyMs,
+              statusLabel: initialPing.statusLabel || ready.initialStatusLabel,
+              evidenceSources: initialPing.error
+                ? [{ label: "runner open ping", text: initialPing.error }]
+                : [],
+            })
+
             if (!initialPing.ok) {
+              if (openInterruption) {
+                throw toDeviceInterruptionError(openInterruption)
+              }
+
               throw new EnvironmentError({
                 code: "runner-open-ping-failed",
                 reason: "The runner did not acknowledge the initial ping command after session open.",
                 nextStep: "Inspect the session runner log artifact and retry the session open.",
-                details: [],
+                details: initialPing.statusLabel ? [`status label: ${initialPing.statusLabel}`] : [],
               })
             }
 
@@ -2284,16 +2713,19 @@ export const RealDeviceHarnessLive = Layer.succeed(
               devicesJsonPath: preflight.devicesJsonPath,
               ddiServicesJsonPath: preflight.ddiServicesJsonPath,
               preflightReportPath: preflight.preflightReportPath,
-              buildLogPath: preflight.buildLogPath,
-              xctestrunPath: injectedXctestrunPath,
-              targetAppPath: preflight.targetAppPath,
-              runnerAppPath: preflight.runnerAppPath,
-              runnerXctestPath: preflight.runnerXctestPath,
-              integrationPoints: preflight.integrationPoints,
-              warnings: buildLiveWarnings(),
-              connection: preflight.connection,
-              refreshConnection: preflight.refreshConnection,
-              close,
+               buildLogPath: preflight.buildLogPath,
+               xctestrunPath: injectedXctestrunPath,
+               targetAppPath: preflight.targetAppPath,
+               runnerAppPath: preflight.runnerAppPath,
+               runnerXctestPath: preflight.runnerXctestPath,
+               integrationPoints: preflight.integrationPoints,
+               warnings: dedupeStrings([
+                 ...buildLiveWarnings(),
+                 ...(openInterruption ? [buildRealDeviceInterruptionWarning(openInterruption)] : []),
+               ]),
+               connection: preflight.connection,
+               refreshConnection: preflight.refreshConnection,
+               close,
               bootstrapPath: ready.bootstrapPath,
               bootstrapSource: "device-bootstrap-manifest",
               runnerTransportContract: ready.runnerTransportContract,
@@ -2335,6 +2767,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
         },
         catch: (error) =>
           error instanceof UserInputError
+          || error instanceof DeviceInterruptionError
           || error instanceof EnvironmentError
           || error instanceof ChildProcessError
             ? error
@@ -2346,5 +2779,20 @@ export const RealDeviceHarnessLive = Layer.succeed(
               }),
       })
     },
+    captureDeviceDiagnosticBundle: (args) =>
+      Effect.tryPromise({
+        try: () => captureDeviceDiagnosticBundle(args),
+        catch: (error) =>
+          error instanceof EnvironmentError
+            ? error
+            : new EnvironmentError({
+                code: args.kind === "sysdiagnose" ? "device-sysdiagnose-capture" : "device-diagnostic-capture",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: args.kind === "sysdiagnose"
+                  ? "Inspect the devicectl sysdiagnose output and retry the device capture."
+                  : "Inspect the devicectl diagnose output and retry the device capture.",
+                details: [],
+              }),
+      }),
   }),
 )
