@@ -64,6 +64,47 @@ const systemCpuXml = `<?xml version="1.0"?>
   </node>
 </trace-query-result>`
 
+const systemThreadOnlyXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="thread-state">
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>state</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>cputime</mnemonic></col>
+      <col><mnemonic>waittime</mnemonic></col>
+    </schema>
+    <row><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><thread-state fmt="Running">Running</thread-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread-cpu-time fmt="1.00 ms">1000000</thread-cpu-time><thread-wait-time fmt="0.50 ms">500000</thread-wait-time></row>
+  </node>
+</trace-query-result>`
+
+const buildLargeSystemCpuXml = (rowCount: number) => {
+  if (rowCount < 2) {
+    throw new Error("rowCount must be at least 2")
+  }
+
+  const repeatedBackgroundRows = Array.from({ length: rowCount - 2 }, () =>
+    "<row><start-time ref=\"10\"/><core ref=\"11\"/><core-state ref=\"12\"/><duration ref=\"13\"/><process ref=\"14\"/><thread ref=\"16\"/><sched-priority ref=\"18\"/></row>",
+  ).join("")
+
+  return `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="cpu-state">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>cpu</mnemonic></col>
+      <col><mnemonic>state</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>priority</mnemonic></col>
+    </schema>
+    <row><start-time id="1" fmt="00:00.000.000">0</start-time><core id="2" fmt="CPU 3">3</core><core-state id="3" fmt="Running">Running</core-state><duration id="4" fmt="1.00 µs">1000</duration><process id="5" fmt="ProbeFixture (111)"><pid id="6">111</pid></process><thread id="7" fmt="Main Thread 0x1 (ProbeFixture, pid: 111)"><tid id="8">1</tid></thread><sched-priority id="9" fmt="31">31</sched-priority></row>
+    <row><start-time id="10" fmt="00:00.001.000">1000</start-time><core id="11" fmt="CPU 5">5</core><core-state id="12" fmt="Idle">Idle</core-state><duration id="13" fmt="1.00 µs">1000</duration><process id="14" fmt="OtherApp (222)"><pid id="15">222</pid></process><thread id="16" fmt="Main Thread 0x2 (OtherApp, pid: 222)"><tid id="17">2</tid></thread><sched-priority id="18" fmt="31">31</sched-priority></row>${repeatedBackgroundRows}
+  </node>
+</trace-query-result>`
+}
+
 const metalXml = `<?xml version="1.0"?>
 <trace-query-result>
   <node xpath='//trace-toc[1]/run[1]/data[1]/table[3]'>
@@ -138,6 +179,31 @@ describe("perf analysis", () => {
     expect(result.summary.metrics.find((metric) => metric.label === "Target CPU intervals")?.value).toBe("1")
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "system-trace-wait-heavy")).toBe(true)
     expect(result.diagnoses.some((diagnosis) => diagnosis.wall)).toBe(true)
+  })
+
+  test("system trace analysis handles a missing cpu-state table", () => {
+    const result = analyzeSystemTraceTables({
+      threadStateTable: parsePerfTableExport(systemThreadOnlyXml),
+      targetPid: 123,
+    })
+
+    expect(result.summary.headline).toContain("1 target thread intervals")
+    expect(result.summary.metrics.find((metric) => metric.label === "Target CPU intervals")?.value).toBe("0")
+    expect(result.summary.metrics.find((metric) => metric.label === "Busy cores")?.value).toBe("none")
+  })
+
+  test("system trace analysis explains large device-wide cpu-state exports", () => {
+    const result = analyzeSystemTraceTables({
+      threadStateTable: parsePerfTableExport(systemThreadXml),
+      cpuStateTable: parsePerfTableExport(buildLargeSystemCpuXml(20_001)),
+      targetPid: 111,
+    })
+
+    const diagnosis = result.diagnoses.find((entry) => entry.code === "system-trace-large-cpu-state")
+
+    expect(diagnosis).toBeTruthy()
+    expect(diagnosis?.details[0]).toContain("20001 cpu-state rows were exported")
+    expect(diagnosis?.details[1]).toContain("full export must be budgeted for the entire device")
   })
 
   test("metal analysis flags frame-budget overruns", () => {

@@ -596,7 +596,7 @@ const matchesTargetProcess = (
 
 export const analyzeSystemTraceTables = (args: {
   readonly threadStateTable: ParsedPerfTable
-  readonly cpuStateTable: ParsedPerfTable
+  readonly cpuStateTable?: ParsedPerfTable
   readonly targetPid: number
 }): {
   readonly summary: PerfSummary
@@ -607,14 +607,18 @@ export const analyzeSystemTraceTables = (args: {
     schema: "thread-state",
     requiredMnemonics: ["thread", "state", "process", "cputime", "waittime"],
   })
-  assertSchemaContract({
-    table: args.cpuStateTable,
-    schema: "cpu-state",
-    requiredMnemonics: ["cpu", "state", "process", "thread"],
-  })
+  if (args.cpuStateTable) {
+    assertSchemaContract({
+      table: args.cpuStateTable,
+      schema: "cpu-state",
+      requiredMnemonics: ["cpu", "state", "process", "thread"],
+    })
+  }
 
   const targetThreadRows = args.threadStateTable.rows.filter((row) => matchesTargetProcess(row, args.targetPid))
-  const targetCpuRows = args.cpuStateTable.rows.filter((row) => matchesTargetProcess(row, args.targetPid))
+  const targetCpuRows = args.cpuStateTable
+    ? args.cpuStateTable.rows.filter((row) => matchesTargetProcess(row, args.targetPid))
+    : []
   const threadStates = targetThreadRows
     .map((row) => readDisplay(row, "state"))
     .filter((value): value is string => value !== null)
@@ -672,6 +676,20 @@ export const analyzeSystemTraceTables = (args: {
     ),
   )
 
+  if (args.cpuStateTable && args.cpuStateTable.rows.length > 20_000) {
+    diagnoses.push(
+      infoDiagnosis(
+        "system-trace-large-cpu-state",
+        "The cpu-state export contained a large number of device-wide rows.",
+        [
+          `${args.cpuStateTable.rows.length} cpu-state rows were exported. xctrace exports are device-wide and cannot be scoped to a single process at export time.`,
+          "Probe filters to target process rows for analysis, but the full export must be budgeted for the entire device.",
+          "Inspect the saved .trace bundle if you need the unfiltered device-wide view.",
+        ],
+      ),
+    )
+  }
+
   return {
     summary: {
       headline:
@@ -699,6 +717,10 @@ interface MetalFrameEstimate {
   readonly duration: number
 }
 
+/** Thresholds for detecting unreliable frame grouping in GPU interval exports. */
+const unreliableFrameAverageNs = 100_000_000 // 100 ms — real apps rarely run below 10 fps
+const unreliableFrameSpanNs = 500_000_000 // 500 ms — single frame spanning half a second signals mixed ownership
+
 interface MetalEncoderAggregate {
   readonly label: string
   readonly encoderCount: number
@@ -707,7 +729,10 @@ interface MetalEncoderAggregate {
   readonly averageDuration: number
 }
 
-const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): ReadonlyArray<MetalFrameEstimate> => {
+const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): {
+  readonly estimates: ReadonlyArray<MetalFrameEstimate>
+  readonly reliable: boolean
+} => {
   const frames = new Map<string, { minStart: number; maxEnd: number }>()
 
   for (const row of rows) {
@@ -731,12 +756,23 @@ const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): ReadonlyArray<M
     frames.set(frameId, { minStart: start, maxEnd: end })
   }
 
-  return [...frames.entries()]
+  const estimates = [...frames.entries()]
     .map(([frameId, bounds]) => ({
       frameId,
       duration: bounds.maxEnd - bounds.minStart,
     }))
     .sort((left, right) => left.frameId.localeCompare(right.frameId, undefined, { numeric: true }))
+
+  if (estimates.length === 0) {
+    return { estimates, reliable: true }
+  }
+
+  const averageFrameDuration = estimates.reduce((total, frame) => total + frame.duration, 0) / estimates.length
+  const hasExtremeOutlier = estimates.some((frame) => frame.duration > unreliableFrameSpanNs)
+
+  const reliable = averageFrameDuration < unreliableFrameAverageNs && !hasExtremeOutlier
+
+  return { estimates, reliable }
 }
 
 const buildMetalEncoderAggregates = (table: ParsedPerfTable | undefined): ReadonlyArray<MetalEncoderAggregate> => {
@@ -857,21 +893,32 @@ export const analyzeMetalSystemTraceTables = (args: {
   const maxLatency = latencies.length === 0 ? null : Math.max(...latencies)
   const averageDuration = averageOf(durations)
   const averageLatency = averageOf(latencies)
-  const frameEstimates = buildMetalFrameEstimates(rows)
+  const { estimates: frameEstimates, reliable: frameEstimatesReliable } = buildMetalFrameEstimates(rows)
   const frameDurations = frameEstimates.map((frame) => frame.duration)
   const averageFrameDuration = averageOf(frameDurations)
   const maxFrameDuration = frameDurations.length === 0 ? null : Math.max(...frameDurations)
-  const estimatedFrameDuration = averageFrameDuration ?? averageDuration
-  const averageFps = estimatedFrameDuration === null || estimatedFrameDuration <= 0 ? null : 1_000_000_000 / estimatedFrameDuration
-  const framesOverBudget = frameDurations.filter((duration) => duration > sixtyFpsFrameBudgetNs).length
   const encoderAggregates = buildMetalEncoderAggregates(args.encoderListTable)
   const topEncoder = encoderAggregates[0] ?? null
   const driverSummary = buildMetalDriverSummary(args.driverEventTable)
   const diagnoses: Array<PerfDiagnosis> = []
-  const estimatedFpsText = formatFramesPerSecond(averageFps)
-  const frameBudgetSummary = frameEstimates.length === 0
-    ? null
-    : `${estimatedFpsText} average; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}`
+
+  // FPS estimation: only compute and display when frame grouping is reliable.
+  // Unreliable grouping produces fabricated frame rates from mixed-process/compositor noise.
+  const estimatedFrameDuration = frameEstimatesReliable
+    ? (averageFrameDuration ?? averageDuration)
+    : averageDuration
+  const averageFps = frameEstimatesReliable && estimatedFrameDuration !== null && estimatedFrameDuration > 0
+    ? 1_000_000_000 / estimatedFrameDuration
+    : null
+  const framesOverBudget = frameEstimatesReliable
+    ? frameDurations.filter((duration) => duration > sixtyFpsFrameBudgetNs).length
+    : 0
+  const estimatedFpsText = frameEstimatesReliable
+    ? formatFramesPerSecond(averageFps)
+    : "withheld (unreliable grouping)"
+  const frameBudgetSummary = frameEstimatesReliable && frameEstimates.length > 0
+    ? `${formatFramesPerSecond(averageFps)} average; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}`
+    : null
 
   if (rows.length === 0) {
     diagnoses.push(
@@ -883,7 +930,22 @@ export const analyzeMetalSystemTraceTables = (args: {
     )
   }
 
-  if (maxDuration !== null && maxDuration > sixtyFpsFrameBudgetNs) {
+  if (!frameEstimatesReliable && frameEstimates.length > 0) {
+    diagnoses.push(
+      warningDiagnosis(
+        "metal-fps-withheld",
+        "Frame-rate estimation was withheld because the GPU interval export showed unreliable frame grouping.",
+        [
+          `Average exported frame span: ${formatNanoseconds(averageFrameDuration)}.`,
+          `Max exported frame span: ${formatNanoseconds(maxFrameDuration)}.`,
+          "This typically happens when the GPU interval table mixes target-app and compositor/system intervals under the same frame IDs, producing inflated frame spans.",
+          "Per-interval GPU timing and encoder breakdown remain trustworthy. The encoder export is usually the more reliable attribution seam.",
+        ],
+      ),
+    )
+  }
+
+  if (frameEstimatesReliable && maxDuration !== null && maxDuration > sixtyFpsFrameBudgetNs) {
     diagnoses.push(
       warningDiagnosis(
         "metal-frame-budget-duration",
@@ -893,7 +955,7 @@ export const analyzeMetalSystemTraceTables = (args: {
     )
   }
 
-  if (maxLatency !== null && maxLatency > sixtyFpsFrameBudgetNs) {
+  if (frameEstimatesReliable && maxLatency !== null && maxLatency > sixtyFpsFrameBudgetNs) {
     diagnoses.push(
       warningDiagnosis(
         "metal-frame-budget-latency",
@@ -903,14 +965,14 @@ export const analyzeMetalSystemTraceTables = (args: {
     )
   }
 
-  if (frameEstimates.length > 0 && framesOverBudget > 0) {
+  if (frameEstimatesReliable && frameEstimates.length > 0 && framesOverBudget > 0) {
     diagnoses.push(
       warningDiagnosis(
         "metal-frame-budget-fps",
         "Estimated GPU frame spans missed a 60 FPS budget.",
         [
           `${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}.`,
-          `Estimated average frame rate: ${estimatedFpsText}.`,
+          `Estimated average frame rate: ${formatFramesPerSecond(averageFps)}.`,
         ],
       ),
     )
@@ -946,11 +1008,15 @@ export const analyzeMetalSystemTraceTables = (args: {
           ? "No Metal GPU intervals were exported."
           : topEncoder && frameBudgetSummary
             ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}; ${topEncoder.label} dominated the encoder timing.`
-            : topEncoder
-              ? `Observed ${rows.length} Metal GPU intervals; ${topEncoder.label} dominated the encoder timing.`
-              : frameBudgetSummary
-                ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}.`
-                : `Observed ${rows.length} Metal GPU intervals across ${uniqueCount(channels)} channels.`,
+            : topEncoder && !frameEstimatesReliable && frameEstimates.length > 0
+              ? `Observed ${rows.length} Metal GPU intervals (FPS withheld — unreliable frame grouping); ${topEncoder.label} dominated the encoder timing.`
+              : !topEncoder && !frameEstimatesReliable && frameEstimates.length > 0
+                ? `Observed ${rows.length} Metal GPU intervals (FPS withheld — unreliable frame grouping) across ${uniqueCount(channels)} channels.`
+                : topEncoder
+                  ? `Observed ${rows.length} Metal GPU intervals; ${topEncoder.label} dominated the encoder timing.`
+                  : frameBudgetSummary
+                    ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}.`
+                    : `Observed ${rows.length} Metal GPU intervals across ${uniqueCount(channels)} channels.`,
       metrics: [
         { label: "GPU intervals", value: String(rows.length) },
         { label: "Channels", value: summarizeCounts(channels) },
@@ -960,7 +1026,7 @@ export const analyzeMetalSystemTraceTables = (args: {
         { label: "Avg CPU→GPU latency", value: formatNanoseconds(averageLatency) },
         { label: "Max CPU→GPU latency", value: formatNanoseconds(maxLatency) },
         { label: "Estimated FPS", value: estimatedFpsText },
-        { label: "Frames over 60 FPS budget", value: frameEstimates.length === 0 ? "n/a" : `${framesOverBudget}/${frameEstimates.length}` },
+        { label: "Frames over 60 FPS budget", value: frameEstimates.length === 0 ? "n/a" : frameEstimatesReliable ? `${framesOverBudget}/${frameEstimates.length}` : "withheld" },
         { label: "Avg frame span", value: formatNanoseconds(averageFrameDuration) },
         { label: "Max frame span", value: formatNanoseconds(maxFrameDuration) },
         { label: "Driver events", value: String(driverSummary.eventCount) },

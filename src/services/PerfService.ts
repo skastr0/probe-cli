@@ -109,6 +109,16 @@ interface StreamedCommandResult extends CommandResult {
   readonly rowCount: number
 }
 
+type ExportAttempt =
+  | {
+      readonly kind: "exported"
+      readonly result: StreamedCommandResult
+    }
+  | {
+      readonly kind: "skipped-budget"
+      readonly error: ExportBudgetExceededError
+    }
+
 interface BackgroundRecordingStopResult extends CommandResult {
   readonly wasRunning: boolean
 }
@@ -226,10 +236,9 @@ const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
       },
     }, {
       schema: "cpu-state",
-      required: true,
       budget: {
-        maxBytes: 6 * mib,
-        maxRows: 20_000,
+        maxBytes: 12 * mib,
+        maxRows: 50_000,
       },
     }],
     maxRecordingTimeLimitMs: 10_000,
@@ -1450,22 +1459,40 @@ export const createPerfService = (dependencies: {
           `Exporting ${schema} rows for ${spec.displayName} (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
         )
 
-        const exportResult = yield* Effect.tryPromise({
-          try: () =>
-            commandRunner.exportToFile({
-              command: "xcrun",
-              commandArgs: [
-                "xctrace",
-                "export",
-                "--input",
-                tracePath,
-                "--xpath",
-                `/trace-toc/run[@number=\"${runNumber}\"]/data/table[@schema=\"${schema}\"]`,
-              ],
-              timeoutMs: defaultCommandOverheadMs,
-              outputPath: exportPath,
-              budget,
-            }),
+        const exportAttempt: ExportAttempt = yield* Effect.tryPromise({
+          try: async () => {
+            try {
+              const result = await commandRunner.exportToFile({
+                command: "xcrun",
+                commandArgs: [
+                  "xctrace",
+                  "export",
+                  "--input",
+                  tracePath,
+                  "--xpath",
+                  `/trace-toc/run[@number=\"${runNumber}\"]/data/table[@schema=\"${schema}\"]`,
+                ],
+                timeoutMs: defaultCommandOverheadMs,
+                outputPath: exportPath,
+                budget,
+              })
+
+              return {
+                kind: "exported",
+                result,
+              } satisfies ExportAttempt
+            } catch (error) {
+              if (error instanceof ExportBudgetExceededError && !exportSpec.required) {
+                await cleanupOutputFile(exportPath)
+                return {
+                  kind: "skipped-budget",
+                  error,
+                } satisfies ExportAttempt
+              }
+
+              throw error
+            }
+          },
           catch: (error) =>
             error instanceof ChildProcessError
               ? error
@@ -1478,6 +1505,19 @@ export const createPerfService = (dependencies: {
                     details: [],
                   }),
         })
+
+        if (exportAttempt.kind === "skipped-budget") {
+          const budgetLabel = exportAttempt.error.kind === "bytes"
+            ? formatBytes(exportAttempt.error.limit)
+            : `${exportAttempt.error.limit} rows`
+          emitProgress(
+            "perf.export",
+            `Skipping optional ${schema} export for ${spec.displayName} after it exceeded the ${budgetLabel} budget.`,
+          )
+          continue
+        }
+
+        const exportResult = exportAttempt.result
 
         const artifact = yield* dependencies.artifactStore.registerArtifact(
           sessionId,
@@ -1889,13 +1929,24 @@ export const createPerfService = (dependencies: {
           }),
         catch: (error) =>
           error instanceof ChildProcessError
-            ? error
+            ? new EnvironmentError({
+                code: "perf-export-schema-failed",
+                reason: `xctrace export for schema ${schema} exited with code ${error.exitCode ?? "unknown"}: ${error.stderrExcerpt || error.reason}`,
+                nextStep: `The trace TOC lists ${schema} but the export command failed. This typically means no signpost intervals were captured during the recording. Verify the app emits os_signpost intervals during the recorded flow, then retry.`,
+                details: [
+                  `schema: ${schema}`,
+                  `exitCode: ${String(error.exitCode ?? "unknown")}`,
+                  `stderr: ${error.stderrExcerpt.length > 0 ? error.stderrExcerpt : "none"}`,
+                ],
+              })
             : error instanceof ExportBudgetExceededError
               ? buildExportBudgetError({ templateName: "Signpost summary", schema, error })
+              : error instanceof EnvironmentError
+                ? error
               : new EnvironmentError({
-                  code: "perf-export-schema",
+                  code: "perf-read-schema-export",
                   reason: error instanceof Error ? error.message : String(error),
-                  nextStep: `Inspect the TOC export and retry the ${schema} export.`,
+                  nextStep: `Inspect the saved ${schema} export XML and retry the summarize command.`,
                   details: [],
                 }),
       })

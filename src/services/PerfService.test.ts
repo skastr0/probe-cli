@@ -4,7 +4,12 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Either } from "effect"
-import { ArtifactNotFoundError, EnvironmentError } from "../domain/errors"
+import {
+  ArtifactNotFoundError,
+  ChildProcessError,
+  EnvironmentError,
+  UnsupportedCapabilityError,
+} from "../domain/errors"
 import type { ArtifactRecord } from "../domain/output"
 import { createPerfService, ExportBudgetExceededError } from "./PerfService"
 
@@ -13,6 +18,24 @@ const mib = 1024 * 1024
 const tocXml = `<?xml version="1.0"?>
 <trace-toc>
   <run number="1"/>
+</trace-toc>`
+
+const loggingTocWithSignpostSchemaXml = `<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <data>
+      <table schema="os-signpost-interval"/>
+    </data>
+  </run>
+</trace-toc>`
+
+const loggingTocWithoutSignpostSchemaXml = `<?xml version="1.0"?>
+<trace-toc>
+  <run number="1">
+    <data>
+      <table schema="thread-state"/>
+    </data>
+  </run>
 </trace-toc>`
 
 const timeProfilerXml = `<?xml version="1.0"?>
@@ -26,6 +49,36 @@ const timeProfilerXml = `<?xml version="1.0"?>
       <col><mnemonic>sample-type</mnemonic></col>
     </schema>
     <row><sample-time fmt="00:00.100.000">100000000</sample-time><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><core fmt="CPU 3">3</core><thread-state fmt="Running">Running</thread-state><time-sample-kind fmt="Stackshot">3</time-sample-kind></row>
+  </node>
+</trace-query-result>`
+
+const systemThreadOnlyXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="thread-state">
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>state</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>cputime</mnemonic></col>
+      <col><mnemonic>waittime</mnemonic></col>
+    </schema>
+    <row><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><thread-state fmt="Running">Running</thread-state><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread-cpu-time fmt="1.00 ms">1000000</thread-cpu-time><thread-wait-time fmt="0.50 ms">500000</thread-wait-time></row>
+  </node>
+</trace-query-result>`
+
+const systemCpuXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="cpu-state">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>cpu</mnemonic></col>
+      <col><mnemonic>state</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>priority</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.000.000">0</start-time><core fmt="CPU 3">3</core><core-state fmt="Running">Running</core-state><duration fmt="1.00 µs">1000</duration><process fmt="ProbeFixture (123)"><pid>123</pid></process><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><sched-priority fmt="31">31</sched-priority></row>
   </node>
 </trace-query-result>`
 
@@ -123,6 +176,21 @@ const signpostIntervalsXml = `<?xml version="1.0"?>
     <row><start-time fmt="00:00.000.000">0</start-time><duration fmt="10.00 ms">10000000</duration><name fmt="loadData">loadData</name><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><subsystem fmt="dev.probe.fixture">dev.probe.fixture</subsystem><category fmt="startup">startup</category></row>
     <row><start-time fmt="00:00.015.000">15000000</start-time><duration fmt="20.00 ms">20000000</duration><name fmt="loadData">loadData</name><thread fmt="Main Thread 0x1 (ProbeFixture, pid: 123)"><tid>1</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><subsystem fmt="dev.probe.fixture">dev.probe.fixture</subsystem><category fmt="startup">startup</category></row>
     <row><start-time fmt="00:00.050.000">50000000</start-time><duration fmt="5.00 ms">5000000</duration><name fmt="renderFrame">renderFrame</name><thread fmt="Render Thread 0x2 (ProbeFixture, pid: 123)"><tid>2</tid></thread><process fmt="ProbeFixture (123)"><pid>123</pid></process><subsystem fmt="dev.probe.fixture">dev.probe.fixture</subsystem><category fmt="render">render</category></row>
+  </node>
+</trace-query-result>`
+
+const emptySignpostIntervalsXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="os-signpost-interval">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>name</mnemonic></col>
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>subsystem</mnemonic></col>
+      <col><mnemonic>category</mnemonic></col>
+    </schema>
   </node>
 </trace-query-result>`
 
@@ -301,6 +369,7 @@ const createSessionHealth = (
 
 const createCommandRunner = (options: {
   readonly exports: Record<string, string>
+  readonly tocXml?: string
   readonly onExport?: (args: {
     readonly outputPath: string
     readonly schema: string
@@ -382,7 +451,7 @@ const createCommandRunner = (options: {
 
         if (args.commandArgs[0] === "xctrace" && args.commandArgs[1] === "export" && args.commandArgs.includes("--toc")) {
           return {
-            stdout: tocXml,
+            stdout: options.tocXml ?? tocXml,
             stderr: "",
             exitCode: 0,
           }
@@ -676,30 +745,83 @@ describe("PerfService", () => {
     })
   })
 
-  test("maps export budget exceeded into a typed environment failure", async () => {
+  test("skips optional system trace exports that exceed the budget", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
         getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
         sendRunnerKeepalive: () => Effect.void,
       }
-      // Provide minimal stubs for the template list/version calls
-      const baseRunner = createCommandRunner({ exports: {} })
-      let exportCalls = 0
+      const commandRunner = createCommandRunner({
+        exports: {
+          "thread-state": systemThreadOnlyXml,
+          "cpu-state": systemCpuXml,
+        },
+        onExport: ({ schema }) => {
+          if (schema === "cpu-state") {
+            throw new ExportBudgetExceededError({
+              kind: "rows",
+              limit: 50_000,
+              observed: 50_001,
+            })
+          }
+        },
+      })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
         sessionRegistry,
-        commandRunner: {
-          capture: baseRunner.runner.capture,
-          exportToFile: async () => {
-            exportCalls++
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          template: "system-trace",
+          timeLimit: "3s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.exportCalls).toBe(2)
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
+        "system-trace-trace",
+        "system-trace-toc",
+        "system-trace-thread-state",
+      ])
+      expect(result.artifacts.exports).toHaveLength(1)
+      expect(result.artifacts.exports[0]?.label).toBe("system-trace-thread-state")
+      expect(result.summary.headline).toContain("1 target thread intervals")
+      expect(result.summary.metrics.find((metric) => metric.label === "Target CPU intervals")?.value).toBe("0")
+      expect(result.summary.metrics.find((metric) => metric.label === "Busy cores")?.value).toBe("none")
+    })
+  })
+
+  test("fails when a required system trace export exceeds the budget", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const commandRunner = createCommandRunner({
+        exports: {
+          "thread-state": systemThreadOnlyXml,
+          "cpu-state": systemCpuXml,
+        },
+        onExport: ({ schema }) => {
+          if (schema === "thread-state") {
             throw new ExportBudgetExceededError({
               kind: "rows",
               limit: 20_000,
               observed: 20_001,
             })
-          },
+          }
         },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
       })
 
       const result = await Effect.runPromise(
@@ -714,7 +836,7 @@ describe("PerfService", () => {
       )
 
       expect(Either.isLeft(result)).toBe(true)
-      expect(exportCalls).toBe(1)
+      expect(commandRunner.stats.exportCalls).toBe(1)
       expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
         "system-trace-trace",
         "system-trace-toc",
@@ -731,7 +853,7 @@ describe("PerfService", () => {
     })
   })
 
-  test("system trace uses reduced budgets and time limits", async () => {
+  test("system trace uses targeted budgets and time limits", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = {
@@ -759,10 +881,10 @@ describe("PerfService", () => {
         }),
       )
 
-      // Verify system trace uses the reduced budgets
+      // Verify system trace uses the targeted budgets
       expect(commandRunner.stats.budgets).toEqual([
         { schema: "thread-state", maxBytes: 6 * mib, maxRows: 20_000 },
-        { schema: "cpu-state", maxBytes: 6 * mib, maxRows: 20_000 },
+        { schema: "cpu-state", maxBytes: 12 * mib, maxRows: 50_000 },
       ])
       expect(result.template).toBe("system-trace")
       expect(result.artifacts.exports).toHaveLength(2)
@@ -1054,6 +1176,7 @@ describe("PerfService", () => {
         sendRunnerKeepalive: () => Effect.void,
       }
       const commandRunner = createCommandRunner({
+        tocXml: loggingTocWithSignpostSchemaXml,
         exports: {
           "os-signpost-interval": signpostIntervalsXml,
         },
@@ -1088,6 +1211,188 @@ describe("PerfService", () => {
         avgDurationNs: 5_000_000,
       })
       expect(artifactStore.artifacts.map((artifact) => artifact.label)).toContain("signpost-intervals")
+    })
+  })
+
+  test("wraps signpost export command failures in a typed environment error", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const tracePath = join(root, "traces", "logging.trace")
+
+      await mkdir(tracePath, { recursive: true })
+      await Effect.runPromise(
+        artifactStore.service.registerArtifact("session-1", {
+          key: "logging-trace",
+          label: "logging-trace",
+          kind: "directory",
+          summary: "logging trace",
+          absolutePath: tracePath,
+          relativePath: "traces/logging.trace",
+          external: false,
+          createdAt: "2026-04-14T00:00:00.000Z",
+        }),
+      )
+
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const baseRunner = createCommandRunner({
+        tocXml: loggingTocWithSignpostSchemaXml,
+        exports: {},
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: {
+          capture: baseRunner.runner.capture,
+          exportToFile: async (args) => {
+            throw new ChildProcessError({
+              code: "command-failed",
+              command: `${args.command} ${args.commandArgs.join(" ")}`,
+              reason: "xcrun exited with code 1",
+              nextStep: "Inspect stderr and retry.",
+              exitCode: 1,
+              stderrExcerpt: "No data found matching export query",
+            })
+          },
+        },
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.summarizeBySignpost({
+            sessionId: "session-1",
+            artifactKey: "logging-trace",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
+        "logging-trace",
+        "signpost-toc",
+      ])
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+        expect(result.left).not.toBeInstanceOf(ChildProcessError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-export-schema-failed")
+          expect(result.left.reason).toContain("os-signpost-interval")
+          expect(result.left.reason).toContain("code 1")
+          expect(result.left.details).toContain("schema: os-signpost-interval")
+          expect(result.left.details).toContain("stderr: No data found matching export query")
+        }
+      }
+    })
+  })
+
+  test("returns an empty signpost summary when export contains zero interval rows", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const tracePath = join(root, "traces", "logging.trace")
+
+      await mkdir(tracePath, { recursive: true })
+      await Effect.runPromise(
+        artifactStore.service.registerArtifact("session-1", {
+          key: "logging-trace",
+          label: "logging-trace",
+          kind: "directory",
+          summary: "logging trace",
+          absolutePath: tracePath,
+          relativePath: "traces/logging.trace",
+          external: false,
+          createdAt: "2026-04-14T00:00:00.000Z",
+        }),
+      )
+
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const commandRunner = createCommandRunner({
+        tocXml: loggingTocWithSignpostSchemaXml,
+        exports: {
+          "os-signpost-interval": emptySignpostIntervalsXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.summarizeBySignpost({
+          sessionId: "session-1",
+          artifactKey: "logging-trace",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.totalIntervals).toBe(0)
+      expect(result.groups).toEqual([])
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toContain("signpost-intervals")
+    })
+  })
+
+  test("fails with unsupported capability when the TOC omits the signpost interval schema", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const tracePath = join(root, "traces", "logging.trace")
+
+      await mkdir(tracePath, { recursive: true })
+      await Effect.runPromise(
+        artifactStore.service.registerArtifact("session-1", {
+          key: "logging-trace",
+          label: "logging-trace",
+          kind: "directory",
+          summary: "logging trace",
+          absolutePath: tracePath,
+          relativePath: "traces/logging.trace",
+          external: false,
+          createdAt: "2026-04-14T00:00:00.000Z",
+        }),
+      )
+
+      const sessionRegistry = {
+        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+        sendRunnerKeepalive: () => Effect.void,
+      }
+      const commandRunner = createCommandRunner({
+        tocXml: loggingTocWithoutSignpostSchemaXml,
+        exports: {},
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.summarizeBySignpost({
+            sessionId: "session-1",
+            artifactKey: "logging-trace",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(commandRunner.stats.exportCalls).toBe(0)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(UnsupportedCapabilityError)
+
+        if (result.left instanceof UnsupportedCapabilityError) {
+          expect(result.left.code).toBe("perf-signpost-schema-missing")
+          expect(result.left.capability).toBe("perf.summarize.group-by.signpost")
+        }
+      }
     })
   })
 })
