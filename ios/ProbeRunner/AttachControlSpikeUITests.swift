@@ -2009,18 +2009,22 @@ final class AttachControlSpikeUITests: XCTestCase {
   }
 
   private func performDirectionalGesture(on coordinate: XCUICoordinate, direction: String) throws {
+    let offset: CGVector
+
     switch direction {
     case "up":
-      coordinate.swipeUp()
+      offset = CGVector(dx: 0, dy: -160)
     case "down":
-      coordinate.swipeDown()
+      offset = CGVector(dx: 0, dy: 160)
     case "left":
-      coordinate.swipeLeft()
+      offset = CGVector(dx: -160, dy: 0)
     case "right":
-      coordinate.swipeRight()
+      offset = CGVector(dx: 160, dy: 0)
     default:
       throw actionError("Unsupported direction \(direction).")
     }
+
+    coordinate.press(forDuration: 0.01, thenDragTo: coordinate.withOffset(offset))
   }
 
   @MainActor
