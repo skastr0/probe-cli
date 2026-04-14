@@ -1,5 +1,10 @@
 import { Schema } from "effect"
-import { FlowContractSchema, FlowResultSchema, FlowStepSchema, validateFlowContract, type FlowContract } from "./action"
+import { FlowStepSchema } from "./action"
+import {
+  SessionFlowContractSchema,
+  SessionFlowResultSchema,
+  validateSessionFlowContract,
+} from "./flow-v2"
 import { ArtifactRecord, NullableString } from "./output"
 import type { SessionHealth } from "./session"
 
@@ -82,7 +87,7 @@ export const CommerceDoctorReportSchema = Schema.Struct({
 export type CommerceDoctorReport = typeof CommerceDoctorReportSchema.Type
 
 const EmbeddedFlowInputSchema = Schema.Union(
-  FlowContractSchema,
+  SessionFlowContractSchema,
   Schema.Struct({
     steps: Schema.Array(FlowStepSchema),
   }),
@@ -91,7 +96,7 @@ const EmbeddedFlowInputSchema = Schema.Union(
 
 export const EmbeddedFlowContractSchema = Schema.transform(
   EmbeddedFlowInputSchema,
-  FlowContractSchema,
+  SessionFlowContractSchema,
   {
     strict: false,
     decode: (input) => {
@@ -265,7 +270,7 @@ export const CommerceValidationStepResultSchema = Schema.Struct({
   summary: Schema.String,
   details: Schema.Array(Schema.String),
   warnings: Schema.Array(Schema.String),
-  flowResult: Schema.Union(FlowResultSchema, Schema.Null),
+  flowResult: Schema.Union(SessionFlowResultSchema, Schema.Null),
 })
 export type CommerceValidationStepResult = typeof CommerceValidationStepResultSchema.Type
 
@@ -360,7 +365,7 @@ export const validateCommerceFlowStep = (step: CommerceFlowStep): string | null 
       return step.rate.trim().length > 0 ? null : "commerce.setTimeRate requires a non-empty rate string."
     default:
       if (isCommerceExecutableStep(step)) {
-        return validateFlowContract(step.flow)
+        return validateSessionFlowContract(step.flow)
       }
 
       return null
@@ -570,4 +575,4 @@ export const buildCommerceValidationReport = (args: {
 }
 
 export type CommerceValidationExecutionStep = CommerceExecutableFlowStep | CommerceStoreKitControlStep
-export type EmbeddedCommerceFlow = FlowContract
+export type EmbeddedCommerceFlow = typeof EmbeddedFlowContractSchema.Type

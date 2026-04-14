@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import { Effect } from "effect"
-import { decodeFlowContract } from "../../domain/action"
 import { UserInputError } from "../../domain/errors"
+import { decodeSessionFlowContract } from "../../domain/flow-v2"
 import {
   defaultPerfTimeLimitForTemplate,
   formatNanoseconds,
@@ -91,7 +91,7 @@ const readFlowFile = (path: string) =>
     })
 
     return yield* Effect.try({
-      try: () => decodeFlowContract(JSON.parse(raw) as unknown),
+      try: () => decodeSessionFlowContract(JSON.parse(raw) as unknown),
       catch: (error) =>
         new UserInputError({
           code: "perf-flow-file-parse",

@@ -1,13 +1,12 @@
 import { Schema } from "effect"
 import {
   ActionRecordingScriptSchema,
-  FlowContractSchema,
-  FlowResultSchema,
   SessionActionResultSchema,
   SessionActionSchema,
   SessionRecordingExportResultSchema,
   SessionReplayResultSchema,
 } from "../domain/action"
+import { SessionFlowContractSchema, SessionFlowResultSchema } from "../domain/flow-v2"
 import { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
 import { ProbeFailurePayload, ProtocolMismatchError } from "../domain/errors"
@@ -257,7 +256,7 @@ export const SessionRunRequest = Schema.Struct({
   method: Schema.Literal("session.run"),
   params: Schema.Struct({
     sessionId: Schema.String,
-    flow: FlowContractSchema,
+    flow: SessionFlowContractSchema,
   }),
 })
 export type SessionRunRequest = typeof SessionRunRequest.Type
@@ -342,7 +341,7 @@ export const PerfAroundRequest = Schema.Struct({
   params: Schema.Struct({
     sessionId: Schema.String,
     template: PerfTemplate,
-    flow: FlowContractSchema,
+    flow: SessionFlowContractSchema,
   }),
 })
 export type PerfAroundRequest = typeof PerfAroundRequest.Type
@@ -556,7 +555,7 @@ export const SessionRunResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.run"),
-  result: FlowResultSchema,
+  result: SessionFlowResultSchema,
 })
 export type SessionRunResponse = typeof SessionRunResponse.Type
 

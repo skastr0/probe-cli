@@ -1,6 +1,6 @@
 import { Schema } from "effect"
-import { FlowResultSchema } from "./action"
 import { ArtifactRecord } from "./output"
+import { SessionFlowResultSchema } from "./flow-v2"
 import { SessionHealthCheck, SessionPhase } from "./session"
 
 const perfTemplateValues = [
@@ -102,7 +102,7 @@ export const PerfAroundFlowResult = Schema.Struct({
   recordedAt: Schema.String,
   xctraceVersion: Schema.String,
   session: PerfSessionOutcome,
-  flow: FlowResultSchema,
+  flow: SessionFlowResultSchema,
   diagnoses: Schema.Array(PerfDiagnosis),
   artifacts: PerfAroundFlowArtifacts,
 })

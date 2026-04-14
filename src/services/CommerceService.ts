@@ -1,7 +1,6 @@
 import { access, readdir, readFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve } from "node:path"
 import { Context, Effect, Layer } from "effect"
-import type { FlowResult } from "../domain/action"
 import {
   buildCommerceDoctorReport,
   buildCommerceEnvironmentReport,
@@ -17,6 +16,7 @@ import {
   type CommerceValidationReport,
   type CommerceValidationStepResult,
 } from "../domain/commerce"
+import type { SessionFlowResult } from "../domain/flow-v2"
 import {
   ArtifactNotFoundError,
   ChildProcessError,
@@ -541,10 +541,10 @@ const formatThrownError = (error: unknown): string =>
       ? error.message
       : String(error)
 
-const flowResultToStepVerdict = (flow: FlowResult): CommerceValidationStepResult["verdict"] =>
+const flowResultToStepVerdict = (flow: SessionFlowResult): CommerceValidationStepResult["verdict"] =>
   flow.verdict === "passed" ? "verified" : "blocked"
 
-const buildStepDetails = (flow: FlowResult): Array<string> => [
+const buildStepDetails = (flow: SessionFlowResult): Array<string> => [
   `flow verdict: ${flow.verdict}`,
   `flow retries: ${flow.retries}`,
   ...(flow.failedStep ? [`failed flow step ${flow.failedStep.index}: ${flow.failedStep.summary}`] : []),

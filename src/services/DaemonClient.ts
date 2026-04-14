@@ -2,13 +2,12 @@ import { randomUUID } from "node:crypto"
 import { Context, Effect, Layer } from "effect"
 import type {
   ActionRecordingScript,
-  FlowContract,
-  FlowResult,
   SessionAction,
   SessionActionResult,
   SessionRecordingExportResult,
   SessionReplayResult,
 } from "../domain/action"
+import type { SessionFlowContract, SessionFlowResult } from "../domain/flow-v2"
 import type { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import {
   ArtifactNotFoundError,
@@ -339,10 +338,10 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
     >
     readonly runSessionFlow: (params: {
       readonly sessionId: string
-      readonly flow: FlowContract
+      readonly flow: SessionFlowContract
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      FlowResult,
+      SessionFlowResult,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError
@@ -436,7 +435,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
     readonly recordPerfAroundFlow: (params: {
       readonly sessionId: string
       readonly template: PerfTemplate
-      readonly flow: FlowContract
+      readonly flow: SessionFlowContract
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
       PerfAroundFlowResult,

@@ -2,16 +2,18 @@ import { readFile } from "node:fs/promises"
 import { Effect } from "effect"
 import {
   decodeActionRecordingScript,
-  decodeFlowContract,
   decodeSessionAction,
   type ActionRecordingScript,
-  type FlowContract,
-  type FlowResult,
   type SessionActionResult,
   type SessionRecordingExportResult,
   type SessionReplayResult,
 } from "../../domain/action"
 import { UserInputError } from "../../domain/errors"
+import {
+  decodeSessionFlowContract,
+  type SessionFlowContract,
+  type SessionFlowResult,
+} from "../../domain/flow-v2"
 import type {
   OutputMode,
   SessionResultAttachmentsResult,
@@ -199,7 +201,7 @@ const formatReplayResult = (result: SessionReplayResult): string => {
   ].join("\n")
 }
 
-const formatFlowResult = (result: FlowResult): string => {
+const formatFlowResult = (result: SessionFlowResult): string => {
   return [
     result.summary,
     `verdict: ${result.verdict}`,
@@ -459,9 +461,9 @@ const parseFlowInvocation = (
     }
 
     const flow = filePath !== null
-      ? yield* readJsonFile<FlowContract>(filePath, "flow", decodeFlowContract)
+      ? yield* readJsonFile<SessionFlowContract>(filePath, "flow", decodeSessionFlowContract)
       : yield* (deps?.readStdinText ?? defaultReadStdinText)().pipe(
-          Effect.flatMap((raw) => decodeInlineJson(raw, "flow", decodeFlowContract)),
+          Effect.flatMap((raw) => decodeInlineJson(raw, "flow", decodeSessionFlowContract)),
         )
 
     return {

@@ -5,7 +5,6 @@ import { basename, dirname, join, relative } from "node:path"
 import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { Context, Effect, Fiber, Layer } from "effect"
-import type { FlowContract, FlowResult } from "../domain/action"
 import {
   PerfAroundFlowResult,
   PerfRecordResult,
@@ -24,6 +23,7 @@ import {
   type PerfSummary,
   type ParsedPerfTable,
 } from "../domain/perf"
+import type { SessionFlowContract, SessionFlowResult } from "../domain/flow-v2"
 import type { ArtifactRecord } from "../domain/output"
 import { isLiveRunnerDetails, type SessionHealth } from "../domain/session"
 import {
@@ -946,7 +946,7 @@ export class PerfService extends Context.Tag("@probe/PerfService")<
     readonly recordAroundFlow: (args: {
       readonly sessionId: string
       readonly template: typeof PerfTemplate.Type
-      readonly flow: FlowContract
+      readonly flow: SessionFlowContract
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
       typeof PerfAroundFlowResult.Type,
@@ -1014,9 +1014,9 @@ interface PerfSessionRegistryAccess {
   readonly sendRunnerKeepalive: (sessionId: string) => Effect.Effect<void, SessionNotFoundError | EnvironmentError>
   readonly runFlow?: (params: {
     readonly sessionId: string
-    readonly flow: FlowContract
+    readonly flow: SessionFlowContract
   }) => Effect.Effect<
-    FlowResult,
+    SessionFlowResult,
     SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
   >
 }
@@ -1715,7 +1715,7 @@ export const createPerfService = (dependencies: {
   const recordAroundFlow = ({ sessionId, template, flow, emitProgress }: {
     readonly sessionId: string
     readonly template: PerfTemplate
-    readonly flow: FlowContract
+    readonly flow: SessionFlowContract
     readonly emitProgress: (stage: string, message: string) => void
   }) =>
     Effect.gen(function* () {
