@@ -1,111 +1,435 @@
-# Probe
+# Probe CLI
 
-Probe is a daemon-first, agent-first iOS runtime controller.
+Probe is a daemon-first, agent-first iOS runtime controller for macOS. It provides reliable, token-efficient control of running iOS apps on Simulator or real device through a local daemon and thin CLI client.
 
-This repository now includes a real control-plane slice: a Bun + TypeScript + Effect daemon, a thin Unix-socket RPC client, artifact-aware session storage, simulator and device session flows built on the existing ProbeRunner/ProbeFixture artifacts, and a validation harness for exercising the product end to end.
+Probe does not own builds, signing, or provisioning of the target app. The app must already be built and installed (except for Probe's own fixture app on Simulator, which it builds automatically).
 
-## What exists today
+## Product Vision
 
-- executable host-side control plane under `src/`
-- single shared Effect `ManagedRuntime`
-- daemon entrypoint at `probe serve`
-- thin client commands for `session open`, `session health`, `session snapshot`, `session action`, `session screenshot`, `session video`, `session close`, `perf record`, and `drill`
-- typed local RPC protocol over a Unix domain socket
-- session registry with TTL cleanup and session artifact roots under `~/.probe/sessions/<session-id>/`
-- simulator sessions in two modes: ProbeFixture `build-and-install` and arbitrary-app `attach-to-running`
-- live real-device runner sessions for installed apps through explicit CoreDevice/DDI/signing preflight
-- runner-backed screenshots and video capture on both simulator and device
-- daemon-backed `perf record` for `time-profiler`, `system-trace`, `metal-system-trace`, `hangs`, and `swift-concurrency`
-- tracked `.agents/` lifecycle folders outside `sdlc/`
+Probe is becoming **the local iOS validation and observability workbench for agents and power users**:
 
-## What does **not** exist yet
+- **iOS-only** — focused exclusively on iOS simulators and devices
+- **Local-first** — runs on your development machine, no cloud tenancy required
+- **Artifact-first** — compact summaries with large evidence offloaded to inspectable artifacts
+- **Typed contracts** — structured JSON over shell-like strings for agent use
+- **Validation lanes** — purpose-built checks for recurring, expensive-to-break iOS seams:
+  - accessibility audits
+  - commerce / subscriptions / paywalls
+  - performance / signposts / Metal
 
-- daemon-owned persistent live device log capture
-- simulator-app and real-device LLDB attach/eval inside Probe sessions
-- broad Instruments coverage beyond the current bounded templates and extractors
-- a final production runner transport beyond the current honest file-mailbox + mixed-stdout seam
+The pattern is: **doctor** (preflight) → **validate** (execute) → **drill** (inspect evidence).
 
-Those surfaces still need the follow-on work items and research packs before the product expands beyond the initial vertical slice.
+## Architecture at a Glance
 
-## Quickstart
+Probe runs as a long-lived daemon (`probe serve`) that speaks RPC over a Unix domain socket. The CLI commands are thin clients that send requests to the daemon. Everything is session-scoped: you open a session against a target app, do your work, then close it.
 
-```bash
-bun install
-bun run typecheck
-bun run test
-bun run probe -- doctor
-bun run scripts/validate-product-flow.ts --target simulator
+```
+CLI commands  -->  Unix socket  -->  Daemon  -->  XCUITest Runner  -->  Target App
+                                       |
+                                       +--> Instruments (xctrace / perf)
+                                       +--> simctl / devicectl
+                                       +--> log stream / oslog
+                                       +--> Artifact storage (~/.probe/sessions/)
 ```
 
-## Commands
+## Prerequisites
 
-### `bun run probe -- doctor`
+- macOS with Xcode installed
+- Bun runtime
+- `ffmpeg` (optional, for stitching video frames into MP4)
+- For real devices: paired device with Developer Mode enabled, signed app installed
 
-Reports the current workspace scaffold, output-threshold defaults, reserved artifact root, and capability readiness.
-
-### `bun run probe -- doctor --json`
-
-Same as above, but JSON.
-
-### `bun run probe -- serve`
-
-Starts the long-lived daemon on the local Unix socket and keeps session state in one shared runtime.
-
-### `bun run probe -- session open --json`
-
-Opens a daemon-backed session.
-
-- simulator + no `--bundle-id`: build/install the Probe fixture app and attach the runner
-- simulator + `--bundle-id <id>`: attach to an already-running installed app
-- device + `--bundle-id <id>`: verify real-device prerequisites, launch the installed app, and attach the runner
-
-The transport seam is still the honest bootstrap-manifest + file-mailbox + mixed-stdout contract.
-
-### `bun run probe -- session screenshot --session-id <id> --json`
-
-Captures a runner-side PNG artifact for the active session. The same runner-backed screenshot path works on both simulator and device sessions.
-
-### `bun run probe -- session video --session-id <id> --duration 5s --json`
-
-Captures a runner-side video artifact for the active session. Probe stitches frame output into MP4 when `ffmpeg` is available and otherwise keeps the frame-sequence artifact.
-
-### `bun run probe -- session health --session-id <id> --json`
-
-Asks the daemon to ping the live runner and report the latest session health.
-
-### `bun run probe -- drill --session-id <id> --artifact xcodebuild-session-log --lines 1:40`
-
-Drills into a stored artifact without dumping the whole file inline.
-
-### `bun run probe -- perf record --session-id <id> --template time-profiler --time-limit 3s --json`
-
-Records one bounded Instruments trace through the daemon, stores the raw `.trace` plus TOC/schema exports under the session `traces/` directory, and returns a compact summary with artifact paths.
-
-Current perf contract:
-
-- supported templates: `time-profiler`, `system-trace`, `metal-system-trace`, `hangs`, `swift-concurrency`
-- `system-trace` is intentionally narrower: max 10s recording, 2 MiB / 8k rows per table export budget because the supported summary is target-attributed scheduling only
-- `metal-system-trace` now keeps the bounded `metal-gpu-intervals` summary path and exports extended driver/encoder tables when they are present and stay within budget
-- `hangs` and `swift-concurrency` stay on the same honest contract: return row-proven summaries when the exported schemas are populated, fail closed when they are not
-- Probe reports the post-record session state in the result so a trace can succeed without pretending the runner session stayed healthy; check `result.session.state` and `result.diagnoses` for `perf-session-*-after-record` warnings
-- Export files are size-checked before parsing to prevent memory amplification (8 MiB cap); exceeding this fails with `perf-export-file-too-large`
-- Network-on-Simulator, full reconstructed Time Profiler call stacks, and per-shader GPU attribution are still explicit walls
-
-## Validation script
-
-`scripts/validate-product-flow.ts` is the canonical local product check.
+## Quick Start
 
 ```bash
-bun run scripts/validate-product-flow.ts --target simulator
-bun run scripts/validate-product-flow.ts --target simulator --bundle-id com.example.notes
-bun run scripts/validate-product-flow.ts --target device --bundle-id com.example.notes --device-id <device-id>
+cd /path/to/probe-cli
+
+# Check environment readiness
+probe doctor --json
+
+# Start the daemon (keep running in background or separate terminal)
+probe serve &
+
+# Open a session (fixture app on simulator)
+probe session open --json
+# Returns health including sessionId, state, capabilities, artifacts
+
+# Do your QA work (screenshots, actions, snapshots, flows, etc.)
+probe session screenshot --session-id <id> --json
+probe session snapshot --session-id <id> --json
+
+# Close when done
+probe session close --session-id <id> --json
 ```
 
-The script starts `probe serve`, opens a session, sends a ping, captures a snapshot, performs a UI action, records a 5-second Time Profiler trace, lists artifacts, closes the session, stops the daemon, and prints a timed pass/fail summary.
+When running from the source repo, prefix commands with `bun run probe --`:
+```bash
+bun run probe -- serve
+bun run probe -- session open --json
+```
 
-## Source layout
+## Command Surface
 
-```text
+### Control plane
+
+| Command | Purpose |
+|---------|---------|
+| `probe doctor [--json]` | Workspace, daemon, and capability readiness |
+| `probe doctor accessibility --session-id <id>` | Accessibility readiness of the target app |
+| `probe doctor commerce --bundle-id <id> [--mode <m>] [--config <p>] [--provider revenuecat]` | StoreKit / commerce readiness |
+| `probe doctor capture --target simulator\|device --session-id <id> [--kind sysdiagnose]` | Capture a diagnostic bundle (sysdiagnose on device) |
+| `probe serve` | Start the daemon |
+| `probe validate accessibility --session-id <id> [--scope current-screen]` | Accessibility checks on current screen |
+| `probe validate commerce --session-id <id> --mode <m> [--plan <p>] [--provider revenuecat]` | Commerce validation; `local-storekit` requires `--plan` |
+
+### Session lifecycle
+
+| Command | Purpose |
+|---------|---------|
+| `probe session list` | List active sessions |
+| `probe session open [--target simulator\|device] [--bundle-id <id>] [--simulator-udid <udid>] [--device-id <id>]` | Open a session |
+| `probe session show --session-id <id>` | Full session health + artifacts |
+| `probe session health --session-id <id>` | Ping the runner and return current health |
+| `probe session close --session-id <id>` | Close and free resources |
+
+### Observation
+
+| Command | Purpose |
+|---------|---------|
+| `probe session snapshot --session-id <id> [--output auto\|inline\|artifact]` | Capture accessibility tree |
+| `probe session screenshot --session-id <id> [--label <name>] [--output auto\|inline\|artifact]` | Capture PNG |
+| `probe session video --session-id <id> --duration <dur>` | Record video clip (MP4 when `ffmpeg` available) |
+| `probe session logs --session-id <id> [--source <s>] [--lines 80] [--match <text>] [--seconds 2] [--predicate <expr>] [--process <n>] [--subsystem <n>] [--category <n>] [--output <m>]` | Read logs from a source |
+| `probe session logs mark --session-id <id> --label <label>` | Drop a named marker into the log stream |
+| `probe session logs capture --session-id <id> [--seconds 3]` | Capture a fixed-duration log window artifact |
+| `probe session logs doctor --session-id <id>` | Report which log sources are available |
+
+### Interaction
+
+| Command | Purpose |
+|---------|---------|
+| `probe session action --session-id <id> (--file <action.json> \| --json <action-json>)` | Perform a single UI action |
+| `probe session run --session-id <id> (--file <flow.json> \| --stdin)` | Run a multi-step flow (`probe.session-flow/v1`) |
+| `probe session recording export --session-id <id> [--label <name>]` | Export recorded actions as a replay script |
+| `probe session replay --session-id <id> --file <recording.json>` | Replay a recording with retries + semantic fallback |
+| `probe session result summary --session-id <id>` | Aggregate session result summary artifact |
+| `probe session result attachments --session-id <id>` | List artifacts attached to the session result |
+
+### Performance
+
+| Command | Purpose |
+|---------|---------|
+| `probe perf record --session-id <id> --template <t> [--time-limit <dur>]` | Record a bounded Instruments trace |
+| `probe perf around --session-id <id> --file <flow.json> --template <t>` | Record a trace while running a flow |
+| `probe perf summarize --session-id <id> --artifact <trace-key> --group-by signpost` | Aggregate signpost intervals from a trace |
+
+### Artifact drill
+
+| Command | Purpose |
+|---------|---------|
+| `probe drill --session-id <id> --artifact <key> --lines <start:end> [--match <text>]` | Text window with optional grep |
+| `probe drill ... --json-pointer <ptr>` | JSON drill by pointer |
+| `probe drill ... --xpath <expr>` | XML drill by XPath |
+| `probe drill ... --xcresult summary` | xcresult test summary |
+| `probe drill ... --xcresult attachments [--attachment-id <id>]` | List or fetch xcresult attachments |
+| All drill variants | Support `--output auto\|inline\|artifact` |
+
+Most commands accept `--json` to emit JSON. When writing against Probe from a script, always pass `--json` — the text format is for humans.
+
+## Session Lifecycle
+
+Every interaction with a target app happens inside a session. Sessions have phases:
+
+| Phase | Meaning |
+|-------|---------|
+| `opening` | Allocating resources, launching runner |
+| `ready` | Healthy, accepts work |
+| `degraded` | Open but some resources unavailable |
+| `closing` | Cleanup in progress |
+| `closed` | Done, resources freed |
+| `failed` | Could not satisfy contract |
+
+A session owns exactly one target app on one target device. Always close sessions when done — they have a TTL (default 15 min) but explicit cleanup is better.
+
+### Opening Sessions
+
+**Simulator with fixture app** (self-test, no app needed):
+```bash
+probe session open --json
+```
+
+**Simulator with your app** (must already be running):
+```bash
+probe session open --target simulator --bundle-id com.example.myapp --json
+# Optionally pin to a specific simulator UDID:
+probe session open --target simulator --bundle-id com.example.myapp --simulator-udid <udid> --json
+```
+
+**Real device** (must be paired, Developer Mode on, app installed):
+```bash
+probe session open --target device --bundle-id com.example.myapp --device-id <device-id> --json
+```
+
+Omitting `--bundle-id` on simulator uses Probe's built-in fixture app in `build-and-install` mode. Passing `--bundle-id` switches to `attach-to-running` mode — you're responsible for launching the app first.
+
+### Inspecting Sessions
+
+```bash
+probe session list --json                      # all active sessions
+probe session show --session-id <id> --json      # full health snapshot
+probe session health --session-id <id> --json    # ping runner for fresh health
+```
+
+## Core Capabilities
+
+### 1. Accessibility Snapshots
+
+Snapshots capture the full accessibility tree of the running app. This is the foundation for all UI interaction — every node gets a stable ref (`@e1`, `@e2`, ...) that you use to target actions.
+
+```bash
+probe session snapshot --session-id <id> --output auto --json
+```
+
+`--output` controls inline body (`inline`), artifact-only (`artifact`), or size-based (`auto`, default).
+
+Returns:
+- `snapshotId` — unique identifier for this snapshot
+- `metrics` — node count, interactive count, weak-identity count, max depth
+- `diff` — changes since previous snapshot (added/removed/updated/remapped)
+- `preview.nodes` — list of nodes with ref, type, identifier, label, value, state
+- `artifact` — path to full snapshot JSON on disk
+
+**Snapshot nodes look like this:**
+```json
+{
+  "ref": "@e5",
+  "type": "button",
+  "identifier": "login-button",
+  "label": "Log In",
+  "value": null,
+  "interactive": true,
+  "state": { "disabled": false, "selected": false, "focused": false }
+}
+```
+
+### 2. Screenshots
+
+```bash
+probe session screenshot --session-id <id> --label "after-login" --output auto --json
+```
+
+- `--label` names the screenshot for organization
+- `--output auto|inline|artifact` controls inline base64 vs artifact-only
+- Stored under `~/.probe/sessions/<id>/screenshots/`
+
+### 3. Video Recording
+
+```bash
+probe session video --session-id <id> --duration 5s --json
+```
+
+- Duration supports units: `5s`, `500ms`, up to 120 seconds max
+- With `ffmpeg` available, frames are stitched into MP4; otherwise a frame-sequence artifact
+- Stored under `~/.probe/sessions/<id>/video/`
+
+### 4. Single UI Actions
+
+```bash
+# From a file
+probe session action --session-id <id> --file action.json --json
+
+# Inline JSON payload (no temp file needed)
+probe session action --session-id <id> \
+  --json '{ "kind": "tap", "target": { "kind": "ref", "ref": "@e5", "fallback": null } }'
+```
+
+The `--json` flag is overloaded on `session action`: when its next token is not another flag, it is taken as inline JSON input; when bare, it requests JSON output. Use `--input-json <payload>` and `--output-json` to disambiguate in scripts.
+
+**Supported action kinds:** `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`
+
+See `actions-reference.md` for full schemas: selectors (ref / semantic / point / absence), assertion expectations, retry policy, and the recording contract.
+
+### 5. Multi-Step Flows (`session run`)
+
+Flows are the preferred way to execute a deterministic sequence of steps in one RPC. The daemon validates the whole script before running, continues on soft failures when asked, and returns a single structured result.
+
+```bash
+probe session run --session-id <id> --file flow.json --json
+# or stream via stdin
+cat flow.json | probe session run --session-id <id> --stdin --json
+```
+
+Flow contract: `probe.session-flow/v1`. Step kinds: `snapshot`, `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`, `logMark`, `sleep`. Any step may set `continueOnError: true` to keep the flow running when that step fails.
+
+See `flows-reference.md` for the flow schema, step shapes, and worked examples.
+
+### 6. Recording and Replay
+
+Probe records every UI action during a session.
+
+```bash
+# Export the current session's recording
+probe session recording export --session-id <id> --label "checkout-flow" --json
+
+# Replay a recording in a new session
+probe session replay --session-id <id> --file recording.json --json
+```
+
+Recording contract: `probe.action-recording/script-v1`. Replay produces a `probe.action-replay/report-v1` with per-step attempts, outcomes (`no-retry`, `retry-succeeded`, `semantic-fallback`, `retry-exhausted`), and a final `succeeded` or `failed` status. Default 3 retry attempts per step (configurable via `PROBE_REPLAY_ATTEMPTS`).
+
+### 7. Logs
+
+Probe can read from several live log sources. Pick with `--source`:
+
+| Source | Content |
+|--------|---------|
+| `runner` (default) | XCUITest runner log (actions, events) |
+| `build` | xcodebuild / build output |
+| `wrapper` | Daemon-side runner wrapper log |
+| `stdout` | Mixed stdout from the runner |
+| `simulator` | Simulator-level `oslog` / `log stream` output |
+
+Common patterns:
+
+```bash
+# Last 200 runner lines, filtered
+probe session logs --session-id <id> --lines 200 --match "error" --json
+
+# Simulator oslog window with predicate / process / subsystem / category filters
+probe session logs --session-id <id> --source simulator --seconds 5 \
+  --predicate 'eventMessage CONTAINS "payment"' --process MyApp \
+  --subsystem com.myapp --category payments --json
+
+# Mark a moment in the stream before a risky action
+probe session logs mark --session-id <id> --label "before-submit" --json
+
+# Capture a 3-second window as a standalone artifact
+probe session logs capture --session-id <id> --seconds 3 --json
+
+# Report which sources are currently available (and why)
+probe session logs doctor --session-id <id> --json
+```
+
+### 8. Accessibility and Commerce Validation
+
+Probe ships opinionated doctors and validators for two common quality lanes.
+
+**Accessibility**
+```bash
+probe doctor accessibility --session-id <id> --json
+probe validate accessibility --session-id <id> --scope current-screen --json
+```
+Reports interactive elements analyzed, categorized issues with severity, and evidence artifacts (snapshot + screenshot + report).
+
+**Commerce (StoreKit / RevenueCat)**
+```bash
+probe doctor commerce --bundle-id com.example.myapp --mode local-storekit --config store.storekit --json
+probe validate commerce --session-id <id> --mode local-storekit --plan plan.json --json
+probe validate commerce --session-id <id> --mode sandbox --provider revenuecat --json
+```
+Modes:
+- `local-storekit` — uses a local `.storekit` config; `--plan <commerce-plan.json>` is required
+- `sandbox` — App Store Sandbox accounts
+- `testflight` — TestFlight build, real Apple ID
+
+`--provider revenuecat` opts into RevenueCat-specific checks.
+
+### 9. Performance Profiling
+
+```bash
+probe perf record --session-id <id> --template time-profiler --json
+probe perf record --session-id <id> --template system-trace --time-limit 5s --json
+
+# Record a trace while driving a flow
+probe perf around --session-id <id> --file flow.json --template time-profiler --json
+
+# Aggregate signpost intervals from an existing trace
+probe perf summarize --session-id <id> --artifact <trace-key> --group-by signpost --json
+```
+
+**Available templates:**
+
+| Template | Default Duration | Use Case |
+|----------|-----------------|---------|
+| `time-profiler` | 3s | CPU hotspots, call stacks |
+| `system-trace` | 3s (max 10s) | Scheduling, thread states |
+| `metal-system-trace` | 60s | GPU workload, Metal performance |
+| `hangs` | 3s | Main thread hangs |
+| `swift-concurrency` | 3s | Task / actor scheduling |
+| `logging` | 3s | `os_log` / signpost capture |
+
+Results include a compact summary headline, key metrics, diagnoses (info / warning / wall), artifact paths (raw `.trace`, TOC, exports), and the post-record session state — a trace can succeed even if the runner degrades. Export files are capped at 8 MiB; exceeding this fails with `perf-export-file-too-large`.
+
+### 10. Artifact Inspection (Drill)
+
+```bash
+# Text artifacts — line range
+probe drill --session-id <id> --artifact snapshot-1 --lines 1:40
+
+# Text artifacts — pattern matching
+probe drill --session-id <id> --artifact runner-log --match "error"
+
+# JSON artifacts — pointer
+probe drill --session-id <id> --artifact snapshot-1 --json-pointer /nodes/0
+
+# XML artifacts — xpath
+probe drill --session-id <id> --artifact perf-toc --xpath "//table[@name='time-sample']"
+
+# xcresult bundles
+probe drill --session-id <id> --artifact session-xcresult --xcresult summary --json
+probe drill --session-id <id> --artifact session-xcresult --xcresult attachments --json
+probe drill --session-id <id> --artifact session-xcresult --xcresult attachments \
+  --attachment-id <id> --output artifact
+```
+
+All drill variants accept `--output auto|inline|artifact`. xcresult drills default to `inline` when combined with `--json`.
+
+### 11. Session Result Artifacts
+
+After a flow or manual exploration, aggregate artifacts for handoff:
+
+```bash
+probe session result summary --session-id <id> --json
+probe session result attachments --session-id <id> --json
+```
+
+## Element Selection Strategy
+
+Probe supports four selector kinds (see `actions-reference.md`):
+
+- **`ref`** — fast, per-snapshot, optional semantic fallback
+- **`semantic`** — durable across UI changes, can be ambiguous
+- **`point`** — raw `x` / `y` coordinates (use sparingly)
+- **`absence`** — wrap another selector with `negate` to assert absence
+
+**Best practice — ref with semantic fallback:**
+```json
+{
+  "kind": "ref",
+  "ref": "@e5",
+  "fallback": {
+    "kind": "semantic",
+    "identifier": "login-button",
+    "label": null, "value": null, "placeholder": null,
+    "type": "button", "section": null, "interactive": true
+  }
+}
+```
+
+Recording export produces this pattern automatically.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROBE_SESSION_TTL_MS` | 900000 (15 min) | Session time-to-live |
+| `PROBE_REPLAY_ATTEMPTS` | 3 | Retry count per replay step |
+| `PROBE_RPC_TIMEOUT_MS` | 600000 (10 min) | RPC timeout |
+| `PROBE_ARTIFACT_RETENTION_MS` | 7 days | Artifact retention period |
+
+## Source Layout
+
+```
 src/
   cli/
     commands/
@@ -118,8 +442,31 @@ ios/
   ProbeRunner/
 ```
 
-The shape is still smaller than the full architecture sketch in `ARCHITECTURE.md`, but it now implements the control-plane seam instead of only reserving it.
+## Validation
 
-## iOS scaffold note
+Run the canonical product validation script:
 
-The `ios/` tree now contains the real fixture/runner artifacts used by Probe's simulator self-test path and the shared runner control surface for live device sessions. The runner transport is still the current honest contract, not the final production contract.
+```bash
+# Simulator with fixture app
+bun run scripts/validate-product-flow.ts --target simulator
+
+# Simulator with your app
+bun run scripts/validate-product-flow.ts --target simulator --bundle-id com.example.myapp
+
+# Real device
+bun run scripts/validate-product-flow.ts --target device --bundle-id com.example.myapp --device-id <device-id>
+```
+
+The script starts `probe serve`, opens a session, sends a ping, captures a snapshot, performs a UI action, records a 5-second Time Profiler trace, lists artifacts, closes the session, stops the daemon, and prints a timed pass/fail summary.
+
+## Supporting References
+
+- `actions-reference.md` — full action and selector schemas, `wait` conditions, assertion expectations, retry policy, recording/replay contracts
+- `flows-reference.md` — `probe.session-flow/v1` schema, step kinds, `continueOnError`, worked examples
+- `recipes.md` — end-to-end QA recipes (login, form validation, commerce, accessibility, perf-around-flow, etc.)
+- `troubleshooting.md` — session won't open, stale refs, log sources unavailable, daemon socket conflicts, perf walls
+- `V2-DIRECTION.md` — product vision and roadmap for the validation and observability workbench
+
+---
+
+**Probe**: local iOS validation and observability for agents and power users.
