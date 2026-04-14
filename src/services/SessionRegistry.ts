@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
-import { join, relative } from "node:path"
+import { basename, dirname, join, relative } from "node:path"
 import { Context, Effect, Either, Layer, Ref } from "effect"
 import {
   buildRecordedSessionAction,
@@ -95,7 +95,6 @@ const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
 const maxVideoDurationMs = 120_000
 const defaultVideoDurationMs = 10_000
 const videoCaptureFps = 10
-const simulatorVideoDeliveryFps = 30
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
 const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
@@ -153,6 +152,23 @@ const normalizeVideoDurationMs = (durationMs: number): number =>
   Math.min(Math.max(Math.round(durationMs), 1), maxVideoDurationMs)
 
 const resolveFfmpegExecutable = (): string => process.env.PROBE_FFMPEG_PATH ?? "ffmpeg"
+
+const resolveFfprobeExecutable = (): string => {
+  const configured = process.env.PROBE_FFPROBE_PATH
+
+  if (configured) {
+    return configured
+  }
+
+  const ffmpegExecutable = resolveFfmpegExecutable()
+  const executableName = basename(ffmpegExecutable)
+
+  if (executableName.includes("ffmpeg")) {
+    return join(dirname(ffmpegExecutable), executableName.replace("ffmpeg", "ffprobe"))
+  }
+
+  return "ffprobe"
+}
 
 const runHostCommand = (args: {
   readonly command: string
@@ -233,6 +249,92 @@ const isFfmpegAvailable = async (): Promise<boolean> => {
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
       return false
+    }
+
+    throw error
+  }
+}
+
+const parseRationalNumber = (value: string): number | null => {
+  const trimmed = value.trim()
+
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    const numeric = Number(trimmed)
+    return Number.isFinite(numeric) ? numeric : null
+  }
+
+  const match = trimmed.match(/^(-?\d+)\/(-?\d+)$/)
+
+  if (!match) {
+    return null
+  }
+
+  const numerator = Number(match[1])
+  const denominator = Number(match[2])
+
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) {
+    return null
+  }
+
+  const numeric = numerator / denominator
+  return Number.isFinite(numeric) ? numeric : null
+}
+
+const formatFpsLabel = (value: number): string => {
+  if (!Number.isFinite(value)) {
+    return "unknown"
+  }
+
+  const rounded = Math.round(value * 100) / 100
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2)
+}
+
+const probeSimulatorVideoFrameRate = async (absolutePath: string): Promise<{
+  readonly expression: string
+  readonly label: string
+} | null> => {
+  const ffprobeExecutable = resolveFfprobeExecutable()
+
+  try {
+    const result = await runHostCommand({
+      command: ffprobeExecutable,
+      commandArgs: [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=0",
+        absolutePath,
+      ],
+      timeoutMs: 10_000,
+    })
+
+    if (result.exitCode !== 0) {
+      return null
+    }
+
+    const match = result.stdout.match(/avg_frame_rate=([^\r\n]+)/)
+    const expression = match?.[1]?.trim() ?? ""
+    const numeric = parseRationalNumber(expression)
+
+    if (numeric === null || numeric <= 0) {
+      return null
+    }
+
+    return {
+      expression,
+      label: formatFpsLabel(numeric),
+    }
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null
     }
 
     throw error
@@ -2591,6 +2693,16 @@ export const SessionRegistryLive = Layer.scoped(
         }
 
         const ffmpegExecutable = resolveFfmpegExecutable()
+        const sourceFrameRate = yield* Effect.tryPromise({
+          try: () => probeSimulatorVideoFrameRate(movPath),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "session-video-ffprobe-run",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: "Inspect ffprobe availability and retry the video request.",
+              details: [],
+            }),
+        })
         const absolutePath = join(videoDirectory, `${args.fileStem}.mp4`)
         const ffmpegResult = yield* Effect.tryPromise({
           try: () =>
@@ -2600,8 +2712,7 @@ export const SessionRegistryLive = Layer.scoped(
                 "-y",
                 "-i",
                 movPath,
-                "-vf",
-                `fps=${simulatorVideoDeliveryFps}`,
+                ...(sourceFrameRate === null ? [] : ["-vf", `fps=${sourceFrameRate.expression}`]),
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -2648,7 +2759,9 @@ export const SessionRegistryLive = Layer.scoped(
           kind: "mp4",
           absolutePath,
           summary:
-            `Native simulator video captured over simctl and normalized to ${simulatorVideoDeliveryFps} fps MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
+            sourceFrameRate === null
+              ? `Native simulator video captured over simctl and transcoded to MP4 via ffmpeg using the source timing for requested duration ${args.durationMs}ms.`
+              : `Native simulator video captured over simctl and normalized to captured simulator rate ${sourceFrameRate.label} fps MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)

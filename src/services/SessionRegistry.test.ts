@@ -67,11 +67,35 @@ const withProbeFfmpegPath = async <T>(ffmpegPath: string | undefined, run: () =>
   }
 }
 
+const withProbeFfprobePath = async <T>(ffprobePath: string | undefined, run: () => Promise<T>): Promise<T> => {
+  const previous = process.env.PROBE_FFPROBE_PATH
+
+  if (ffprobePath === undefined) {
+    delete process.env.PROBE_FFPROBE_PATH
+  } else {
+    process.env.PROBE_FFPROBE_PATH = ffprobePath
+  }
+
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) {
+      delete process.env.PROBE_FFPROBE_PATH
+    } else {
+      process.env.PROBE_FFPROBE_PATH = previous
+    }
+  }
+}
+
 const createFakeFfmpegExecutable = async (
   root: string,
+  options?: {
+    readonly ffprobeStdout?: string
+  },
 ): Promise<{ readonly executablePath: string; readonly argsLogPath: string }> => {
   const executablePath = join(root, "fake-ffmpeg")
   const argsLogPath = join(root, "fake-ffmpeg.args")
+  const ffprobeExecutablePath = join(root, "fake-ffprobe")
 
   await writeFile(
     executablePath,
@@ -93,6 +117,19 @@ const createFakeFfmpegExecutable = async (
     "utf8",
   )
   await chmod(executablePath, 0o755)
+  await writeFile(
+    ffprobeExecutablePath,
+    [
+      "#!/bin/sh",
+      "cat <<'EOF'",
+      options?.ffprobeStdout ?? "avg_frame_rate=120/1",
+      "EOF",
+      "exit 0",
+      "",
+    ].join("\n"),
+    "utf8",
+  )
+  await chmod(ffprobeExecutablePath, 0o755)
   return {
     executablePath,
     argsLogPath,
@@ -2417,7 +2454,7 @@ describe("SessionRegistry", () => {
           expect(result.summary).toContain("MP4 video artifact")
           expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake mp4 data")
           expect((await readFile(argsLogPath, "utf8")).split(/\r?\n/).filter(Boolean)).toEqual(
-            expect.arrayContaining(["-vf", "fps=30", "-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            expect.arrayContaining(["-vf", "fps=120/1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]),
           )
           expect(runnerCommands.some((command) => command.action === "recordVideo")).toBe(false)
 
@@ -2457,6 +2494,78 @@ describe("SessionRegistry", () => {
           expect(result.summary).toContain("QuickTime video artifact")
           expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake native simulator video")
           expect(runnerCommands.some((command) => command.action === "recordVideo")).toBe(false)
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
+  test("falls back to source timing mp4 when ffprobe is unavailable", async () => {
+    await withTempRoot(async (root) => {
+      const { executablePath: fakeFfmpegPath, argsLogPath } = await createFakeFfmpegExecutable(root)
+
+      await withProbeFfmpegPath(fakeFfmpegPath, async () => {
+        await withProbeFfprobePath(join(root, "missing-ffprobe"), async () => {
+          const runtime = makeRuntime(root, createFakeHarness())
+
+          try {
+            const registry = await runtime.runPromise(Effect.gen(function* () {
+              return yield* SessionRegistry
+            }))
+
+            const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+            const result = await runtime.runPromise(registry.recordVideo({
+              sessionId: session.sessionId,
+              duration: "1m",
+            }))
+
+            const ffmpegArgs = (await readFile(argsLogPath, "utf8")).split(/\r?\n/).filter(Boolean)
+
+            expect(result.artifact.kind).toBe("mp4")
+            expect(result.artifact.summary).toContain("source timing")
+            expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake mp4 data")
+            expect(ffmpegArgs).not.toContain("-vf")
+            expect(ffmpegArgs).toEqual(expect.arrayContaining(["-c:v", "libx264", "-pix_fmt", "yuv420p"]))
+
+            await runtime.runPromise(registry.closeSession(session.sessionId))
+          } finally {
+            await runtime.dispose()
+          }
+        })
+      })
+    })
+  })
+
+  test("falls back to source timing mp4 when ffprobe returns an invalid frame rate", async () => {
+    await withTempRoot(async (root) => {
+      const { executablePath: fakeFfmpegPath, argsLogPath } = await createFakeFfmpegExecutable(root, {
+        ffprobeStdout: "avg_frame_rate=0/0",
+      })
+
+      await withProbeFfmpegPath(fakeFfmpegPath, async () => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const result = await runtime.runPromise(registry.recordVideo({
+            sessionId: session.sessionId,
+            duration: "1m",
+          }))
+
+          const ffmpegArgs = (await readFile(argsLogPath, "utf8")).split(/\r?\n/).filter(Boolean)
+
+          expect(result.artifact.kind).toBe("mp4")
+          expect(result.artifact.summary).toContain("source timing")
+          expect(await readFile(result.artifact.absolutePath, "utf8")).toBe("fake mp4 data")
+          expect(ffmpegArgs).not.toContain("-vf")
+          expect(ffmpegArgs).toEqual(expect.arrayContaining(["-c:v", "libx264", "-pix_fmt", "yuv420p"]))
 
           await runtime.runPromise(registry.closeSession(session.sessionId))
         } finally {
