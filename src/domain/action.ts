@@ -1,20 +1,66 @@
 import { Schema } from "effect"
-import { ArtifactRecord, NullableString } from "./output"
-import type { SnapshotNodeState, StoredSnapshotArtifact, StoredSnapshotNode } from "./snapshot"
+import { ArtifactRecord, NullableString, OutputMode } from "./output"
+import type { SnapshotFrame, SnapshotNodeState, StoredSnapshotArtifact, StoredSnapshotNode } from "./snapshot"
 
 const NullableBoolean = Schema.Union(Schema.Boolean, Schema.Null)
 const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
+const OptionalNullableBoolean = Schema.optional(NullableBoolean)
+const OptionalNullableString = Schema.optional(NullableString)
+
+const PositiveIntegerSchema = Schema.Number.pipe(Schema.int())
+
+export const RetryReasonCode = Schema.Literal(
+  "not-found",
+  "not-hittable",
+  "runner-timeout",
+  "transient-transport",
+  "assertion-failed",
+)
+export type RetryReasonCode = typeof RetryReasonCode.Type
+
+export const RetryPolicySchema = Schema.Struct({
+  maxAttempts: PositiveIntegerSchema,
+  backoffMs: PositiveIntegerSchema,
+  refreshSnapshotBetweenAttempts: Schema.Boolean,
+  retryOn: Schema.Array(RetryReasonCode),
+})
+export type RetryPolicy = typeof RetryPolicySchema.Type
+
+const OptionalRetryPolicy = Schema.optional(RetryPolicySchema)
+const OptionalContinueOnError = Schema.optional(Schema.Boolean)
+
+export const WaitCondition = Schema.Literal("match", "text", "absence", "duration")
+export type WaitCondition = typeof WaitCondition.Type
+
+export const ActionVerdict = Schema.Literal("passed", "failed", "timed-out")
+export type ActionVerdict = typeof ActionVerdict.Type
 
 export const ActionDirection = Schema.Literal("up", "down", "left", "right")
 export type ActionDirection = typeof ActionDirection.Type
 
-export const ActionKind = Schema.Literal("tap", "press", "swipe", "type", "scroll", "assert", "screenshot", "video")
+export const ActionKind = Schema.Literal("tap", "press", "swipe", "type", "scroll", "wait", "assert", "screenshot", "video")
 export type ActionKind = typeof ActionKind.Type
 
-export const ActionResolutionSource = Schema.Literal("ref", "semantic", "absence", "none")
+export const FlowStepKind = Schema.Literal(
+  "snapshot",
+  "tap",
+  "press",
+  "swipe",
+  "type",
+  "scroll",
+  "wait",
+  "assert",
+  "screenshot",
+  "video",
+  "logMark",
+  "sleep",
+)
+export type FlowStepKind = typeof FlowStepKind.Type
+
+export const ActionResolutionSource = Schema.Literal("ref", "semantic", "point", "absence", "none")
 export type ActionResolutionSource = typeof ActionResolutionSource.Type
 
-export const SemanticSelectorSchema = Schema.Struct({
+const SemanticSelectorCanonicalFields = {
   kind: Schema.Literal("semantic"),
   identifier: NullableString,
   label: NullableString,
@@ -23,7 +69,28 @@ export const SemanticSelectorSchema = Schema.Struct({
   type: NullableString,
   section: NullableString,
   interactive: NullableBoolean,
-})
+}
+
+const SemanticSelectorCanonicalSchema = Schema.Struct(SemanticSelectorCanonicalFields)
+
+// XCUI exposes element roles as XCUIElementType, so `type` remains the canonical
+// internal field. `role` is accepted as a JSON input alias to align with the work
+// item contract without changing the existing snapshot vocabulary.
+export const SemanticSelectorSchema = Schema.transform(
+  Schema.Struct({
+    ...SemanticSelectorCanonicalFields,
+    type: OptionalNullableString,
+    role: OptionalNullableString,
+  }),
+  SemanticSelectorCanonicalSchema,
+  {
+    decode: ({ role, type, ...selector }) => ({
+      ...selector,
+      type: type ?? role ?? null,
+    }),
+    encode: (selector) => selector,
+  },
+)
 export type SemanticSelector = typeof SemanticSelectorSchema.Type
 
 export const RefSelectorSchema = Schema.Struct({
@@ -33,11 +100,35 @@ export const RefSelectorSchema = Schema.Struct({
 })
 export type RefSelector = typeof RefSelectorSchema.Type
 
-export const ActionSelectorSchema = Schema.Union(RefSelectorSchema, SemanticSelectorSchema)
+export const PointSelectorSchema = Schema.Struct({
+  kind: Schema.Literal("point"),
+  x: Schema.Number,
+  y: Schema.Number,
+})
+export type PointSelector = typeof PointSelectorSchema.Type
+
+const PresenceSelectorSchema = Schema.Union(RefSelectorSchema, SemanticSelectorSchema)
+type PresenceSelector = typeof PresenceSelectorSchema.Type
+
+export const AbsenceSelectorSchema = Schema.Struct({
+  kind: Schema.Literal("absence"),
+  negate: PresenceSelectorSchema,
+})
+export type AbsenceSelector = typeof AbsenceSelectorSchema.Type
+
+export const ActionSelectorSchema = Schema.Union(
+  RefSelectorSchema,
+  SemanticSelectorSchema,
+  PointSelectorSchema,
+  AbsenceSelectorSchema,
+)
 export type ActionSelector = typeof ActionSelectorSchema.Type
 
-export const AssertionExpectationSchema = Schema.Struct({
-  exists: Schema.Boolean,
+const AssertionExpectationCanonicalFields = {
+  exists: NullableBoolean,
+  visible: NullableBoolean,
+  hidden: NullableBoolean,
+  text: NullableString,
   label: NullableString,
   value: NullableString,
   type: NullableString,
@@ -45,12 +136,48 @@ export const AssertionExpectationSchema = Schema.Struct({
   selected: NullableBoolean,
   focused: NullableBoolean,
   interactive: NullableBoolean,
-})
+}
+
+const AssertionExpectationCanonicalSchema = Schema.Struct(AssertionExpectationCanonicalFields)
+
+export const AssertionExpectationSchema = Schema.transform(
+  Schema.Struct({
+    exists: OptionalNullableBoolean,
+    visible: OptionalNullableBoolean,
+    hidden: OptionalNullableBoolean,
+    text: OptionalNullableString,
+    label: OptionalNullableString,
+    value: OptionalNullableString,
+    type: OptionalNullableString,
+    enabled: OptionalNullableBoolean,
+    selected: OptionalNullableBoolean,
+    focused: OptionalNullableBoolean,
+    interactive: OptionalNullableBoolean,
+  }),
+  AssertionExpectationCanonicalSchema,
+  {
+    decode: (expectation) => ({
+      exists: expectation.exists ?? null,
+      visible: expectation.visible ?? null,
+      hidden: expectation.hidden ?? null,
+      text: expectation.text ?? null,
+      label: expectation.label ?? null,
+      value: expectation.value ?? null,
+      type: expectation.type ?? null,
+      enabled: expectation.enabled ?? null,
+      selected: expectation.selected ?? null,
+      focused: expectation.focused ?? null,
+      interactive: expectation.interactive ?? null,
+    }),
+    encode: (expectation) => expectation,
+  },
+)
 export type AssertionExpectation = typeof AssertionExpectationSchema.Type
 
 export const TapActionSchema = Schema.Struct({
   kind: Schema.Literal("tap"),
   target: ActionSelectorSchema,
+  retryPolicy: OptionalRetryPolicy,
 })
 export type TapAction = typeof TapActionSchema.Type
 
@@ -58,6 +185,7 @@ export const PressActionSchema = Schema.Struct({
   kind: Schema.Literal("press"),
   target: ActionSelectorSchema,
   durationMs: Schema.Number,
+  retryPolicy: OptionalRetryPolicy,
 })
 export type PressAction = typeof PressActionSchema.Type
 
@@ -65,6 +193,7 @@ export const SwipeActionSchema = Schema.Struct({
   kind: Schema.Literal("swipe"),
   target: ActionSelectorSchema,
   direction: ActionDirection,
+  retryPolicy: OptionalRetryPolicy,
 })
 export type SwipeAction = typeof SwipeActionSchema.Type
 
@@ -73,6 +202,7 @@ export const TypeActionSchema = Schema.Struct({
   target: ActionSelectorSchema,
   text: Schema.String,
   replace: Schema.Boolean,
+  retryPolicy: OptionalRetryPolicy,
 })
 export type TypeAction = typeof TypeActionSchema.Type
 
@@ -81,6 +211,7 @@ export const ScrollActionSchema = Schema.Struct({
   target: ActionSelectorSchema,
   direction: ActionDirection,
   steps: Schema.Number,
+  retryPolicy: OptionalRetryPolicy,
 })
 export type ScrollAction = typeof ScrollActionSchema.Type
 
@@ -88,11 +219,23 @@ export const AssertActionSchema = Schema.Struct({
   kind: Schema.Literal("assert"),
   target: ActionSelectorSchema,
   expectation: AssertionExpectationSchema,
+  retryPolicy: OptionalRetryPolicy,
 })
 export type AssertAction = typeof AssertActionSchema.Type
 
+export const WaitActionSchema = Schema.Struct({
+  kind: Schema.Literal("wait"),
+  target: Schema.Union(ActionSelectorSchema, Schema.Null),
+  timeoutMs: Schema.Number,
+  condition: WaitCondition,
+  text: NullableString,
+  retryPolicy: OptionalRetryPolicy,
+})
+export type WaitAction = typeof WaitActionSchema.Type
+
 export const ScreenshotActionSchema = Schema.Struct({
   kind: Schema.Literal("screenshot"),
+  retryPolicy: OptionalRetryPolicy,
 })
 export type ScreenshotAction = typeof ScreenshotActionSchema.Type
 
@@ -108,12 +251,117 @@ export const VideoActionSchema = Schema.Struct({
 })
 export type VideoAction = typeof VideoActionSchema.Type
 
+export const FlowSnapshotStepSchema = Schema.Struct({
+  kind: Schema.Literal("snapshot"),
+  output: Schema.optional(OutputMode),
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowSnapshotStep = typeof FlowSnapshotStepSchema.Type
+
+export const FlowTapStepSchema = Schema.Struct({
+  ...TapActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowTapStep = typeof FlowTapStepSchema.Type
+
+export const FlowPressStepSchema = Schema.Struct({
+  ...PressActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowPressStep = typeof FlowPressStepSchema.Type
+
+export const FlowSwipeStepSchema = Schema.Struct({
+  ...SwipeActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowSwipeStep = typeof FlowSwipeStepSchema.Type
+
+export const FlowTypeStepSchema = Schema.Struct({
+  ...TypeActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowTypeStep = typeof FlowTypeStepSchema.Type
+
+export const FlowScrollStepSchema = Schema.Struct({
+  ...ScrollActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowScrollStep = typeof FlowScrollStepSchema.Type
+
+export const FlowWaitStepSchema = Schema.Struct({
+  ...WaitActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowWaitStep = typeof FlowWaitStepSchema.Type
+
+export const FlowAssertStepSchema = Schema.Struct({
+  ...AssertActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowAssertStep = typeof FlowAssertStepSchema.Type
+
+export const FlowScreenshotStepSchema = Schema.Struct({
+  kind: Schema.Literal("screenshot"),
+  label: Schema.optional(NullableString),
+  retryPolicy: OptionalRetryPolicy,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowScreenshotStep = typeof FlowScreenshotStepSchema.Type
+
+export const FlowVideoStepSchema = Schema.Struct({
+  ...VideoActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowVideoStep = typeof FlowVideoStepSchema.Type
+
+export const FlowLogMarkStepSchema = Schema.Struct({
+  kind: Schema.Literal("logMark"),
+  label: Schema.String,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowLogMarkStep = typeof FlowLogMarkStepSchema.Type
+
+export const FlowSleepStepSchema = Schema.Struct({
+  kind: Schema.Literal("sleep"),
+  durationMs: PositiveIntegerSchema,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowSleepStep = typeof FlowSleepStepSchema.Type
+
+export const FlowSessionActionStepSchema = Schema.Union(
+  FlowTapStepSchema,
+  FlowPressStepSchema,
+  FlowSwipeStepSchema,
+  FlowTypeStepSchema,
+  FlowScrollStepSchema,
+  FlowWaitStepSchema,
+  FlowAssertStepSchema,
+  FlowScreenshotStepSchema,
+  FlowVideoStepSchema,
+)
+export type FlowSessionActionStep = typeof FlowSessionActionStepSchema.Type
+
+export const FlowStepSchema = Schema.Union(
+  FlowSnapshotStepSchema,
+  FlowSessionActionStepSchema,
+  FlowLogMarkStepSchema,
+  FlowSleepStepSchema,
+)
+export type FlowStep = typeof FlowStepSchema.Type
+
+export const FlowContractSchema = Schema.Struct({
+  contract: Schema.Literal("probe.session-flow/v1"),
+  steps: Schema.Array(FlowStepSchema),
+})
+export type FlowContract = typeof FlowContractSchema.Type
+
 export const SessionActionSchema = Schema.Union(
   TapActionSchema,
   PressActionSchema,
   SwipeActionSchema,
   TypeActionSchema,
   ScrollActionSchema,
+  WaitActionSchema,
   AssertActionSchema,
   ScreenshotActionSchema,
   VideoActionSchema,
@@ -126,7 +374,7 @@ type RunnerUiActionSource = RunnerUiSessionAction | RunnerUiRecordedSessionActio
 
 export const RecordedActionTargetSchema = Schema.Struct({
   preferredRef: NullableString,
-  fallback: Schema.Union(SemanticSelectorSchema, Schema.Null),
+  fallback: Schema.Union(ActionSelectorSchema, Schema.Null),
   description: Schema.String,
 })
 export type RecordedActionTarget = typeof RecordedActionTargetSchema.Type
@@ -174,6 +422,15 @@ export const RecordedAssertActionSchema = Schema.Struct({
 })
 export type RecordedAssertAction = typeof RecordedAssertActionSchema.Type
 
+export const RecordedWaitActionSchema = Schema.Struct({
+  kind: Schema.Literal("wait"),
+  target: Schema.Union(RecordedActionTargetSchema, Schema.Null),
+  timeoutMs: Schema.Number,
+  condition: WaitCondition,
+  text: NullableString,
+})
+export type RecordedWaitAction = typeof RecordedWaitActionSchema.Type
+
 export const RecordedScreenshotActionSchema = Schema.Struct({
   kind: Schema.Literal("screenshot"),
 })
@@ -191,6 +448,7 @@ export const RecordedSessionActionSchema = Schema.Union(
   RecordedSwipeActionSchema,
   RecordedTypeActionSchema,
   RecordedScrollActionSchema,
+  RecordedWaitActionSchema,
   RecordedAssertActionSchema,
   RecordedScreenshotActionSchema,
   RecordedVideoActionSchema,
@@ -206,10 +464,19 @@ export const ActionRecordingScriptSchema = Schema.Struct({
 })
 export type ActionRecordingScript = typeof ActionRecordingScriptSchema.Type
 
+export const ReplayStepOutcomeSchema = Schema.Literal(
+  "no-retry",
+  "retry-succeeded",
+  "semantic-fallback",
+  "retry-exhausted",
+)
+export type ReplayStepOutcome = typeof ReplayStepOutcomeSchema.Type
+
 export const ReplayStepReportSchema = Schema.Struct({
   index: Schema.Number,
   kind: ActionKind,
   attempts: Schema.Number,
+  outcome: ReplayStepOutcomeSchema,
   resolvedBy: ActionResolutionSource,
   matchedRef: NullableString,
   artifact: Schema.Union(ArtifactRecord, Schema.Null),
@@ -249,6 +516,11 @@ export const SessionActionResultSchema = Schema.Struct({
   latestSnapshotId: NullableString,
   artifact: Schema.Union(ArtifactRecord, Schema.Null),
   recordingLength: Schema.Number,
+  retryCount: Schema.Number,
+  retryReasons: Schema.Array(Schema.String),
+  verdict: Schema.Union(ActionVerdict, Schema.Null),
+  waitedMs: NullableNumber,
+  polledCount: NullableNumber,
 })
 export type SessionActionResult = typeof SessionActionResultSchema.Type
 
@@ -269,6 +541,43 @@ export const SessionReplayResultSchema = Schema.Struct({
 })
 export type SessionReplayResult = typeof SessionReplayResultSchema.Type
 
+export const FlowStepResultSchema = Schema.Struct({
+  index: PositiveIntegerSchema,
+  kind: FlowStepKind,
+  summary: Schema.String,
+  verdict: ActionVerdict,
+  matchedRef: NullableString,
+  latestSnapshotId: NullableString,
+  retryCount: Schema.Number,
+  retryReasons: Schema.Array(Schema.String),
+  artifacts: Schema.Array(ArtifactRecord),
+  warnings: Schema.Array(Schema.String),
+})
+export type FlowStepResult = typeof FlowStepResultSchema.Type
+
+export const FlowFailedStepSchema = Schema.Struct({
+  index: PositiveIntegerSchema,
+  kind: FlowStepKind,
+  summary: Schema.String,
+  verdict: ActionVerdict,
+})
+export type FlowFailedStep = typeof FlowFailedStepSchema.Type
+
+export const FlowResultSchema = Schema.Struct({
+  contract: Schema.Literal("probe.session-flow/report-v1"),
+  executedAt: Schema.String,
+  sessionId: Schema.String,
+  summary: Schema.String,
+  verdict: ActionVerdict,
+  executedSteps: Schema.Array(FlowStepResultSchema),
+  failedStep: Schema.Union(FlowFailedStepSchema, Schema.Null),
+  retries: Schema.Number,
+  artifacts: Schema.Array(ArtifactRecord),
+  finalSnapshotId: NullableString,
+  warnings: Schema.Array(Schema.String),
+})
+export type FlowResult = typeof FlowResultSchema.Type
+
 export interface FlattenedStoredSnapshotNode {
   readonly ref: string
   readonly node: StoredSnapshotNode
@@ -276,13 +585,29 @@ export interface FlattenedStoredSnapshotNode {
 }
 
 export interface ResolvedSnapshotTarget extends FlattenedStoredSnapshotNode {
-  readonly resolvedBy: Exclude<ActionResolutionSource, "absence" | "none">
+  readonly kind: "snapshot"
+  readonly resolvedBy: Extract<ActionResolutionSource, "ref" | "semantic">
 }
+
+export interface ResolvedPointTarget {
+  readonly kind: "point"
+  readonly x: number
+  readonly y: number
+  readonly resolvedBy: "point"
+}
+
+export interface ResolvedAbsenceTarget {
+  readonly kind: "absence"
+  readonly selector: PresenceSelector
+  readonly resolvedBy: "absence"
+}
+
+export type ResolvedActionTarget = ResolvedSnapshotTarget | ResolvedPointTarget | ResolvedAbsenceTarget
 
 export interface TargetResolution {
   readonly outcome: "matched" | "not-found" | "ambiguous"
   readonly reason: string
-  readonly target: ResolvedSnapshotTarget | null
+  readonly target: ResolvedActionTarget | null
 }
 
 export interface AssertionEvaluation {
@@ -293,6 +618,7 @@ export interface AssertionEvaluation {
 }
 
 export interface RunnerActionLocator {
+  readonly kind: "semantic" | "point"
   readonly identifier: string | null
   readonly label: string | null
   readonly value: string | null
@@ -301,6 +627,8 @@ export interface RunnerActionLocator {
   readonly section: string | null
   readonly interactive: boolean | null
   readonly ordinal: number | null
+  readonly x: number | null
+  readonly y: number | null
 }
 
 export interface RunnerUiActionPayload {
@@ -322,6 +650,36 @@ interface FlattenArgs {
 const sectionToken = (node: Pick<StoredSnapshotNode, "identifier" | "label">): string | null => node.identifier ?? node.label
 
 const nodeStateBoolean = (state: SnapshotNodeState | null, key: keyof SnapshotNodeState): boolean => state?.[key] === true
+
+const frameLooksHiddenOrOffscreen = (frame: SnapshotFrame | null): boolean =>
+  frame !== null && (frame.width <= 0 || frame.height <= 0 || frame.x + frame.width <= 0 || frame.y + frame.height <= 0)
+
+const describeFrame = (frame: SnapshotFrame): string =>
+  `x=${frame.x}, y=${frame.y}, width=${frame.width}, height=${frame.height}`
+
+const inferSnapshotNodeVisibility = (node: StoredSnapshotNode): { readonly visible: boolean; readonly reason: string } => {
+  if (node.frame !== null) {
+    return frameLooksHiddenOrOffscreen(node.frame)
+      ? {
+          visible: false,
+          reason: `frame heuristics treated ${describeFrame(node.frame)} as hidden/offscreen`,
+        }
+      : {
+          visible: true,
+          reason: `frame heuristics treated ${describeFrame(node.frame)} as visible`,
+        }
+  }
+
+  return node.interactive
+    ? {
+        visible: true,
+        reason: "no frame data was available, so Probe treated interactive=true as visible",
+      }
+    : {
+        visible: false,
+        reason: "no frame data was available, so Probe treated interactive=false as hidden",
+      }
+}
 
 export const describeSemanticSelector = (selector: SemanticSelector): string => {
   const parts: Array<string> = []
@@ -358,7 +716,11 @@ export const describeActionSelector = (selector: ActionSelector): string =>
     ? selector.fallback
       ? `${selector.ref} (${describeSemanticSelector(selector.fallback)})`
       : selector.ref
-    : describeSemanticSelector(selector)
+    : selector.kind === "semantic"
+      ? describeSemanticSelector(selector)
+      : selector.kind === "point"
+        ? `point(${selector.x}, ${selector.y})`
+        : `absence(${describeActionSelector(selector.negate)})`
 
 export const describeRecordedActionTarget = (target: RecordedActionTarget): string => {
   if (target.description.length > 0) {
@@ -370,7 +732,7 @@ export const describeRecordedActionTarget = (target: RecordedActionTarget): stri
   }
 
   if (target.fallback) {
-    return describeSemanticSelector(target.fallback)
+    return describeActionSelector(target.fallback)
   }
 
   return "recorded target"
@@ -425,6 +787,9 @@ export const flattenStoredSnapshot = (snapshot: StoredSnapshotArtifact): Array<F
 }
 
 const semanticSelectorMatchesNode = (selector: SemanticSelector, entry: FlattenedStoredSnapshotNode): boolean => {
+  // Probe semantic selectors use conjunctive matching — all provided fields must
+  // match. This is more precise than a cascading fallback chain and avoids false
+  // positives from partial matches.
   if (selector.identifier !== null && entry.node.identifier !== selector.identifier) {
     return false
   }
@@ -459,6 +824,17 @@ const semanticSelectorMatchesNode = (selector: SemanticSelector, entry: Flattene
 const semanticMatches = (snapshot: StoredSnapshotArtifact, selector: SemanticSelector): Array<FlattenedStoredSnapshotNode> =>
   flattenStoredSnapshot(snapshot).filter((entry) => semanticSelectorMatchesNode(selector, entry))
 
+const requiresSnapshot = (selector: ActionSelector): boolean => selector.kind !== "point"
+
+const missingSnapshotResolution = (selector: ActionSelector): TargetResolution => ({
+  outcome: "not-found",
+  reason: `Selector ${describeActionSelector(selector)} requires a current snapshot, but none is available.`,
+  target: null,
+})
+
+const isResolvedSnapshotTarget = (target: ResolvedActionTarget | null): target is ResolvedSnapshotTarget =>
+  target?.kind === "snapshot"
+
 const resolveSemanticSelector = (snapshot: StoredSnapshotArtifact, selector: SemanticSelector): TargetResolution => {
   const matches = semanticMatches(snapshot, selector)
 
@@ -483,18 +859,73 @@ const resolveSemanticSelector = (snapshot: StoredSnapshotArtifact, selector: Sem
     outcome: "matched",
     reason: `Resolved ${describeSemanticSelector(selector)} to ${describeSnapshotNode(match.node)}.`,
     target: {
+      kind: "snapshot",
       ...match,
       resolvedBy: "semantic",
     },
   }
 }
 
-export const resolveActionSelectorInSnapshot = (snapshot: StoredSnapshotArtifact, selector: ActionSelector): TargetResolution => {
-  if (selector.kind === "semantic") {
-    return resolveSemanticSelector(snapshot, selector)
+export const resolveActionSelectorInSnapshot = (snapshot: StoredSnapshotArtifact | null, selector: ActionSelector): TargetResolution => {
+  if (selector.kind === "point") {
+    return {
+      outcome: "matched",
+      reason: `Resolved ${describeActionSelector(selector)} in the interaction-root coordinate space.`,
+      target: {
+        kind: "point",
+        x: selector.x,
+        y: selector.y,
+        resolvedBy: "point",
+      },
+    }
   }
 
-  const entries = flattenStoredSnapshot(snapshot)
+  if (snapshot === null && requiresSnapshot(selector)) {
+    return missingSnapshotResolution(selector)
+  }
+
+  const currentSnapshot = snapshot!
+
+  if (selector.kind === "absence") {
+    const negated = resolveActionSelectorInSnapshot(currentSnapshot, selector.negate)
+
+    if (negated.outcome === "ambiguous") {
+      return {
+        outcome: "ambiguous",
+        reason: `Could not confirm ${describeActionSelector(selector)}: ${negated.reason}`,
+        target: null,
+      }
+    }
+
+    if (negated.outcome === "not-found") {
+      return {
+        outcome: "matched",
+        reason: `Confirmed absence of ${describeActionSelector(selector.negate)} in ${currentSnapshot.snapshotId}.`,
+        target: {
+          kind: "absence",
+          selector: selector.negate,
+          resolvedBy: "absence",
+        },
+      }
+    }
+
+    const matchedTarget = negated.target
+    const matchedDescription = isResolvedSnapshotTarget(matchedTarget)
+      ? `${describeSnapshotNode(matchedTarget.node)} (${matchedTarget.ref})`
+      : describeActionSelector(selector.negate)
+
+    return {
+      outcome: "not-found",
+      reason: `Expected absence of ${describeActionSelector(selector.negate)}, but it resolved to ${matchedDescription}.`,
+      target: null,
+    }
+  }
+
+  if (selector.kind === "semantic") {
+    return resolveSemanticSelector(currentSnapshot, selector)
+  }
+
+  const entries = flattenStoredSnapshot(currentSnapshot)
   const refMatch = entries.find((entry) => entry.ref === selector.ref)
 
   if (refMatch) {
@@ -503,6 +934,7 @@ export const resolveActionSelectorInSnapshot = (snapshot: StoredSnapshotArtifact
         outcome: "matched",
         reason: `Resolved ${selector.ref} to ${describeSnapshotNode(refMatch.node)}.`,
         target: {
+          kind: "snapshot",
           ...refMatch,
           resolvedBy: "ref",
         },
@@ -511,7 +943,7 @@ export const resolveActionSelectorInSnapshot = (snapshot: StoredSnapshotArtifact
   }
 
   if (selector.fallback !== null) {
-    const fallbackResult = resolveSemanticSelector(snapshot, selector.fallback)
+    const fallbackResult = resolveSemanticSelector(currentSnapshot, selector.fallback)
 
     if (fallbackResult.outcome === "matched") {
       return {
@@ -527,25 +959,33 @@ export const resolveActionSelectorInSnapshot = (snapshot: StoredSnapshotArtifact
 
   return {
     outcome: "not-found",
-    reason: `Ref ${selector.ref} was not present in ${snapshot.snapshotId}.`,
+    reason: `Ref ${selector.ref} was not present in ${currentSnapshot.snapshotId}.`,
     target: null,
   }
 }
 
 export const resolveRecordedActionTargetInSnapshot = (
-  snapshot: StoredSnapshotArtifact,
+  snapshot: StoredSnapshotArtifact | null,
   target: RecordedActionTarget,
 ): TargetResolution => {
   if (target.preferredRef !== null) {
-    return resolveActionSelectorInSnapshot(snapshot, {
+    const refResult = resolveActionSelectorInSnapshot(snapshot, {
       kind: "ref",
       ref: target.preferredRef,
-      fallback: target.fallback,
+      fallback: target.fallback?.kind === "semantic" ? target.fallback : null,
     })
+
+    if (refResult.outcome === "matched" || target.fallback === null || target.fallback.kind === "semantic") {
+      return refResult
+    }
+
+    return refResult.outcome === "not-found"
+      ? resolveActionSelectorInSnapshot(snapshot, target.fallback)
+      : refResult
   }
 
   if (target.fallback !== null) {
-    return resolveSemanticSelector(snapshot, target.fallback)
+    return resolveActionSelectorInSnapshot(snapshot, target.fallback)
   }
 
   return {
@@ -570,8 +1010,8 @@ const buildStableSemanticSelector = (entry: FlattenedStoredSnapshotNode): Semant
   }
 }
 
-export const buildRecordedActionTarget = (selector: ActionSelector, resolved: ResolvedSnapshotTarget | null): RecordedActionTarget => {
-  if (resolved) {
+export const buildRecordedActionTarget = (selector: ActionSelector, resolved: ResolvedActionTarget | null): RecordedActionTarget => {
+  if (resolved?.kind === "snapshot") {
     return {
       preferredRef: resolved.ref,
       fallback: buildStableSemanticSelector(resolved),
@@ -596,7 +1036,7 @@ export const buildRecordedActionTarget = (selector: ActionSelector, resolved: Re
 
 export const buildRecordedSessionAction = (
   action: SessionAction,
-  resolved: ResolvedSnapshotTarget | null,
+  resolved: ResolvedActionTarget | null,
 ): RecordedSessionAction => {
   if (action.kind === "screenshot") {
     return { kind: action.kind }
@@ -604,6 +1044,16 @@ export const buildRecordedSessionAction = (
 
   if (action.kind === "video") {
     return { kind: action.kind, durationMs: action.durationMs }
+  }
+
+  if (action.kind === "wait") {
+    return {
+      kind: action.kind,
+      target: action.target === null ? null : buildRecordedActionTarget(action.target, resolved),
+      timeoutMs: action.timeoutMs,
+      condition: action.condition,
+      text: action.text,
+    }
   }
 
   const target = buildRecordedActionTarget(action.target, resolved)
@@ -621,13 +1071,18 @@ export const buildRecordedSessionAction = (
       return { kind: action.kind, target, direction: action.direction, steps: action.steps }
     case "assert":
       return { kind: action.kind, target, expectation: action.expectation }
+    default:
+      return action satisfies never
   }
 }
 
-const assertionMismatch = (description: string): AssertionEvaluation => ({
+const assertionMismatch = (
+  description: string,
+  context?: Partial<Pick<AssertionEvaluation, "resolvedBy" | "matchedRef">>,
+): AssertionEvaluation => ({
   ok: false,
-  resolvedBy: "absence",
-  matchedRef: null,
+  resolvedBy: context?.resolvedBy ?? "none",
+  matchedRef: context?.matchedRef ?? null,
   summary: description,
 })
 
@@ -635,12 +1090,14 @@ export const evaluateAssertion = (
   resolution: TargetResolution,
   expectation: AssertionExpectation,
 ): AssertionEvaluation => {
+  const absenceSatisfied = expectation.exists === false
+
   if (resolution.outcome === "ambiguous") {
     return assertionMismatch(resolution.reason)
   }
 
   if (resolution.outcome === "not-found") {
-    return expectation.exists === false
+    return absenceSatisfied
       ? {
           ok: true,
           resolvedBy: "absence",
@@ -652,24 +1109,79 @@ export const evaluateAssertion = (
 
   const target = resolution.target!
 
-  if (expectation.exists === false) {
-    return assertionMismatch(`Expected ${describeSnapshotNode(target.node)} to be absent, but it exists as ${target.ref}.`)
+  if (target.kind === "point") {
+    return assertionMismatch(
+      `Point selector point(${target.x}, ${target.y}) cannot be used for assertions. Use ref, semantic, or absence selectors instead.`,
+      { resolvedBy: "point" },
+    )
+  }
+
+  if (target.kind === "absence") {
+    return expectation.exists === true || absenceSatisfied
+      ? {
+          ok: true,
+          resolvedBy: "absence",
+          matchedRef: null,
+          summary: resolution.reason,
+        }
+      : assertionMismatch(`Expected ${describeActionSelector({ kind: "absence", negate: target.selector })} not to match, but absence was already confirmed.`, {
+          resolvedBy: "absence",
+        })
+  }
+
+  if (absenceSatisfied) {
+    return assertionMismatch(
+      `Expected ${describeSnapshotNode(target.node)} to be absent, but it exists as ${target.ref}.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
+    )
+  }
+
+  const visibility = inferSnapshotNodeVisibility(target.node)
+
+  if (expectation.visible !== null && visibility.visible !== expectation.visible) {
+    return assertionMismatch(
+      expectation.visible
+        ? `Expected ${describeSnapshotNode(target.node)} to be visible, but ${visibility.reason}.`
+        : `Expected ${describeSnapshotNode(target.node)} to be hidden/offscreen, but ${visibility.reason}.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
+    )
+  }
+
+  if (expectation.hidden !== null && visibility.visible === expectation.hidden) {
+    return assertionMismatch(
+      expectation.hidden
+        ? `Expected ${describeSnapshotNode(target.node)} to be hidden/offscreen, but ${visibility.reason}.`
+        : `Expected ${describeSnapshotNode(target.node)} to be visible, but ${visibility.reason}.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
+    )
+  }
+
+  if (expectation.text !== null && target.node.label !== expectation.text && target.node.value !== expectation.text) {
+    return assertionMismatch(
+      `Expected ${describeSnapshotNode(target.node)} text ${JSON.stringify(expectation.text)}, received label ${JSON.stringify(target.node.label)} and value ${JSON.stringify(target.node.value)}.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
+    )
   }
 
   if (expectation.label !== null && target.node.label !== expectation.label) {
     return assertionMismatch(
       `Expected ${describeSnapshotNode(target.node)} label ${JSON.stringify(expectation.label)}, received ${JSON.stringify(target.node.label)}.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
     )
   }
 
   if (expectation.value !== null && target.node.value !== expectation.value) {
     return assertionMismatch(
       `Expected ${describeSnapshotNode(target.node)} value ${JSON.stringify(expectation.value)}, received ${JSON.stringify(target.node.value)}.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
     )
   }
 
   if (expectation.type !== null && target.node.type !== expectation.type) {
-    return assertionMismatch(`Expected type ${expectation.type}, received ${target.node.type}.`)
+    return assertionMismatch(`Expected type ${expectation.type}, received ${target.node.type}.`, {
+      resolvedBy: target.resolvedBy,
+      matchedRef: target.ref,
+    })
   }
 
   if (expectation.enabled !== null && (target.node.state?.disabled === true) === expectation.enabled) {
@@ -677,6 +1189,7 @@ export const evaluateAssertion = (
       expectation.enabled
         ? `Expected ${describeSnapshotNode(target.node)} to be enabled.`
         : `Expected ${describeSnapshotNode(target.node)} to be disabled.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
     )
   }
 
@@ -685,6 +1198,7 @@ export const evaluateAssertion = (
       expectation.selected
         ? `Expected ${describeSnapshotNode(target.node)} to be selected.`
         : `Expected ${describeSnapshotNode(target.node)} to be unselected.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
     )
   }
 
@@ -693,6 +1207,7 @@ export const evaluateAssertion = (
       expectation.focused
         ? `Expected ${describeSnapshotNode(target.node)} to be focused.`
         : `Expected ${describeSnapshotNode(target.node)} to be unfocused.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
     )
   }
 
@@ -701,6 +1216,7 @@ export const evaluateAssertion = (
       expectation.interactive
         ? `Expected ${describeSnapshotNode(target.node)} to be interactive.`
         : `Expected ${describeSnapshotNode(target.node)} to be non-interactive.`,
+      { resolvedBy: target.resolvedBy, matchedRef: target.ref },
     )
   }
 
@@ -713,14 +1229,87 @@ export const evaluateAssertion = (
 }
 
 export const validateSessionAction = (action: SessionAction): string | null => {
+  const retryPolicy = "retryPolicy" in action ? action.retryPolicy : undefined
+
+  if (retryPolicy !== undefined) {
+    if (!Number.isInteger(retryPolicy.maxAttempts) || retryPolicy.maxAttempts <= 0) {
+      return "Retry policy maxAttempts must be a positive integer."
+    }
+
+    if (!Number.isInteger(retryPolicy.backoffMs) || retryPolicy.backoffMs < 0) {
+      return "Retry policy backoffMs must be a non-negative integer."
+    }
+  }
+
   switch (action.kind) {
+    case "tap":
+    case "swipe":
+    case "type":
+      return action.target.kind === "absence" ? "Absence selectors can only be used with assert actions." : null
     case "press":
+      if (action.target.kind === "absence") {
+        return "Absence selectors can only be used with assert actions."
+      }
       return action.durationMs > 0 ? null : "Press duration must be a positive number of milliseconds."
+    case "assert":
+      if (action.target.kind === "point") {
+        return "Point selectors cannot be used with assert actions. Use ref, semantic, or absence selectors instead."
+      }
+
+      if (action.expectation.visible === true && action.expectation.hidden === true) {
+        return "Assert expectations cannot require both visible and hidden at the same time."
+      }
+
+      return [
+        action.expectation.exists,
+        action.expectation.visible,
+        action.expectation.hidden,
+        action.expectation.text,
+        action.expectation.label,
+        action.expectation.value,
+        action.expectation.type,
+        action.expectation.enabled,
+        action.expectation.selected,
+        action.expectation.focused,
+        action.expectation.interactive,
+      ].every((value) => value === null)
+        ? "Assert actions require at least one expectation field."
+        : null
+    case "wait": {
+      if (!Number.isInteger(action.timeoutMs) || action.timeoutMs <= 0) {
+        return "Wait timeoutMs must be a positive integer."
+      }
+
+      if (action.condition === "duration") {
+        return action.target === null ? null : "Duration waits cannot include a selector or target."
+      }
+
+      if (action.target === null) {
+        return "Wait actions require a selector or target unless condition is duration."
+      }
+
+      if (action.target.kind === "point") {
+        return "Point selectors cannot be used with wait actions. Use ref, semantic, or absence selectors instead."
+      }
+
+      if (action.condition === "text" && (action.text === null || action.text.length === 0)) {
+        return "Wait text conditions require a non-empty text field."
+      }
+
+      if (action.condition === "text" && action.target.kind === "absence") {
+        return "Wait text conditions require a ref or semantic selector, not an absence selector."
+      }
+
+      return null
+    }
     case "video":
       return Number.isFinite(action.durationMs) && action.durationMs > 0
         ? null
         : "Video duration must be a positive number of milliseconds."
     case "scroll":
+      if (action.target.kind === "absence") {
+        return "Absence selectors can only be used with assert actions."
+      }
       return Number.isInteger(action.steps) && action.steps > 0 ? null : "Scroll steps must be a positive integer."
     default:
       return null
@@ -733,6 +1322,17 @@ export const isRunnerUiSessionAction = (action: SessionAction): action is Runner
   || action.kind === "swipe"
   || action.kind === "type"
   || action.kind === "scroll"
+
+export const isFlowSessionActionStep = (step: FlowStep): step is FlowSessionActionStep =>
+  step.kind === "tap"
+  || step.kind === "press"
+  || step.kind === "swipe"
+  || step.kind === "type"
+  || step.kind === "scroll"
+  || step.kind === "wait"
+  || step.kind === "assert"
+  || step.kind === "screenshot"
+  || step.kind === "video"
 
 export const isRunnerUiRecordedSessionAction = (
   action: RecordedSessionAction,
@@ -752,6 +1352,7 @@ const buildRunnerLocator = (
   const matchIndex = matches.findIndex((entry) => entry.ref === resolved.ref)
 
   return {
+    kind: "semantic",
     identifier: semantic.identifier,
     label: semantic.label,
     value: semantic.value,
@@ -760,19 +1361,47 @@ const buildRunnerLocator = (
     section: semantic.section,
     interactive: semantic.interactive,
     ordinal: matches.length > 1 && matchIndex >= 0 ? matchIndex + 1 : null,
+    x: null,
+    y: null,
   }
 }
 
+const buildPointRunnerLocator = (resolved: ResolvedPointTarget): RunnerActionLocator => ({
+  kind: "point",
+  identifier: null,
+  label: null,
+  value: null,
+  placeholder: null,
+  type: null,
+  section: null,
+  interactive: null,
+  ordinal: null,
+  x: resolved.x,
+  y: resolved.y,
+})
+
 export const buildRunnerUiActionPayload = (
   action: RunnerUiActionSource,
-  resolved: ResolvedSnapshotTarget,
-  snapshot: StoredSnapshotArtifact,
+  resolved: ResolvedActionTarget,
+  snapshot: StoredSnapshotArtifact | null,
 ): RunnerUiActionPayload => {
+  const locator = resolved.kind === "point"
+    ? buildPointRunnerLocator(resolved)
+    : resolved.kind === "snapshot"
+      ? snapshot === null
+        ? (() => {
+            throw new Error("Snapshot-backed selectors require a current snapshot to build a runner locator.")
+          })()
+        : buildRunnerLocator(snapshot, resolved)
+      : (() => {
+          throw new Error("Absence selectors cannot drive runner UI actions.")
+        })()
+
   switch (action.kind) {
     case "tap":
       return {
         kind: action.kind,
-        locator: buildRunnerLocator(snapshot, resolved),
+        locator,
         direction: null,
         text: null,
         replace: null,
@@ -782,7 +1411,7 @@ export const buildRunnerUiActionPayload = (
     case "press":
       return {
         kind: action.kind,
-        locator: buildRunnerLocator(snapshot, resolved),
+        locator,
         direction: null,
         text: null,
         replace: null,
@@ -792,7 +1421,7 @@ export const buildRunnerUiActionPayload = (
     case "swipe":
       return {
         kind: action.kind,
-        locator: buildRunnerLocator(snapshot, resolved),
+        locator,
         direction: action.direction,
         text: null,
         replace: null,
@@ -802,7 +1431,7 @@ export const buildRunnerUiActionPayload = (
     case "type":
       return {
         kind: action.kind,
-        locator: buildRunnerLocator(snapshot, resolved),
+        locator,
         direction: null,
         text: action.text,
         replace: action.replace,
@@ -812,7 +1441,7 @@ export const buildRunnerUiActionPayload = (
     case "scroll":
       return {
         kind: action.kind,
-        locator: buildRunnerLocator(snapshot, resolved),
+        locator,
         direction: action.direction,
         text: null,
         replace: null,
@@ -822,5 +1451,196 @@ export const buildRunnerUiActionPayload = (
   }
 }
 
-export const decodeSessionAction = Schema.decodeUnknownSync(SessionActionSchema)
+export const flowStepToSessionAction = (step: FlowSessionActionStep): SessionAction => {
+  switch (step.kind) {
+    case "tap":
+    case "press":
+    case "swipe":
+    case "type":
+    case "scroll":
+    case "wait":
+    case "assert":
+    case "video":
+      return step
+    case "screenshot":
+      return {
+        kind: "screenshot",
+        retryPolicy: step.retryPolicy,
+      }
+  }
+}
+
+export const validateFlowStep = (step: FlowStep): string | null => {
+  switch (step.kind) {
+    case "snapshot":
+      return null
+    case "logMark":
+      return step.label.trim().length > 0 ? null : "Log mark steps require a non-empty label."
+    case "sleep":
+      return Number.isInteger(step.durationMs) && step.durationMs > 0
+        ? null
+        : "Sleep durationMs must be a positive integer."
+    default:
+      return validateSessionAction(flowStepToSessionAction(step))
+  }
+}
+
+export const validateFlowContract = (flow: FlowContract): string | null => {
+  if (flow.steps.length === 0) {
+    return "Flow contracts require at least one step."
+  }
+
+  for (const [index, step] of flow.steps.entries()) {
+    const validationError = validateFlowStep(step)
+
+    if (validationError !== null) {
+      return `Step ${index + 1}: ${validationError}`
+    }
+  }
+
+  return null
+}
+
+const normalizeActionSelectorInput = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) {
+    return value
+  }
+
+  const record = value as Record<string, unknown>
+
+  if (record.kind === "absence") {
+    return {
+      ...record,
+      negate: normalizeActionSelectorInput(record.negate ?? record.selector),
+    }
+  }
+
+  if (record.kind === "ref") {
+    return {
+      ...record,
+      fallback: normalizeActionSelectorInput(record.fallback ?? null),
+    }
+  }
+
+  return record
+}
+
+const normalizeSessionActionInput = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) {
+    return value
+  }
+
+  const record = value as Record<string, unknown>
+
+  if (
+    record.kind === "tap"
+    || record.kind === "press"
+    || record.kind === "swipe"
+    || record.kind === "type"
+    || record.kind === "scroll"
+  ) {
+    return {
+      ...record,
+      target: normalizeActionSelectorInput(record.target ?? record.selector),
+    }
+  }
+
+  if (record.kind === "assert") {
+    const expectation = typeof record.expectation === "object" && record.expectation !== null
+      ? record.expectation as Record<string, unknown>
+      : {}
+
+    return {
+      ...record,
+      target: normalizeActionSelectorInput(record.target ?? record.selector),
+      expectation,
+    }
+  }
+
+  if (record.kind === "wait") {
+    const hasTarget = record.target !== undefined || record.selector !== undefined
+
+    return {
+      ...record,
+      target: normalizeActionSelectorInput(record.target ?? record.selector ?? null),
+      condition: record.condition ?? (hasTarget ? "match" : "duration"),
+      text: record.text ?? null,
+    }
+  }
+
+  return value
+}
+
+const normalizeFlowStepInput = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) {
+    return value
+  }
+
+  const record = value as Record<string, unknown>
+
+  if (
+    record.kind === "tap"
+    || record.kind === "press"
+    || record.kind === "swipe"
+    || record.kind === "type"
+    || record.kind === "scroll"
+  ) {
+    return {
+      ...record,
+      target: normalizeActionSelectorInput(record.target ?? record.selector),
+    }
+  }
+
+  if (record.kind === "assert") {
+    const expectation = typeof record.expectation === "object" && record.expectation !== null
+      ? record.expectation as Record<string, unknown>
+      : {}
+
+    return {
+      ...record,
+      target: normalizeActionSelectorInput(record.target ?? record.selector),
+      expectation,
+    }
+  }
+
+  if (record.kind === "wait") {
+    const hasTarget = record.target !== undefined || record.selector !== undefined
+
+    return {
+      ...record,
+      target: normalizeActionSelectorInput(record.target ?? record.selector ?? null),
+      condition: record.condition ?? (hasTarget ? "match" : "duration"),
+      text: record.text ?? null,
+    }
+  }
+
+  if (record.kind === "screenshot") {
+    return {
+      ...record,
+      label: record.label ?? null,
+    }
+  }
+
+  return value
+}
+
+const normalizeFlowContractInput = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) {
+    return value
+  }
+
+  const record = value as Record<string, unknown>
+
+  return {
+    ...record,
+    steps: Array.isArray(record.steps)
+      ? record.steps.map((step) => normalizeFlowStepInput(step))
+      : record.steps,
+  }
+}
+
+export const decodeSessionAction = (value: unknown): SessionAction =>
+  Schema.decodeUnknownSync(SessionActionSchema)(normalizeSessionActionInput(value))
+export const decodeFlowContract = (value: unknown): FlowContract =>
+  Schema.decodeUnknownSync(FlowContractSchema)(normalizeFlowContractInput(value))
 export const decodeActionRecordingScript = Schema.decodeUnknownSync(ActionRecordingScriptSchema)

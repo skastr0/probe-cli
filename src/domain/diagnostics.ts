@@ -17,3 +17,9 @@ export const KnownWall = Schema.Struct({
   details: Schema.Array(Schema.String),
 })
 export type KnownWall = typeof KnownWall.Type
+
+export const DiagnosticCaptureTarget = Schema.Literal("simulator", "device")
+export type DiagnosticCaptureTarget = typeof DiagnosticCaptureTarget.Type
+
+export const DiagnosticCaptureKind = Schema.Literal("sysdiagnose")
+export type DiagnosticCaptureKind = typeof DiagnosticCaptureKind.Type

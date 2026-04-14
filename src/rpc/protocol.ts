@@ -1,16 +1,36 @@
 import { Schema } from "effect"
 import {
   ActionRecordingScriptSchema,
+  FlowContractSchema,
+  FlowResultSchema,
   SessionActionResultSchema,
   SessionActionSchema,
   SessionRecordingExportResultSchema,
   SessionReplayResultSchema,
 } from "../domain/action"
 import { DebugCommandInput, DebugCommandResult } from "../domain/debug"
+import { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
 import { ProbeFailurePayload, ProtocolMismatchError } from "../domain/errors"
-import { DrillQuery, DrillResult, OutputMode, SessionLogSource, SessionLogsResult, SummaryArtifactResult } from "../domain/output"
-import { PerfRecordResult, PerfTemplate } from "../domain/perf"
-import { SessionHealth, SimulatorSessionMode } from "../domain/session"
+import {
+  DrillQuery,
+  DrillResult,
+  OutputMode,
+  SessionResultAttachmentsResultSchema,
+  SessionLogDoctorReport,
+  SessionLogSource,
+  SessionLogsResult,
+  SessionResultSummaryResultSchema,
+  SessionScreenshotResult,
+  SummaryArtifactResult,
+} from "../domain/output"
+import {
+  PerfAroundFlowResult,
+  PerfRecordResult,
+  PerfSignpostSummaryResult,
+  PerfSummaryGroupBy,
+  PerfTemplate,
+} from "../domain/perf"
+import { SessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
 import { SessionSnapshotResultSchema } from "../domain/snapshot"
 
 export const PROBE_PROTOCOL_VERSION = "probe-rpc/v1"
@@ -19,18 +39,29 @@ const NullableString = Schema.Union(Schema.String, Schema.Null)
 
 export const RpcMethod = Schema.Literal(
   "daemon.ping",
+  "session.list",
+  "session.show",
   "session.open",
   "session.health",
   "session.logs",
+  "session.logs.mark",
+  "session.logs.capture",
+  "session.logs.doctor",
+  "session.diagnostic.capture",
   "session.debug",
   "session.snapshot",
+  "session.run",
   "session.screenshot",
   "session.video",
   "session.action",
   "session.recording.export",
   "session.replay",
+  "session.result.summary",
+  "session.result.attachments",
   "session.close",
   "perf.record",
+  "perf.around",
+  "perf.summarize",
   "artifact.drill",
 )
 export type RpcMethod = typeof RpcMethod.Type
@@ -58,6 +89,26 @@ export const SessionOpenRequest = Schema.Struct({
   }),
 })
 export type SessionOpenRequest = typeof SessionOpenRequest.Type
+
+export const SessionListRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.list"),
+  params: Schema.Struct({}),
+})
+export type SessionListRequest = typeof SessionListRequest.Type
+
+export const SessionShowRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.show"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+  }),
+})
+export type SessionShowRequest = typeof SessionShowRequest.Type
 
 export const SessionHealthRequest = Schema.Struct({
   kind: Schema.Literal("request"),
@@ -100,6 +151,54 @@ export const SessionLogsRequest = Schema.Struct({
   }),
 })
 export type SessionLogsRequest = typeof SessionLogsRequest.Type
+
+export const SessionLogsMarkRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.logs.mark"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    label: Schema.String,
+  }),
+})
+export type SessionLogsMarkRequest = typeof SessionLogsMarkRequest.Type
+
+export const SessionLogsCaptureRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.logs.capture"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    captureSeconds: Schema.Number,
+  }),
+})
+export type SessionLogsCaptureRequest = typeof SessionLogsCaptureRequest.Type
+
+export const SessionLogsDoctorRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.logs.doctor"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+  }),
+})
+export type SessionLogsDoctorRequest = typeof SessionLogsDoctorRequest.Type
+
+export const SessionDiagnosticCaptureRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.diagnostic.capture"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    target: DiagnosticCaptureTarget,
+    kind: Schema.Union(DiagnosticCaptureKind, Schema.Null),
+  }),
+})
+export type SessionDiagnosticCaptureRequest = typeof SessionDiagnosticCaptureRequest.Type
 
 export const SessionDebugRequest = Schema.Struct({
   kind: Schema.Literal("request"),
@@ -151,6 +250,18 @@ export const SessionActionRequest = Schema.Struct({
 })
 export type SessionActionRequest = typeof SessionActionRequest.Type
 
+export const SessionRunRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.run"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    flow: FlowContractSchema,
+  }),
+})
+export type SessionRunRequest = typeof SessionRunRequest.Type
+
 export const SessionRecordingExportRequest = Schema.Struct({
   kind: Schema.Literal("request"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -174,6 +285,28 @@ export const SessionReplayRequest = Schema.Struct({
   }),
 })
 export type SessionReplayRequest = typeof SessionReplayRequest.Type
+
+export const SessionResultSummaryRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.result.summary"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+  }),
+})
+export type SessionResultSummaryRequest = typeof SessionResultSummaryRequest.Type
+
+export const SessionResultAttachmentsRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.result.attachments"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+  }),
+})
+export type SessionResultAttachmentsRequest = typeof SessionResultAttachmentsRequest.Type
 
 export const SessionSnapshotRequest = Schema.Struct({
   kind: Schema.Literal("request"),
@@ -200,6 +333,32 @@ export const PerfRecordRequest = Schema.Struct({
 })
 export type PerfRecordRequest = typeof PerfRecordRequest.Type
 
+export const PerfAroundRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.around"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    template: PerfTemplate,
+    flow: FlowContractSchema,
+  }),
+})
+export type PerfAroundRequest = typeof PerfAroundRequest.Type
+
+export const PerfSummarizeRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.summarize"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    artifactKey: Schema.String,
+    groupBy: PerfSummaryGroupBy,
+  }),
+})
+export type PerfSummarizeRequest = typeof PerfSummarizeRequest.Type
+
 export const ArtifactDrillRequest = Schema.Struct({
   kind: Schema.Literal("request"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -216,18 +375,29 @@ export type ArtifactDrillRequest = typeof ArtifactDrillRequest.Type
 
 export const RpcRequest = Schema.Union(
   DaemonPingRequest,
+  SessionListRequest,
+  SessionShowRequest,
   SessionOpenRequest,
   SessionHealthRequest,
   SessionCloseRequest,
   SessionLogsRequest,
+  SessionLogsMarkRequest,
+  SessionLogsCaptureRequest,
+  SessionLogsDoctorRequest,
+  SessionDiagnosticCaptureRequest,
   SessionDebugRequest,
   SessionSnapshotRequest,
+  SessionRunRequest,
   SessionScreenshotRequest,
   SessionVideoRequest,
   SessionActionRequest,
   SessionRecordingExportRequest,
   SessionReplayRequest,
+  SessionResultSummaryRequest,
+  SessionResultAttachmentsRequest,
   PerfRecordRequest,
+  PerfAroundRequest,
+  PerfSummarizeRequest,
   ArtifactDrillRequest,
 )
 export type RpcRequest = typeof RpcRequest.Type
@@ -258,6 +428,24 @@ export const SessionOpenResponse = Schema.Struct({
   result: SessionHealth,
 })
 export type SessionOpenResponse = typeof SessionOpenResponse.Type
+
+export const SessionListResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.list"),
+  result: Schema.Array(SessionListEntry),
+})
+export type SessionListResponse = typeof SessionListResponse.Type
+
+export const SessionShowResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.show"),
+  result: SessionHealth,
+})
+export type SessionShowResponse = typeof SessionShowResponse.Type
 
 export const SessionHealthResponse = Schema.Struct({
   kind: Schema.Literal("response"),
@@ -290,6 +478,42 @@ export const SessionLogsResponse = Schema.Struct({
 })
 export type SessionLogsResponse = typeof SessionLogsResponse.Type
 
+export const SessionLogsMarkResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.logs.mark"),
+  result: SummaryArtifactResult,
+})
+export type SessionLogsMarkResponse = typeof SessionLogsMarkResponse.Type
+
+export const SessionLogsCaptureResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.logs.capture"),
+  result: SummaryArtifactResult,
+})
+export type SessionLogsCaptureResponse = typeof SessionLogsCaptureResponse.Type
+
+export const SessionLogsDoctorResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.logs.doctor"),
+  result: SessionLogDoctorReport,
+})
+export type SessionLogsDoctorResponse = typeof SessionLogsDoctorResponse.Type
+
+export const SessionDiagnosticCaptureResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.diagnostic.capture"),
+  result: SummaryArtifactResult,
+})
+export type SessionDiagnosticCaptureResponse = typeof SessionDiagnosticCaptureResponse.Type
+
 export const SessionDebugResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -304,7 +528,7 @@ export const SessionScreenshotResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.screenshot"),
-  result: SummaryArtifactResult,
+  result: SessionScreenshotResult,
 })
 export type SessionScreenshotResponse = typeof SessionScreenshotResponse.Type
 
@@ -326,6 +550,15 @@ export const SessionActionResponse = Schema.Struct({
 })
 export type SessionActionResponse = typeof SessionActionResponse.Type
 
+export const SessionRunResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.run"),
+  result: FlowResultSchema,
+})
+export type SessionRunResponse = typeof SessionRunResponse.Type
+
 export const SessionRecordingExportResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -343,6 +576,24 @@ export const SessionReplayResponse = Schema.Struct({
   result: SessionReplayResultSchema,
 })
 export type SessionReplayResponse = typeof SessionReplayResponse.Type
+
+export const SessionResultSummaryResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.result.summary"),
+  result: SessionResultSummaryResultSchema,
+})
+export type SessionResultSummaryResponse = typeof SessionResultSummaryResponse.Type
+
+export const SessionResultAttachmentsResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("session.result.attachments"),
+  result: SessionResultAttachmentsResultSchema,
+})
+export type SessionResultAttachmentsResponse = typeof SessionResultAttachmentsResponse.Type
 
 export const SessionSnapshotResponse = Schema.Struct({
   kind: Schema.Literal("response"),
@@ -362,6 +613,24 @@ export const PerfRecordResponse = Schema.Struct({
 })
 export type PerfRecordResponse = typeof PerfRecordResponse.Type
 
+export const PerfAroundResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.around"),
+  result: PerfAroundFlowResult,
+})
+export type PerfAroundResponse = typeof PerfAroundResponse.Type
+
+export const PerfSummarizeResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.summarize"),
+  result: PerfSignpostSummaryResult,
+})
+export type PerfSummarizeResponse = typeof PerfSummarizeResponse.Type
+
 export const ArtifactDrillResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -373,18 +642,29 @@ export type ArtifactDrillResponse = typeof ArtifactDrillResponse.Type
 
 export const RpcResponse = Schema.Union(
   DaemonPingResponse,
+  SessionListResponse,
+  SessionShowResponse,
   SessionOpenResponse,
   SessionHealthResponse,
   SessionCloseResponse,
   SessionLogsResponse,
+  SessionLogsMarkResponse,
+  SessionLogsCaptureResponse,
+  SessionLogsDoctorResponse,
+  SessionDiagnosticCaptureResponse,
   SessionDebugResponse,
   SessionSnapshotResponse,
+  SessionRunResponse,
   SessionScreenshotResponse,
   SessionVideoResponse,
   SessionActionResponse,
   SessionRecordingExportResponse,
   SessionReplayResponse,
+  SessionResultSummaryResponse,
+  SessionResultAttachmentsResponse,
   PerfRecordResponse,
+  PerfAroundResponse,
+  PerfSummarizeResponse,
   ArtifactDrillResponse,
 )
 export type RpcResponse = typeof RpcResponse.Type
@@ -433,18 +713,29 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const coerceRpcMethod = (value: unknown): RpcMethod => {
   switch (value) {
     case "daemon.ping":
+    case "session.list":
+    case "session.show":
     case "session.open":
     case "session.health":
     case "session.logs":
+    case "session.logs.mark":
+    case "session.logs.capture":
+    case "session.logs.doctor":
+    case "session.diagnostic.capture":
     case "session.debug":
     case "session.snapshot":
+    case "session.run":
     case "session.screenshot":
     case "session.video":
     case "session.action":
     case "session.recording.export":
     case "session.replay":
+    case "session.result.summary":
+    case "session.result.attachments":
     case "session.close":
     case "perf.record":
+    case "perf.around":
+    case "perf.summarize":
     case "artifact.drill":
       return value
     default:

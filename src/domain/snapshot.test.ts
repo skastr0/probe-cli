@@ -190,6 +190,47 @@ describe("snapshot domain", () => {
     expect(result.preview?.nodes.length).toBeGreaterThan(1)
   })
 
+  test("includes retry metadata in session snapshot results", () => {
+    const built = buildSnapshotArtifact({
+      previous: null,
+      nextSnapshotIndex: 1,
+      nextElementRefIndex: 1,
+      raw: rawSnapshot(
+        node({
+          type: "application",
+          children: [
+            node({
+              type: "button",
+              identifier: "fixture.form.applyButton",
+              label: "Apply Input",
+              interactive: true,
+            }),
+          ],
+        }),
+      ),
+    })
+
+    const defaultResult = buildSessionSnapshotResult({
+      artifact: built.artifact,
+      artifactRecord,
+      outputMode: "inline",
+    })
+    const retriedResult = buildSessionSnapshotResult({
+      artifact: built.artifact,
+      artifactRecord,
+      outputMode: "inline",
+      retry: {
+        retryCount: 2,
+        retryReasons: ["runner-timeout: timed out", "transient-transport: disconnected"],
+      },
+    })
+
+    expect(defaultResult.retryCount).toBe(0)
+    expect(defaultResult.retryReasons).toEqual([])
+    expect(retriedResult.retryCount).toBe(2)
+    expect(retriedResult.retryReasons).toHaveLength(2)
+  })
+
   test("reports stale refs when a node disappears without remapping", () => {
     const first = buildSnapshotArtifact({
       previous: null,

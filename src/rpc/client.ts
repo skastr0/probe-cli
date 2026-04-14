@@ -21,32 +21,54 @@ import {
   RpcRequest,
 } from "./protocol"
 import type {
-  ArtifactDrillRequest,
-  ArtifactDrillResponse,
-  DaemonPingRequest,
-  DaemonPingResponse,
-  PerfRecordRequest,
-  PerfRecordResponse,
-  SessionActionRequest,
-  SessionActionResponse,
+    ArtifactDrillRequest,
+    ArtifactDrillResponse,
+    PerfAroundRequest,
+    PerfAroundResponse,
+    DaemonPingRequest,
+    DaemonPingResponse,
+    PerfRecordRequest,
+    PerfRecordResponse,
+    PerfSummarizeRequest,
+    PerfSummarizeResponse,
+    SessionActionRequest,
+    SessionActionResponse,
   SessionCloseRequest,
   SessionCloseResponse,
   SessionDebugRequest,
   SessionDebugResponse,
   SessionHealthRequest,
   SessionHealthResponse,
+  SessionListRequest,
+  SessionListResponse,
   SessionLogsRequest,
+  SessionLogsMarkRequest,
+  SessionLogsMarkResponse,
+  SessionLogsCaptureRequest,
+  SessionLogsCaptureResponse,
+  SessionDiagnosticCaptureRequest,
+  SessionDiagnosticCaptureResponse,
+  SessionLogsDoctorRequest,
+  SessionLogsDoctorResponse,
   SessionLogsResponse,
   SessionOpenRequest,
   SessionOpenResponse,
-  SessionRecordingExportRequest,
-  SessionRecordingExportResponse,
-  SessionReplayRequest,
-  SessionReplayResponse,
-  SessionSnapshotRequest,
-  SessionSnapshotResponse,
+    SessionRecordingExportRequest,
+    SessionRecordingExportResponse,
+    SessionReplayRequest,
+    SessionReplayResponse,
+    SessionResultAttachmentsRequest,
+    SessionResultAttachmentsResponse,
+    SessionResultSummaryRequest,
+    SessionResultSummaryResponse,
+    SessionRunRequest,
+    SessionRunResponse,
+    SessionSnapshotRequest,
+    SessionSnapshotResponse,
   SessionScreenshotRequest,
   SessionScreenshotResponse,
+  SessionShowRequest,
+  SessionShowResponse,
   SessionVideoRequest,
   SessionVideoResponse,
 } from "./protocol"
@@ -299,6 +321,12 @@ const sendRequest = <TResponse extends RpcFrame>(
 export const sendDaemonPing = (options: RpcClientOptions, request: DaemonPingRequest) =>
   sendRequest<DaemonPingResponse>(options, request)
 
+export const sendSessionList = (options: RpcClientOptions, request: SessionListRequest) =>
+  sendRequest<SessionListResponse>(options, request)
+
+export const sendSessionShow = (options: RpcClientOptions, request: SessionShowRequest) =>
+  sendRequest<SessionShowResponse>(options, request)
+
 export const sendSessionOpen = (options: RpcClientOptions, request: SessionOpenRequest) =>
   sendRequest<SessionOpenResponse>(options, request)
 
@@ -313,6 +341,18 @@ export const sendSessionClose = (options: RpcClientOptions, request: SessionClos
 export const sendSessionLogs = (options: RpcClientOptions, request: SessionLogsRequest) =>
   sendRequest<SessionLogsResponse>(options, request)
 
+export const sendSessionLogsMark = (options: RpcClientOptions, request: SessionLogsMarkRequest) =>
+  sendRequest<SessionLogsMarkResponse>(options, request)
+
+export const sendSessionLogsCapture = (options: RpcClientOptions, request: SessionLogsCaptureRequest) =>
+  sendRequest<SessionLogsCaptureResponse>(options, request)
+
+export const sendSessionLogsDoctor = (options: RpcClientOptions, request: SessionLogsDoctorRequest) =>
+  sendRequest<SessionLogsDoctorResponse>(options, request)
+
+export const sendSessionDiagnosticCapture = (options: RpcClientOptions, request: SessionDiagnosticCaptureRequest) =>
+  sendRequest<SessionDiagnosticCaptureResponse>(options, request)
+
 export const sendSessionDebug = (options: RpcClientOptions, request: SessionDebugRequest) =>
   sendRequest<SessionDebugResponse>(options, request)
 
@@ -325,6 +365,9 @@ export const sendSessionVideo = (options: RpcClientOptions, request: SessionVide
 export const sendSessionAction = (options: RpcClientOptions, request: SessionActionRequest) =>
   sendRequest<SessionActionResponse>(options, request)
 
+export const sendSessionRun = (options: RpcClientOptions, request: SessionRunRequest) =>
+  sendRequest<SessionRunResponse>(options, request)
+
 export const sendSessionRecordingExport = (
   options: RpcClientOptions,
   request: SessionRecordingExportRequest,
@@ -333,11 +376,23 @@ export const sendSessionRecordingExport = (
 export const sendSessionReplay = (options: RpcClientOptions, request: SessionReplayRequest) =>
   sendRequest<SessionReplayResponse>(options, request)
 
+export const sendSessionResultSummary = (options: RpcClientOptions, request: SessionResultSummaryRequest) =>
+  sendRequest<SessionResultSummaryResponse>(options, request)
+
+export const sendSessionResultAttachments = (options: RpcClientOptions, request: SessionResultAttachmentsRequest) =>
+  sendRequest<SessionResultAttachmentsResponse>(options, request)
+
 export const sendSessionSnapshot = (options: RpcClientOptions, request: SessionSnapshotRequest) =>
   sendRequest<SessionSnapshotResponse>(options, request)
 
 export const sendPerfRecord = (options: RpcClientOptions, request: PerfRecordRequest) =>
   sendRequest<PerfRecordResponse>(options, request)
+
+export const sendPerfAround = (options: RpcClientOptions, request: PerfAroundRequest) =>
+  sendRequest<PerfAroundResponse>(options, request)
+
+export const sendPerfSummarize = (options: RpcClientOptions, request: PerfSummarizeRequest) =>
+  sendRequest<PerfSummarizeResponse>(options, request)
 
 export const sendArtifactDrill = (
   options: RpcClientOptions,

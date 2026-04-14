@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { FlowResultSchema } from "./action"
 import { ArtifactRecord } from "./output"
 import { SessionHealthCheck, SessionPhase } from "./session"
 
@@ -8,6 +9,7 @@ const perfTemplateValues = [
   "metal-system-trace",
   "hangs",
   "swift-concurrency",
+  "logging",
 ] as const
 
 export const PerfTemplate = Schema.Literal(...perfTemplateValues)
@@ -22,6 +24,7 @@ const defaultPerfTimeLimits: Record<PerfTemplate, string> = {
   "metal-system-trace": "60s",
   "hangs": "3s",
   "swift-concurrency": "3s",
+  logging: "3s",
 }
 
 export const defaultPerfTimeLimitForTemplate = (template: PerfTemplate): string => defaultPerfTimeLimits[template]
@@ -76,6 +79,57 @@ export const PerfRecordResult = Schema.Struct({
   artifacts: PerfArtifacts,
 })
 export type PerfRecordResult = typeof PerfRecordResult.Type
+
+export const PerfAroundFlowArtifacts = Schema.Struct({
+  trace: ArtifactRecord,
+  toc: ArtifactRecord,
+})
+export type PerfAroundFlowArtifacts = typeof PerfAroundFlowArtifacts.Type
+
+export const PerfAroundFlowResult = Schema.Struct({
+  sessionId: Schema.String,
+  template: PerfTemplate,
+  templateName: Schema.String,
+  recordedAt: Schema.String,
+  xctraceVersion: Schema.String,
+  session: PerfSessionOutcome,
+  flow: FlowResultSchema,
+  diagnoses: Schema.Array(PerfDiagnosis),
+  artifacts: PerfAroundFlowArtifacts,
+})
+export type PerfAroundFlowResult = typeof PerfAroundFlowResult.Type
+
+export const PerfSummaryGroupBy = Schema.Literal("signpost")
+export type PerfSummaryGroupBy = typeof PerfSummaryGroupBy.Type
+
+export const PerfSignpostGroup = Schema.Struct({
+  intervalName: Schema.String,
+  count: Schema.Number,
+  minDurationNs: Schema.Number,
+  maxDurationNs: Schema.Number,
+  avgDurationNs: Schema.Number,
+  wallTimeNs: Schema.Number,
+})
+export type PerfSignpostGroup = typeof PerfSignpostGroup.Type
+
+export const PerfSignpostSummaryArtifacts = Schema.Struct({
+  trace: ArtifactRecord,
+  toc: ArtifactRecord,
+  export: ArtifactRecord,
+})
+export type PerfSignpostSummaryArtifacts = typeof PerfSignpostSummaryArtifacts.Type
+
+export const PerfSignpostSummaryResult = Schema.Struct({
+  sessionId: Schema.String,
+  artifactKey: Schema.String,
+  groupBy: PerfSummaryGroupBy,
+  generatedAt: Schema.String,
+  xctraceVersion: Schema.String,
+  totalIntervals: Schema.Number,
+  groups: Schema.Array(PerfSignpostGroup),
+  artifacts: PerfSignpostSummaryArtifacts,
+})
+export type PerfSignpostSummaryResult = typeof PerfSignpostSummaryResult.Type
 
 export interface ParsedPerfCell {
   readonly raw: string | null
@@ -352,6 +406,94 @@ const wallDiagnosis = (code: string, summary: string, details: ReadonlyArray<str
   details: [...details],
   wall: true,
 })
+
+export const summarizeSignpostIntervalsTable = (table: ParsedPerfTable): ReadonlyArray<PerfSignpostGroup> => {
+  assertSchemaContract({
+    table,
+    schema: "os-signpost-interval",
+    requiredMnemonics: ["name", "duration"],
+  })
+
+  const aggregates = new Map<string, { count: number; min: number; max: number; total: number }>()
+
+  for (const row of table.rows) {
+    const intervalName = readDisplay(row, "name") ?? readRaw(row, "name")
+    const duration = readNumber(row, "duration")
+
+    if (!intervalName || duration === null) {
+      continue
+    }
+
+    const existing = aggregates.get(intervalName)
+
+    if (existing) {
+      existing.count += 1
+      existing.min = Math.min(existing.min, duration)
+      existing.max = Math.max(existing.max, duration)
+      existing.total += duration
+      continue
+    }
+
+    aggregates.set(intervalName, {
+      count: 1,
+      min: duration,
+      max: duration,
+      total: duration,
+    })
+  }
+
+  return [...aggregates.entries()]
+    .map(([intervalName, aggregate]) => ({
+      intervalName,
+      count: aggregate.count,
+      minDurationNs: aggregate.min,
+      maxDurationNs: aggregate.max,
+      avgDurationNs: aggregate.total / aggregate.count,
+      wallTimeNs: aggregate.total,
+    }))
+    .sort((left, right) => right.wallTimeNs - left.wallTimeNs || left.intervalName.localeCompare(right.intervalName))
+}
+
+export const analyzeSignpostIntervalTable = (table: ParsedPerfTable): {
+  readonly summary: PerfSummary
+  readonly diagnoses: ReadonlyArray<PerfDiagnosis>
+} => {
+  const groups = summarizeSignpostIntervalsTable(table)
+  const totalIntervals = groups.reduce((total, group) => total + group.count, 0)
+  const totalWallTimeNs = groups.reduce((total, group) => total + group.wallTimeNs, 0)
+  const averageDurationNs = totalIntervals === 0 ? null : totalWallTimeNs / totalIntervals
+  const topGroup = groups[0] ?? null
+  const diagnoses: Array<PerfDiagnosis> = []
+
+  if (totalIntervals === 0) {
+    diagnoses.push(
+      warningDiagnosis(
+        "logging-no-signpost-intervals",
+        "The recording did not export any signpost interval rows.",
+        ["Verify the app emits os_signpost / OSSignposter intervals during the recorded flow, then retry the capture."],
+      ),
+    )
+  }
+
+  return {
+    summary: {
+      headline:
+        totalIntervals === 0
+          ? "No signpost intervals were exported."
+          : topGroup
+            ? `Observed ${totalIntervals} signpost intervals across ${groups.length} interval name(s); ${topGroup.intervalName} dominated the wall time.`
+            : `Observed ${totalIntervals} signpost intervals across ${groups.length} interval name(s).`,
+      metrics: [
+        { label: "Signpost intervals", value: String(totalIntervals) },
+        { label: "Interval groups", value: String(groups.length) },
+        { label: "Avg duration", value: formatNanoseconds(averageDurationNs) },
+        { label: "Total wall time", value: formatNanoseconds(totalWallTimeNs === 0 ? null : totalWallTimeNs) },
+        { label: "Top interval", value: topGroup ? `${topGroup.intervalName} (${topGroup.count}, ${formatNanoseconds(topGroup.wallTimeNs)})` : "none" },
+      ],
+    },
+    diagnoses,
+  }
+}
 
 export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
   readonly summary: PerfSummary

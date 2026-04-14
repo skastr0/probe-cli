@@ -10,6 +10,32 @@ import {
 } from "./protocol"
 
 describe("rpc protocol", () => {
+  test("decodes a session list request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-list",
+      method: "session.list",
+      params: {},
+    })
+
+    expect(request.method).toBe("session.list")
+  })
+
+  test("decodes a session show request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-show",
+      method: "session.show",
+      params: {
+        sessionId: "session-1",
+      },
+    })
+
+    expect(request.method).toBe("session.show")
+  })
+
   test("decodes a session open request", () => {
     const request = decodeRpcRequest({
       kind: "request",
@@ -49,6 +75,66 @@ describe("rpc protocol", () => {
     })
 
     expect(request.method).toBe("session.logs")
+  })
+
+  test("decodes a session logs mark request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-logs-mark",
+      method: "session.logs.mark",
+      params: {
+        sessionId: "session-1",
+        label: "before-submit",
+      },
+    })
+
+    expect(request.method).toBe("session.logs.mark")
+  })
+
+  test("decodes a session logs capture request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-logs-capture",
+      method: "session.logs.capture",
+      params: {
+        sessionId: "session-1",
+        captureSeconds: 3,
+      },
+    })
+
+    expect(request.method).toBe("session.logs.capture")
+  })
+
+  test("decodes a session logs doctor request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-logs-doctor",
+      method: "session.logs.doctor",
+      params: {
+        sessionId: "session-1",
+      },
+    })
+
+    expect(request.method).toBe("session.logs.doctor")
+  })
+
+  test("decodes a session diagnostic capture request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-diagnostic-capture",
+      method: "session.diagnostic.capture",
+      params: {
+        sessionId: "session-1",
+        target: "device",
+        kind: "sysdiagnose",
+      },
+    })
+
+    expect(request.method).toBe("session.diagnostic.capture")
   })
 
   test("decodes a session snapshot request", () => {
@@ -93,6 +179,29 @@ describe("rpc protocol", () => {
     expect(request.method).toBe("session.action")
   })
 
+  test("decodes a session run request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-run",
+      method: "session.run",
+      params: {
+        sessionId: "session-1",
+        flow: {
+          contract: "probe.session-flow/v1",
+          steps: [
+            {
+              kind: "sleep",
+              durationMs: 100,
+            },
+          ],
+        },
+      },
+    })
+
+    expect(request.method).toBe("session.run")
+  })
+
   test("decodes a session video request", () => {
     const request = decodeRpcRequest({
       kind: "request",
@@ -122,6 +231,95 @@ describe("rpc protocol", () => {
     })
 
     expect(request.method).toBe("perf.record")
+  })
+
+  test("decodes a perf around request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-perf-around",
+      method: "perf.around",
+      params: {
+        sessionId: "session-1",
+        template: "logging",
+        flow: {
+          contract: "probe.session-flow/v1",
+          steps: [
+            {
+              kind: "sleep",
+              durationMs: 250,
+            },
+          ],
+        },
+      },
+    })
+
+    expect(request.method).toBe("perf.around")
+  })
+
+  test("decodes a perf summarize request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-perf-summarize",
+      method: "perf.summarize",
+      params: {
+        sessionId: "session-1",
+        artifactKey: "logging-trace",
+        groupBy: "signpost",
+      },
+    })
+
+    expect(request.method).toBe("perf.summarize")
+  })
+
+  test("decodes an xcresult artifact drill request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-drill",
+      method: "artifact.drill",
+      params: {
+        sessionId: "session-1",
+        artifactKey: "result-bundle",
+        outputMode: "inline",
+        query: {
+          kind: "xcresult",
+          view: "attachments",
+          attachmentId: "att-123",
+        },
+      },
+    })
+
+    expect(request.method).toBe("artifact.drill")
+  })
+
+  test("decodes a session result summary request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-result-summary",
+      method: "session.result.summary",
+      params: {
+        sessionId: "session-1",
+      },
+    })
+
+    expect(request.method).toBe("session.result.summary")
+  })
+
+  test("decodes a session result attachments request", () => {
+    const request = decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-result-attachments",
+      method: "session.result.attachments",
+      params: {
+        sessionId: "session-1",
+      },
+    })
+
+    expect(request.method).toBe("session.result.attachments")
   })
 
   test("encodes and decodes a progress frame", () => {

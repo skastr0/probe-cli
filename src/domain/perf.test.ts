@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import {
+  analyzeSignpostIntervalTable,
   defaultPerfTimeLimitForTemplate,
   analyzeMetalSystemTraceTable,
   analyzeSystemTraceTables,
   analyzeTimeProfilerTable,
   parsePerfTableExport,
+  summarizeSignpostIntervalsTable,
 } from "./perf"
 
 const timeProfilerXml = `<?xml version="1.0"?>
@@ -77,6 +79,20 @@ const metalXml = `<?xml version="1.0"?>
   </node>
 </trace-query-result>`
 
+const signpostXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[1]'>
+    <schema name="os-signpost-interval">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>name</mnemonic></col>
+    </schema>
+    <row><start-time fmt="00:00.000.000">0</start-time><duration fmt="10.00 ms">10000000</duration><name fmt="loadData">loadData</name></row>
+    <row><start-time fmt="00:00.020.000">20000000</start-time><duration fmt="20.00 ms">20000000</duration><name fmt="loadData">loadData</name></row>
+    <row><start-time fmt="00:00.050.000">50000000</start-time><duration fmt="5.00 ms">5000000</duration><name fmt="renderFrame">renderFrame</name></row>
+  </node>
+</trace-query-result>`
+
 describe("perf export parsing", () => {
   test("resolves refs and sentinels from xctrace export rows", () => {
     const table = parsePerfTableExport(timeProfilerXml)
@@ -94,6 +110,10 @@ describe("perf export parsing", () => {
 describe("perf analysis", () => {
   test("uses the longer default time limit for metal traces", () => {
     expect(defaultPerfTimeLimitForTemplate("metal-system-trace")).toBe("60s")
+  })
+
+  test("uses the default short time limit for logging traces", () => {
+    expect(defaultPerfTimeLimitForTemplate("logging")).toBe("3s")
   })
 
   test("time profiler analysis flags blocked-heavy traces and preserves walls", () => {
@@ -128,5 +148,32 @@ describe("perf analysis", () => {
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-frame-budget-duration")).toBe(true)
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-frame-budget-latency")).toBe(true)
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-gpu-counters-required")).toBe(true)
+  })
+
+  test("summarizes signpost intervals by interval name", () => {
+    const groups = summarizeSignpostIntervalsTable(parsePerfTableExport(signpostXml))
+
+    expect(groups).toEqual([
+      {
+        intervalName: "loadData",
+        count: 2,
+        minDurationNs: 10_000_000,
+        maxDurationNs: 20_000_000,
+        avgDurationNs: 15_000_000,
+        wallTimeNs: 30_000_000,
+      },
+      {
+        intervalName: "renderFrame",
+        count: 1,
+        minDurationNs: 5_000_000,
+        maxDurationNs: 5_000_000,
+        avgDurationNs: 5_000_000,
+        wallTimeNs: 5_000_000,
+      },
+    ])
+
+    const analysis = analyzeSignpostIntervalTable(parsePerfTableExport(signpostXml))
+    expect(analysis.summary.headline).toContain("Observed 3 signpost intervals")
+    expect(analysis.summary.metrics.find((metric) => metric.label === "Top interval")?.value).toContain("loadData")
   })
 })

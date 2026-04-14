@@ -1,6 +1,12 @@
 import { Schema } from "effect"
-import type { ArtifactRecord as ArtifactRecordModel, OutputMode, OutputThreshold } from "./output"
+import type {
+  ArtifactRecord as ArtifactRecordModel,
+  CommandRetryMetadata,
+  OutputMode,
+  OutputThreshold,
+} from "./output"
 import { ArtifactRecord, countLines } from "./output"
+import { CommandRetryMetadataSchema } from "./output"
 
 const NullableBoolean = Schema.Union(Schema.Boolean, Schema.Null)
 const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
@@ -112,6 +118,7 @@ export const SessionSnapshotResultSchema = Schema.Struct({
   metrics: SnapshotMetricsSchema,
   diff: SnapshotDiffSchema,
   warnings: Schema.Array(Schema.String),
+  ...CommandRetryMetadataSchema.fields,
 })
 export type SessionSnapshotResult = typeof SessionSnapshotResultSchema.Type
 
@@ -199,6 +206,43 @@ export interface StoredSnapshotArtifact {
     readonly collapsed: StoredSnapshotRendering
   }
 }
+
+export const StoredSnapshotNodeSchema: Schema.Schema<StoredSnapshotNode> = Schema.suspend(() =>
+  Schema.Struct({
+    ref: Schema.String,
+    type: Schema.String,
+    identifier: NullableString,
+    label: NullableString,
+    value: NullableString,
+    placeholder: NullableString,
+    frame: Schema.Union(SnapshotFrameSchema, Schema.Null),
+    state: Schema.Union(SnapshotNodeStateSchema, Schema.Null),
+    interactive: Schema.Boolean,
+    identity: Schema.Literal("strong", "weak"),
+    children: Schema.Array(StoredSnapshotNodeSchema),
+  })
+)
+
+export const StoredSnapshotRenderingSchema = Schema.Struct({
+  totalNodes: Schema.Number,
+  nodes: Schema.Array(SnapshotPreviewItemSchema),
+})
+
+export const StoredSnapshotArtifactSchema: Schema.Schema<StoredSnapshotArtifact> = Schema.Struct({
+  contract: Schema.Literal("probe.snapshot/artifact-v1"),
+  snapshotId: Schema.String,
+  capturedAt: Schema.String,
+  previousSnapshotId: NullableString,
+  statusLabel: NullableString,
+  metrics: SnapshotMetricsSchema,
+  diff: SnapshotDiffSchema,
+  warnings: Schema.Array(Schema.String),
+  root: StoredSnapshotNodeSchema,
+  renderings: Schema.Struct({
+    interactive: StoredSnapshotRenderingSchema,
+    collapsed: StoredSnapshotRenderingSchema,
+  }),
+})
 
 interface SnapshotLikeNode {
   readonly type: string
@@ -612,6 +656,7 @@ const RunnerSnapshotPayloadContractSchema = Schema.Struct({
 })
 
 const decodeRunnerSnapshotPayloadContractSync = Schema.decodeUnknownSync(RunnerSnapshotPayloadContractSchema)
+const decodeStoredSnapshotArtifactSync = Schema.decodeUnknownSync(StoredSnapshotArtifactSchema)
 
 const normalizeNullableString = (value: unknown): string | null =>
   typeof value === "string" ? value : null
@@ -699,6 +744,9 @@ export const decodeRunnerSnapshotPayload = (content: string): RunnerSnapshotPayl
     root: normalizeRunnerSnapshotNode(raw.root),
   }
 }
+
+export const decodeStoredSnapshotArtifact = (value: unknown): StoredSnapshotArtifact =>
+  decodeWithLabel("stored snapshot artifact", decodeStoredSnapshotArtifactSync, value)
 
 export const buildSnapshotArtifact = (args: {
   readonly previous: StoredSnapshotArtifact | null
@@ -920,7 +968,12 @@ export const buildSessionSnapshotResult = (args: {
   readonly artifact: StoredSnapshotArtifact
   readonly artifactRecord: ArtifactRecordModel
   readonly outputMode: OutputMode
+  readonly retry?: CommandRetryMetadata
 }): SessionSnapshotResult => {
+  const retry = args.retry ?? {
+    retryCount: 0,
+    retryReasons: [],
+  }
   const interactivePreview = buildPreview(
     "interactive",
     args.artifact.renderings.interactive,
@@ -996,5 +1049,7 @@ export const buildSessionSnapshotResult = (args: {
     metrics: args.artifact.metrics,
     diff: args.artifact.diff,
     warnings: [...args.artifact.warnings],
+    retryCount: retry.retryCount,
+    retryReasons: [...retry.retryReasons],
   }
 }

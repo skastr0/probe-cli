@@ -64,7 +64,7 @@ export const LiveRunnerTransportContract = Schema.Struct({
   bootstrapSource: Schema.Literal("simulator-bootstrap-manifest"),
   bootstrapPath: Schema.String,
   sessionIdentifier: Schema.String,
-  commandIngress: Schema.Literal("file-mailbox"),
+  commandIngress: Schema.Literal("http-post"),
   eventEgress: Schema.Literal("stdout-jsonl-mixed-log"),
   stdinProbeStatus: Schema.String,
   note: Schema.String,
@@ -77,7 +77,7 @@ export const RealDeviceLiveTransportContract = Schema.Struct({
   bootstrapSource: Schema.Literal("device-bootstrap-manifest"),
   bootstrapPath: Schema.String,
   sessionIdentifier: Schema.String,
-  commandIngress: Schema.Literal("file-mailbox", "http-post"),
+  commandIngress: Schema.Literal("http-post"),
   eventEgress: Schema.Literal("stdout-jsonl-mixed-log"),
   stdinProbeStatus: Schema.String,
   note: Schema.String,
@@ -210,6 +210,23 @@ export type ProbeSessionHealth = typeof ProbeSessionHealth.Type
 
 export const SessionHealth = ProbeSessionHealth
 export type SessionHealth = typeof ProbeSessionHealth.Type
+
+export const SessionListTarget = Schema.Struct({
+  platform: SessionTarget.fields.platform,
+  deviceId: SessionTarget.fields.deviceId,
+  deviceName: SessionTarget.fields.deviceName,
+  runtime: SessionTarget.fields.runtime,
+})
+export type SessionListTarget = typeof SessionListTarget.Type
+
+export const SessionListEntry = Schema.Struct({
+  id: Schema.String,
+  target: SessionListTarget,
+  bundleId: Schema.String,
+  state: SessionPhase,
+  openedAt: Schema.String,
+})
+export type SessionListEntry = typeof SessionListEntry.Type
 
 export const isLiveRunnerTransport = (
   transport: SessionTransportDetails,
