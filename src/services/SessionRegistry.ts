@@ -5,7 +5,9 @@ import { basename, dirname, join, relative } from "node:path"
 import { Context, Effect, Either, Layer, Ref } from "effect"
 import {
   buildRecordedSessionAction,
+  buildDirectRunnerUiActionPayload,
   buildRunnerUiActionPayload,
+  describeActionSelector,
   describeRecordedActionTarget,
   describeSnapshotNode,
   evaluateAssertion,
@@ -18,7 +20,6 @@ import {
   validateFlowContract,
   validateSessionAction,
   type ActionRecordingScript,
-  type FlowContract,
   type FlowFailedStep,
   type FlowResult,
   type FlowStep,
@@ -33,6 +34,22 @@ import {
   type SessionRecordingExportResult,
   type SessionReplayResult,
 } from "../domain/action"
+import {
+  flowV2StepToSessionAction,
+  isFlowV2Contract,
+  isFlowV2SessionActionStep,
+  validateSessionFlowContract,
+  type FlowSequenceAction,
+  type FlowSequenceChildFailure,
+  type FlowV2FastSingleStep,
+  type FlowV2FailedStep,
+  type FlowV2Result,
+  type FlowV2Step,
+  type FlowV2StepResult,
+  type SessionFlowContract,
+  type SessionFlowResult,
+} from "../domain/flow-v2"
+import { planFlowExecution, type PlannedStep } from "../domain/flow-planner"
 import { CapabilityReport } from "../domain/capabilities"
 import {
   type DebugBreakpointLocation,
@@ -459,6 +476,10 @@ interface RetryAttemptMetadata {
   readonly retryReasons: Array<string>
 }
 
+type ExtendedSessionActionResult = SessionActionResult & {
+  readonly handledMs?: number | null
+}
+
 type RetryAttemptOutcome<T, E extends SessionActionError> =
   | {
       readonly ok: true
@@ -474,7 +495,7 @@ type RetryAttemptOutcome<T, E extends SessionActionError> =
 type ActionExecutionOutcome =
   | {
       readonly ok: true
-      readonly result: SessionActionResult
+      readonly result: ExtendedSessionActionResult
     }
   | {
       readonly ok: false
@@ -1362,9 +1383,9 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
     >
     readonly runFlow: (params: {
       readonly sessionId: string
-      readonly flow: FlowContract
+      readonly flow: SessionFlowContract
     }) => Effect.Effect<
-      FlowResult,
+      SessionFlowResult,
       SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
     >
     readonly exportRecording: (params: {
@@ -1657,8 +1678,9 @@ export const SessionRegistryLive = Layer.scoped(
               latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
               artifact: captureResult.value.artifact,
               recordingLength: record.recording.steps.length,
+              handledMs: captureResult.value.handledMs,
               ...buildActionResultMetadata(captureResult.retry),
-            } satisfies SessionActionResult,
+            } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
         }
 
@@ -1707,8 +1729,9 @@ export const SessionRegistryLive = Layer.scoped(
               latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
               artifact: captureResult.right.artifact,
               recordingLength: record.recording.steps.length,
+              handledMs: captureResult.right.handledMs,
               ...buildActionResultMetadata(emptyRetryAttemptMetadata()),
-            } satisfies SessionActionResult,
+            } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
         }
 
@@ -1777,8 +1800,9 @@ export const SessionRegistryLive = Layer.scoped(
               latestSnapshotId: result.value.snapshot.artifact.snapshotId,
               artifact: null,
               recordingLength: record.recording.steps.length,
+              handledMs: null,
               ...buildActionResultMetadata(result.retry, "passed", null, result.retry.retryCount + 1),
-            } satisfies SessionActionResult,
+            } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
         }
 
@@ -1802,8 +1826,9 @@ export const SessionRegistryLive = Layer.scoped(
                 latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                 artifact: null,
                 recordingLength: record.recording.steps.length,
+                handledMs: null,
                 ...buildActionResultMetadata(emptyRetryAttemptMetadata(), "passed", action.timeoutMs, 1),
-              } satisfies SessionActionResult,
+              } satisfies ExtendedSessionActionResult,
             } satisfies ActionExecutionOutcome
           }
 
@@ -1881,8 +1906,9 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: snapshot.artifact.snapshotId,
                   artifact: null,
                   recordingLength: record.recording.steps.length,
+                  handledMs: null,
                   ...buildActionResultMetadata({ retryCount: attempts - 1, retryReasons }, "passed", waitedMs, attempts),
-                } satisfies SessionActionResult,
+                } satisfies ExtendedSessionActionResult,
               } satisfies ActionExecutionOutcome
             }
 
@@ -1988,7 +2014,11 @@ export const SessionRegistryLive = Layer.scoped(
 
               const postSnapshot = yield* captureSnapshotArtifactInternal(args.sessionId, record)
 
-              return { postSnapshot, resolvedTarget }
+              return {
+                postSnapshot,
+                resolvedTarget,
+                handledMs: response.handledMs,
+              }
             }),
         })
 
@@ -2026,11 +2056,12 @@ export const SessionRegistryLive = Layer.scoped(
             resolvedBy: actionResult.value.resolvedTarget.resolvedBy,
             statusLabel: actionResult.value.postSnapshot.artifact.statusLabel,
             latestSnapshotId: actionResult.value.postSnapshot.artifact.snapshotId,
-            artifact: null,
-            recordingLength: record.recording.steps.length,
-            ...buildActionResultMetadata(actionResult.retry),
-          } satisfies SessionActionResult,
-        } satisfies ActionExecutionOutcome
+              artifact: null,
+              recordingLength: record.recording.steps.length,
+              handledMs: actionResult.value.handledMs,
+              ...buildActionResultMetadata(actionResult.retry),
+            } satisfies ExtendedSessionActionResult,
+          } satisfies ActionExecutionOutcome
       })
 
     const validateLogRequest = (args: {
@@ -2300,6 +2331,7 @@ export const SessionRegistryLive = Layer.scoped(
         return {
           artifact,
           statusLabel: response.statusLabel,
+          handledMs: response.handledMs,
         }
       })
 
@@ -2334,6 +2366,7 @@ export const SessionRegistryLive = Layer.scoped(
         return {
           artifact,
           statusLabel: null,
+          handledMs: null,
         }
       })
 
@@ -2568,6 +2601,7 @@ export const SessionRegistryLive = Layer.scoped(
             artifact,
             statusLabel: response.statusLabel,
             mode: "frame-sequence" as const,
+            handledMs: response.handledMs,
           }
         }
 
@@ -2640,6 +2674,7 @@ export const SessionRegistryLive = Layer.scoped(
           artifact,
           statusLabel: response.statusLabel,
           mode: "mp4" as const,
+          handledMs: response.handledMs,
         }
       })
 
@@ -2689,6 +2724,7 @@ export const SessionRegistryLive = Layer.scoped(
             artifact,
             statusLabel: null,
             mode: "mov" as const,
+            handledMs: null,
           }
         }
 
@@ -2770,6 +2806,7 @@ export const SessionRegistryLive = Layer.scoped(
           artifact,
           statusLabel: null,
           mode: "mp4" as const,
+          handledMs: null,
         }
       })
 
@@ -3397,6 +3434,7 @@ export const SessionRegistryLive = Layer.scoped(
         return {
           artifact: built.artifact,
           artifactRecord: artifact,
+          handledMs: response.handledMs,
         }
       })
 
@@ -4955,7 +4993,7 @@ export const SessionRegistryLive = Layer.scoped(
         }),
       runFlow: ({ sessionId, flow }) =>
         Effect.gen(function* () {
-          const validationError = validateFlowContract(flow)
+          const validationError = validateSessionFlowContract(flow)
 
           if (validationError !== null) {
             return yield* new UserInputError({
@@ -4966,15 +5004,17 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          const isV2SessionFlow = isFlowV2Contract(flow)
           const record = yield* requireSessionRecord(sessionId)
           yield* refreshSessionArtifacts(sessionId, record)
+          const plan = planFlowExecution(flow)
 
           const diffArtifacts = (before: ReadonlyArray<ArtifactRecord>, after: ReadonlyArray<ArtifactRecord>) => {
             const knownKeys = new Set(before.map((artifact) => artifact.key))
             return after.filter((artifact) => !knownKeys.has(artifact.key))
           }
 
-          const failureVerdict = (error: SessionActionError | SessionNotFoundError): FlowResult["verdict"] =>
+          const failureVerdict = (error: SessionActionError | SessionNotFoundError): SessionFlowResult["verdict"] =>
             error instanceof EnvironmentError && error.code === "session-wait-timeout" ? "timed-out" : "failed"
 
           const failureWarnings = (args: {
@@ -5004,19 +5044,18 @@ export const SessionRegistryLive = Layer.scoped(
               : error.reason
 
           const successWarnings = (args: {
-            readonly step: FlowStep
+            readonly step: FlowStep | FlowV2Step
             readonly baseWarnings: ReadonlyArray<string>
             readonly resolvedBy?: SessionActionResult["resolvedBy"]
           }) => {
             const warnings = [...args.baseWarnings]
+            const target = "target" in args.step ? args.step.target : null
 
             if (
               args.resolvedBy === "semantic"
-              && isFlowSessionActionStep(args.step)
-              && "target" in args.step
-              && args.step.target !== null
-              && args.step.target.kind === "ref"
-              && args.step.target.fallback !== null
+              && target !== null
+              && target.kind === "ref"
+              && target.fallback !== null
             ) {
               warnings.push(selectorDriftContractWarning)
             }
@@ -5024,14 +5063,104 @@ export const SessionRegistryLive = Layer.scoped(
             return dedupeStrings(warnings)
           }
 
-          const toFailedStep = (step: FlowStepResult): FlowFailedStep => ({
-            index: step.index,
-            kind: step.kind,
-            summary: step.summary,
-            verdict: step.verdict,
-          })
+          const plannedExecutionProfile = (plannedStep: PlannedStep): FlowStepResult["executionProfile"] => {
+            if (!isV2SessionFlow) {
+              return null
+            }
 
-          const mergeVerdict = (current: FlowResult["verdict"], next: FlowResult["verdict"]): FlowResult["verdict"] => {
+            return plannedStep.kind === "fast-single" ? "fast" : "verified"
+          }
+
+          const plannedTransportLane = (plannedStep: PlannedStep): FlowStepResult["transportLane"] => {
+            if (!isV2SessionFlow) {
+              return null
+            }
+
+            if (plannedStep.kind !== "fast-single") {
+              return "host-single"
+            }
+
+            return plannedStep.step.kind === "wait" ? "host-single" : "runner-single"
+          }
+
+          type BuiltFlowStepResult = FlowStepResult | FlowV2StepResult
+          type BuiltFailedStep = FlowFailedStep | FlowV2FailedStep
+
+          const buildFlowStepResult = (args: {
+            readonly plannedStep: PlannedStep
+            readonly kind: FlowStepResult["kind"] | FlowV2StepResult["kind"]
+            readonly summary: string
+            readonly verdict: SessionFlowResult["verdict"]
+            readonly matchedRef: string | null
+            readonly latestSnapshotId: string | null
+            readonly retryCount: number
+            readonly retryReasons: Array<string>
+            readonly warnings: Array<string>
+            readonly handledMs: number | null
+            readonly checkpoint?: FlowV2StepResult["checkpoint"]
+            readonly sequenceChildFailure?: FlowSequenceChildFailure | null
+          }): BuiltFlowStepResult => {
+            const executionProfile = plannedExecutionProfile(args.plannedStep)
+            const transportLane = plannedTransportLane(args.plannedStep)
+
+            const base = {
+              index: args.plannedStep.index,
+              kind: args.kind as FlowStepResult["kind"],
+              summary: args.summary,
+              verdict: args.verdict,
+              matchedRef: args.matchedRef,
+              latestSnapshotId: args.latestSnapshotId,
+              retryCount: args.retryCount,
+              retryReasons: args.retryReasons,
+              artifacts: [] as Array<ArtifactRecord>,
+              executionProfile,
+              transportLane,
+              handledMs: args.handledMs,
+              warnings: args.warnings,
+            }
+
+            if (!isV2SessionFlow) {
+              return base satisfies FlowStepResult
+            }
+
+            return {
+              ...base,
+              kind: args.kind as FlowV2StepResult["kind"],
+              executionProfile: executionProfile ?? "verified",
+              transportLane: transportLane ?? "host-single",
+              checkpoint: args.checkpoint ?? null,
+              sequenceChildFailure: args.sequenceChildFailure ?? null,
+            } satisfies FlowV2StepResult
+          }
+
+          const toFailedStep = (step: BuiltFlowStepResult): BuiltFailedStep => {
+            if (!isV2SessionFlow) {
+              return {
+                index: step.index,
+                kind: step.kind as FlowFailedStep["kind"],
+                summary: step.summary,
+                verdict: step.verdict,
+              } satisfies FlowFailedStep
+            }
+
+            const stepResult = step as FlowV2StepResult
+            return {
+              index: stepResult.index,
+              kind: stepResult.kind,
+              summary: stepResult.summary,
+              verdict: stepResult.verdict,
+              executionProfile: stepResult.executionProfile,
+              transportLane: stepResult.transportLane,
+              handledMs: stepResult.handledMs,
+              checkpoint: stepResult.checkpoint,
+              sequenceChildFailure: stepResult.sequenceChildFailure,
+            } satisfies FlowV2FailedStep
+          }
+
+          const mergeVerdict = (
+            current: SessionFlowResult["verdict"],
+            next: SessionFlowResult["verdict"],
+          ): SessionFlowResult["verdict"] => {
             if (current === "timed-out" || next === "timed-out") {
               return "timed-out"
             }
@@ -5043,17 +5172,166 @@ export const SessionRegistryLive = Layer.scoped(
             return "passed"
           }
 
-          const executedSteps: Array<FlowStepResult> = []
+          const toSessionAction = (step: FlowStep | FlowV2Step): SessionAction => {
+            if (isV2SessionFlow && isFlowV2SessionActionStep(step as FlowV2Step)) {
+              return flowV2StepToSessionAction(step as Parameters<typeof flowV2StepToSessionAction>[0])
+            }
+
+            if (isFlowSessionActionStep(step as FlowStep)) {
+              return flowStepToSessionAction(step as Parameters<typeof flowStepToSessionAction>[0])
+            }
+
+            throw new Error(`Expected a flow session-action step, received ${(step as { readonly kind: string }).kind}.`)
+          }
+
+          const classifyFastFailureCode = (reason: string): "session-action-target-not-found" | "session-action-failed" =>
+            /\bnot found\b|\bno element\b|\bmissing\b|\bcould not resolve\b/i.test(reason)
+              ? "session-action-target-not-found"
+              : "session-action-failed"
+
+          const executeFastSingleStep = (
+            step: FlowV2FastSingleStep,
+          ) =>
+            Effect.gen(function* () {
+              if (!isRunnerBackedRecord(record)) {
+                return yield* new UnsupportedCapabilityError({
+                  code: "session-action-real-device-runner",
+                  capability: "session.run.fast",
+                  reason: "This session does not currently expose a live runner transport for fast flow actions.",
+                  nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+                  details: [],
+                  wall: false,
+                })
+              }
+
+              const runnerRecord = record
+
+              if (step.kind === "wait") {
+                yield* Effect.sleep(step.timeoutMs)
+                updateHealthCheck(record, step.kind, true)
+                yield* persistHealth(sessionId, record.health)
+                yield* syncDaemonMetadata
+
+                return {
+                  ok: true as const,
+                  result: {
+                    summary: `Waited ${step.timeoutMs}ms before continuing.`,
+                    action: step.kind,
+                    matchedRef: null,
+                    resolvedBy: "none",
+                    statusLabel: record.snapshotState.latest?.statusLabel ?? null,
+                    latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                    artifact: null,
+                    recordingLength: record.recording.steps.length,
+                    handledMs: null,
+                    ...buildActionResultMetadata(emptyRetryAttemptMetadata(), "passed", step.timeoutMs, 1),
+                  } satisfies ExtendedSessionActionResult,
+                } satisfies ActionExecutionOutcome
+              }
+
+              const action = flowV2StepToSessionAction(step)
+
+              if (!isRunnerUiSessionAction(action)) {
+                return yield* new EnvironmentError({
+                  code: "session-action-invalid",
+                  reason: `Fast runner execution only supports tap, press, swipe, type, scroll, and duration waits; received ${step.kind}.`,
+                  nextStep: "Use verified execution for unsupported steps, or adjust the flow contract before retrying.",
+                  details: [],
+                })
+              }
+
+              const resolvedBy: SessionActionResult["resolvedBy"] = step.target.kind === "point" ? "point" : "semantic"
+              const actionResult = yield* attemptWithRetry({
+                policy: action.retryPolicy ?? defaultMutationRetryPolicy,
+                run: () =>
+                  Effect.gen(function* () {
+                    const payload = yield* Effect.try({
+                      try: () => buildDirectRunnerUiActionPayload(action, step.target),
+                      catch: (error) =>
+                        new EnvironmentError({
+                          code: "session-action-target-not-found",
+                          reason: error instanceof Error ? error.message : String(error),
+                          nextStep: "Use a semantic selector, point selector, or ref selector with a semantic fallback for fast runner steps.",
+                          details: [],
+                        }),
+                    })
+
+                    const response = yield* sendRunnerCommand(
+                      sessionId,
+                      runnerRecord,
+                      "uiAction",
+                      JSON.stringify(payload),
+                    )
+                    record.nextSequence += 1
+
+                    if (!response.ok) {
+                      const failureReason = response.error
+                        ?? response.payload
+                        ?? `Runner ${action.kind} failed with status ${response.statusLabel}.`
+
+                      return yield* new EnvironmentError({
+                        code: classifyFastFailureCode(failureReason),
+                        reason: failureReason,
+                        nextStep: withOffscreenNextStep(
+                          "Inspect the latest runner log artifacts, refine the direct selector, and retry the fast step.",
+                          failureReason,
+                        ),
+                        details: [],
+                      })
+                    }
+
+                    return { response }
+                  }),
+              })
+
+              if (!actionResult.ok) {
+                yield* Effect.either(captureSnapshotArtifactInternal(sessionId, record))
+                yield* persistActionFailure(sessionId, record, step.kind)
+
+                return {
+                  ok: false,
+                  error: actionResult.error,
+                  retry: actionResult.retry,
+                } satisfies ActionExecutionOutcome
+              }
+
+              updateHealthCheck(record, step.kind, true)
+              yield* persistHealth(sessionId, record.health)
+              yield* syncDaemonMetadata
+
+              const summary = step.target.kind === "point"
+                ? `Executed fast ${step.kind} at point(${step.target.x}, ${step.target.y}) without host snapshots.`
+                : `Executed fast ${step.kind} on ${describeActionSelector(step.target)} without host snapshots.`
+
+              return {
+                ok: true,
+                result: {
+                  summary,
+                  action: step.kind,
+                  matchedRef: null,
+                  resolvedBy,
+                  statusLabel: actionResult.value.response.statusLabel,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  artifact: null,
+                  recordingLength: record.recording.steps.length,
+                  handledMs: actionResult.value.response.handledMs,
+                  ...buildActionResultMetadata(actionResult.retry),
+                } satisfies ExtendedSessionActionResult,
+              } satisfies ActionExecutionOutcome
+            })
+
+          const executedSteps: Array<BuiltFlowStepResult> = []
           const createdArtifacts: Array<ArtifactRecord> = []
-          let failedStep: FlowFailedStep | null = null
-          let overallVerdict: FlowResult["verdict"] = "passed"
+          let failedStep: BuiltFailedStep | null = null
+          let overallVerdict: SessionFlowResult["verdict"] = "passed"
           let totalRetries = 0
           let stoppedEarly = false
 
-          for (const [stepIndex, step] of flow.steps.entries()) {
+          for (const plannedStep of plan.steps) {
+            const step = plannedStep.step
             const beforeArtifacts = [...record.health.artifacts]
             const continueOnError = step.continueOnError === true
-            let stepResult: FlowStepResult
+            let stepResult: BuiltFlowStepResult
 
             if (step.kind === "snapshot") {
               const captured = yield* attemptWithRetry({
@@ -5069,8 +5347,8 @@ export const SessionRegistryLive = Layer.scoped(
                   retry: captured.retry,
                 })
 
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: snapshotResult.summary,
                   verdict: "passed",
@@ -5078,15 +5356,15 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: snapshotResult.snapshotId,
                   retryCount: captured.retry.retryCount,
                   retryReasons: captured.retry.retryReasons,
-                  artifacts: [],
+                  handledMs: captured.value.handledMs,
                   warnings: successWarnings({
                     step,
                     baseWarnings: snapshotResult.warnings,
                   }),
-                }
+                })
               } else {
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: captured.error.reason,
                   verdict: failureVerdict(captured.error),
@@ -5094,12 +5372,12 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: captured.retry.retryCount,
                   retryReasons: captured.retry.retryReasons,
-                  artifacts: [],
+                  handledMs: null,
                   warnings: failureWarnings({
                     error: captured.error,
                     continued: continueOnError,
                   }),
-                }
+                })
               }
             } else if (step.kind === "screenshot") {
               const labelStem = sanitizeFileComponent(step.label ?? null, "screenshot")
@@ -5118,8 +5396,8 @@ export const SessionRegistryLive = Layer.scoped(
 
               if (captured.ok) {
                 updateHealthCheck(record, step.kind, true)
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: `Captured screenshot artifact ${captured.value.artifact.absolutePath}.`,
                   verdict: "passed",
@@ -5127,17 +5405,17 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: captured.retry.retryCount,
                   retryReasons: captured.retry.retryReasons,
-                  artifacts: [],
+                  handledMs: captured.value.handledMs,
                   warnings: successWarnings({
                     step,
                     baseWarnings: [],
                   }),
-                }
+                })
               } else {
                 updateHealthCheck(record, step.kind, false)
                 yield* persistRecordHealth(sessionId, record)
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: captured.error.reason,
                   verdict: failureVerdict(captured.error),
@@ -5145,12 +5423,12 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: captured.retry.retryCount,
                   retryReasons: captured.retry.retryReasons,
-                  artifacts: [],
+                  handledMs: null,
                   warnings: failureWarnings({
                     error: captured.error,
                     continued: continueOnError,
                   }),
-                }
+                })
               }
             } else if (step.kind === "video") {
               const durationMs = normalizeVideoDurationMs(step.durationMs)
@@ -5171,8 +5449,8 @@ export const SessionRegistryLive = Layer.scoped(
                   ? ` Requested duration ${step.durationMs}ms was clamped to ${durationMs}ms.`
                   : ""
 
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: `Captured ${modeSummary} at ${captured.right.artifact.absolutePath}.${clampNote}`,
                   verdict: "passed",
@@ -5180,17 +5458,17 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: 0,
                   retryReasons: [],
-                  artifacts: [],
+                  handledMs: captured.right.handledMs,
                   warnings: successWarnings({
                     step,
                     baseWarnings: [],
                   }),
-                }
+                })
               } else {
                 updateHealthCheck(record, step.kind, false)
                 yield* persistRecordHealth(sessionId, record)
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: captured.left.reason,
                   verdict: failureVerdict(captured.left),
@@ -5198,12 +5476,12 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: 0,
                   retryReasons: [],
-                  artifacts: [],
+                  handledMs: null,
                   warnings: failureWarnings({
                     error: captured.left,
                     continued: continueOnError,
                   }),
-                }
+                })
               }
             } else if (step.kind === "logMark") {
               const marked = yield* Effect.either(registry.markLog({
@@ -5212,8 +5490,8 @@ export const SessionRegistryLive = Layer.scoped(
               }))
 
               if (marked._tag === "Right") {
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: marked.right.summary,
                   verdict: "passed",
@@ -5221,15 +5499,15 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: 0,
                   retryReasons: [],
-                  artifacts: [],
+                  handledMs: null,
                   warnings: successWarnings({
                     step,
                     baseWarnings: [],
                   }),
-                }
+                })
               } else {
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: errorSummary(marked.left),
                   verdict: failureVerdict(marked.left),
@@ -5237,17 +5515,17 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: 0,
                   retryReasons: [],
-                  artifacts: [],
+                  handledMs: null,
                   warnings: failureWarnings({
                     error: marked.left,
                     continued: continueOnError,
                   }),
-                }
+                })
               }
             } else if (step.kind === "sleep") {
               yield* Effect.sleep(step.durationMs)
-              stepResult = {
-                index: stepIndex + 1,
+              stepResult = buildFlowStepResult({
+                plannedStep,
                 kind: step.kind,
                 summary: `Slept for ${step.durationMs}ms.`,
                 verdict: "passed",
@@ -5255,19 +5533,110 @@ export const SessionRegistryLive = Layer.scoped(
                 latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                 retryCount: 0,
                 retryReasons: [],
-                artifacts: [],
+                handledMs: null,
                 warnings: [],
+              })
+            } else if (plannedStep.kind === "batch-sequence") {
+              let sequenceRetryCount = 0
+              const sequenceRetryReasons: Array<string> = []
+              let sequenceMatchedRef: string | null = null
+              let sequenceLatestSnapshotId = record.snapshotState.latest?.snapshotId ?? null
+              let sequenceHandledMs: number | null = null
+              let sequenceFailure: {
+                readonly error: SessionActionError | SessionNotFoundError
+                readonly child: FlowSequenceChildFailure
+              } | null = null
+
+              for (const [childIndex, action] of plannedStep.step.actions.entries()) {
+                const actionEffect = yield* Effect.either(executeSessionAction({
+                  sessionId,
+                  action: action as unknown as SessionAction,
+                  recordAction: false,
+                }))
+
+                if (actionEffect._tag === "Left") {
+                  sequenceFailure = {
+                    error: actionEffect.left,
+                    child: {
+                      index: childIndex + 1,
+                      kind: action.kind,
+                      summary: errorSummary(actionEffect.left),
+                    },
+                  }
+                  break
+                }
+
+                if (!actionEffect.right.ok) {
+                  sequenceRetryCount += actionEffect.right.retry.retryCount
+                  sequenceRetryReasons.push(...actionEffect.right.retry.retryReasons)
+                  sequenceFailure = {
+                    error: actionEffect.right.error,
+                    child: {
+                      index: childIndex + 1,
+                      kind: action.kind,
+                      summary: actionEffect.right.error.reason,
+                    },
+                  }
+                  break
+                }
+
+                const actionResult = actionEffect.right.result
+                sequenceRetryCount += actionResult.retryCount
+                sequenceRetryReasons.push(...actionResult.retryReasons)
+                sequenceMatchedRef = actionResult.matchedRef
+                sequenceLatestSnapshotId = actionResult.latestSnapshotId
+                sequenceHandledMs = actionResult.handledMs ?? sequenceHandledMs
+              }
+
+              if (sequenceFailure !== null) {
+                stepResult = buildFlowStepResult({
+                  plannedStep,
+                  kind: plannedStep.step.kind,
+                  summary: `Sequence child ${sequenceFailure.child.index} (${sequenceFailure.child.kind}) failed: ${sequenceFailure.child.summary}`,
+                  verdict: failureVerdict(sequenceFailure.error),
+                  matchedRef: null,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? sequenceLatestSnapshotId,
+                  retryCount: sequenceRetryCount,
+                  retryReasons: sequenceRetryReasons,
+                  handledMs: sequenceHandledMs,
+                  warnings: failureWarnings({
+                    error: sequenceFailure.error,
+                    continued: continueOnError,
+                  }),
+                  checkpoint: plannedStep.step.checkpoint ?? null,
+                  sequenceChildFailure: sequenceFailure.child,
+                })
+              } else {
+                stepResult = buildFlowStepResult({
+                  plannedStep,
+                  kind: plannedStep.step.kind,
+                  summary: `Executed sequence step with ${plannedStep.step.actions.length} child action(s) through the verified host lane.`,
+                  verdict: "passed",
+                  matchedRef: sequenceMatchedRef,
+                  latestSnapshotId: sequenceLatestSnapshotId,
+                  retryCount: sequenceRetryCount,
+                  retryReasons: sequenceRetryReasons,
+                  handledMs: sequenceHandledMs,
+                  warnings: successWarnings({
+                    step,
+                    baseWarnings: [],
+                  }),
+                  checkpoint: plannedStep.step.checkpoint ?? null,
+                  sequenceChildFailure: null,
+                })
               }
             } else {
-              const actionEffect = yield* Effect.either(executeSessionAction({
-                sessionId,
-                action: flowStepToSessionAction(step),
-                recordAction: false,
-              }))
+              const actionEffect = plannedStep.kind === "fast-single"
+                ? yield* Effect.either(executeFastSingleStep(plannedStep.step as FlowV2FastSingleStep))
+                : yield* Effect.either(executeSessionAction({
+                    sessionId,
+                    action: toSessionAction(step),
+                    recordAction: false,
+                  }))
 
               if (actionEffect._tag === "Left") {
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: errorSummary(actionEffect.left),
                   verdict: failureVerdict(actionEffect.left),
@@ -5275,15 +5644,15 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: 0,
                   retryReasons: [],
-                  artifacts: [],
+                  handledMs: null,
                   warnings: failureWarnings({
                     error: actionEffect.left,
                     continued: continueOnError,
                   }),
-                }
+                })
               } else if (!actionEffect.right.ok) {
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: actionEffect.right.error.reason,
                   verdict: failureVerdict(actionEffect.right.error),
@@ -5291,16 +5660,16 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
                   retryCount: actionEffect.right.retry.retryCount,
                   retryReasons: actionEffect.right.retry.retryReasons,
-                  artifacts: [],
+                  handledMs: null,
                   warnings: failureWarnings({
                     error: actionEffect.right.error,
                     continued: continueOnError,
                   }),
-                }
+                })
               } else {
                 const actionResult = actionEffect.right.result
-                stepResult = {
-                  index: stepIndex + 1,
+                stepResult = buildFlowStepResult({
+                  plannedStep,
                   kind: step.kind,
                   summary: actionResult.summary,
                   verdict: actionResult.verdict ?? "passed",
@@ -5308,23 +5677,20 @@ export const SessionRegistryLive = Layer.scoped(
                   latestSnapshotId: actionResult.latestSnapshotId,
                   retryCount: actionResult.retryCount,
                   retryReasons: actionResult.retryReasons,
-                  artifacts: [],
+                  handledMs: actionResult.handledMs ?? null,
                   warnings: successWarnings({
                     step,
                     baseWarnings: [],
                     resolvedBy: actionResult.resolvedBy,
                   }),
-                }
+                })
               }
             }
 
             yield* refreshSessionArtifacts(sessionId, record)
 
             const artifacts = diffArtifacts(beforeArtifacts, record.health.artifacts)
-            stepResult = {
-              ...stepResult,
-              artifacts,
-            }
+            stepResult = { ...stepResult, artifacts } as BuiltFlowStepResult
 
             executedSteps.push(stepResult)
             createdArtifacts.push(...artifacts)
@@ -5352,14 +5718,30 @@ export const SessionRegistryLive = Layer.scoped(
               ? `Flow ${overallVerdict === "timed-out" ? "timed out" : "failed"} at step ${failedStep.index} after ${executedSteps.length} executed step(s) and ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
               : `Executed ${executedSteps.length} flow step(s) with ${failedStepCount} failed step(s), continuing past failures where continueOnError was enabled.`
 
+          if (isV2SessionFlow) {
+            return {
+              contract: "probe.session-flow/report-v2",
+              executedAt: nowIso(),
+              sessionId,
+              summary,
+              verdict: overallVerdict,
+              executedSteps: executedSteps as Array<FlowV2StepResult>,
+              failedStep: failedStep as FlowV2FailedStep | null,
+              retries: totalRetries,
+              artifacts: dedupedArtifacts,
+              finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+              warnings: overallWarnings,
+            } satisfies FlowV2Result
+          }
+
           return {
             contract: "probe.session-flow/report-v1",
             executedAt: nowIso(),
             sessionId,
             summary,
             verdict: overallVerdict,
-            executedSteps,
-            failedStep,
+            executedSteps: executedSteps as Array<FlowStepResult>,
+            failedStep: failedStep as FlowFailedStep | null,
             retries: totalRetries,
             artifacts: dedupedArtifacts,
             finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,

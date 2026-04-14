@@ -5,6 +5,7 @@ import { dirname, join } from "node:path"
 import { Effect, Either, Layer, ManagedRuntime } from "effect"
 import type { ActionRecordingScript, FlowContract, ReplayReport } from "../domain/action"
 import type { SessionDebuggerDetails } from "../domain/debug"
+import type { FlowV2Contract } from "../domain/flow-v2"
 import {
   ArtifactNotFoundError,
   DeviceInterruptionError,
@@ -3191,6 +3192,295 @@ describe("SessionRegistry", () => {
         expect(result.executedSteps[2]?.kind).toBe("tap")
         expect(result.executedSteps[2]?.retryCount).toBe(2)
         expect(result.retries).toBe(4)
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("executes fast v2 single steps without pre/post snapshots", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const flow: FlowV2Contract = {
+          contract: "probe.session-flow/v2",
+          steps: [
+            {
+              kind: "tap",
+              execution: "fast",
+              target: {
+                kind: "semantic",
+                identifier: "fixture.navigation.detailButton",
+                label: null,
+                value: null,
+                placeholder: null,
+                type: "button",
+                section: null,
+                interactive: true,
+              },
+            },
+          ],
+        }
+
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("passed")
+        expect(result.executedSteps).toHaveLength(1)
+        expect(result.executedSteps[0]).toMatchObject({
+          kind: "tap",
+          executionProfile: "fast",
+          transportLane: "runner-single",
+          handledMs: 1,
+          latestSnapshotId: null,
+        })
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("captures failure evidence snapshots for fast v2 steps", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+        interceptUiAction: ({ kind, identifier }) => {
+          if (kind === "tap" && identifier === "fixture.problem.offscreenButton") {
+            return {
+              ok: false,
+              error: "Expected fixture.problem.offscreenButton to be hittable before tap.",
+            }
+          }
+
+          return null
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "tap",
+                execution: "fast",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.problem.offscreenButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+                retryPolicy: {
+                  maxAttempts: 1,
+                  backoffMs: 0,
+                  refreshSnapshotBetweenAttempts: false,
+                  retryOn: ["not-hittable"],
+                },
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("failed")
+        expect(result.failedStep?.index).toBe(1)
+        expect(result.executedSteps[0]?.executionProfile).toBe("fast")
+        expect(result.executedSteps[0]?.transportLane).toBe("runner-single")
+        expect(result.executedSteps[0]?.latestSnapshotId).not.toBeNull()
+        expect(result.executedSteps[0]?.artifacts.some((artifact) => artifact.kind === "json")).toBe(true)
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("runs mixed verified and fast v2 flows", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              { kind: "snapshot" },
+              {
+                kind: "tap",
+                execution: "fast",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.navigation.detailButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+              },
+              { kind: "screenshot", label: "mixed-flow" },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("passed")
+        expect(result.executedSteps.map((step) => [step.kind, step.executionProfile, step.transportLane])).toEqual([
+          ["snapshot", "verified", "host-single"],
+          ["tap", "fast", "runner-single"],
+          ["screenshot", "verified", "host-single"],
+        ])
+        expect(result.executedSteps[0]?.handledMs).toBe(1)
+        expect(result.executedSteps[1]?.handledMs).toBe(1)
+        expect(result.executedSteps[2]?.handledMs).toBeNull()
+        expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiAction"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("supports the go fast then assert final state pattern", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            execution: "fast",
+            steps: [
+              {
+                kind: "type",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.form.input",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "textField",
+                  section: null,
+                  interactive: true,
+                },
+                text: "delta",
+                replace: true,
+              },
+              {
+                kind: "tap",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.form.applyButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+              },
+              {
+                kind: "assert",
+                execution: "verified",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.status.label",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "staticText",
+                  section: null,
+                  interactive: false,
+                },
+                expectation: {
+                  exists: null,
+                  visible: null,
+                  hidden: null,
+                  text: null,
+                  label: "Input applied: delta",
+                  value: null,
+                  type: null,
+                  enabled: null,
+                  selected: null,
+                  focused: null,
+                  interactive: null,
+                },
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("passed")
+        expect(result.executedSteps.map((step) => [step.kind, step.executionProfile])).toEqual([
+          ["type", "fast"],
+          ["tap", "fast"],
+          ["assert", "verified"],
+        ])
+        expect(result.executedSteps[2]?.latestSnapshotId).not.toBeNull()
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "uiAction", "snapshot"])
       } finally {
         await runtime.dispose()
       }
