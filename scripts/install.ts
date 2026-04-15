@@ -1,108 +1,137 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync } from "fs";
-import { join } from "path";
-import { homedir, platform, arch } from "os";
+import { spawnSync } from "node:child_process"
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
+import { homedir } from "node:os"
+import { basename, dirname, join } from "node:path"
+import { pathToFileURL } from "node:url"
 
-const INSTALL_DIR = process.env.INSTALL_DIR || join(homedir(), ".local", "bin");
-const BINARY_NAME = "probe";
+const BIN_DIR = process.env.INSTALL_DIR || join(homedir(), ".local", "bin")
+const INSTALL_ROOT = process.env.PROBE_INSTALL_ROOT || join(homedir(), ".probe", "install")
+const BINARY_NAME = "probe"
+const DIST_SRC_DIR = join("dist", "src")
+const IOS_DIR = "ios"
+const ENTRY_POINT = join(INSTALL_ROOT, "dist", "src", "cli", "main.js")
 
-function detectPlatform(): string {
-  const os = platform();
-  const cpu = arch();
-
-  let platformStr: string;
-  switch (os) {
-    case "darwin":
-      platformStr = "darwin";
-      break;
-    case "linux":
-      platformStr = "linux";
-      break;
-    default:
-      console.error(`Unsupported operating system: ${os}`);
-      process.exit(1);
-  }
-
-  let archStr: string;
-  switch (cpu) {
-    case "x64":
-      archStr = "x64";
-      break;
-    case "arm64":
-      archStr = "arm64";
-      break;
-    default:
-      console.error(`Unsupported architecture: ${cpu}`);
-      process.exit(1);
-  }
-
-  return `${platformStr}-${archStr}`;
+const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+  readonly name?: string
+  readonly version?: string
+  readonly type?: string
+  readonly dependencies?: Record<string, string>
 }
 
-async function install() {
-  const platformArch = detectPlatform();
-  console.log(`Detected platform: ${platformArch}`);
-
-  const binaryPath = join("dist", `${BINARY_NAME}-${platformArch}`);
-
-  if (!existsSync(binaryPath)) {
-    console.error(`Binary not found: ${binaryPath}`);
-    console.error("Run 'bun run build' first to create the binaries.");
-    process.exit(1);
+const ensureBuildExists = () => {
+  if (!existsSync(join(DIST_SRC_DIR, "cli", "main.js"))) {
+    console.error(`Missing transpiled CLI entrypoint: ${join(DIST_SRC_DIR, "cli", "main.js")}`)
+    console.error("Run 'bun run build' first.")
+    process.exit(1)
   }
 
-  mkdirSync(INSTALL_DIR, { recursive: true });
+  if (!existsSync(IOS_DIR)) {
+    console.error(`Missing packaged iOS sources: ${IOS_DIR}`)
+    process.exit(1)
+  }
+}
 
-  const destPath = join(INSTALL_DIR, BINARY_NAME);
+const shouldCopyIosPath = (source: string): boolean => {
+  const name = basename(source)
 
-  console.log(`Installing to ${destPath}...`);
-  await Bun.$`cp ${binaryPath} ${destPath}`;
-  await Bun.$`chmod +x ${destPath}`;
-
-  try {
-    await Bun.$`codesign --remove-signature ${destPath}`.quiet();
-  } catch {
-    // fresh binaries may not have a removable signature yet
+  if (name === ".DS_Store" || name === ".build" || name === "xcuserdata") {
+    return false
   }
 
-  try {
-    await Bun.$`codesign --sign - --force ${destPath}`.quiet();
-    console.log("Binary signed (ad-hoc)");
-  } catch (error) {
-    console.log("Ad-hoc signing failed; the installed binary may be killed by macOS until it is re-signed manually.");
-    throw error;
+  return !source.endsWith(".xcuserstate")
+}
+
+const writeProductionPackageJson = () => {
+  const productionPackageJson = {
+    name: packageJson.name ?? "probe-cli",
+    version: packageJson.version ?? "0.0.0",
+    private: true,
+    type: packageJson.type ?? "module",
+    dependencies: packageJson.dependencies ?? {},
   }
 
-  // Remove macOS provenance/quarantine attributes that block locally-built binaries
-  try {
-    await Bun.$`xattr -d com.apple.provenance ${destPath}`.quiet();
-    await Bun.$`xattr -d com.apple.quarantine ${destPath}`.quiet();
-  } catch {
-    // attrs may not be present, that's fine
+  writeFileSync(
+    join(INSTALL_ROOT, "package.json"),
+    `${JSON.stringify(productionPackageJson, null, 2)}\n`,
+  )
+}
+
+const installProductionDependencies = () => {
+  console.log("Installing production dependencies...")
+
+  const result = spawnSync(process.execPath, ["install", "--production"], {
+    cwd: INSTALL_ROOT,
+    env: process.env,
+    stdio: "inherit",
+  })
+
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1)
   }
+}
 
-  console.log(`\nInstalled ${BINARY_NAME} to ${destPath}`);
+const writeBinShim = () => {
+  const destPath = join(BIN_DIR, BINARY_NAME)
+  const entryUrl = pathToFileURL(ENTRY_POINT).href
+  const script = `#!/usr/bin/env bun
 
-  // Check if INSTALL_DIR is in PATH
-  const pathDirs = (process.env.PATH || "").split(":");
-  if (!pathDirs.includes(INSTALL_DIR)) {
+await import(${JSON.stringify(entryUrl)})
+`
+
+  mkdirSync(dirname(destPath), { recursive: true })
+  writeFileSync(destPath, script)
+  chmodSync(destPath, 0o755)
+
+  return destPath
+}
+
+const install = () => {
+  ensureBuildExists()
+
+  console.log(`Installing package tree to ${INSTALL_ROOT}...`)
+  rmSync(INSTALL_ROOT, { recursive: true, force: true })
+  mkdirSync(INSTALL_ROOT, { recursive: true })
+
+  cpSync(DIST_SRC_DIR, join(INSTALL_ROOT, "dist", "src"), {
+    recursive: true,
+    force: true,
+  })
+
+  cpSync(IOS_DIR, join(INSTALL_ROOT, IOS_DIR), {
+    recursive: true,
+    force: true,
+    filter: shouldCopyIosPath,
+  })
+
+  writeProductionPackageJson()
+  installProductionDependencies()
+
+  const binPath = writeBinShim()
+
+  console.log(`\nInstalled ${BINARY_NAME} to ${binPath}`)
+  console.log(`Runtime package root: ${INSTALL_ROOT}`)
+
+  const pathDirs = (process.env.PATH || "").split(":")
+  if (!pathDirs.includes(BIN_DIR)) {
     console.log(`
-Note: ${INSTALL_DIR} is not in your PATH.
+Note: ${BIN_DIR} is not in your PATH.
 Add it to your shell configuration:
 
-  # bash (~/.bashrc or ~/.bash_profile)
   export PATH="$HOME/.local/bin:$PATH"
-
-  # zsh (~/.zshrc)
-  export PATH="$HOME/.local/bin:$PATH"
-
-  # fish (~/.config/fish/config.fish)
-  set -gx PATH $HOME/.local/bin $PATH
-`);
+`)
   }
 
-  console.log(`\nRun '${BINARY_NAME} doctor' to get started.`);
+  console.log(`\nRun '${BINARY_NAME} doctor --json' to verify the install.`)
 }
 
-install();
+install()
