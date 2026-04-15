@@ -9,7 +9,8 @@ import {
 import { SessionFlowContractSchema, SessionFlowResultSchema } from "../domain/flow-v2"
 import { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
-import { ProbeFailurePayload, ProtocolMismatchError } from "../domain/errors"
+import { ProtocolMismatchError } from "../domain/errors"
+import type { ProbeFailurePayload } from "../domain/errors"
 import {
   DrillQuery,
   DrillResult,

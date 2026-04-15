@@ -4,18 +4,16 @@ import { Effect, Either } from "effect"
 import {
   EnvironmentError,
   isProbeError,
-  ProbeError,
   toFailurePayload,
 } from "../domain/errors"
+import type { ProbeError } from "../domain/errors"
 import {
   createFailureFrame,
   decodeRpcRequestLine,
   encodeRpcLine,
   PROBE_PROTOCOL_VERSION,
-  RpcProgressEvent,
-  RpcRequest,
-  RpcResponse,
 } from "./protocol"
+import type { RpcProgressEvent, RpcRequest, RpcResponse } from "./protocol"
 
 export interface RpcServerConfig {
   readonly socketPath: string
