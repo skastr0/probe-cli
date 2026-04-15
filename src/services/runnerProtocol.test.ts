@@ -19,6 +19,7 @@ const makeSimulatorReadyFrame = (): Record<string, unknown> => ({
   attachLatencyMs: 21,
   bootstrapPath: "/tmp/probe-runner-bootstrap/SIM-1.json",
   bootstrapSource: "simulator-bootstrap-manifest",
+  capabilities: ["uiAction", "uiActionBatch"],
   controlDirectoryPath: "/tmp/probe-runtime/session-1",
   currentDirectoryPath: "/",
   egressTransport: "stdout-jsonl-mixed-log",
@@ -59,6 +60,7 @@ describe("runner protocol", () => {
     expect(ready.ingressTransport).toBe(RUNNER_HTTP_COMMAND_INGRESS)
     expect(ready.egressTransport).toBe("stdout-jsonl-mixed-log")
     expect(ready.runnerPort).toBe(41041)
+    expect(ready.capabilities).toEqual(["uiAction", "uiActionBatch"])
   })
 
   test("decodes the snapshot response shape Probe consumes from local runner output", () => {
@@ -92,6 +94,34 @@ describe("runner protocol", () => {
       action: "uiAction",
       payload: '{"kind":"tap"}',
     })
+  })
+
+  test("decodes batch response metadata for runner sequence execution", () => {
+    const response = decodeRunnerResponseFrame({
+      kind: "response",
+      sequence: 9,
+      ok: false,
+      action: "uiActionBatch",
+      error: "tap on fixture.form.applyButton failed",
+      payload: null,
+      snapshotPayloadPath: null,
+      inlinePayload: null,
+      inlinePayloadEncoding: null,
+      handledMs: 7,
+      statusLabel: "Batch failed",
+      snapshotNodeCount: null,
+      failedActionIndex: 1,
+      failedActionKind: "tap",
+      totalHandledMs: 12,
+      childHandledMs: [4, 8, null],
+      recordedAt: "2026-04-14T00:00:00.000Z",
+    })
+
+    expect(response.action).toBe("uiActionBatch")
+    expect(response.failedActionIndex).toBe(1)
+    expect(response.failedActionKind).toBe("tap")
+    expect(response.totalHandledMs).toBe(12)
+    expect(response.childHandledMs).toEqual([4, 8, null])
   })
 
   test("fails with a focused error when a ready frame loses session identity", () => {

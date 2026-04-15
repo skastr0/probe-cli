@@ -1,7 +1,13 @@
 import { Schema } from "effect"
+import { RunnerCapabilityFlag } from "../domain/session"
 
 const OptionalNullableString = Schema.Union(Schema.String, Schema.Null, Schema.Undefined)
 const OptionalNullableNumber = Schema.Union(Schema.Number, Schema.Null, Schema.Undefined)
+const OptionalNullableNumberArray = Schema.Union(
+  Schema.Array(Schema.Union(Schema.Number, Schema.Null)),
+  Schema.Null,
+  Schema.Undefined,
+)
 const OptionalString = Schema.Union(Schema.String, Schema.Undefined)
 
 export const RUNNER_TRANSPORT_CONTRACT = "probe.runner.transport/hybrid-v1"
@@ -10,7 +16,19 @@ export const RUNNER_EVENT_EGRESS = "stdout-jsonl-mixed-log"
 const RunnerBootstrapSourceSchema = Schema.Literal("simulator-bootstrap-manifest", "device-bootstrap-manifest")
 const RunnerReadyIngressTransportSchema = Schema.Literal(RUNNER_HTTP_COMMAND_INGRESS)
 
-export const RunnerActionSchema = Schema.Literal("ping", "applyInput", "snapshot", "screenshot", "recordVideo", "shutdown", "uiAction")
+export const RunnerCapabilitySchema = RunnerCapabilityFlag
+export type RunnerCapability = typeof RunnerCapabilitySchema.Type
+
+export const RunnerActionSchema = Schema.Literal(
+  "ping",
+  "applyInput",
+  "snapshot",
+  "screenshot",
+  "recordVideo",
+  "shutdown",
+  "uiAction",
+  "uiActionBatch",
+)
 export type RunnerAction = typeof RunnerActionSchema.Type
 
 export const RunnerBootstrapManifestSchema = Schema.Struct({
@@ -37,6 +55,7 @@ export const RunnerReadyFrameSchema = Schema.Struct({
   attachLatencyMs: Schema.Number,
   bootstrapPath: Schema.String,
   bootstrapSource: RunnerBootstrapSourceSchema,
+  capabilities: Schema.optional(Schema.Array(RunnerCapabilitySchema)),
   controlDirectoryPath: Schema.String,
   currentDirectoryPath: Schema.String,
   egressTransport: Schema.Literal(RUNNER_EVENT_EGRESS),
@@ -66,6 +85,10 @@ export const RunnerResponseFrameSchema = Schema.Struct({
   handledMs: Schema.Number,
   statusLabel: Schema.String,
   snapshotNodeCount: OptionalNullableNumber,
+  failedActionIndex: OptionalNullableNumber,
+  failedActionKind: OptionalNullableString,
+  totalHandledMs: OptionalNullableNumber,
+  childHandledMs: OptionalNullableNumberArray,
   recordedAt: Schema.String,
   hostObservedAt: OptionalString,
 })
