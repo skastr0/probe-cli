@@ -41,6 +41,7 @@ import {
   validateSessionFlowContract,
   type FlowSequenceAction,
   type FlowSequenceChildFailure,
+  type FlowSequenceStep,
   type FlowV2FastSingleStep,
   type FlowV2FailedStep,
   type FlowV2Result,
@@ -83,6 +84,7 @@ import type {
 import { appendSessionLogMarkers, summarizeContent } from "../domain/output"
 import {
   SessionHealth,
+  isLiveRunnerDetails,
   type SessionConnectionDetails,
   type SessionHealthCheck,
   type SessionListEntry,
@@ -101,6 +103,7 @@ import {
   RealDeviceHarness,
 } from "./RealDeviceHarness"
 import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
+import type { RunnerAction } from "./runnerProtocol"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
 const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
@@ -712,7 +715,7 @@ interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
   nextSequence: number
   readonly sendRunnerCommand: (
     sequence: number,
-    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+    action: RunnerAction,
     payload?: string,
   ) => Promise<RunnerCommandResult>
   readonly closeResources: () => Promise<void>
@@ -726,7 +729,7 @@ interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
   nextSequence: number
   readonly sendRunnerCommand: ((
     sequence: number,
-    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+    action: RunnerAction,
     payload?: string,
   ) => Promise<RunnerCommandResult>) | null
   readonly refreshConnection: () => Promise<SessionConnectionDetails>
@@ -1130,6 +1133,7 @@ const buildSimulatorCapabilities = (): ReadonlyArray<CapabilityReport> => [
     details: [
       "xcodebuild stdin is not treated as a usable host-to-runner transport in this slice.",
       "The same runner transport is used for both Probe's built-in fixture app and attach-to-running simulator sessions.",
+      "Runner feature flags such as uiAction and uiActionBatch are reported under session health runner details.",
     ],
   },
   {
@@ -1204,6 +1208,7 @@ const buildRealDeviceCapabilities = (args: {
       ? [
           "Command ingress uses the runner-local HTTP listener reported in the ready frame.",
           "Ready-state events are still parsed from stdout JSONL frames embedded in the mixed xcodebuild/XCTest log stream.",
+          "Runner feature flags such as uiAction and uiActionBatch are reported under session health runner details.",
         ]
       : [
           "The Simulator bootstrap-manifest transport is not claimed for real devices.",
@@ -1550,7 +1555,7 @@ export const SessionRegistryLive = Layer.scoped(
     const sendRunnerCommand = (
       sessionId: string,
       record: RunnerBackedActiveSessionRecord,
-      action: "ping" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+      action: RunnerAction,
       payload?: string,
     ) =>
       Effect.tryPromise({
@@ -3973,6 +3978,7 @@ export const SessionRegistryLive = Layer.scoped(
                       stdinProbeStatus: opened.stdinProbeStatus,
                       connectionStatus: opened.connection.status,
                       lastCheckedAt: opened.connection.checkedAt,
+                      capabilities: [...opened.capabilities],
                       note:
                         "The real-device runner is live over HTTP POST command ingress with stdout-JSONL mixed-log observation for readiness and diagnostics.",
                     },
@@ -4198,6 +4204,7 @@ export const SessionRegistryLive = Layer.scoped(
                       resultBundlePath: opened.resultBundlePath,
                       wrapperStderrPath: opened.wrapperStderrPath,
                       stdinProbeStatus: opened.stdinProbeStatus,
+                      capabilities: [...opened.capabilities],
                     },
                     healthCheck,
                     debugger: debuggerState,
@@ -5068,7 +5075,9 @@ export const SessionRegistryLive = Layer.scoped(
               return null
             }
 
-            return plannedStep.kind === "fast-single" ? "fast" : "verified"
+            return plannedStep.kind === "fast-single" || plannedStep.kind === "batch-sequence"
+              ? "fast"
+              : "verified"
           }
 
           const plannedTransportLane = (plannedStep: PlannedStep): FlowStepResult["transportLane"] => {
@@ -5076,11 +5085,91 @@ export const SessionRegistryLive = Layer.scoped(
               return null
             }
 
+            if (plannedStep.kind === "batch-sequence") {
+              return "runner-batch"
+            }
+
             if (plannedStep.kind !== "fast-single") {
               return "host-single"
             }
 
             return plannedStep.step.kind === "wait" ? "host-single" : "runner-single"
+          }
+
+          const runnerSupportsCapability = (
+            activeRecord: ActiveSessionRecord,
+            capability: "uiAction" | "uiActionBatch",
+          ): boolean =>
+            isLiveRunnerDetails(activeRecord.health.runner)
+            && (activeRecord.health.runner.capabilities ?? []).includes(capability)
+
+          const describeRunnerCapabilities = (activeRecord: ActiveSessionRecord): string =>
+            isLiveRunnerDetails(activeRecord.health.runner)
+              ? (activeRecord.health.runner.capabilities ?? []).join(", ") || "none"
+              : "none"
+
+          type RunnerBatchWaitActionPayload = {
+            readonly kind: "wait"
+            readonly timeoutMs: number
+          }
+
+          type RunnerBatchSequenceActionPayload = ReturnType<typeof buildDirectRunnerUiActionPayload> | RunnerBatchWaitActionPayload
+
+          type RunnerBatchSequencePayload = {
+            readonly actions: ReadonlyArray<RunnerBatchSequenceActionPayload>
+          }
+
+          const buildRunnerBatchSequencePayload = (actions: ReadonlyArray<FlowSequenceAction>): RunnerBatchSequencePayload => ({
+            actions: actions.map((action) => {
+              switch (action.kind) {
+                case "wait":
+                  return {
+                    kind: "wait",
+                    timeoutMs: action.timeoutMs,
+                  }
+                case "tap":
+                case "press":
+                case "swipe":
+                case "type":
+                case "scroll":
+                  return buildDirectRunnerUiActionPayload(action, action.target)
+              }
+            }),
+          })
+
+          const toFlowSequenceActionKind = (value: string | null | undefined): FlowSequenceAction["kind"] | null => {
+            switch (value) {
+              case "tap":
+              case "press":
+              case "swipe":
+              case "type":
+              case "scroll":
+              case "wait":
+                return value
+              default:
+                return null
+            }
+          }
+
+          const buildBatchSequenceChildFailure = (args: {
+            readonly step: FlowSequenceStep
+            readonly response: RunnerCommandResult
+            readonly failureReason: string
+          }): FlowSequenceChildFailure | null => {
+            const rawIndex = args.response.failedActionIndex
+
+            if (rawIndex === null || rawIndex === undefined || !Number.isInteger(rawIndex) || rawIndex < 0) {
+              return null
+            }
+
+            const plannedChild = args.step.actions[rawIndex]
+            const fallbackKind = toFlowSequenceActionKind(args.response.failedActionKind)
+
+            return {
+              index: rawIndex + 1,
+              kind: plannedChild?.kind ?? fallbackKind ?? "tap",
+              summary: args.failureReason,
+            }
           }
 
           type BuiltFlowStepResult = FlowStepResult | FlowV2StepResult
@@ -5200,6 +5289,17 @@ export const SessionRegistryLive = Layer.scoped(
                   reason: "This session does not currently expose a live runner transport for fast flow actions.",
                   nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
                   details: [],
+                  wall: false,
+                })
+              }
+
+              if (!runnerSupportsCapability(record, "uiAction")) {
+                return yield* new UnsupportedCapabilityError({
+                  code: "session-runner-capability-ui-action",
+                  capability: "session.run.fast",
+                  reason: "The connected runner does not advertise uiAction support required for fast single-step flow execution.",
+                  nextStep: "Open a session against a runner that reports uiAction capability, or switch the flow step back to verified execution.",
+                  details: [`runner capabilities: ${describeRunnerCapabilities(record)}`],
                   wall: false,
                 })
               }
@@ -5537,93 +5637,182 @@ export const SessionRegistryLive = Layer.scoped(
                 warnings: [],
               })
             } else if (plannedStep.kind === "batch-sequence") {
-              let sequenceRetryCount = 0
-              const sequenceRetryReasons: Array<string> = []
-              let sequenceMatchedRef: string | null = null
-              let sequenceLatestSnapshotId = record.snapshotState.latest?.snapshotId ?? null
-              let sequenceHandledMs: number | null = null
-              let sequenceFailure: {
-                readonly error: SessionActionError | SessionNotFoundError
-                readonly child: FlowSequenceChildFailure
-              } | null = null
-
-              for (const [childIndex, action] of plannedStep.step.actions.entries()) {
-                const actionEffect = yield* Effect.either(executeSessionAction({
-                  sessionId,
-                  action: action as unknown as SessionAction,
-                  recordAction: false,
-                }))
-
-                if (actionEffect._tag === "Left") {
-                  sequenceFailure = {
-                    error: actionEffect.left,
-                    child: {
-                      index: childIndex + 1,
-                      kind: action.kind,
-                      summary: errorSummary(actionEffect.left),
-                    },
+              const checkpoint = plannedStep.step.checkpoint ?? "none"
+              const batchEffect = yield* Effect.either(
+                Effect.gen(function* () {
+                  if (!isRunnerBackedRecord(record)) {
+                    return yield* new UnsupportedCapabilityError({
+                      code: "session-action-real-device-runner",
+                      capability: "session.run.sequence.batch",
+                      reason: "This session does not currently expose a live runner transport for batch sequence flow steps.",
+                      nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+                      details: [],
+                      wall: false,
+                    })
                   }
-                  break
-                }
 
-                if (!actionEffect.right.ok) {
-                  sequenceRetryCount += actionEffect.right.retry.retryCount
-                  sequenceRetryReasons.push(...actionEffect.right.retry.retryReasons)
-                  sequenceFailure = {
-                    error: actionEffect.right.error,
-                    child: {
-                      index: childIndex + 1,
-                      kind: action.kind,
-                      summary: actionEffect.right.error.reason,
-                    },
+                  if (!runnerSupportsCapability(record, "uiActionBatch")) {
+                    return yield* new UnsupportedCapabilityError({
+                      code: "session-runner-capability-ui-action-batch",
+                      capability: "session.run.sequence.batch",
+                      reason: "The connected runner does not advertise uiActionBatch support required for fast sequence execution.",
+                      nextStep: "Open a session against a runner that reports uiActionBatch capability, or rewrite the flow as verified single steps.",
+                      details: [`runner capabilities: ${describeRunnerCapabilities(record)}`],
+                      wall: false,
+                    })
                   }
-                  break
-                }
 
-                const actionResult = actionEffect.right.result
-                sequenceRetryCount += actionResult.retryCount
-                sequenceRetryReasons.push(...actionResult.retryReasons)
-                sequenceMatchedRef = actionResult.matchedRef
-                sequenceLatestSnapshotId = actionResult.latestSnapshotId
-                sequenceHandledMs = actionResult.handledMs ?? sequenceHandledMs
-              }
+                  const payload = yield* Effect.try({
+                    try: () => buildRunnerBatchSequencePayload(plannedStep.step.actions),
+                    catch: (error) =>
+                      new EnvironmentError({
+                        code: "session-action-target-not-found",
+                        reason: error instanceof Error ? error.message : String(error),
+                        nextStep: "Use semantic selectors, point selectors, or ref selectors with semantic fallbacks for batched sequence actions.",
+                        details: [],
+                      }),
+                  })
 
-              if (sequenceFailure !== null) {
+                  const response = yield* sendRunnerCommand(
+                    sessionId,
+                    record,
+                    "uiActionBatch",
+                    JSON.stringify(payload),
+                  )
+                  record.nextSequence += 1
+                  updateHealthCheck(record, response.action, response.ok)
+
+                  const checkpointCapture = checkpoint === "end"
+                    ? yield* Effect.either(captureSnapshotArtifactInternal(sessionId, record))
+                    : null
+
+                  if (checkpoint === "none") {
+                    yield* persistRecordHealth(sessionId, record)
+                  }
+
+                  return {
+                    response,
+                    checkpointCapture,
+                  }
+                }),
+              )
+
+              if (batchEffect._tag === "Left") {
                 stepResult = buildFlowStepResult({
                   plannedStep,
                   kind: plannedStep.step.kind,
-                  summary: `Sequence child ${sequenceFailure.child.index} (${sequenceFailure.child.kind}) failed: ${sequenceFailure.child.summary}`,
-                  verdict: failureVerdict(sequenceFailure.error),
+                  summary: errorSummary(batchEffect.left),
+                  verdict: failureVerdict(batchEffect.left),
                   matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? sequenceLatestSnapshotId,
-                  retryCount: sequenceRetryCount,
-                  retryReasons: sequenceRetryReasons,
-                  handledMs: sequenceHandledMs,
+                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                  retryCount: 0,
+                  retryReasons: [],
+                  handledMs: null,
                   warnings: failureWarnings({
-                    error: sequenceFailure.error,
+                    error: batchEffect.left,
                     continued: continueOnError,
                   }),
-                  checkpoint: plannedStep.step.checkpoint ?? null,
-                  sequenceChildFailure: sequenceFailure.child,
-                })
-              } else {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: plannedStep.step.kind,
-                  summary: `Executed sequence step with ${plannedStep.step.actions.length} child action(s) through the verified host lane.`,
-                  verdict: "passed",
-                  matchedRef: sequenceMatchedRef,
-                  latestSnapshotId: sequenceLatestSnapshotId,
-                  retryCount: sequenceRetryCount,
-                  retryReasons: sequenceRetryReasons,
-                  handledMs: sequenceHandledMs,
-                  warnings: successWarnings({
-                    step,
-                    baseWarnings: [],
-                  }),
-                  checkpoint: plannedStep.step.checkpoint ?? null,
+                  checkpoint,
                   sequenceChildFailure: null,
                 })
+              } else {
+                const { response, checkpointCapture } = batchEffect.right
+                const checkpointSnapshot = checkpointCapture !== null && checkpointCapture._tag === "Right"
+                  ? checkpointCapture.right
+                  : null
+                const checkpointError = checkpointCapture !== null && checkpointCapture._tag === "Left"
+                  ? checkpointCapture.left
+                  : null
+                const batchHandledMs = response.totalHandledMs ?? response.handledMs
+                const latestSnapshotId = checkpointSnapshot?.artifact.snapshotId
+                  ?? record.snapshotState.latest?.snapshotId
+                  ?? null
+
+                if (!response.ok) {
+                  const failureReason = response.error
+                    ?? response.payload
+                    ?? `Runner batch sequence failed with status ${response.statusLabel}.`
+                  const sequenceChildFailure = buildBatchSequenceChildFailure({
+                    step: plannedStep.step,
+                    response,
+                    failureReason,
+                  })
+                  const batchFailure = new EnvironmentError({
+                    code: classifyFastFailureCode(failureReason),
+                    reason: failureReason,
+                    nextStep: withOffscreenNextStep(
+                      "Inspect the latest runner log artifacts, refine the direct selectors, and retry the batch sequence step.",
+                      failureReason,
+                    ),
+                    details: [],
+                  })
+                  const warnings = failureWarnings({
+                    error: batchFailure,
+                    continued: continueOnError,
+                  })
+
+                  if (checkpointError) {
+                    warnings.push(
+                      `Requested end checkpoint failed after the batch error: ${checkpointError.reason}`,
+                      ...("details" in checkpointError && Array.isArray(checkpointError.details) ? checkpointError.details : []),
+                    )
+                  }
+
+                  stepResult = buildFlowStepResult({
+                    plannedStep,
+                    kind: plannedStep.step.kind,
+                    summary: sequenceChildFailure
+                      ? `Sequence child ${sequenceChildFailure.index} (${sequenceChildFailure.kind}) failed in runner batch lane: ${sequenceChildFailure.summary}`
+                      : failureReason,
+                    verdict: failureVerdict(batchFailure),
+                    matchedRef: null,
+                    latestSnapshotId,
+                    retryCount: 0,
+                    retryReasons: [],
+                    handledMs: batchHandledMs,
+                    warnings: dedupeStrings(warnings),
+                    checkpoint,
+                    sequenceChildFailure,
+                  })
+                } else if (checkpointError) {
+                  stepResult = buildFlowStepResult({
+                    plannedStep,
+                    kind: plannedStep.step.kind,
+                    summary: `Batch sequence executed, but the requested end checkpoint failed: ${checkpointError.reason}`,
+                    verdict: failureVerdict(checkpointError),
+                    matchedRef: null,
+                    latestSnapshotId,
+                    retryCount: 0,
+                    retryReasons: [],
+                    handledMs: batchHandledMs,
+                    warnings: failureWarnings({
+                      error: checkpointError,
+                      continued: continueOnError,
+                    }),
+                    checkpoint,
+                    sequenceChildFailure: null,
+                  })
+                } else {
+                  stepResult = buildFlowStepResult({
+                    plannedStep,
+                    kind: plannedStep.step.kind,
+                    summary: checkpoint === "end"
+                      ? `Executed fast sequence step with ${plannedStep.step.actions.length} child action(s) through the runner batch lane; captured ${latestSnapshotId}.`
+                      : `Executed fast sequence step with ${plannedStep.step.actions.length} child action(s) through the runner batch lane without host checkpoints.`,
+                    verdict: "passed",
+                    matchedRef: null,
+                    latestSnapshotId,
+                    retryCount: 0,
+                    retryReasons: [],
+                    handledMs: batchHandledMs,
+                    warnings: successWarnings({
+                      step,
+                      baseWarnings: [],
+                    }),
+                    checkpoint,
+                    sequenceChildFailure: null,
+                  })
+                }
               }
             } else {
               const actionEffect = plannedStep.kind === "fast-single"

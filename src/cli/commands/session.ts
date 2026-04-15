@@ -92,6 +92,7 @@ const formatSessionHealth = (health: SessionHealth): string => {
     ? [
         `wrapper running: ${health.healthCheck.wrapperRunning}`,
         `last ping rtt: ${health.healthCheck.pingRttMs ?? "n/a"}`,
+        `runner capabilities: ${(health.runner.capabilities ?? []).join(", ") || "none"}`,
         `runner log: ${health.runner.logPath}`,
         `result bundle: ${health.runner.resultBundlePath}`,
       ]

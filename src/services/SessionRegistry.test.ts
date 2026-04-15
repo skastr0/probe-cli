@@ -18,6 +18,7 @@ import { PROBE_PROTOCOL_VERSION } from "../rpc/protocol"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { RealDeviceHarness } from "./RealDeviceHarness"
+import type { RunnerAction } from "./runnerProtocol"
 import { buildSessionCoordination, SessionRegistry, SessionRegistryLive } from "./SessionRegistry"
 import { SimulatorHarness } from "./SimulatorHarness"
 import { type LldbBridgeHandle, LldbBridgeFactory, type LldbBridgeResponseFrame } from "./LldbBridge"
@@ -483,6 +484,7 @@ const createFakeHarness = (options?: {
   readonly releaseOpen?: Promise<void>
   readonly failWith?: Error
   readonly captureOpenArgs?: (args: FakeHarnessOpenArgs) => void
+  readonly runnerCapabilities?: ReadonlyArray<"uiAction" | "uiActionBatch">
   readonly captureSessionControl?: (control: FakeHarnessSessionControl) => void
   readonly captureRunnerCommand?: (command: FakeHarnessRunnerCommand) => void
   readonly interceptSnapshot?: (
@@ -575,6 +577,7 @@ const createFakeHarness = (options?: {
           let inputValue = ""
           let uiActionCallCount = 0
           let snapshotCallCount = 0
+          const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction", "uiActionBatch"]
 
           const buildSnapshotPayload = () => ({
             capturedAt: "2026-04-10T00:00:00.000Z",
@@ -677,8 +680,7 @@ const createFakeHarness = (options?: {
             },
           })
 
-          const handleUiAction = (payload: string | undefined | null): FakeHarnessUiActionInterceptResult => {
-            const command = JSON.parse(payload ?? "{}") as {
+          const handleUiActionCommand = (command: {
               readonly kind?: string
               readonly locator?: {
                 readonly identifier?: string | null
@@ -686,7 +688,7 @@ const createFakeHarness = (options?: {
               }
               readonly text?: string | null
               readonly replace?: boolean | null
-            }
+            }): FakeHarnessUiActionInterceptResult => {
             const identifier = command.locator?.identifier ?? null
             const label = command.locator?.label ?? null
             uiActionCallCount += 1
@@ -747,6 +749,69 @@ const createFakeHarness = (options?: {
             }
           }
 
+          const handleUiAction = (payload: string | undefined | null): FakeHarnessUiActionInterceptResult =>
+            handleUiActionCommand(JSON.parse(payload ?? "{}") as {
+              readonly kind?: string
+              readonly locator?: {
+                readonly identifier?: string | null
+                readonly label?: string | null
+              }
+              readonly text?: string | null
+              readonly replace?: boolean | null
+            })
+
+          const handleUiActionBatch = (payload: string | undefined | null) => {
+            const parsed = JSON.parse(payload ?? "{}") as {
+              readonly actions?: ReadonlyArray<{
+                readonly kind?: string
+                readonly locator?: {
+                  readonly identifier?: string | null
+                  readonly label?: string | null
+                }
+                readonly text?: string | null
+                readonly replace?: boolean | null
+                readonly timeoutMs?: number | null
+              }>
+            }
+            const actions = parsed.actions ?? []
+            const childHandledMs: Array<number | null> = []
+            let totalHandledMs = 0
+
+            for (const [index, action] of actions.entries()) {
+              if (action.kind === "wait") {
+                childHandledMs.push(1)
+                totalHandledMs += 1
+                continue
+              }
+
+              const handled = handleUiActionCommand(action)
+              childHandledMs.push(1)
+              totalHandledMs += 1
+
+              if (!handled.ok) {
+                return {
+                  ok: false,
+                  payload: handled.payload ?? null,
+                  error: handled.error ?? null,
+                  failedActionIndex: index,
+                  failedActionKind: action.kind ?? null,
+                  totalHandledMs,
+                  childHandledMs,
+                }
+              }
+            }
+
+            return {
+              ok: true,
+              payload: `executed ${actions.length} batched action(s)`,
+              error: null,
+              failedActionIndex: null,
+              failedActionKind: null,
+              totalHandledMs,
+              childHandledMs,
+            }
+          }
+
           return {
             simulator: {
               udid: args.simulatorUdid ?? "sim-001",
@@ -774,7 +839,8 @@ const createFakeHarness = (options?: {
             stdinProbeStatus: "not-required-http",
             initialPingRttMs: 5,
             nextSequence: 2,
-            sendCommand: async (_sequence, action, payload) => {
+            capabilities: runnerCapabilities,
+            sendCommand: async (_sequence, action: RunnerAction, payload) => {
               options?.captureRunnerCommand?.({
                 sequence: _sequence,
                 action,
@@ -826,6 +892,25 @@ const createFakeHarness = (options?: {
                   payload: handled.payload ?? null,
                   snapshotPayloadPath: null,
                   handledMs: 1,
+                  statusLabel,
+                  snapshotNodeCount: null,
+                  hostRttMs: 1,
+                }
+              }
+
+              if (action === "uiActionBatch") {
+                const handled = handleUiActionBatch(payload)
+                return {
+                  ok: handled.ok,
+                  action,
+                  error: handled.error ?? null,
+                  payload: handled.payload ?? null,
+                  snapshotPayloadPath: null,
+                  handledMs: handled.totalHandledMs ?? 0,
+                  totalHandledMs: handled.totalHandledMs ?? 0,
+                  childHandledMs: handled.childHandledMs,
+                  failedActionIndex: handled.failedActionIndex,
+                  failedActionKind: handled.failedActionKind,
                   statusLabel,
                   snapshotNodeCount: null,
                   hostRttMs: 1,
@@ -989,6 +1074,7 @@ const createFakeRealDeviceHarness = (options?: {
   readonly connectionStates?: ReadonlyArray<"connected" | "disconnected">
   readonly pingStatusLabels?: ReadonlyArray<string>
 }) => {
+  const runnerCapabilities = ["uiAction", "uiActionBatch"] as const
   let connectionIndex = 0
   let pingStatusLabelIndex = 0
   let running = true
@@ -1213,7 +1299,8 @@ const createFakeRealDeviceHarness = (options?: {
             launchJsonPath,
             nextSequence: 2,
             initialPingRttMs: 18,
-            sendCommand: async (sequence, action) => {
+            capabilities: [...runnerCapabilities],
+            sendCommand: async (sequence, action: RunnerAction) => {
               const configuredPingStatusLabel = action === "ping"
                 ? options?.pingStatusLabels?.[Math.min(
                     pingStatusLabelIndex,
@@ -3329,6 +3416,278 @@ describe("SessionRegistry", () => {
     })
   })
 
+  test("executes fast v2 sequence steps through the runner batch lane", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+
+        if (session.runner.kind !== "simulator-runner") {
+          throw new Error(`Expected a simulator runner session, received ${session.runner.kind}.`)
+        }
+
+        expect(session.runner.capabilities).toContain("uiActionBatch")
+
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "sequence",
+                execution: "fast",
+                checkpoint: "end",
+                actions: [
+                  {
+                    kind: "type",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.form.input",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "textField",
+                      section: null,
+                      interactive: true,
+                    },
+                    text: "delta",
+                    replace: true,
+                  },
+                  {
+                    kind: "tap",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.form.applyButton",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "button",
+                      section: null,
+                      interactive: true,
+                    },
+                  },
+                ],
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("passed")
+        expect(result.executedSteps[0]).toMatchObject({
+          kind: "sequence",
+          executionProfile: "fast",
+          transportLane: "runner-batch",
+          checkpoint: "end",
+          sequenceChildFailure: null,
+          handledMs: 2,
+        })
+        expect(result.executedSteps[0]?.latestSnapshotId).not.toBeNull()
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiActionBatch", "snapshot"])
+
+        const batchPayload = JSON.parse(runnerCommands[0]?.payload ?? "{}") as {
+          readonly actions?: ReadonlyArray<{ readonly kind?: string }>
+        }
+        expect(batchPayload.actions?.map((action) => action.kind)).toEqual(["type", "tap"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("stops batched sequences at the first failed child and reports the failing action", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const attemptedTargets: Array<string | null> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+        interceptUiAction: ({ kind, identifier }) => {
+          attemptedTargets.push(identifier)
+
+          if (kind === "tap" && identifier === "fixture.form.applyButton") {
+            return {
+              ok: false,
+              error: "fixture.form.applyButton forced batched failure",
+            }
+          }
+
+          return null
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "sequence",
+                execution: "fast",
+                actions: [
+                  {
+                    kind: "type",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.form.input",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "textField",
+                      section: null,
+                      interactive: true,
+                    },
+                    text: "delta",
+                    replace: true,
+                  },
+                  {
+                    kind: "tap",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.form.applyButton",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "button",
+                      section: null,
+                      interactive: true,
+                    },
+                  },
+                  {
+                    kind: "tap",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.navigation.detailButton",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "button",
+                      section: null,
+                      interactive: true,
+                    },
+                  },
+                ],
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("failed")
+        expect(result.failedStep?.index).toBe(1)
+        expect(result.executedSteps[0]).toMatchObject({
+          kind: "sequence",
+          executionProfile: "fast",
+          transportLane: "runner-batch",
+          handledMs: 2,
+          checkpoint: "none",
+          sequenceChildFailure: {
+            index: 2,
+            kind: "tap",
+          },
+        })
+        expect(result.executedSteps[0]?.summary).toContain("child 2")
+        expect(attemptedTargets).toEqual(["fixture.form.input", "fixture.form.applyButton"])
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiActionBatch"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("fails closed when the runner does not advertise batch support", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction"],
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+
+        if (session.runner.kind !== "simulator-runner") {
+          throw new Error(`Expected a simulator runner session, received ${session.runner.kind}.`)
+        }
+
+        expect(session.runner.capabilities).toEqual(["uiAction"])
+
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "sequence",
+                execution: "fast",
+                actions: [
+                  {
+                    kind: "tap",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.navigation.detailButton",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "button",
+                      section: null,
+                      interactive: true,
+                    },
+                  },
+                ],
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("failed")
+        expect(result.failedStep?.index).toBe(1)
+        expect(result.executedSteps[0]).toMatchObject({
+          kind: "sequence",
+          executionProfile: "fast",
+          transportLane: "runner-batch",
+        })
+        expect(result.executedSteps[0]?.summary).toContain("uiActionBatch")
+        expect(runnerCommands).toHaveLength(0)
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
   test("runs mixed verified and fast v2 flows", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
@@ -3383,6 +3742,113 @@ describe("SessionRegistry", () => {
         expect(result.executedSteps[1]?.handledMs).toBe(1)
         expect(result.executedSteps[2]?.handledMs).toBeNull()
         expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiAction"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("runs mixed verified and batched v2 flows", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              { kind: "snapshot" },
+              {
+                kind: "sequence",
+                execution: "fast",
+                actions: [
+                  {
+                    kind: "type",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.form.input",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "textField",
+                      section: null,
+                      interactive: true,
+                    },
+                    text: "delta",
+                    replace: true,
+                  },
+                  {
+                    kind: "tap",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.form.applyButton",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "button",
+                      section: null,
+                      interactive: true,
+                    },
+                  },
+                ],
+              },
+              {
+                kind: "assert",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.status.label",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "staticText",
+                  section: null,
+                  interactive: false,
+                },
+                expectation: {
+                  exists: true,
+                  visible: null,
+                  hidden: null,
+                  text: null,
+                  label: "Input applied: delta",
+                  value: null,
+                  type: "staticText",
+                  enabled: null,
+                  selected: null,
+                  focused: null,
+                  interactive: false,
+                },
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("passed")
+        expect(result.executedSteps.map((step) => [step.kind, step.executionProfile, step.transportLane])).toEqual([
+          ["snapshot", "verified", "host-single"],
+          ["sequence", "fast", "runner-batch"],
+          ["assert", "verified", "host-single"],
+        ])
+        expect(result.executedSteps[1]).toMatchObject({
+          checkpoint: "none",
+          sequenceChildFailure: null,
+          handledMs: 2,
+        })
+        expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiActionBatch", "snapshot"])
       } finally {
         await runtime.dispose()
       }
@@ -3880,6 +4346,7 @@ describe("SessionRegistry", () => {
         expect(session.resources.runner).toBe("ready")
         expect(session.transport.kind).toBe("real-device-live")
         expect(session.runner.kind).toBe("real-device-live")
+        expect(session.runner.capabilities).toContain("uiActionBatch")
 
         const realDeviceCapability = session.capabilities.find((capability) => capability.area === "real-device")
         const simulatorCapability = session.capabilities.find((capability) => capability.area === "simulator")
