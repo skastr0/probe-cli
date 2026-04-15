@@ -1,0 +1,52 @@
+{
+  "contract": "probe.session-flow/v2",
+  "steps": [
+    {
+      "kind": "snapshot"
+    },
+    {
+      "kind": "tap",
+      "execution": "fast",
+      "target": {
+        "kind": "semantic",
+        "identifier": "fixture.navigation.detailButton",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "type": "button",
+        "section": null,
+        "interactive": true
+      }
+    },
+    {
+      "kind": "screenshot",
+      "label": "after-fast-navigation"
+    },
+    {
+      "kind": "assert",
+      "target": {
+        "kind": "semantic",
+        "identifier": "fixture.detail.title",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "type": "staticText",
+        "section": null,
+        "interactive": false
+      },
+      "expectation": {
+        "exists": true,
+        "visible": null,
+        "hidden": null,
+        "text": null,
+        "label": "Detail",
+        "value": null,
+        "type": "staticText",
+        "enabled": null,
+        "selected": null,
+        "focused": null,
+        "interactive": false
+      }
+    }
+  ]
+}

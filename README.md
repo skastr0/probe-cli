@@ -109,7 +109,7 @@ bun run probe -- session open --json
 | Command | Purpose |
 |---------|---------|
 | `probe session action --session-id <id> (--file <action.json> \| --json <action-json>)` | Perform a single UI action |
-| `probe session run --session-id <id> (--file <flow.json> \| --stdin)` | Run a multi-step flow (`probe.session-flow/v1`) |
+| `probe session run --session-id <id> (--file <flow.json> \| --stdin)` | Run a multi-step flow (`probe.session-flow/v1` or `probe.session-flow/v2`) |
 | `probe session recording export --session-id <id> [--label <name>]` | Export recorded actions as a replay script |
 | `probe session replay --session-id <id> --file <recording.json>` | Replay a recording with retries + semantic fallback |
 | `probe session result summary --session-id <id>` | Aggregate session result summary artifact |
@@ -259,9 +259,15 @@ probe session run --session-id <id> --file flow.json --json
 cat flow.json | probe session run --session-id <id> --stdin --json
 ```
 
-Flow contract: `probe.session-flow/v1`. Step kinds: `snapshot`, `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`, `logMark`, `sleep`. Any step may set `continueOnError: true` to keep the flow running when that step fails.
+Flow contracts:
+- `probe.session-flow/v1` — verified-only execution, unchanged behavior, same step kinds as the original flow contract
+- `probe.session-flow/v2` — adds execution profiles (`verified` / `fast`), explicit `sequence` batching, per-step transport reporting, and checkpoint metadata
 
-See `flows-reference.md` for the flow schema, step shapes, and worked examples.
+Shared step kinds: `snapshot`, `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`, `logMark`, `sleep`. Flow v2 also adds `sequence` for runner-batched fast actions. Any step may set `continueOnError: true` to keep the flow running when that step fails.
+
+Fast execution is opt-in. It trades host-side evidence collection for speed, so prefer a final verified assert or an explicit sequence `checkpoint: "end"` when you need end-state proof.
+
+See `docs/examples/flows/README.md` for worked `session run` examples covering verified-only, fast-with-final-assert, mixed-mode, and explicit sequence batching flows.
 
 ### 6. Recording and Replay
 
@@ -462,7 +468,7 @@ The script starts `probe serve`, opens a session, sends a ping, captures a snaps
 ## Supporting References
 
 - `actions-reference.md` — full action and selector schemas, `wait` conditions, assertion expectations, retry policy, recording/replay contracts
-- `flows-reference.md` — `probe.session-flow/v1` schema, step kinds, `continueOnError`, worked examples
+- `docs/examples/flows/README.md` — `probe.session-flow/v1` and `probe.session-flow/v2` examples, fast/verified trade-offs, and batching patterns
 - `recipes.md` — end-to-end QA recipes (login, form validation, commerce, accessibility, perf-around-flow, etc.)
 - `troubleshooting.md` — session won't open, stale refs, log sources unavailable, daemon socket conflicts, perf walls
 - `V2-DIRECTION.md` — product vision and roadmap for the validation and observability workbench

@@ -1,0 +1,66 @@
+{
+  "contract": "probe.session-flow/v2",
+  "steps": [
+    {
+      "kind": "sequence",
+      "execution": "fast",
+      "checkpoint": "end",
+      "actions": [
+        {
+          "kind": "type",
+          "target": {
+            "kind": "semantic",
+            "identifier": "fixture.form.input",
+            "label": null,
+            "value": null,
+            "placeholder": null,
+            "type": "textField",
+            "section": null,
+            "interactive": true
+          },
+          "text": "delta",
+          "replace": true
+        },
+        {
+          "kind": "tap",
+          "target": {
+            "kind": "semantic",
+            "identifier": "fixture.form.applyButton",
+            "label": null,
+            "value": null,
+            "placeholder": null,
+            "type": "button",
+            "section": null,
+            "interactive": true
+          }
+        }
+      ]
+    },
+    {
+      "kind": "assert",
+      "target": {
+        "kind": "semantic",
+        "identifier": "fixture.status.label",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "type": "staticText",
+        "section": null,
+        "interactive": false
+      },
+      "expectation": {
+        "exists": true,
+        "visible": null,
+        "hidden": null,
+        "text": null,
+        "label": "Input applied: delta",
+        "value": null,
+        "type": "staticText",
+        "enabled": null,
+        "selected": null,
+        "focused": null,
+        "interactive": false
+      }
+    }
+  ]
+}
