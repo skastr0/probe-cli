@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Either } from "effect"
 import { UserInputError } from "../../domain/errors"
+import type { SessionFlowResult } from "../../domain/flow-v2"
 import type { DrillQuery, OutputMode } from "../../domain/output"
 import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
@@ -43,9 +44,15 @@ type CapturedFlowParams = {
   readonly sessionId: string
   readonly flow: {
     readonly contract: string
+    readonly execution?: string
     readonly steps: Array<{
       readonly kind: string
+      readonly execution?: string
+      readonly checkpoint?: string
       readonly continueOnError?: boolean
+      readonly actions?: Array<{
+        readonly kind: string
+      }>
     }>
   }
 }
@@ -197,6 +204,35 @@ const buildCapturedFlowClient = (capture: (params: CapturedFlowParams) => void) 
         details: [],
       }))
     },
+    exportSessionRecording: unexpectedClientCall,
+    replaySessionRecording: unexpectedClientCall,
+    getSessionResultSummary: unexpectedClientCall,
+    getSessionResultAttachments: unexpectedClientCall,
+    recordPerf: unexpectedClientCall,
+    recordPerfAroundFlow: unexpectedClientCall,
+    summarizePerfBySignpost: unexpectedClientCall,
+    drillArtifact: unexpectedClientCall,
+    captureDiagnosticBundle: unexpectedClientCall,
+  })
+
+const buildReturningFlowClient = (result: SessionFlowResult) =>
+  DaemonClient.of({
+    ping: unexpectedClientCall,
+    openSession: unexpectedClientCall,
+    getSessionHealth: unexpectedClientCall,
+    closeSession: unexpectedClientCall,
+    listSessions: unexpectedClientCall,
+    showSession: unexpectedClientCall,
+    getSessionLogs: unexpectedClientCall,
+    markSessionLog: unexpectedClientCall,
+    captureLogWindow: unexpectedClientCall,
+    getLogDoctorReport: unexpectedClientCall,
+    runSessionDebugCommand: unexpectedClientCall,
+    captureSnapshot: unexpectedClientCall,
+    captureScreenshot: unexpectedClientCall,
+    recordVideo: unexpectedClientCall,
+    performSessionAction: unexpectedClientCall,
+    runSessionFlow: () => Effect.succeed(result),
     exportSessionRecording: unexpectedClientCall,
     replaySessionRecording: unexpectedClientCall,
     getSessionResultSummary: unexpectedClientCall,
@@ -561,6 +597,23 @@ const expectUserInputFailure = async (effect: Effect.Effect<unknown, unknown, un
   }
 
   throw new Error("Expected a UserInputError")
+}
+
+const captureConsoleLogs = async (effect: Effect.Effect<unknown, unknown, never>) => {
+  const originalConsoleLog = console.log
+  const lines: Array<string> = []
+
+  console.log = (...args: Array<unknown>) => {
+    lines.push(args.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join(" "))
+  }
+
+  try {
+    await Effect.runPromise(effect)
+  } finally {
+    console.log = originalConsoleLog
+  }
+
+  return lines.join("\n")
 }
 
 describe("cli user input handling", () => {
@@ -980,6 +1033,69 @@ describe("cli user input handling", () => {
     }
   })
 
+  test("session run dispatches v2 flow contracts from files", async () => {
+    const captured = { current: null as CapturedFlowParams | null }
+    const root = await mkdtemp(join(tmpdir(), "probe-cli-flow-v2-"))
+    const flowPath = join(root, "flow-v2.json")
+
+    try {
+      await writeFile(
+        flowPath,
+        `${JSON.stringify({
+          contract: "probe.session-flow/v2",
+          execution: "fast",
+          steps: [
+            {
+              kind: "sequence",
+              checkpoint: "end",
+              actions: [
+                {
+                  kind: "tap",
+                  target: {
+                    kind: "semantic",
+                    identifier: "fixture.navigation.detailButton",
+                    label: null,
+                    value: null,
+                    placeholder: null,
+                    type: "button",
+                    section: null,
+                    interactive: true,
+                  },
+                },
+              ],
+            },
+          ],
+        }, null, 2)}\n`,
+        "utf8",
+      )
+
+      await Effect.runPromise(
+        Effect.either(
+          runSessionCommand(["run", "--session-id", "session-1", "--file", flowPath, "--json"]).pipe(
+            Effect.provideService(DaemonClient, buildCapturedFlowClient((params) => {
+              captured.current = params
+            })),
+          ),
+        ),
+      )
+
+      expect(captured.current).not.toBeNull()
+
+      if (captured.current === null) {
+        throw new Error("Expected flow params to be captured")
+      }
+
+      expect(captured.current.sessionId).toBe("session-1")
+      expect(captured.current.flow.contract).toBe("probe.session-flow/v2")
+      expect(captured.current.flow.execution).toBe("fast")
+      expect(captured.current.flow.steps[0]?.kind).toBe("sequence")
+      expect(captured.current.flow.steps[0]?.checkpoint).toBe("end")
+      expect(captured.current.flow.steps[0]?.actions?.[0]?.kind).toBe("tap")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("session run accepts flow contracts from stdin", async () => {
     const captured = { current: null as CapturedFlowParams | null }
 
@@ -1016,6 +1132,227 @@ describe("cli user input handling", () => {
     expect(captured.current.sessionId).toBe("session-1")
     expect(captured.current.flow.steps[0]?.kind).toBe("sleep")
     expect(captured.current.flow.steps[0]?.continueOnError).toBe(true)
+  })
+
+  test("session run accepts v2 flow contracts from stdin", async () => {
+    const captured = { current: null as CapturedFlowParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runSessionCommand(
+          ["run", "--session-id", "session-1", "--stdin", "--json"],
+          {
+            readStdinText: () => Effect.succeed(JSON.stringify({
+              contract: "probe.session-flow/v2",
+              steps: [
+                {
+                  kind: "tap",
+                  execution: "fast",
+                  target: {
+                    kind: "semantic",
+                    identifier: "fixture.navigation.detailButton",
+                    label: null,
+                    value: null,
+                    placeholder: null,
+                    type: "button",
+                    section: null,
+                    interactive: true,
+                  },
+                },
+                {
+                  kind: "assert",
+                  target: {
+                    kind: "semantic",
+                    identifier: "fixture.status.label",
+                    label: null,
+                    value: null,
+                    placeholder: null,
+                    type: "staticText",
+                    section: null,
+                    interactive: false,
+                  },
+                  expectation: {
+                    exists: true,
+                  },
+                },
+              ],
+            })),
+          },
+        ).pipe(
+          Effect.provideService(DaemonClient, buildCapturedFlowClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current).not.toBeNull()
+
+    if (captured.current === null) {
+      throw new Error("Expected stdin flow params to be captured")
+    }
+
+    expect(captured.current.sessionId).toBe("session-1")
+    expect(captured.current.flow.contract).toBe("probe.session-flow/v2")
+    expect(captured.current.flow.steps[0]?.kind).toBe("tap")
+    expect(captured.current.flow.steps[0]?.execution).toBe("fast")
+    expect(captured.current.flow.steps[1]?.kind).toBe("assert")
+  })
+
+  test("session run text output surfaces v2 execution details", async () => {
+    const output = await captureConsoleLogs(
+      runSessionCommand(
+        ["run", "--session-id", "session-1", "--stdin"],
+        {
+          readStdinText: () => Effect.succeed(JSON.stringify({
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "sequence",
+                execution: "fast",
+                checkpoint: "end",
+                actions: [
+                  {
+                    kind: "tap",
+                    target: {
+                      kind: "semantic",
+                      identifier: "fixture.navigation.detailButton",
+                      label: null,
+                      value: null,
+                      placeholder: null,
+                      type: "button",
+                      section: null,
+                      interactive: true,
+                    },
+                  },
+                ],
+              },
+            ],
+          })),
+        },
+      ).pipe(
+        Effect.provideService(DaemonClient, buildReturningFlowClient({
+          contract: "probe.session-flow/report-v2",
+          executedAt: "2026-04-15T00:00:00.000Z",
+          sessionId: "session-1",
+          summary: "Flow failed inside a batched sequence.",
+          verdict: "failed",
+          executedSteps: [
+            {
+              index: 1,
+              kind: "sequence",
+              summary: "Sequence child 2 (tap) failed in runner batch lane: fixture.form.applyButton forced batched failure",
+              verdict: "failed",
+              matchedRef: null,
+              latestSnapshotId: "@s2",
+              retryCount: 0,
+              retryReasons: [],
+              artifacts: [],
+              executionProfile: "fast",
+              transportLane: "runner-batch",
+              handledMs: 2,
+              warnings: [],
+              checkpoint: "end",
+              sequenceChildFailure: {
+                index: 2,
+                kind: "tap",
+                summary: "fixture.form.applyButton forced batched failure",
+              },
+            },
+          ],
+          failedStep: {
+            index: 1,
+            kind: "sequence",
+            summary: "Sequence child 2 (tap) failed in runner batch lane: fixture.form.applyButton forced batched failure",
+            verdict: "failed",
+            executionProfile: "fast",
+            transportLane: "runner-batch",
+            handledMs: 2,
+            checkpoint: "end",
+            sequenceChildFailure: {
+              index: 2,
+              kind: "tap",
+              summary: "fixture.form.applyButton forced batched failure",
+            },
+          },
+          retries: 0,
+          artifacts: [],
+          finalSnapshotId: "@s2",
+          warnings: [],
+        } satisfies SessionFlowResult)),
+      ),
+    )
+
+    expect(output).toContain("execution profile: fast")
+    expect(output).toContain("transport lane: runner-batch")
+    expect(output).toContain("checkpoint: end")
+    expect(output).toContain("failure child: #2 tap — fixture.form.applyButton forced batched failure")
+  })
+
+  test("session run json output preserves v2 execution details", async () => {
+    const output = await captureConsoleLogs(
+      runSessionCommand(
+        ["run", "--session-id", "session-1", "--stdin", "--json"],
+        {
+          readStdinText: () => Effect.succeed(JSON.stringify({
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "tap",
+                execution: "fast",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.navigation.detailButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+              },
+            ],
+          })),
+        },
+      ).pipe(
+        Effect.provideService(DaemonClient, buildReturningFlowClient({
+          contract: "probe.session-flow/report-v2",
+          executedAt: "2026-04-15T00:00:00.000Z",
+          sessionId: "session-1",
+          summary: "Executed 1 flow step successfully.",
+          verdict: "passed",
+          executedSteps: [
+            {
+              index: 1,
+              kind: "tap",
+              summary: "Executed fast tap on fixture.navigation.detailButton without host snapshots.",
+              verdict: "passed",
+              matchedRef: null,
+              latestSnapshotId: null,
+              retryCount: 0,
+              retryReasons: [],
+              artifacts: [],
+              executionProfile: "fast",
+              transportLane: "runner-single",
+              handledMs: 1,
+              warnings: [],
+              checkpoint: null,
+              sequenceChildFailure: null,
+            },
+          ],
+          failedStep: null,
+          retries: 0,
+          artifacts: [],
+          finalSnapshotId: null,
+          warnings: [],
+        } satisfies SessionFlowResult)),
+      ),
+    )
+
+    expect(output).toContain('"executionProfile": "fast"')
+    expect(output).toContain('"transportLane": "runner-single"')
+    expect(output).toContain('"checkpoint": null')
+    expect(output).toContain('"sequenceChildFailure": null')
   })
 
   test("perf around dispatches bounded flow profiling requests from files", async () => {

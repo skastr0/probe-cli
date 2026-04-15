@@ -202,7 +202,67 @@ const formatReplayResult = (result: SessionReplayResult): string => {
   ].join("\n")
 }
 
+type FlowV2CliResult = Extract<SessionFlowResult, { readonly contract: "probe.session-flow/report-v2" }>
+type FlowV2CliStepResult = FlowV2CliResult["executedSteps"][number]
+
+const isFlowV2CliResult = (result: SessionFlowResult): result is FlowV2CliResult =>
+  result.contract === "probe.session-flow/report-v2"
+
+const formatFlowV2SequenceChildFailure = (step: FlowV2CliStepResult): string => {
+  if (step.kind !== "sequence") {
+    return "n/a"
+  }
+
+  if (step.sequenceChildFailure === null) {
+    return "none"
+  }
+
+  return `#${step.sequenceChildFailure.index} ${step.sequenceChildFailure.kind} — ${step.sequenceChildFailure.summary}`
+}
+
+const formatFlowV2StepResult = (step: FlowV2CliStepResult): string => {
+  const lines = [
+    `- [${step.index}] ${step.kind} [${step.verdict}] ${step.summary}`,
+    `  execution profile: ${step.executionProfile}`,
+    `  transport lane: ${step.transportLane}`,
+    `  checkpoint: ${step.checkpoint ?? "n/a"}`,
+    `  latest snapshot: ${step.latestSnapshotId ?? "n/a"}`,
+    `  retries: ${step.retryCount}`,
+    `  handled ms: ${step.handledMs ?? "n/a"}`,
+  ]
+
+  if (step.kind === "sequence") {
+    lines.push(`  failure child: ${formatFlowV2SequenceChildFailure(step)}`)
+  }
+
+  return lines.join("\n")
+}
+
+const formatFlowV2Result = (result: FlowV2CliResult): string => {
+  const stepLines = result.executedSteps.length === 0
+    ? ["- none"]
+    : result.executedSteps.flatMap((step) => [formatFlowV2StepResult(step)])
+
+  return [
+    result.summary,
+    `verdict: ${result.verdict}`,
+    `executed steps: ${result.executedSteps.length}`,
+    `failed step: ${result.failedStep?.index ?? "n/a"}`,
+    `retries: ${result.retries}`,
+    `final snapshot: ${result.finalSnapshotId ?? "n/a"}`,
+    `artifacts: ${result.artifacts.length}`,
+    `warnings: ${result.warnings.length}`,
+    "",
+    "steps:",
+    ...stepLines,
+  ].join("\n")
+}
+
 const formatFlowResult = (result: SessionFlowResult): string => {
+  if (isFlowV2CliResult(result)) {
+    return formatFlowV2Result(result)
+  }
+
   return [
     result.summary,
     `verdict: ${result.verdict}`,
