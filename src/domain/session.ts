@@ -58,6 +58,9 @@ export const SessionConnectionDetails = Schema.Struct({
 })
 export type SessionConnectionDetails = typeof SessionConnectionDetails.Type
 
+export const RunnerCapabilityFlag = Schema.Literal("uiAction", "uiActionBatch")
+export type RunnerCapabilityFlag = typeof RunnerCapabilityFlag.Type
+
 export const LiveRunnerTransportContract = Schema.Struct({
   kind: Schema.Literal("simulator-runner"),
   contract: Schema.Literal("probe.runner.transport/hybrid-v1"),
@@ -119,6 +122,7 @@ export const LiveRunnerSessionDetails = Schema.Struct({
   resultBundlePath: Schema.String,
   wrapperStderrPath: Schema.String,
   stdinProbeStatus: Schema.String,
+  capabilities: Schema.optional(Schema.Array(RunnerCapabilityFlag)),
 })
 export type LiveRunnerSessionDetails = typeof LiveRunnerSessionDetails.Type
 
@@ -139,6 +143,7 @@ export const RealDeviceLiveRunnerDetails = Schema.Struct({
   connectionStatus: SessionConnectionStatus,
   lastCheckedAt: Schema.String,
   note: Schema.String,
+  capabilities: Schema.optional(Schema.Array(RunnerCapabilityFlag)),
 })
 export type RealDeviceLiveRunnerDetails = typeof RealDeviceLiveRunnerDetails.Type
 
@@ -159,6 +164,7 @@ export const RealDevicePreflightRunnerDetails = Schema.Struct({
   connectionStatus: SessionConnectionStatus,
   lastCheckedAt: Schema.String,
   note: Schema.String,
+  capabilities: Schema.optional(Schema.Array(RunnerCapabilityFlag)),
 })
 export type RealDevicePreflightRunnerDetails = typeof RealDevicePreflightRunnerDetails.Type
 

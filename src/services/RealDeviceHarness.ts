@@ -12,6 +12,7 @@ import {
 import type { SessionConnectionDetails } from "../domain/session"
 import type { RunnerCommandResult } from "./SimulatorHarness"
 import {
+  type RunnerCapability,
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
   encodeRunnerCommandFrame,
@@ -272,9 +273,10 @@ export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePrefli
   readonly launchJsonPath: string
   readonly nextSequence: number
   readonly initialPingRttMs: number
+  readonly capabilities: ReadonlyArray<RunnerCapability>
   readonly sendCommand: (
     sequence: number,
-    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+    action: RunnerAction,
     payload?: string,
   ) => Promise<RunnerCommandResult>
   readonly isWrapperRunning: () => boolean
@@ -2649,7 +2651,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const sendCommand = async (
               sequence: number,
-              action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+              action: RunnerAction,
               payload?: string,
             ): Promise<RunnerCommandResult> => {
               const commandStartedAt = Date.now()
@@ -2703,6 +2705,10 @@ export const RealDeviceHarnessLive = Layer.succeed(
                 inlinePayload: responseFrame.inlinePayload ?? null,
                 inlinePayloadEncoding: responseFrame.inlinePayloadEncoding ?? null,
                 handledMs: responseFrame.handledMs,
+                totalHandledMs: responseFrame.totalHandledMs ?? null,
+                childHandledMs: responseFrame.childHandledMs ?? null,
+                failedActionIndex: responseFrame.failedActionIndex ?? null,
+                failedActionKind: responseFrame.failedActionKind ?? null,
                 statusLabel: responseFrame.statusLabel,
                 snapshotNodeCount: responseFrame.snapshotNodeCount ?? null,
                 hostRttMs: Date.now() - commandStartedAt,
@@ -2790,6 +2796,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               launchJsonPath,
               nextSequence: 2,
               initialPingRttMs: initialPing.hostRttMs,
+              capabilities: ready.capabilities ?? ["uiAction"],
               sendCommand,
               isWrapperRunning,
               waitForExit: wrapper.exit,

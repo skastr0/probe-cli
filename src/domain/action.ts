@@ -7,7 +7,7 @@ const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
 const OptionalNullableBoolean = Schema.optional(NullableBoolean)
 const OptionalNullableString = Schema.optional(NullableString)
 const NullableFlowExecutionProfile = Schema.Union(Schema.Literal("verified", "fast"), Schema.Null)
-const NullableFlowTransportLane = Schema.Union(Schema.Literal("host-single", "runner-single"), Schema.Null)
+const NullableFlowTransportLane = Schema.Union(Schema.Literal("host-single", "runner-single", "runner-batch"), Schema.Null)
 
 const PositiveIntegerSchema = Schema.Number.pipe(Schema.int())
 

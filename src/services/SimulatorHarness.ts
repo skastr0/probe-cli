@@ -11,6 +11,7 @@ import {
 } from "../domain/errors"
 import type { SimulatorSessionMode } from "../domain/session"
 import {
+  type RunnerCapability,
   decodeRunnerReadyFrame,
   decodeRunnerResponseFrame,
   encodeRunnerCommandFrame,
@@ -68,13 +69,17 @@ type ResponseFrame = RunnerResponseFrame
 
 export interface RunnerCommandResult {
   readonly ok: boolean
-  readonly action: string
+  readonly action: RunnerAction
   readonly error: string | null
   readonly payload: string | null
   readonly snapshotPayloadPath: string | null
   readonly inlinePayload?: string | null
   readonly inlinePayloadEncoding?: string | null
   readonly handledMs: number
+  readonly totalHandledMs?: number | null
+  readonly childHandledMs?: ReadonlyArray<number | null> | null
+  readonly failedActionIndex?: number | null
+  readonly failedActionKind?: string | null
   readonly statusLabel: string
   readonly snapshotNodeCount: number | null
   readonly hostRttMs: number
@@ -107,9 +112,10 @@ export interface OpenedSimulatorSession {
   readonly stdinProbeStatus: string
   readonly initialPingRttMs: number
   readonly nextSequence: number
+  readonly capabilities: ReadonlyArray<RunnerCapability>
   readonly sendCommand: (
     sequence: number,
-    action: "ping" | "applyInput" | "snapshot" | "screenshot" | "recordVideo" | "shutdown" | "uiAction",
+    action: RunnerAction,
     payload?: string,
   ) => Promise<RunnerCommandResult>
   readonly isWrapperRunning: () => boolean
@@ -582,6 +588,10 @@ export const createHttpRunnerCommandSender = (commandUrl: string) =>
       inlinePayload: response.inlinePayload ?? null,
       inlinePayloadEncoding: response.inlinePayloadEncoding ?? null,
       handledMs: response.handledMs,
+      totalHandledMs: response.totalHandledMs ?? null,
+      childHandledMs: response.childHandledMs ?? null,
+      failedActionIndex: response.failedActionIndex ?? null,
+      failedActionKind: response.failedActionKind ?? null,
       statusLabel: response.statusLabel,
       snapshotNodeCount: response.snapshotNodeCount ?? null,
       hostRttMs: Date.now() - startedAt,
@@ -1567,6 +1577,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               stdinProbeStatus: "not-required-http",
               initialPingRttMs: initialPing.hostRttMs,
               nextSequence: 2,
+              capabilities: ready.capabilities ?? ["uiAction"],
               sendCommand,
               isWrapperRunning,
               waitForExit: wrapper.exit,
