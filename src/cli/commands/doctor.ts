@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import type { AccessibilityDoctorReport } from "../../domain/accessibility"
 import type { CommerceDoctorReport, CommerceProvider, CommerceValidationMode } from "../../domain/commerce"
 import type {
@@ -13,7 +13,31 @@ import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
 import { DaemonClient } from "../../services/DaemonClient"
 import { ProbeKernel } from "../../services/ProbeKernel"
+import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
+
+const NullableString = Schema.Union(Schema.String, Schema.Null)
+
+const DoctorAccessibilityPayload = Schema.Struct({
+  sessionId: Schema.String,
+})
+
+const DoctorCommercePayload = Schema.Struct({
+  bundleId: Schema.String,
+  mode: Schema.optional(Schema.Union(Schema.Literal("local-storekit", "sandbox", "testflight"), Schema.Null)),
+  provider: Schema.optional(Schema.Union(Schema.Literal("revenuecat"), Schema.Null)),
+  storekitConfigPath: Schema.optional(NullableString),
+})
+
+const DoctorCapturePayload = Schema.Struct({
+  sessionId: Schema.String,
+  target: Schema.Literal("simulator", "device"),
+  kind: Schema.optional(Schema.Union(Schema.Literal("sysdiagnose"), Schema.Null)),
+})
+
+const decodeDoctorAccessibilityPayload = Schema.decodeUnknownSync(DoctorAccessibilityPayload)
+const decodeDoctorCommercePayload = Schema.decodeUnknownSync(DoctorCommercePayload)
+const decodeDoctorCapturePayload = Schema.decodeUnknownSync(DoctorCapturePayload)
 
 const formatDiagnostic = (diagnostic: DiagnosticReport): Array<string> => [
   `- ${diagnostic.key} [${diagnostic.status}] ${diagnostic.summary}`,
@@ -184,7 +208,7 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
     if (subcommand === undefined || subcommand.startsWith("--")) {
       const kernel = yield* ProbeKernel
       const status = yield* kernel.getWorkspaceStatus()
-      const asJson = args.includes("--json")
+      const asJson = hasMachineJsonOutput(args)
 
       yield* Effect.sync(() => {
         const output = asJson ? JSON.stringify(status, null, 2) : formatWorkspaceStatus(status)
@@ -195,8 +219,9 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
 
     switch (subcommand) {
       case "accessibility": {
-        const sessionId = yield* requireOption(rest, "--session-id")
-        const asJson = rest.includes("--json")
+        const payload = yield* readOptionalJsonInput(rest, "doctor accessibility payload", decodeDoctorAccessibilityPayload)
+        const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
+        const asJson = hasMachineJsonOutput(rest)
         const accessibility = yield* AccessibilityService
         const report = yield* accessibility.doctor({ sessionId })
 
@@ -207,11 +232,14 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
       }
 
       case "commerce": {
-        const bundleId = yield* requireOption(rest, "--bundle-id")
-        const mode = yield* parseCommerceMode(rest)
-        const provider = yield* parseCommerceProvider(rest)
-        const storekitConfigPath = yield* optionalOption(rest, "--config")
-        const asJson = rest.includes("--json")
+        const payload = yield* readOptionalJsonInput(rest, "doctor commerce payload", decodeDoctorCommercePayload)
+        const bundleId = payload?.bundleId ?? (yield* requireOption(rest, "--bundle-id"))
+        const mode = payload === null ? yield* parseCommerceMode(rest) : payload.mode ?? null
+        const provider = payload === null ? yield* parseCommerceProvider(rest) : payload.provider ?? null
+        const storekitConfigPath = payload === null
+          ? yield* optionalOption(rest, "--config")
+          : payload.storekitConfigPath ?? null
+        const asJson = hasMachineJsonOutput(rest)
         const commerce = yield* CommerceService
         const report = yield* commerce.doctor({
           bundleId,
@@ -227,10 +255,11 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
       }
 
       case "capture": {
-        const target = yield* parseDiagnosticCaptureTarget(rest)
-        const sessionId = yield* requireOption(rest, "--session-id")
-        const kind = yield* parseDiagnosticCaptureKind(rest, target)
-        const asJson = rest.includes("--json")
+        const payload = yield* readOptionalJsonInput(rest, "doctor capture payload", decodeDoctorCapturePayload)
+        const target = payload?.target ?? (yield* parseDiagnosticCaptureTarget(rest))
+        const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
+        const kind = payload === null ? yield* parseDiagnosticCaptureKind(rest, target) : payload.kind ?? null
+        const asJson = hasMachineJsonOutput(rest)
         const client = yield* DaemonClient
         const result = yield* client.captureDiagnosticBundle({
           sessionId,
@@ -252,4 +281,15 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
       default:
         return yield* unknownSubcommand("doctor", subcommand)
     }
+  })
+
+export const runCapabilitiesCommand = (args: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const kernel = yield* ProbeKernel
+    const status = yield* kernel.getWorkspaceStatus()
+    const asJson = hasMachineJsonOutput(args)
+
+    yield* Effect.sync(() => {
+      console.log(asJson ? JSON.stringify(status, null, 2) : formatWorkspaceStatus(status))
+    })
   })

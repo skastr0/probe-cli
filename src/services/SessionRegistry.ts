@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
+import { statSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
 import { Context, Effect, Either, Layer, Ref } from "effect"
@@ -847,6 +848,14 @@ const createArtifactRecord = (args: {
   summary: args.summary,
   absolutePath: args.absolutePath,
   relativePath: relative(args.artifactRoot, args.absolutePath),
+  ...(() => {
+    try {
+      const fileStat = statSync(args.absolutePath)
+      return fileStat.isFile() ? { sizeBytes: fileStat.size } : {}
+    } catch {
+      return {}
+    }
+  })(),
   external: false,
   createdAt: nowIso(),
 })

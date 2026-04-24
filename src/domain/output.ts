@@ -61,6 +61,7 @@ export const ArtifactRecord = Schema.Struct({
   summary: Schema.String,
   absolutePath: Schema.String,
   relativePath: NullableString,
+  sizeBytes: Schema.optional(Schema.Number),
   external: Schema.Boolean,
   createdAt: Schema.String,
 })

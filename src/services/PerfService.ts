@@ -922,6 +922,14 @@ const createArtifactRecord = (args: {
   summary: args.summary,
   absolutePath: args.absolutePath,
   relativePath: relative(args.artifactRoot, args.absolutePath),
+  ...(() => {
+    try {
+      const fileStat = statSync(args.absolutePath)
+      return fileStat.isFile() ? { sizeBytes: fileStat.size } : {}
+    } catch {
+      return {}
+    }
+  })(),
   external: false,
   createdAt: nowIso(),
 })

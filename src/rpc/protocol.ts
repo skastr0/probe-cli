@@ -674,8 +674,16 @@ export const RpcProgressEvent = Schema.Struct({
   kind: Schema.Literal("event"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
+  method: RpcMethod,
+  type: Schema.String,
+  sequence: Schema.Number,
+  timestamp: Schema.String,
   stage: Schema.String,
   message: Schema.String,
+  data: Schema.Struct({
+    stage: Schema.String,
+    message: Schema.String,
+  }),
 })
 export type RpcProgressEvent = typeof RpcProgressEvent.Type
 
@@ -689,6 +697,8 @@ export const RpcFailure = Schema.Struct({
     category: Schema.String,
     reason: Schema.String,
     nextStep: Schema.String,
+    next_step: Schema.String,
+    retryable: Schema.Boolean,
     details: Schema.Array(Schema.String),
     capability: NullableString,
     expectedVersion: NullableString,
@@ -792,13 +802,23 @@ export const decodeRpcFrameLine = (line: string): RpcFrame => {
 
 export const encodeRpcLine = (frame: RpcFrame | RpcRequest): string => `${JSON.stringify(frame)}\n`
 
+type ProbeFailurePayloadInput =
+  Omit<ProbeFailurePayload, "next_step" | "retryable"> & {
+    readonly next_step?: string
+    readonly retryable?: boolean
+  }
+
 export const createFailureFrame = (
   request: RpcRequest,
-  failure: ProbeFailurePayload,
+  failure: ProbeFailurePayloadInput,
 ): RpcFailure => ({
   kind: "failure",
   protocolVersion: PROBE_PROTOCOL_VERSION,
   requestId: request.requestId,
   method: request.method,
-  failure,
+  failure: {
+    ...failure,
+    next_step: failure.next_step ?? failure.nextStep,
+    retryable: failure.retryable ?? false,
+  },
 })

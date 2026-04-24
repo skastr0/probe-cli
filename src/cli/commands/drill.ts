@@ -1,7 +1,17 @@
-import { Effect } from "effect"
-import type { DrillQuery, OutputMode } from "../../domain/output"
+import { Effect, Schema } from "effect"
+import { DrillQuery, OutputMode } from "../../domain/output"
 import { DaemonClient } from "../../services/DaemonClient"
+import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption } from "../options"
+
+const DrillPayload = Schema.Struct({
+  sessionId: Schema.String,
+  artifactKey: Schema.String,
+  outputMode: Schema.optional(OutputMode),
+  query: DrillQuery,
+})
+
+const decodeDrillPayload = Schema.decodeUnknownSync(DrillPayload)
 
 const parseLines = (value: string) =>
   Effect.gen(function* () {
@@ -108,11 +118,15 @@ const parseOutputMode = (args: ReadonlyArray<string>, query: DrillQuery, asJson:
 
 export const runDrillCommand = (args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
-    const sessionId = yield* requireOption(args, "--session-id")
-    const artifactKey = yield* requireOption(args, "--artifact")
-    const asJson = args.includes("--json")
-    const query = yield* parseDrillQuery(args)
-    const outputMode = yield* parseOutputMode(args, query, asJson)
+    const payload = yield* readOptionalJsonInput(args, "drill payload", decodeDrillPayload, undefined, {
+      allowFile: false,
+      allowStdin: false,
+    })
+    const sessionId = payload?.sessionId ?? (yield* requireOption(args, "--session-id"))
+    const artifactKey = payload?.artifactKey ?? (yield* requireOption(args, "--artifact"))
+    const asJson = hasMachineJsonOutput(args)
+    const query = payload?.query ?? (yield* parseDrillQuery(args))
+    const outputMode = payload?.outputMode ?? (yield* parseOutputMode(args, query, asJson))
     const client = yield* DaemonClient
     const result = yield* client.drillArtifact({
       sessionId,

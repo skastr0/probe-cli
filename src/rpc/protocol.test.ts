@@ -343,13 +343,27 @@ describe("rpc protocol", () => {
       kind: "event",
       protocolVersion: PROBE_PROTOCOL_VERSION,
       requestId: "req-1",
+      method: "session.open",
+      type: "session.open.progress",
+      sequence: 1,
+      timestamp: "2026-04-24T12:00:00.000Z",
       stage: "session.open",
       message: "Opening session",
+      data: {
+        stage: "session.open",
+        message: "Opening session",
+      },
     })
 
     const decoded = decodeRpcFrame(JSON.parse(line.trim()))
     expect(decoded.kind).toBe("event")
     expect(decoded.protocolVersion).toBe(PROBE_PROTOCOL_VERSION)
+    if (decoded.kind === "event") {
+      expect(decoded.type).toBe("session.open.progress")
+      expect(decoded.sequence).toBe(1)
+      expect(decoded.timestamp).toBe("2026-04-24T12:00:00.000Z")
+      expect(decoded.data.stage).toBe("session.open")
+    }
   })
 
   test("detects request protocol mismatches before schema validation", () => {
@@ -391,6 +405,8 @@ describe("rpc protocol", () => {
             category: "protocol",
             reason: "mismatch",
             nextStep: "upgrade",
+            next_step: "upgrade",
+            retryable: true,
             details: [],
             capability: null,
             expectedVersion: PROBE_PROTOCOL_VERSION,

@@ -127,6 +127,16 @@ const readStringArray = (value: unknown): ReadonlyArray<string> =>
 
 const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
   {
+    area: "daemon",
+    status: "supported",
+    summary:
+      "Probe uses one long-lived local daemon as the canonical owner of sessions, runners, RPC, artifacts, and expensive Apple-tooling resources.",
+    details: [
+      "Thin CLI commands speak versioned probe-rpc/v1 frames over a Unix domain socket.",
+      "If the daemon is not running, session commands fail fast with a recoverable daemon-not-running error and next step.",
+    ],
+  },
+  {
     area: "simulator",
     status: "supported",
     summary:
@@ -150,6 +160,36 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
     summary:
       "Runner control is real and uses an honest XCUITest transport seam: simulator and real-device sessions both use HTTP POST command ingress, while stdout remains the ready/diagnostic observation seam.",
     details: [],
+  },
+  {
+    area: "artifact",
+    status: "supported",
+    summary:
+      "Probe stores large evidence in session artifacts and returns compact summaries with artifact records containing key, kind, absolute path, size, and creation time.",
+    details: [
+      "Artifact records are indexed per session under the local Probe artifact root.",
+      "Drill commands inspect bounded slices instead of forcing agents to ingest full artifacts.",
+    ],
+  },
+  {
+    area: "accessibility",
+    status: "supported",
+    summary:
+      "Accessibility snapshots, screenshots, semantic selectors, action targeting, doctor reports, and validation reports are first-class session workflows.",
+    details: [
+      "Snapshots return compact previews while storing the full tree as an artifact.",
+      "Accessibility validation emits evidence artifacts for snapshot, screenshot, and report data.",
+    ],
+  },
+  {
+    area: "commerce",
+    status: "degraded",
+    summary:
+      "Commerce doctor and validation lanes model StoreKit, sandbox, TestFlight, and RevenueCat checks, while keeping Apple-side account/configuration walls explicit.",
+    details: [
+      "local-storekit validation requires a commerce plan payload or --plan file.",
+      "sandbox and testflight checks report whether the authority is Apple-side and non-automatable from the local host.",
+    ],
   },
   {
     area: "perf",
@@ -179,6 +219,16 @@ const workspaceCapabilities: ReadonlyArray<CapabilityReport> = [
       "Attach/eval/vars/backtrace/breakpoint/continue/detach flow through the long-lived LLDB Python bridge with JSON payloads and artifact offload.",
       "Non-attach commands fail closed unless the session already has an attached LLDB target.",
       "The verified path today is a signed local macOS process; session-app attach on Simulator and device attach are still follow-up validation seams.",
+    ],
+  },
+  {
+    area: "optional-dependencies",
+    status: "degraded",
+    summary:
+      "Optional dependency readiness is reported through doctor diagnostics; missing ffmpeg degrades video artifact format but does not block core session control.",
+    details: [
+      "ffmpeg is optional for MP4 stitching and can be overridden with PROBE_FFMPEG_PATH.",
+      "xmllint is used only for XML drill XPath evaluation and fails as a targeted command error when unavailable.",
     ],
   },
 ]
@@ -993,13 +1043,23 @@ export const ProbeKernelLive = Layer.effect(
 
     const handleRpcRequest = (request: RpcRequest, emit: (event: RpcProgressEvent) => void) =>
       Effect.gen(function* () {
+        let eventSequence = 0
         const progress = (stage: string, message: string) => {
+          eventSequence += 1
           emit({
             kind: "event",
             protocolVersion: PROBE_PROTOCOL_VERSION,
             requestId: request.requestId,
+            method: request.method,
+            type: `${request.method}.progress`,
+            sequence: eventSequence,
+            timestamp: nowIso(),
             stage,
             message,
+            data: {
+              stage,
+              message,
+            },
           })
         }
 
@@ -1613,22 +1673,31 @@ export const ProbeKernelLive = Layer.effect(
             artifactRoot,
             outputThreshold: outputPolicy.getDefaultInlineThreshold(),
             commands: [
-              "doctor",
-              "doctor accessibility --session-id <id> [--json]",
-              "doctor capture --target simulator|device --session-id <id> [--kind sysdiagnose] [--json]",
+              "doctor [--output-json]",
+              "capabilities [--output-json]",
+              "schema list|show [--output-json]",
+              "examples list|show [--output-json]",
+              "doctor accessibility (--input-json <payload> | --session-id <id>) [--output-json]",
+              "doctor commerce (--input-json <payload> | --bundle-id <bundle-id> [--mode local-storekit|sandbox|testflight] [--config <path>] [--provider revenuecat]) [--output-json]",
+              "doctor capture (--input-json <payload> | --target simulator|device --session-id <id> [--kind sysdiagnose]) [--output-json]",
               "serve",
-              "validate accessibility --session-id <id> [--scope current-screen] [--json]",
-              "session open [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--json]",
-              "session health --session-id <id> [--json]",
-              "session logs --session-id <id> [--source runner|build|wrapper|stdout|simulator] [--lines 80] [--match <text>] [--seconds 2] [--output auto|inline|artifact] [--json]",
-              "session snapshot --session-id <id> [--output auto|inline|artifact] [--json]",
-              "session result summary --session-id <id> [--json]",
-              "session result attachments --session-id <id> [--json]",
-              "session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--json]",
-              "session video --session-id <id> --duration <duration> [--json]",
-              "session close --session-id <id> [--json]",
-              `perf record --session-id <id> (--template ${perfTemplateChoiceText} | --custom-template <path.tracetemplate>) [--time-limit <duration>] [--json]`,
-              "drill --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact] [--json]",
+              "validate accessibility (--input-json <payload> | --session-id <id> [--scope current-screen]) [--output-json]",
+              "validate commerce (--input-json <payload> | --session-id <id> --mode local-storekit|sandbox|testflight [--plan <commerce-plan.json>] [--provider revenuecat]) [--output-json]",
+              "session open [--input-json <payload>] [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--output-json]",
+              "session health --session-id <id> [--output-json]",
+              "session logs (--input-json <payload> | --session-id <id> [--source runner|build|wrapper|stdout|simulator] [--lines 80] [--match <text>] [--seconds 2] [--output auto|inline|artifact]) [--output-json]",
+              "session snapshot --session-id <id> [--output auto|inline|artifact] [--output-json]",
+              "session run (--input-json <payload> | --session-id <id> (--file <flow.json> | --stdin)) [--output-json]",
+              "session action (--input-json <payload> | --session-id <id> --file <action.json>) [--output-json]",
+              "session replay (--input-json <payload> | --session-id <id> --file <recording.json>) [--output-json]",
+              "session result summary (--input-json <payload> | --session-id <id>) [--output-json]",
+              "session result attachments (--input-json <payload> | --session-id <id>) [--output-json]",
+              "session screenshot --session-id <id> [--label <name>] [--output auto|inline|artifact] [--output-json]",
+              "session video --session-id <id> --duration <duration> [--output-json]",
+              "session close --session-id <id> [--output-json]",
+              `perf record (--input-json <payload> | --session-id <id> (--template ${perfTemplateChoiceText} | --custom-template <path.tracetemplate>) [--time-limit <duration>]) [--output-json]`,
+              `perf around (--input-json <payload> | --session-id <id> --file <flow.json> --template ${perfTemplateChoiceText}) [--output-json]`,
+              "drill (--input-json <payload> | --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact]) [--output-json]",
             ],
             daemon: {
               running: daemonRunning,

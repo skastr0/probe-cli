@@ -141,6 +141,8 @@ export interface ProbeFailurePayload {
     | "not-found"
   readonly reason: string
   readonly nextStep: string
+  readonly next_step: string
+  readonly retryable: boolean
   readonly details: ReadonlyArray<string>
   readonly capability: string | null
   readonly expectedVersion: string | null
@@ -151,6 +153,16 @@ export interface ProbeFailurePayload {
   readonly artifactKey: string | null
   readonly wall: boolean
 }
+
+const makeFailurePayload = (
+  payload: Omit<ProbeFailurePayload, "next_step" | "retryable"> & {
+    readonly retryable?: boolean
+  },
+): ProbeFailurePayload => ({
+  ...payload,
+  next_step: payload.nextStep,
+  retryable: payload.retryable ?? false,
+})
 
 export const isProbeError = (value: unknown): value is ProbeError => {
   if (typeof value !== "object" || value === null || !("_tag" in value)) {
@@ -177,7 +189,7 @@ export const isProbeError = (value: unknown): value is ProbeError => {
 export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
   switch (error._tag) {
     case "CapabilityNotReadyError":
-      return {
+      return makeFailurePayload({
         code: "capability-not-ready",
         category: "unsupported",
         reason: `${error.capability}: ${error.reason}`,
@@ -191,10 +203,10 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: true,
-      }
+      })
 
     case "UserInputError":
-      return {
+      return makeFailurePayload({
         code: error.code,
         category: "user",
         reason: error.reason,
@@ -208,14 +220,15 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "EnvironmentError":
-      return {
+      return makeFailurePayload({
         code: error.code,
         category: "environment",
         reason: error.reason,
         nextStep: error.nextStep,
+        retryable: true,
         details: [...error.details],
         capability: null,
         expectedVersion: null,
@@ -225,14 +238,15 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "DeviceInterruptionError":
-      return {
+      return makeFailurePayload({
         code: error.code,
         category: "environment",
         reason: error.reason,
         nextStep: error.nextStep,
+        retryable: true,
         details: [...error.details],
         capability: null,
         expectedVersion: null,
@@ -242,10 +256,10 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "UnsupportedCapabilityError":
-      return {
+      return makeFailurePayload({
         code: error.code,
         category: "unsupported",
         reason: error.reason,
@@ -259,14 +273,15 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: error.wall,
-      }
+      })
 
     case "ChildProcessError":
-      return {
+      return makeFailurePayload({
         code: error.code,
         category: "child-process",
         reason: error.reason,
         nextStep: error.nextStep,
+        retryable: true,
         details: error.stderrExcerpt.length === 0 ? [] : [error.stderrExcerpt],
         capability: null,
         expectedVersion: null,
@@ -276,14 +291,15 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "DaemonNotRunningError":
-      return {
+      return makeFailurePayload({
         code: "daemon-not-running",
         category: "daemon",
         reason: error.reason,
         nextStep: error.nextStep,
+        retryable: true,
         details: [`socket: ${error.socketPath}`],
         capability: null,
         expectedVersion: null,
@@ -293,14 +309,15 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "ProtocolMismatchError":
-      return {
+      return makeFailurePayload({
         code: "protocol-mismatch",
         category: "protocol",
         reason: `Expected protocol ${error.expectedVersion} but received ${error.receivedVersion}.`,
         nextStep: error.nextStep,
+        retryable: true,
         details: [],
         capability: null,
         expectedVersion: error.expectedVersion,
@@ -310,14 +327,15 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "SessionConflictError":
-      return {
+      return makeFailurePayload({
         code: "session-conflict",
         category: "conflict",
         reason: error.reason,
         nextStep: error.nextStep,
+        retryable: true,
         details: [],
         capability: null,
         expectedVersion: null,
@@ -327,10 +345,10 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "SessionNotFoundError":
-      return {
+      return makeFailurePayload({
         code: "session-not-found",
         category: "not-found",
         reason: `Session ${error.sessionId} was not found.`,
@@ -344,10 +362,10 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: error.sessionId,
         artifactKey: null,
         wall: false,
-      }
+      })
 
     case "ArtifactNotFoundError":
-      return {
+      return makeFailurePayload({
         code: "artifact-not-found",
         category: "not-found",
         reason: `Artifact ${error.artifactKey} was not found for session ${error.sessionId}.`,
@@ -361,7 +379,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: error.sessionId,
         artifactKey: error.artifactKey,
         wall: false,
-      }
+      })
   }
 }
 

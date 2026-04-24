@@ -3,7 +3,7 @@
 Run any example with:
 
 ```bash
-probe session run --session-id <id> --file docs/examples/flows/<example>.json --json
+probe session run --session-id <id> --file docs/examples/flows/<example>.json --output-json
 ```
 
 ## Examples

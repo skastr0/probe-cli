@@ -10,7 +10,7 @@ import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
 import { DaemonClient } from "../../services/DaemonClient"
 import { ProbeKernel } from "../../services/ProbeKernel"
-import { runDoctorCommand } from "./doctor"
+import { runCapabilitiesCommand, runDoctorCommand } from "./doctor"
 import { runDrillCommand } from "./drill"
 import { runPerfCommand } from "./perf"
 import { runSessionCommand } from "./session"
@@ -73,6 +73,13 @@ type CapturedPerfSummaryParams = {
   readonly artifactKey: string
 }
 
+type CapturedPerfRecordParams = {
+  readonly sessionId: string
+  readonly template?: string
+  readonly customTemplatePath?: string
+  readonly timeLimit: string
+}
+
 type CapturedLogMarkParams = {
   readonly sessionId: string
   readonly label: string
@@ -85,6 +92,19 @@ type CapturedLogCaptureParams = {
 
 type CapturedLogDoctorParams = {
   readonly sessionId: string
+}
+
+type CapturedLogsParams = {
+  readonly sessionId: string
+  readonly source: string
+  readonly lineCount: number
+  readonly match: string | null
+  readonly outputMode: OutputMode
+  readonly captureSeconds: number
+  readonly predicate: string | null
+  readonly process: string | null
+  readonly subsystem: string | null
+  readonly category: string | null
 }
 
 type CapturedDiagnosticCaptureParams = {
@@ -281,6 +301,43 @@ const buildCapturedPerfAroundClient = (capture: (params: CapturedPerfAroundParam
     captureDiagnosticBundle: unexpectedClientCall,
   })
 
+const buildCapturedPerfRecordClient = (capture: (params: CapturedPerfRecordParams) => void) =>
+  DaemonClient.of({
+    ping: unexpectedClientCall,
+    openSession: unexpectedClientCall,
+    getSessionHealth: unexpectedClientCall,
+    closeSession: unexpectedClientCall,
+    listSessions: unexpectedClientCall,
+    showSession: unexpectedClientCall,
+    getSessionLogs: unexpectedClientCall,
+    markSessionLog: unexpectedClientCall,
+    captureLogWindow: unexpectedClientCall,
+    getLogDoctorReport: unexpectedClientCall,
+    runSessionDebugCommand: unexpectedClientCall,
+    captureSnapshot: unexpectedClientCall,
+    captureScreenshot: unexpectedClientCall,
+    recordVideo: unexpectedClientCall,
+    performSessionAction: unexpectedClientCall,
+    runSessionFlow: unexpectedClientCall,
+    exportSessionRecording: unexpectedClientCall,
+    replaySessionRecording: unexpectedClientCall,
+    getSessionResultSummary: unexpectedClientCall,
+    getSessionResultAttachments: unexpectedClientCall,
+    recordPerf: (params) => {
+      capture(params as CapturedPerfRecordParams)
+      return Effect.fail(new UserInputError({
+        code: "captured-perf-record",
+        reason: "captured",
+        nextStep: "none",
+        details: [],
+      }))
+    },
+    recordPerfAroundFlow: unexpectedClientCall,
+    summarizePerfBySignpost: unexpectedClientCall,
+    drillArtifact: unexpectedClientCall,
+    captureDiagnosticBundle: unexpectedClientCall,
+  })
+
 const buildCapturedPerfSummaryClient = (capture: (params: CapturedPerfSummaryParams) => void) =>
   DaemonClient.of({
     ping: unexpectedClientCall,
@@ -412,6 +469,43 @@ const buildCapturedLogDoctorClient = (capture: (params: CapturedLogDoctorParams)
         details: [],
       }))
     },
+    runSessionDebugCommand: unexpectedClientCall,
+    captureSnapshot: unexpectedClientCall,
+    captureScreenshot: unexpectedClientCall,
+    recordVideo: unexpectedClientCall,
+    performSessionAction: unexpectedClientCall,
+    runSessionFlow: unexpectedClientCall,
+    exportSessionRecording: unexpectedClientCall,
+    replaySessionRecording: unexpectedClientCall,
+    getSessionResultSummary: unexpectedClientCall,
+    getSessionResultAttachments: unexpectedClientCall,
+    recordPerf: unexpectedClientCall,
+    recordPerfAroundFlow: unexpectedClientCall,
+    summarizePerfBySignpost: unexpectedClientCall,
+    drillArtifact: unexpectedClientCall,
+    captureDiagnosticBundle: unexpectedClientCall,
+  })
+
+const buildCapturedLogsClient = (capture: (params: CapturedLogsParams) => void) =>
+  DaemonClient.of({
+    ping: unexpectedClientCall,
+    listSessions: unexpectedClientCall,
+    openSession: unexpectedClientCall,
+    showSession: unexpectedClientCall,
+    getSessionHealth: unexpectedClientCall,
+    closeSession: unexpectedClientCall,
+    getSessionLogs: (params) => {
+      capture(params as CapturedLogsParams)
+      return Effect.fail(new UserInputError({
+        code: "captured-logs",
+        reason: "captured",
+        nextStep: "none",
+        details: [],
+      }))
+    },
+    markSessionLog: unexpectedClientCall,
+    captureLogWindow: unexpectedClientCall,
+    getLogDoctorReport: unexpectedClientCall,
     runSessionDebugCommand: unexpectedClientCall,
     captureSnapshot: unexpectedClientCall,
     captureScreenshot: unexpectedClientCall,
@@ -957,7 +1051,66 @@ describe("cli user input handling", () => {
     })
   })
 
-  test("session action accepts inline json payloads and selector aliases", async () => {
+  test("capabilities reports daemon and major readiness areas", async () => {
+    const output = await captureConsoleLogs(
+      runCapabilitiesCommand(["--output-json"]).pipe(
+        Effect.provideService(ProbeKernel, ProbeKernel.of({
+          getWorkspaceStatus: () => Effect.succeed({
+            workspaceRoot: "/tmp/probe-cli",
+            artifactRoot: "/tmp/.probe",
+            outputThreshold: {
+              maxInlineBytes: 8192,
+              maxInlineLines: 120,
+            },
+            commands: ["capabilities [--output-json]"],
+            daemon: {
+              running: true,
+              socketPath: "/tmp/probe.sock",
+              metadataPath: "/tmp/daemon.json",
+              protocolVersion: "probe-rpc/v1",
+              sessionTtlMs: 900_000,
+              artifactRetentionMs: 604_800_000,
+            },
+            capabilities: [
+              { area: "daemon", status: "supported", summary: "daemon ready", details: [] },
+              { area: "runner", status: "supported", summary: "runner ready", details: [] },
+              { area: "simulator", status: "supported", summary: "simulator ready", details: [] },
+              { area: "real-device", status: "degraded", summary: "device partial", details: [] },
+              { area: "artifact", status: "supported", summary: "artifact ready", details: [] },
+              { area: "accessibility", status: "supported", summary: "accessibility ready", details: [] },
+              { area: "commerce", status: "degraded", summary: "commerce partial", details: [] },
+              { area: "perf", status: "degraded", summary: "performance partial", details: [] },
+              { area: "logs", status: "degraded", summary: "logging partial", details: [] },
+              { area: "optional-dependencies", status: "degraded", summary: "optional partial", details: [] },
+            ],
+            diagnostics: [],
+            knownWalls: [],
+            notes: [],
+          }),
+          serve: unexpectedClientCall,
+          handleRpcRequest: unexpectedClientCall,
+        } as any)),
+      ),
+    )
+    const status = JSON.parse(output)
+    const areas = status.capabilities.map((capability: { readonly area: string }) => capability.area)
+
+    expect(status.daemon.running).toBe(true)
+    expect(areas).toEqual(expect.arrayContaining([
+      "daemon",
+      "runner",
+      "simulator",
+      "real-device",
+      "artifact",
+      "accessibility",
+      "commerce",
+      "perf",
+      "logs",
+      "optional-dependencies",
+    ]))
+  })
+
+  test("session action accepts input-json payloads and selector aliases", async () => {
     const captured = { current: null as CapturedActionParams | null }
 
     await Effect.runPromise(
@@ -966,8 +1119,9 @@ describe("cli user input handling", () => {
           "action",
           "--session-id",
           "session-1",
-          "--json",
+          "--input-json",
           '{"kind":"assert","selector":{"kind":"semantic","identifier":"fixture.status.label","label":null,"value":null,"placeholder":null,"type":"staticText","section":null,"interactive":false},"expectation":{"exists":true,"interactive":false}}',
+          "--output-json",
         ]).pipe(
           Effect.provideService(DaemonClient, buildCapturedActionClient((params) => {
             captured.current = params
@@ -1421,5 +1575,198 @@ describe("cli user input handling", () => {
 
     expect(captured.current.sessionId).toBe("session-1")
     expect(captured.current.artifactKey).toBe("logging-trace")
+  })
+
+  test("session action accepts canonical full JSON payloads", async () => {
+    const captured = { current: null as CapturedActionParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runSessionCommand([
+          "action",
+          "--input-json",
+          JSON.stringify({
+            sessionId: "session-1",
+            action: {
+              kind: "tap",
+              target: {
+                kind: "ref",
+                ref: "@e5",
+                fallback: null,
+              },
+            },
+          }),
+          "--output-json",
+        ]).pipe(
+          Effect.provideService(DaemonClient, buildCapturedActionClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current).toMatchObject({
+      sessionId: "session-1",
+      action: {
+        kind: "tap",
+        target: {
+          kind: "ref",
+        },
+      },
+    })
+  })
+
+  test("session action rejects legacy --json inline payloads", async () => {
+    const error = await expectUserInputFailure(
+      runSessionCommand([
+        "action",
+        "--session-id",
+        "session-1",
+        "--json",
+        '{"kind":"tap","target":{"kind":"ref","ref":"@e5","fallback":null}}',
+      ]),
+    )
+
+    expect(error.code).toBe("legacy-json-input")
+    expect(error.nextStep).toContain("--input-json")
+  })
+
+  test("session open accepts JSON payloads", async () => {
+    const captured = { current: null as CapturedOpenParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runSessionCommand([
+          "open",
+          "--input-json",
+          JSON.stringify({
+            target: "device",
+            bundleId: "com.example.notes",
+            deviceId: "device-1",
+          }),
+          "--output-json",
+        ]).pipe(
+          Effect.provideService(DaemonClient, buildCapturedOpenClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current).toMatchObject({
+      target: "device",
+      bundleId: "com.example.notes",
+      sessionMode: null,
+      simulatorUdid: null,
+      deviceId: "device-1",
+    })
+  })
+
+  test("session logs accepts JSON filter payloads", async () => {
+    const captured = { current: null as CapturedLogsParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runSessionCommand([
+          "logs",
+          "--input-json",
+          JSON.stringify({
+            sessionId: "session-1",
+            source: "simulator",
+            lineCount: 120,
+            match: "payment",
+            outputMode: "artifact",
+            captureSeconds: 4,
+            predicate: "eventMessage CONTAINS \"payment\"",
+            process: "Fixture",
+            subsystem: "dev.probe",
+            category: "commerce",
+          }),
+          "--output-json",
+        ]).pipe(
+          Effect.provideService(DaemonClient, buildCapturedLogsClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current).toMatchObject({
+      sessionId: "session-1",
+      source: "simulator",
+      lineCount: 120,
+      match: "payment",
+      outputMode: "artifact",
+      captureSeconds: 4,
+      predicate: "eventMessage CONTAINS \"payment\"",
+      process: "Fixture",
+      subsystem: "dev.probe",
+      category: "commerce",
+    })
+  })
+
+  test("perf record accepts JSON payloads", async () => {
+    const captured = { current: null as CapturedPerfRecordParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runPerfCommand([
+          "record",
+          "--input-json",
+          JSON.stringify({
+            sessionId: "session-1",
+            template: "time-profiler",
+            timeLimit: "5s",
+          }),
+          "--output-json",
+        ]).pipe(
+          Effect.provideService(DaemonClient, buildCapturedPerfRecordClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current).toMatchObject({
+      sessionId: "session-1",
+      template: "time-profiler",
+      timeLimit: "5s",
+    })
+  })
+
+  test("drill accepts JSON query payloads", async () => {
+    const captured = { current: null as CapturedDrillParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runDrillCommand([
+          "--input-json",
+          JSON.stringify({
+            sessionId: "session-1",
+            artifactKey: "snapshot.latest",
+            outputMode: "inline",
+            query: {
+              kind: "json",
+              pointer: "/nodes/0",
+            },
+          }),
+          "--output-json",
+        ]).pipe(
+          Effect.provideService(DaemonClient, buildCapturedDrillClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current).toMatchObject({
+      sessionId: "session-1",
+      artifactKey: "snapshot.latest",
+      outputMode: "inline",
+      query: {
+        kind: "json",
+        pointer: "/nodes/0",
+      },
+    })
   })
 })

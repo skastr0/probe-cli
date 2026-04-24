@@ -52,6 +52,7 @@ const createArtifactRecord = (
   kind: ArtifactKind,
   absolutePath: string,
   summary: string,
+  sizeBytes?: number,
 ): ArtifactRecord => ({
   key,
   label,
@@ -59,9 +60,19 @@ const createArtifactRecord = (
   summary,
   absolutePath,
   relativePath: absolutePath.startsWith(probeRoot) ? relative(probeRoot, absolutePath) : null,
+  ...(sizeBytes === undefined ? {} : { sizeBytes }),
   external: !absolutePath.startsWith(probeRoot),
   createdAt: nowIso(),
 })
+
+const readFileSize = async (absolutePath: string): Promise<number | undefined> => {
+  try {
+    const fileStat = await stat(absolutePath)
+    return fileStat.isFile() ? fileStat.size : undefined
+  } catch {
+    return undefined
+  }
+}
 
 const socketReachable = async (socketPath: string): Promise<boolean> =>
   await new Promise<boolean>((resolve) => {
@@ -497,10 +508,12 @@ export const ArtifactStoreLive = Layer.effect(
         }),
       registerArtifact: (sessionId, record) =>
         Effect.gen(function* () {
+          const sizeBytes = record.sizeBytes ?? (yield* Effect.promise(() => readFileSize(record.absolutePath)))
+          const normalizedRecord = sizeBytes === undefined ? record : { ...record, sizeBytes }
           const existing = yield* readArtifactIndex(sessionId)
-          const next = [...existing.filter((entry) => entry.key !== record.key), record]
+          const next = [...existing.filter((entry) => entry.key !== normalizedRecord.key), normalizedRecord]
           yield* writeArtifactIndex(sessionId, next)
-          return record
+          return normalizedRecord
         }),
       listArtifacts: (sessionId) => readArtifactIndex(sessionId),
       getArtifact: (sessionId, artifactKey) =>
@@ -537,6 +550,7 @@ export const ArtifactStoreLive = Layer.effect(
               format,
               absolutePath,
               summary,
+              Buffer.byteLength(content, "utf8"),
             )
 
             const existing = await Effect.runPromise(readArtifactIndex(sessionId))
@@ -570,6 +584,7 @@ export const ArtifactStoreLive = Layer.effect(
               kind,
               absolutePath,
               summary,
+              await readFileSize(absolutePath),
             )
 
             const existing = await Effect.runPromise(readArtifactIndex(sessionId))

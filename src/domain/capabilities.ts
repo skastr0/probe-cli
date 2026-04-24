@@ -1,12 +1,17 @@
 import { Schema } from "effect"
 
 export const CapabilityArea = Schema.Literal(
+  "daemon",
   "simulator",
   "real-device",
   "runner",
+  "artifact",
+  "accessibility",
+  "commerce",
   "perf",
   "logs",
   "debug",
+  "optional-dependencies",
 )
 export type CapabilityArea = typeof CapabilityArea.Type
 

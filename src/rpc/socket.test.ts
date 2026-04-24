@@ -143,6 +143,8 @@ describe("rpc socket behavior", () => {
               category: "protocol",
               reason: `Expected protocol ${PROBE_PROTOCOL_VERSION} but received probe-rpc/v0.`,
               nextStep: "upgrade",
+              next_step: "upgrade",
+              retryable: true,
               details: [],
               capability: null,
               expectedVersion: PROBE_PROTOCOL_VERSION,

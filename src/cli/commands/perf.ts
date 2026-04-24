@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { UserInputError } from "../../domain/errors"
 import { decodeSessionFlowContract } from "../../domain/flow-v2"
 import {
@@ -10,10 +10,47 @@ import {
   perfTemplateChoices,
   type PerfRecordResult,
   type PerfSignpostSummaryResult,
-  type PerfTemplate,
+  PerfTemplate,
 } from "../../domain/perf"
 import { DaemonClient } from "../../services/DaemonClient"
+import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
+
+const PerfRecordPayload = Schema.Struct({
+  sessionId: Schema.String,
+  template: Schema.optional(PerfTemplate),
+  customTemplatePath: Schema.optional(Schema.String),
+  timeLimit: Schema.optional(Schema.String),
+})
+
+const PerfAroundPayload = Schema.Struct({
+  sessionId: Schema.optional(Schema.String),
+  template: Schema.optional(PerfTemplate),
+  flow: Schema.Unknown,
+})
+
+const decodePerfRecordPayload = Schema.decodeUnknownSync(PerfRecordPayload)
+const decodePerfAroundPayloadEnvelope = Schema.decodeUnknownSync(PerfAroundPayload)
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null
+
+const decodePerfAroundPayload = (value: unknown) => {
+  if (isRecord(value) && "flow" in value) {
+    const payload = decodePerfAroundPayloadEnvelope(value)
+    return {
+      sessionId: payload.sessionId ?? null,
+      template: payload.template ?? null,
+      flow: payload.flow,
+    }
+  }
+
+  return {
+    sessionId: null,
+    template: null,
+    flow: value,
+  }
+}
 
 const customTemplateUsageText = "--custom-template <path.tracetemplate>"
 const perfRecordTemplateUsageText = `--template ${perfTemplateChoiceText} or ${customTemplateUsageText}`
@@ -102,6 +139,18 @@ const readFlowFile = (path: string) =>
     })
   })
 
+const decodeFlowPayload = (value: unknown) =>
+  Effect.try({
+    try: () => decodeSessionFlowContract(value),
+    catch: (error) =>
+      new UserInputError({
+        code: "perf-flow-payload-parse",
+        reason: `Could not parse flow payload: ${error instanceof Error ? error.message : String(error)}.`,
+        nextStep: "Validate the flow JSON shape and retry the command.",
+        details: [],
+      }),
+  })
+
 const formatPerfResult = (result: PerfRecordResult): string => {
   const metricLines = result.summary.metrics.map((metric) => `- ${metric.label}: ${metric.value}`)
   const diagnosisLines = result.diagnoses.map((diagnosis) => {
@@ -188,13 +237,40 @@ const formatSignpostSummary = (result: PerfSignpostSummaryResult): string => {
 export const runPerfCommand = (args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const [subcommand, ...rest] = args
-    const asJson = rest.includes("--json")
+    const asJson = hasMachineJsonOutput(rest)
 
     switch (subcommand) {
       case "record": {
-        const sessionId = yield* requireOption(rest, "--session-id")
-        const selection = yield* resolveRecordTemplateSelection(rest)
-        const timeLimit = (yield* optionalOption(rest, "--time-limit"))
+        const payload = yield* readOptionalJsonInput(rest, "perf record payload", decodePerfRecordPayload, undefined, {
+          allowFile: false,
+          allowStdin: false,
+        })
+        const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
+        const selection = payload === null
+          ? yield* resolveRecordTemplateSelection(rest)
+          : {
+              template: payload.template,
+              customTemplatePath: payload.customTemplatePath,
+            }
+
+        if (selection.template && selection.customTemplatePath) {
+          return yield* invalidOption(
+            "--custom-template",
+            "cannot be combined with template in the perf record JSON payload.",
+            "Provide either template or customTemplatePath and retry the command.",
+          )
+        }
+
+        if (!selection.template && !selection.customTemplatePath) {
+          return yield* invalidOption(
+            "--template",
+            "missing template or customTemplatePath in the perf record JSON payload.",
+            `Provide template ${perfTemplateChoiceText} or customTemplatePath and retry the command.`,
+          )
+        }
+
+        const timeLimit = payload?.timeLimit
+          ?? (yield* optionalOption(rest, "--time-limit"))
           ?? (selection.template ? defaultPerfTimeLimitForTemplate(selection.template) : "3s")
         const client = yield* DaemonClient
         const result = yield* client.recordPerf({
@@ -216,11 +292,12 @@ export const runPerfCommand = (args: ReadonlyArray<string>) =>
       }
 
       case "around": {
-        const sessionId = yield* requireOption(rest, "--session-id")
-        const filePath = yield* requireOption(rest, "--file")
-        const templateOption = yield* requireOption(rest, "--template")
-        const template = yield* parseTemplate(templateOption)
-        const flow = yield* readFlowFile(filePath)
+        const payload = yield* readOptionalJsonInput(rest, "perf around payload", decodePerfAroundPayload)
+        const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
+        const template = payload?.template ?? (yield* parseTemplate(yield* requireOption(rest, "--template")))
+        const flow = payload === null
+          ? yield* readFlowFile(yield* requireOption(rest, "--file"))
+          : yield* decodeFlowPayload(payload.flow)
         const client = yield* DaemonClient
         const result = yield* client.recordPerfAroundFlow({
           sessionId,

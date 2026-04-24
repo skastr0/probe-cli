@@ -1,9 +1,7 @@
-import { readFile } from "node:fs/promises"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import {
   decodeActionRecordingScript,
   decodeSessionAction,
-  type ActionRecordingScript,
   type SessionActionResult,
   type SessionRecordingExportResult,
   type SessionReplayResult,
@@ -11,14 +9,14 @@ import {
 import { UserInputError } from "../../domain/errors"
 import {
   decodeSessionFlowContract,
-  type SessionFlowContract,
   type SessionFlowResult,
 } from "../../domain/flow-v2"
+import { OutputMode, SessionLogSource } from "../../domain/output"
 import type {
-  OutputMode,
+  OutputMode as OutputModeType,
   SessionResultAttachmentsResult,
   SessionLogDoctorReport,
-  SessionLogSource,
+  SessionLogSource as SessionLogSourceType,
   SessionResultSummaryResult,
   SessionScreenshotResult,
   SummaryArtifactResult,
@@ -26,18 +24,133 @@ import type {
 import {
   isLiveRunnerDetails,
   isLiveRunnerTransport,
+  SimulatorSessionMode as SimulatorSessionModeSchema,
   type SimulatorSessionMode,
   type SessionHealth,
   type SessionListEntry,
 } from "../../domain/session"
 import type { SessionSnapshotResult } from "../../domain/snapshot"
 import { DaemonClient } from "../../services/DaemonClient"
+import {
+  failLegacyJsonInput,
+  hasLegacyJsonInput,
+  hasMachineJsonOutput,
+  readOptionalJsonInput,
+} from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
 const defaultTestBundleId = "dev.probe.fixture"
+const NullableString = Schema.Union(Schema.String, Schema.Null)
+
+const SessionOpenPayload = Schema.Struct({
+  target: Schema.optional(Schema.Literal("simulator", "device")),
+  bundleId: Schema.optional(Schema.String),
+  sessionMode: Schema.optional(Schema.Union(SimulatorSessionModeSchema, Schema.Null)),
+  simulatorUdid: Schema.optional(NullableString),
+  deviceId: Schema.optional(NullableString),
+})
+
+const SessionLogsPayload = Schema.Struct({
+  sessionId: Schema.String,
+  source: Schema.optional(SessionLogSource),
+  lineCount: Schema.optional(Schema.Number),
+  match: Schema.optional(NullableString),
+  outputMode: Schema.optional(OutputMode),
+  captureSeconds: Schema.optional(Schema.Number),
+  predicate: Schema.optional(NullableString),
+  process: Schema.optional(NullableString),
+  subsystem: Schema.optional(NullableString),
+  category: Schema.optional(NullableString),
+})
+
+const SessionLogsMarkPayload = Schema.Struct({
+  sessionId: Schema.String,
+  label: Schema.String,
+})
+
+const SessionLogsCapturePayload = Schema.Struct({
+  sessionId: Schema.String,
+  captureSeconds: Schema.optional(Schema.Number),
+})
+
+const SessionScopedPayload = Schema.Struct({
+  sessionId: Schema.String,
+})
+
+const SessionActionPayload = Schema.Struct({
+  sessionId: Schema.optional(Schema.String),
+  action: Schema.Unknown,
+})
+
+const SessionRunPayload = Schema.Struct({
+  sessionId: Schema.optional(Schema.String),
+  flow: Schema.Unknown,
+})
+
+const SessionReplayPayload = Schema.Struct({
+  sessionId: Schema.optional(Schema.String),
+  script: Schema.Unknown,
+})
+
+const decodeSessionOpenPayload = Schema.decodeUnknownSync(SessionOpenPayload)
+const decodeSessionLogsPayload = Schema.decodeUnknownSync(SessionLogsPayload)
+const decodeSessionLogsMarkPayload = Schema.decodeUnknownSync(SessionLogsMarkPayload)
+const decodeSessionLogsCapturePayload = Schema.decodeUnknownSync(SessionLogsCapturePayload)
+const decodeSessionScopedPayload = Schema.decodeUnknownSync(SessionScopedPayload)
+const decodeSessionActionPayloadEnvelope = Schema.decodeUnknownSync(SessionActionPayload)
+const decodeSessionRunPayloadEnvelope = Schema.decodeUnknownSync(SessionRunPayload)
+const decodeSessionReplayPayloadEnvelope = Schema.decodeUnknownSync(SessionReplayPayload)
 
 export interface SessionCommandDependencies {
   readonly readStdinText?: () => Effect.Effect<string, UserInputError>
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null
+
+const decodeSessionActionPayload = (value: unknown) => {
+  if (isRecord(value) && "action" in value) {
+    const payload = decodeSessionActionPayloadEnvelope(value)
+    return {
+      sessionId: payload.sessionId ?? null,
+      action: decodeSessionAction(payload.action),
+    }
+  }
+
+  return {
+    sessionId: null,
+    action: decodeSessionAction(value),
+  }
+}
+
+const decodeSessionRunPayload = (value: unknown) => {
+  if (isRecord(value) && "flow" in value) {
+    const payload = decodeSessionRunPayloadEnvelope(value)
+    return {
+      sessionId: payload.sessionId ?? null,
+      flow: decodeSessionFlowContract(payload.flow),
+    }
+  }
+
+  return {
+    sessionId: null,
+    flow: decodeSessionFlowContract(value),
+  }
+}
+
+const decodeSessionReplayPayload = (value: unknown) => {
+  if (isRecord(value) && "script" in value) {
+    const payload = decodeSessionReplayPayloadEnvelope(value)
+    return {
+      sessionId: payload.sessionId ?? null,
+      script: decodeActionRecordingScript(payload.script),
+    }
+  }
+
+  return {
+    sessionId: null,
+    script: decodeActionRecordingScript(value),
+  }
 }
 
 const inferSimulatorSessionMode = (bundleId: string): SimulatorSessionMode =>
@@ -347,11 +460,11 @@ const parseOutputMode = (args: ReadonlyArray<string>) =>
     const mode = yield* optionalOption(args, "--output")
 
     if (!mode) {
-      return "auto" satisfies OutputMode
+      return "auto" satisfies OutputModeType
     }
 
     if (mode === "auto" || mode === "inline" || mode === "artifact") {
-      return mode satisfies OutputMode
+      return mode satisfies OutputModeType
     }
 
     return yield* invalidOption(
@@ -387,7 +500,7 @@ const parseLogSource = (args: ReadonlyArray<string>) =>
     const source = yield* optionalOption(args, "--source")
 
     if (!source) {
-      return "runner" satisfies SessionLogSource
+      return "runner" satisfies SessionLogSourceType
     }
 
     if (
@@ -397,7 +510,7 @@ const parseLogSource = (args: ReadonlyArray<string>) =>
       || source === "stdout"
       || source === "simulator"
     ) {
-      return source satisfies SessionLogSource
+      return source satisfies SessionLogSourceType
     }
 
     return yield* invalidOption(
@@ -407,101 +520,26 @@ const parseLogSource = (args: ReadonlyArray<string>) =>
     )
   })
 
-const readJsonFile = <T>(path: string, label: string, decode: (value: unknown) => T) =>
-  Effect.gen(function* () {
-    const raw = yield* Effect.tryPromise({
-      try: () => readFile(path, "utf8"),
-      catch: (error) =>
-        new UserInputError({
-          code: "session-json-file-read",
-          reason: `Could not read ${label} file ${path}: ${error instanceof Error ? error.message : String(error)}.`,
-          nextStep: `Verify the ${label} file path and retry the command.`,
-          details: [],
-        }),
-    })
-
-    return yield* Effect.try({
-      try: () => decode(JSON.parse(raw) as unknown),
-      catch: (error) =>
-        new UserInputError({
-          code: "session-json-file-parse",
-          reason: `Could not parse ${label} file ${path}: ${error instanceof Error ? error.message : String(error)}.`,
-          nextStep: `Validate the ${label} JSON shape and retry the command.`,
-          details: [],
-        }),
-    })
-  })
-
-const decodeInlineJson = <T>(raw: string, label: string, decode: (value: unknown) => T) =>
-  Effect.try({
-    try: () => decode(JSON.parse(raw) as unknown),
-    catch: (error) =>
-      new UserInputError({
-        code: "session-json-inline-parse",
-        reason: `Could not parse inline ${label} JSON: ${error instanceof Error ? error.message : String(error)}.`,
-        nextStep: `Validate the inline ${label} JSON shape and retry the command.`,
-        details: [],
-      }),
-  })
-
-const defaultReadStdinText = () =>
-  Effect.tryPromise({
-    try: async () => {
-      const chunks: Array<string> = []
-
-      for await (const chunk of process.stdin) {
-        chunks.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"))
-      }
-
-      return chunks.join("")
-    },
-    catch: (error) =>
-      new UserInputError({
-        code: "session-stdin-read",
-        reason: `Could not read flow JSON from stdin: ${error instanceof Error ? error.message : String(error)}.`,
-        nextStep: "Pipe valid flow JSON to stdin and retry the command.",
-        details: [],
-      }),
-  })
-
 const parseActionInvocation = (args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
-    const filePath = yield* optionalOption(args, "--file")
-    const explicitInlineJson = yield* optionalOption(args, "--input-json")
-    let inlineJson = explicitInlineJson
-    let outputAsJson = args.includes("--output-json")
-
-    for (let index = 0; index < args.length; index += 1) {
-      if (args[index] !== "--json") {
-        continue
-      }
-
-      const next = args[index + 1]
-
-      if (typeof next === "string" && !next.startsWith("--")) {
-        inlineJson = next
-        index += 1
-        continue
-      }
-
-      outputAsJson = true
+    if (hasLegacyJsonInput(args)) {
+      return yield* failLegacyJsonInput("probe session action")
     }
 
-    if ((filePath === null && inlineJson === null) || (filePath !== null && inlineJson !== null)) {
+    const payload = yield* readOptionalJsonInput(args, "session action payload", decodeSessionActionPayload)
+
+    if (payload === null) {
       return yield* invalidOption(
-        filePath !== null ? "--json" : "--file",
-        "provide exactly one of --file <path> or --json/--input-json <payload>.",
-        "Pass either --file <action.json> or --json <action-json> and retry the command.",
+        "--input-json",
+        "missing action payload.",
+        "Pass --input-json <payload>, --file <action.json>, or --stdin and retry the command.",
       )
     }
 
-    const action = filePath !== null
-      ? yield* readJsonFile(filePath, "action", decodeSessionAction)
-      : yield* decodeInlineJson(inlineJson!, "action", decodeSessionAction)
-
     return {
-      action,
-      outputAsJson,
+      sessionId: payload.sessionId,
+      action: payload.action,
+      outputAsJson: hasMachineJsonOutput(args),
     }
   })
 
@@ -510,26 +548,20 @@ const parseFlowInvocation = (
   deps?: SessionCommandDependencies,
 ) =>
   Effect.gen(function* () {
-    const filePath = yield* optionalOption(args, "--file")
-    const useStdin = args.includes("--stdin")
+    const payload = yield* readOptionalJsonInput(args, "session run payload", decodeSessionRunPayload, deps)
 
-    if ((filePath === null && !useStdin) || (filePath !== null && useStdin)) {
+    if (payload === null) {
       return yield* invalidOption(
-        filePath !== null ? "--stdin" : "--file",
-        "provide exactly one of --file <path> or --stdin.",
-        "Pass either --file <flow.json> or --stdin and retry the command.",
+        "--input-json",
+        "missing flow payload.",
+        "Pass --input-json <payload>, --file <flow.json>, or --stdin and retry the command.",
       )
     }
 
-    const flow = filePath !== null
-      ? yield* readJsonFile<SessionFlowContract>(filePath, "flow", decodeSessionFlowContract)
-      : yield* (deps?.readStdinText ?? defaultReadStdinText)().pipe(
-          Effect.flatMap((raw) => decodeInlineJson(raw, "flow", decodeSessionFlowContract)),
-        )
-
     return {
-      flow,
-      outputAsJson: args.includes("--json"),
+      sessionId: payload.sessionId,
+      flow: payload.flow,
+      outputAsJson: hasMachineJsonOutput(args),
     }
   })
 
@@ -575,7 +607,7 @@ const parseSessionOpenTarget = (args: ReadonlyArray<string>) =>
 export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCommandDependencies) =>
   Effect.gen(function* () {
     const [subcommand, ...rest] = args
-    const asJson = rest.includes("--json")
+    const asJson = hasMachineJsonOutput(rest)
 
     switch (subcommand) {
       case "list": {
@@ -591,10 +623,19 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
       }
 
       case "open": {
-        const bundleId = (yield* optionalOption(rest, "--bundle-id")) ?? defaultTestBundleId
-        const openTarget = yield* parseSessionOpenTarget(rest)
+        const payload = yield* readOptionalJsonInput(rest, "session open payload", decodeSessionOpenPayload, undefined, {
+          allowFile: false,
+          allowStdin: false,
+        })
+        const bundleId = payload?.bundleId ?? (yield* optionalOption(rest, "--bundle-id")) ?? defaultTestBundleId
+        const openTarget = yield* parseSessionOpenTarget([
+          ...(payload?.target ? ["--target", payload.target] : []),
+          ...(payload?.simulatorUdid ? ["--simulator-udid", payload.simulatorUdid] : []),
+          ...(payload?.deviceId ? ["--device-id", payload.deviceId] : []),
+          ...rest,
+        ])
         const sessionMode = openTarget.target === "simulator"
-          ? inferSimulatorSessionMode(bundleId)
+          ? payload?.sessionMode ?? inferSimulatorSessionMode(bundleId)
           : null
         const client = yield* DaemonClient
         const health = yield* client.openSession({
@@ -639,8 +680,12 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
 
         switch (logsSubcommand) {
           case "mark": {
-            const sessionId = yield* requireOption(logsRest, "--session-id")
-            const label = yield* requireOption(logsRest, "--label")
+            const payload = yield* readOptionalJsonInput(logsRest, "session logs mark payload", decodeSessionLogsMarkPayload, undefined, {
+              allowFile: false,
+              allowStdin: false,
+            })
+            const sessionId = payload?.sessionId ?? (yield* requireOption(logsRest, "--session-id"))
+            const label = payload?.label ?? (yield* requireOption(logsRest, "--label"))
             const client = yield* DaemonClient
             const result = yield* client.markSessionLog({
               sessionId,
@@ -655,8 +700,12 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
           }
 
           case "capture": {
-            const sessionId = yield* requireOption(logsRest, "--session-id")
-            const captureSeconds = yield* parsePositiveIntegerOption(logsRest, "--seconds", 2)
+            const payload = yield* readOptionalJsonInput(logsRest, "session logs capture payload", decodeSessionLogsCapturePayload, undefined, {
+              allowFile: false,
+              allowStdin: false,
+            })
+            const sessionId = payload?.sessionId ?? (yield* requireOption(logsRest, "--session-id"))
+            const captureSeconds = payload?.captureSeconds ?? (yield* parsePositiveIntegerOption(logsRest, "--seconds", 2))
             const client = yield* DaemonClient
             const result = yield* client.captureLogWindow({
               sessionId,
@@ -671,7 +720,11 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
           }
 
           case "doctor": {
-            const sessionId = yield* requireOption(logsRest, "--session-id")
+            const payload = yield* readOptionalJsonInput(logsRest, "session logs doctor payload", decodeSessionScopedPayload, undefined, {
+              allowFile: false,
+              allowStdin: false,
+            })
+            const sessionId = payload?.sessionId ?? (yield* requireOption(logsRest, "--session-id"))
             const client = yield* DaemonClient
             const result = yield* client.getLogDoctorReport({
               sessionId,
@@ -689,16 +742,20 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
               return yield* unknownSubcommand("session logs", logsSubcommand)
             }
 
-            const sessionId = yield* requireOption(rest, "--session-id")
-            const source = yield* parseLogSource(rest)
-            const lineCount = yield* parsePositiveIntegerOption(rest, "--lines", 80)
-            const captureSeconds = yield* parsePositiveIntegerOption(rest, "--seconds", 2)
-            const match = yield* optionalOption(rest, "--match")
-            const predicate = yield* optionalOption(rest, "--predicate")
-            const process = yield* optionalOption(rest, "--process")
-            const subsystem = yield* optionalOption(rest, "--subsystem")
-            const category = yield* optionalOption(rest, "--category")
-            const outputMode = yield* parseOutputMode(rest)
+            const payload = yield* readOptionalJsonInput(rest, "session logs payload", decodeSessionLogsPayload, undefined, {
+              allowFile: false,
+              allowStdin: false,
+            })
+            const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
+            const source = payload?.source ?? (yield* parseLogSource(rest))
+            const lineCount = payload?.lineCount ?? (yield* parsePositiveIntegerOption(rest, "--lines", 80))
+            const captureSeconds = payload?.captureSeconds ?? (yield* parsePositiveIntegerOption(rest, "--seconds", 2))
+            const match = payload?.match ?? (yield* optionalOption(rest, "--match"))
+            const predicate = payload?.predicate ?? (yield* optionalOption(rest, "--predicate"))
+            const process = payload?.process ?? (yield* optionalOption(rest, "--process"))
+            const subsystem = payload?.subsystem ?? (yield* optionalOption(rest, "--subsystem"))
+            const category = payload?.category ?? (yield* optionalOption(rest, "--category"))
+            const outputMode = payload?.outputMode ?? (yield* parseOutputMode(rest))
             const client = yield* DaemonClient
             const result = yield* client.getSessionLogs({
               sessionId,
@@ -755,8 +812,8 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
       }
 
       case "run": {
-        const sessionId = yield* requireOption(rest, "--session-id")
         const parsed = yield* parseFlowInvocation(rest, deps)
+        const sessionId = parsed.sessionId ?? (yield* requireOption(rest, "--session-id"))
         const client = yield* DaemonClient
         const result = yield* client.runSessionFlow({
           sessionId,
@@ -771,8 +828,8 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
       }
 
       case "action": {
-        const sessionId = yield* requireOption(rest, "--session-id")
         const parsed = yield* parseActionInvocation(rest)
+        const sessionId = parsed.sessionId ?? (yield* requireOption(rest, "--session-id"))
         const client = yield* DaemonClient
         const result = yield* client.performSessionAction({
           sessionId,
@@ -788,7 +845,7 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
 
       case "recording": {
         const [recordingSubcommand, ...recordingRest] = rest
-        const recordingAsJson = recordingRest.includes("--json")
+        const recordingAsJson = hasMachineJsonOutput(recordingRest)
 
         switch (recordingSubcommand) {
           case "export": {
@@ -813,9 +870,13 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
       }
 
       case "replay": {
-        const sessionId = yield* requireOption(rest, "--session-id")
-        const filePath = yield* requireOption(rest, "--file")
-        const script = yield* readJsonFile<ActionRecordingScript>(filePath, "replay script", decodeActionRecordingScript)
+        const payload = yield* readOptionalJsonInput(rest, "session replay payload", decodeSessionReplayPayload)
+        const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
+        const script = payload?.script ?? (yield* invalidOption(
+          "--input-json",
+          "missing replay script payload.",
+          "Pass --input-json <payload>, --file <recording.json>, or --stdin and retry the command.",
+        ))
         const client = yield* DaemonClient
         const result = yield* client.replaySessionRecording({
           sessionId,
@@ -834,7 +895,11 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
 
         switch (resultSubcommand) {
           case "summary": {
-            const sessionId = yield* requireOption(resultRest, "--session-id")
+            const payload = yield* readOptionalJsonInput(resultRest, "session result payload", decodeSessionScopedPayload, undefined, {
+              allowFile: false,
+              allowStdin: false,
+            })
+            const sessionId = payload?.sessionId ?? (yield* requireOption(resultRest, "--session-id"))
             yield* runSessionResultCommand({
               sessionId,
               view: "summary",
@@ -844,7 +909,11 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
           }
 
           case "attachments": {
-            const sessionId = yield* requireOption(resultRest, "--session-id")
+            const payload = yield* readOptionalJsonInput(resultRest, "session result payload", decodeSessionScopedPayload, undefined, {
+              allowFile: false,
+              allowStdin: false,
+            })
+            const sessionId = payload?.sessionId ?? (yield* requireOption(resultRest, "--session-id"))
             yield* runSessionResultCommand({
               sessionId,
               view: "attachments",
