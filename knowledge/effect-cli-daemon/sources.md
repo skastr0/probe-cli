@@ -9,7 +9,7 @@ Accessed: 2026-04-09
 | `ARCHITECTURE.md` | Confirms Probe is daemon-first, single-runtime, artifact-first, and expects `ManagedRuntime` + `Layer.scoped` + daemon-owned subprocess cleanup. |
 | `AGENTS.md` | Requires Effect guidance first for CLI/daemon work and requires reusable research packs under `knowledge/`. |
 | `knowledge/README.md` | Defines the reusable pack shape and the rule to prefer official / primary sources. |
-| `.agents/sdlc/building/001a-probe-effect-cli-daemon-research-pack.md` | Defines the acceptance criteria for this pack. |
+| Telechy Control SDLC item `PRB-003` | Defines the acceptance criteria for this pack. |
 
 ## Official / primary external sources
 

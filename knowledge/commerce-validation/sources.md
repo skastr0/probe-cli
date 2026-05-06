@@ -15,5 +15,5 @@
 
 ## Local references
 
-- `.agents/sdlc/building/056-commerce-validation.md`
+- Telechy Control SDLC item `PRB-058`
 - `V2-DIRECTION.md` section 10

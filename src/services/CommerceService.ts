@@ -79,7 +79,7 @@ const revenueCatPublicKeyPattern = /\b(?:appl|test)_[A-Za-z0-9_]+\b/g
 const storeKitProductFieldNames = new Set(["productId", "productID", "productIdentifier", "storeProductId", "storeProductID", "id", "identifier"])
 const revenueCatProductFieldNames = new Set(["productId", "productID", "productIdentifier", "storeProductId", "storeProductID", "appleProductId", "apple_product_id", "id"])
 const revenueCatEntitlementFieldNames = new Set(["entitlement", "entitlementId", "entitlementID", "entitlementIdentifier", "entitlements"])
-const ignoredWorkspaceDirectoryNames = new Set([".git", ".agents", "node_modules", "Pods", "build", "coverage", "dist", ".next"])
+const ignoredWorkspaceDirectoryNames = new Set([".git", "node_modules", "Pods", "build", "coverage", "dist", ".next"])
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null
