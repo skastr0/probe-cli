@@ -32,6 +32,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Validate release version
+        id: release-version
         shell: bash
         run: |
           version="$(node -p "require('./package.json').version")"
@@ -45,6 +46,44 @@ jobs:
             exit 1
           fi
 
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check npm version availability
+        id: npm-availability
+        shell: bash
+        run: |
+          version="${{ steps.release-version.outputs.version }}"
+          packages=(
+            "@skastr0/probe-darwin-arm64"
+            "@skastr0/probe-darwin-x64"
+            "@skastr0/probe"
+          )
+
+          existing=0
+          missing=0
+
+          for package in "${packages[@]}"; do
+            if npm view "${package}@${version}" version >/dev/null 2>&1; then
+              echo "${package}@${version} already exists on npm."
+              existing=$((existing + 1))
+            else
+              echo "${package}@${version} is available for publish."
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [ "${existing}" -gt 0 ] && [ "${missing}" -gt 0 ]; then
+            echo "Refusing partial publish state: ${existing} existing package(s), ${missing} missing package(s)."
+            exit 1
+          fi
+
+          if [ "${existing}" -gt 0 ]; then
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            echo "All package versions already exist on npm; skipping publish."
+          else
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Verify
         run: bun run verify
 
@@ -55,9 +94,11 @@ jobs:
         run: bun run validate:npm
 
       - name: Publish platform packages
+        if: steps.npm-availability.outputs.publish == 'true'
         run: |
           npm publish ./packages/probe-darwin-arm64 --access public
           npm publish ./packages/probe-darwin-x64 --access public
 
       - name: Publish launcher package
+        if: steps.npm-availability.outputs.publish == 'true'
         run: npm publish ./packages/probe --access public
