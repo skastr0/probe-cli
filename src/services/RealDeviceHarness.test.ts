@@ -205,7 +205,7 @@ describe("buildRealDeviceBuildForTestingCommandArgs", () => {
     expect(buildRealDeviceBuildForTestingCommandArgs({
       projectPath: "/tmp/ProbeFixture.xcodeproj",
       derivedDataPath: "/tmp/probe-derived-data",
-      developmentTeam: "4452968868",
+      developmentTeam: "TEAMID1234",
     })).toEqual([
       "-project",
       "/tmp/ProbeFixture.xcodeproj",
@@ -217,7 +217,7 @@ describe("buildRealDeviceBuildForTestingCommandArgs", () => {
       "/tmp/probe-derived-data",
       "-allowProvisioningUpdates",
       "-allowProvisioningDeviceRegistration",
-      "DEVELOPMENT_TEAM=4452968868",
+      "DEVELOPMENT_TEAM=TEAMID1234",
       "build-for-testing",
     ])
   })

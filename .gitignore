@@ -8,3 +8,7 @@ coverage/
 *.pyc
 .env
 release.md
+**/xcuserdata/
+*.xcuserstate
+dist/native/
+packages/probe-darwin-*/bin/probe

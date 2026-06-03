@@ -155,12 +155,12 @@
 				LastUpgradeCheck = 2600;
 				TargetAttributes = {
 					AE6AE876E19BFF4030967AAA = {
-						DevelopmentTeam = 4452968868;
+						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 					C6BEF88323EE551A9FF34BA9 = {
 						CreatedOnToolsVersion = 26.3;
-						DevelopmentTeam = 4452968868;
+						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 						TestTargetID = AE6AE876E19BFF4030967AAA;
 					};
@@ -240,7 +240,7 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 4452968868;
+				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ProbeFixture/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -261,7 +261,7 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 4452968868;
+				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ../ProbeRunner/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -397,7 +397,7 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 4452968868;
+				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ../ProbeRunner/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -420,7 +420,7 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 4452968868;
+				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ProbeFixture/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
