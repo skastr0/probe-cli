@@ -1,0 +1,31 @@
+{
+  "name": "@skastr0/probe",
+  "version": "0.1.0",
+  "description": "iOS app inspection and automation CLI for development workflows.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skastr0/probe.git",
+    "directory": "packages/probe"
+  },
+  "homepage": "https://github.com/skastr0/probe#readme",
+  "bugs": {
+    "url": "https://github.com/skastr0/probe/issues"
+  },
+  "type": "commonjs",
+  "bin": {
+    "probe": "bin/probe.js"
+  },
+  "optionalDependencies": {
+    "@skastr0/probe-darwin-arm64": "0.1.0",
+    "@skastr0/probe-darwin-x64": "0.1.0"
+  },
+  "files": [
+    "bin/probe.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -12,10 +12,12 @@ import { runServeCommand } from "./commands/serve"
 import { runSessionCommand } from "./commands/session"
 import { runValidateCommand } from "./commands/validate"
 import { hasMachineJsonOutput } from "./json"
+import { probeVersion } from "../services/RuntimeAssets"
 
 const helpText = `Probe control plane
 
 Usage:
+  probe --version
   probe doctor [--output-json|--json]
   probe capabilities [--output-json|--json]
   probe schema list [--output-json|--json]
@@ -116,6 +118,13 @@ const runCli = (args: ReadonlyArray<string>) =>
       case "--help":
       case "-h": {
         yield* print(helpText)
+        return
+      }
+
+      case "version":
+      case "--version":
+      case "-v": {
+        yield* print(probeVersion)
         return
       }
 

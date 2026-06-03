@@ -22,7 +22,7 @@ import type { WorkspaceStatus } from "../domain/workspace"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
-import { findProjectRoot } from "./ProjectRoot"
+import { resolveProbeRuntimeRoot } from "./ProjectRoot"
 import { SessionRegistry } from "./SessionRegistry"
 import { SimulatorHarness } from "./SimulatorHarness"
 import {
@@ -64,7 +64,7 @@ import {
 } from "../rpc/protocol"
 
 const nowIso = (): string => new Date().toISOString()
-const probeProjectRoot = findProjectRoot()
+const probeProjectRoot = resolveProbeRuntimeRoot()
 
 interface HostCommandResult {
   readonly stdout: string

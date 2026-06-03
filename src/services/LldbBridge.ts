@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { createInterface } from "node:readline"
 import { Context, Effect, Layer } from "effect"
 import { EnvironmentError } from "../domain/errors"
+import { resolveProbeLldbBridgeScriptPath, resolveProbeRuntimeRoot } from "./ProjectRoot"
 import {
   decodeLldbBridgeFrameLine,
   encodeLldbBridgeRequestLine,
@@ -82,7 +83,7 @@ export const LldbBridgeFactoryLive = Layer.succeed(
           const stderrLogPath = join(debugDirectory, `${fileStem}-lldb-bridge.stderr.log`)
           const frameLog = createWriteStream(frameLogPath, { flags: "a" })
           const stderrLog = createWriteStream(stderrLogPath, { flags: "a" })
-          const bridgeScriptPath = join(import.meta.dir, "..", "bridge", "lldb-python", "bridge.py")
+          const bridgeScriptPath = resolveProbeLldbBridgeScriptPath(resolveProbeRuntimeRoot())
           const child = spawn("xcrun", ["python3", bridgeScriptPath], {
             cwd: process.cwd(),
             stdio: ["pipe", "pipe", "pipe"],

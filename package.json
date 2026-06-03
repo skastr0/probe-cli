@@ -1,22 +1,26 @@
 {
   "name": "@skastr0/probe",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.14",
   "scripts": {
+    "generate:runtime-assets": "bun scripts/generate-runtime-assets.ts",
     "probe": "bun run src/cli/main.ts",
     "serve": "bun run src/cli/main.ts serve",
     "doctor": "bun run src/cli/main.ts doctor",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck",
-    "build": "bun scripts/build.ts",
+    "build": "bun run generate:runtime-assets && bun scripts/build.ts",
+    "build:native": "bun run generate:runtime-assets && bun scripts/build-native.ts",
+    "prepare:npm": "bun run build:native && bun scripts/prepare-npm-packages.ts",
+    "validate:npm": "bun scripts/validate-npm-packages.ts",
     "install:local": "bun scripts/install.ts",
     "transport-spike": "bun run src/spikes/runner-transport/benchmark.ts",
     "lldb-bridge-spike": "bun run src/spikes/lldb-python-bridge/validate.ts",
     "coexistence-spike": "bun run src/spikes/concurrent-attachment-coexistence/validate.ts",
-    "verify": "bun run typecheck && bun run test && bun run build"
+    "verify": "bun run generate:runtime-assets && bun run typecheck && bun run test && bun run build"
   },
   "files": [
     "src",

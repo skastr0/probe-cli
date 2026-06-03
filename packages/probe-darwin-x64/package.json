@@ -1,0 +1,29 @@
+{
+  "name": "@skastr0/probe-darwin-x64",
+  "version": "0.1.0",
+  "description": "Native Probe CLI binary for macOS.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skastr0/probe.git",
+    "directory": "packages/probe-darwin-x64"
+  },
+  "homepage": "https://github.com/skastr0/probe#readme",
+  "bugs": {
+    "url": "https://github.com/skastr0/probe/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/probe",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
