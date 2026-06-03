@@ -8,7 +8,7 @@ Probe does not own builds, signing, or provisioning of the target app. The app m
 
 Probe is public and experimental. It is useful for local iOS validation workflows, but command contracts, fixture behavior, and release packaging may change before the first stable release.
 
-The current supported distribution lane is source checkout plus local Bun install. npm publishing, standalone GitHub Release binaries, and Homebrew distribution are intentionally deferred until the runtime package layout, binary artifact shape, and release authority are validated.
+The current end-user distribution lane is npm: `@skastr0/probe` installs a Node.js launcher plus the matching macOS native binary package. It does not require Probe source or Bun at runtime. Source checkout plus Bun remains the development path. Homebrew remains deferred.
 
 ## Product Vision
 
@@ -41,9 +41,18 @@ CLI commands  -->  Unix socket  -->  Daemon  -->  XCUITest Runner  -->  Target A
 ## Prerequisites
 
 - macOS with Xcode installed
-- Bun runtime
+- Node.js/npm for npm installation
+- Bun runtime for source checkout and development
 - `ffmpeg` (optional, for stitching video frames into MP4)
 - For real devices: paired device with Developer Mode enabled, signed app installed
+
+## Install From npm
+
+```bash
+npm install -g @skastr0/probe
+probe --version
+probe doctor --output-json
+```
 
 ## Install From Source
 
@@ -87,13 +96,15 @@ bun run probe -- session open --output-json
 
 ## Release Plan
 
-The prepared release lane is:
+The release lane is:
 
 1. Keep the repository public as an experimental source-available CLI.
-2. Validate every release candidate with `bun install --frozen-lockfile`, `bun run verify`, public-readiness scans, and package/release audits.
-3. Create a git tag and GitHub Release only after maintainer approval.
-4. Add standalone binary artifacts and Homebrew only after `scripts/build.ts` produces a stable release asset shape.
-5. Consider npm only after Probe has a versioned package contract with a `bin` entry, a safe `files` allowlist, and registry authority configured.
+2. Validate every release candidate with `bun install --frozen-lockfile`, `bun run verify`, package dry-runs, install smoke tests, public-readiness scans, and package/release audits.
+3. Publish npm through `@skastr0/probe` plus `@skastr0/probe-darwin-arm64` and `@skastr0/probe-darwin-x64`.
+4. Use `.github/workflows/publish.yml` and npm trusted publishing for subsequent npm releases after the local `0.1.0` bootstrap.
+5. Add GitHub Release binaries and Homebrew only after npm distribution has shipped and the release asset/checksum policy is validated.
+
+See `docs/release/npm.md` for the npm runbook.
 
 Real publishing, tags, GitHub Releases, Homebrew formula pushes, npm setup, and registry uploads require explicit maintainer approval. `release.md` is ignored because it is temporary coordination scratch space, not a release artifact.
 
