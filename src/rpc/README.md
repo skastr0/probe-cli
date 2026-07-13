@@ -21,3 +21,9 @@ Discovery:
 Important caveat:
 
 - the daemon-backed simulator vertical slice is real, and runner ingress uses the validated HTTP POST seam; stdout remains the mixed-log observation path through the `xcodebuild` boundary
+
+Known defects (PRB-087):
+
+- `serveRpc` dispatches each request via a bare `Effect.runPromise` (`src/rpc/server.ts:148`) that is not a child fiber of the daemon's own scope, so in-flight requests keep running after the daemon is interrupted/shut down.
+- The `sequence` field on event frames (`src/rpc/protocol.ts:679`) is never validated by the client, so dropped or reordered progress events are undetectable.
+- See `knowledge/rpc-daemon-defects/` for the full write-up, the reproduction harness (`src/investigations/rpc-daemon-defects/`, run via `bun run benchmark:investigation`), and the captured baseline (`knowledge/rpc-daemon-defects/baselines/v1.json`). These are recorded as expected-red observations, not yet fixed.

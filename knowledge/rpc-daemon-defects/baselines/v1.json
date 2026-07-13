@@ -1,0 +1,117 @@
+{
+  "schemaVersion": 1,
+  "glyphId": "PRB-087",
+  "provenance": {
+    "generatedAt": "2026-07-13T20:33:29.044Z",
+    "gitSha": "ac8f6b022d41474ecf19de7d3f86955042dbb91b",
+    "gitBranch": "prb/prb-087",
+    "gitDirty": true,
+    "host": {
+      "platform": "darwin",
+      "arch": "arm64",
+      "bunVersion": "1.3.14",
+      "xcodeVersion": "Xcode 26.6"
+    }
+  },
+  "lanes": {
+    "simulator": {
+      "lane": "simulator",
+      "status": "ran",
+      "summary": "Booted and confirmed simulator iPhone 17 Pro (2B12EBC6-EFAD-4E58-84FD-90A1E61A7CDC) via simctl.",
+      "details": [
+        "Selected simulator: iPhone 17 Pro (2B12EBC6-EFAD-4E58-84FD-90A1E61A7CDC), initial state Booted.",
+        "Post-boot state: Booted."
+      ],
+      "receipts": [
+        "$ xcrun simctl list devices available --json -> exit 0",
+        "$ xcrun simctl list devices 2B12EBC6-EFAD-4E58-84FD-90A1E61A7CDC --json -> exit 0"
+      ]
+    },
+    "device": {
+      "lane": "device",
+      "status": "ran",
+      "summary": "devicectl reported 2 known device(s); this investigation does not drive a live device session against them.",
+      "details": [
+        "devicectl reported 2 known device(s).",
+        "known device: Guilherme’s Apple Watch (00008301-D8996DAC3EE8402E)",
+        "known device: iPhone (2) (00008110-0006293936C0401E)"
+      ],
+      "receipts": [
+        "$ xcrun devicectl list devices --json-output /var/folders/f5/yx3b1gkj4fz_8wc5mjk3pl180000gn/T/probe-investigation-devicectl-wq1i8Q/devices.json -> exit 0"
+      ]
+    }
+  },
+  "findings": [
+    {
+      "id": "detached-rpc-work-01",
+      "category": "detached-rpc-work",
+      "verdict": "red",
+      "summary": "The in-flight request handler kept running and settled after the daemon fiber was interrupted (socket closed, metadata removed), confirming request work is detached from serveRpc's own Effect scope.",
+      "evidence": [
+        "src/rpc/server.ts:148 — Effect.runPromise(Effect.either(config.onRequest(request, emit))).then(...) is invoked outside the Effect.acquireRelease/Effect.scoped block that owns serveRpc's own lifecycle (src/rpc/server.ts:49-241), so it is never a child fiber of the daemon and Fiber.interrupt on the daemon cannot reach it.",
+        "daemon fiber interrupted 43ms after the handler started (handler configured to sleep 150ms); handler settled 152ms after start."
+      ],
+      "metrics": {
+        "handlerSleepMs": 150,
+        "interruptAfterMs": 40,
+        "observeAfterMs": 300,
+        "settledImmediatelyAfterInterrupt": 0,
+        "settledAfterWait": 1
+      }
+    },
+    {
+      "id": "ambiguous-mutation-delivery-01",
+      "category": "ambiguous-mutation-delivery",
+      "verdict": "red",
+      "summary": "The client accepted a sequence gap (1 -> 5) in progress events and still resolved the request successfully, so a caller cannot tell dropped or reordered mutation events from a complete stream.",
+      "evidence": [
+        "src/rpc/protocol.ts:679 — RpcProgressEvent declares `sequence: Schema.Number` but no producer or consumer in src/rpc/server.ts or src/rpc/client.ts validates monotonicity or contiguity.",
+        "src/rpc/client.ts:265-268 — event frames are handed to `options.onEvent` and the loop just `continue`s; there is no tracking of the last-seen sequence number.",
+        "observed sequence stream: [1, 5]; request settled as success."
+      ],
+      "metrics": {
+        "observedEventCount": 2,
+        "requestSucceeded": 1,
+        "sequenceGapDetected": 1
+      }
+    },
+    {
+      "id": "artifact-race-01",
+      "category": "artifact-race",
+      "verdict": "red",
+      "summary": "Concurrent artifact registrations for the same session lost one registration in 16/16 trials: registerArtifact reads the whole index, appends in memory, then overwrites the file, so two concurrent registrations can both read the pre-write state and the later write clobbers the earlier one.",
+      "evidence": [
+        "src/services/ArtifactStore.ts:509-517 — registerArtifact does `const existing = yield* readArtifactIndex(sessionId)`, appends in memory, then `yield* writeArtifactIndex(sessionId, next)` with no lock, version check, or atomic append.",
+        "src/services/ArtifactStore.ts:258-293 — readArtifactIndex/writeArtifactIndex operate on the same JSON file with no compare-and-swap.",
+        "reproduction: 16/16 trials lost a registration (100%)."
+      ],
+      "metrics": {
+        "trialCount": 16,
+        "lostTrials": 16,
+        "reproductionRate": 1
+      }
+    },
+    {
+      "id": "eager-export-01",
+      "category": "eager-export",
+      "verdict": "red",
+      "summary": "In 16/16 trials, both concurrent registrations reported success with no thrown error even though only one was actually persisted — a caller that receives the \"artifact registered\" result has no guarantee the artifact is durably discoverable via a subsequent list/drill call.",
+      "evidence": [
+        "src/services/ArtifactStore.ts:509-517 — registerArtifact always resolves with `normalizedRecord` on the happy path; it never re-reads the index after writing to confirm its own entry survived a concurrent writer.",
+        "src/services/SessionRegistry.ts:5982-5993 (exportRecording) and :534-558 (writeDerivedOutput) both treat a resolved registerArtifact call as export success and return that result to the RPC caller without a post-write verification read.",
+        "reproduction: 16/16 trials returned success for a registration that did not survive (100%)."
+      ],
+      "metrics": {
+        "trialCount": 16,
+        "eagerLossTrials": 16,
+        "reproductionRate": 1
+      }
+    }
+  ],
+  "overallVerdict": "red",
+  "notes": [
+    "This baseline intentionally captures known-red defects (ambiguous mutation delivery, eager export, artifact races, detached RPC work) without fixing them; see PRB-087.",
+    "The artifact-race and eager-export scenarios exercise a faithful mirror of ArtifactStore.registerArtifact's read-modify-write algorithm against a temp directory rather than the real ArtifactStoreLive service, because that service roots artifacts under `join(homedir(), \".probe\")` with no injection point and Bun's os.homedir() does not honor a HOME override at call time.",
+    "The simulator lane boots and shuts down a real iOS Simulator via simctl but does not install/launch the Probe XCUITest runner app; a full app-session lane requires the ios/ Xcode build pipeline and is out of scope for this harness."
+  ]
+}
