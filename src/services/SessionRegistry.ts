@@ -18,11 +18,9 @@ import {
   isRunnerUiRecordedSessionAction,
   resolveActionSelectorInSnapshot,
   resolveRecordedActionTargetInSnapshot,
-  validateFlowContract,
   validateSessionAction,
   type ActionRecordingScript,
   type FlowFailedStep,
-  type FlowResult,
   type FlowStep,
   type FlowStepResult,
   type RecordedSessionAction,
@@ -5916,35 +5914,21 @@ export const SessionRegistryLive = Layer.scoped(
               ? `Flow ${overallVerdict === "timed-out" ? "timed out" : "failed"} at step ${failedStep.index} after ${executedSteps.length} executed step(s) and ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
               : `Executed ${executedSteps.length} flow step(s) with ${failedStepCount} failed step(s), continuing past failures where continueOnError was enabled.`
 
-          if (isV2SessionFlow) {
-            return {
-              contract: "probe.session-flow/report-v2",
-              executedAt: nowIso(),
-              sessionId,
-              summary,
-              verdict: overallVerdict,
-              executedSteps: executedSteps as Array<FlowV2StepResult>,
-              failedStep: failedStep as FlowV2FailedStep | null,
-              retries: totalRetries,
-              artifacts: dedupedArtifacts,
-              finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-              warnings: overallWarnings,
-            } satisfies FlowV2Result
-          }
-
+          // isV2SessionFlow is always true post-PRB-082: SessionFlowContract has a
+          // single canonical version, so the v1 report-shape branch is gone.
           return {
-            contract: "probe.session-flow/report-v1",
+            contract: "probe.session-flow/report-v2",
             executedAt: nowIso(),
             sessionId,
             summary,
             verdict: overallVerdict,
-            executedSteps: executedSteps as Array<FlowStepResult>,
-            failedStep: failedStep as FlowFailedStep | null,
+            executedSteps: executedSteps as Array<FlowV2StepResult>,
+            failedStep: failedStep as FlowV2FailedStep | null,
             retries: totalRetries,
             artifacts: dedupedArtifacts,
             finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
             warnings: overallWarnings,
-          } satisfies FlowResult
+          } satisfies FlowV2Result
         }),
       exportRecording: ({ sessionId, label }) =>
         Effect.gen(function* () {

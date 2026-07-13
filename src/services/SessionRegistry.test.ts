@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { Effect, Either, Layer, ManagedRuntime } from "effect"
-import type { ActionRecordingScript, FlowContract, ReplayReport } from "../domain/action"
+import type { ActionRecordingScript, ReplayReport } from "../domain/action"
 import type { SessionDebuggerDetails } from "../domain/debug"
 import type { FlowV2Contract } from "../domain/flow-v2"
 import {
@@ -3054,8 +3054,8 @@ describe("SessionRegistry", () => {
           }))
 
           const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
-          const flow: FlowContract = {
-            contract: "probe.session-flow/v1",
+          const flow: FlowV2Contract = {
+            contract: "probe.session-flow/v2",
             steps: [
               { kind: "snapshot" },
               {
@@ -3229,7 +3229,7 @@ describe("SessionRegistry", () => {
         const result = await runtime.runPromise(registry.runFlow({
           sessionId: session.sessionId,
           flow: {
-            contract: "probe.session-flow/v1",
+            contract: "probe.session-flow/v2",
             steps: [
               {
                 kind: "tap",

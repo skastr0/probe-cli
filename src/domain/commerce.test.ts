@@ -9,6 +9,7 @@ import {
   decodeCommerceValidationPlan,
   validateCommerceValidationPlan,
 } from "./commerce"
+import { UnsupportedFlowContractError } from "./errors"
 import type { SessionHealth } from "./session"
 
 const baseSession = (overrides?: Partial<SessionHealth>): SessionHealth => ({
@@ -124,8 +125,31 @@ describe("commerce domain", () => {
       throw new Error("Expected commerce.loadProducts step")
     }
 
-    expect(plan.steps[0].flow.contract).toBe("probe.session-flow/v1")
+    expect(plan.steps[0].flow.contract).toBe("probe.session-flow/v2")
     expect(plan.steps[0].flow.steps[0]?.kind).toBe("sleep")
+  })
+
+  test("rejects an explicitly v1-tagged embedded commerce flow instead of silently upgrading it", () => {
+    const decodeV1EmbeddedFlow = () =>
+      decodeCommerceValidationPlan({
+        contract: "probe.commerce-plan/v1",
+        steps: [
+          {
+            kind: "commerce.loadProducts",
+            flow: {
+              contract: "probe.session-flow/v1",
+              steps: [
+                {
+                  kind: "sleep",
+                  durationMs: 250,
+                },
+              ],
+            },
+          },
+        ],
+      })
+
+    expect(decodeV1EmbeddedFlow).toThrow(UnsupportedFlowContractError)
   })
 
   test("rejects invalid commerce steps", () => {
@@ -137,7 +161,7 @@ describe("commerce domain", () => {
           entitlement: "",
           state: "active",
           flow: {
-            contract: "probe.session-flow/v1",
+            contract: "probe.session-flow/v2",
             steps: [
               {
                 kind: "sleep",

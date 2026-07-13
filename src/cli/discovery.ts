@@ -247,7 +247,7 @@ export const exampleEntries: ReadonlyArray<ExampleDiscoveryEntry> = [
     name: "session-run-file-json",
     command: "session run",
     description: "Run a flow from a JSON file and request machine output.",
-    invocation: "probe session run --session-id <session-id> --file docs/examples/flows/verified-only-v1.json --output-json",
+    invocation: "probe session run --session-id <session-id> --file docs/examples/flows/verified-only-v2.json --output-json",
     payload: null,
   },
   {

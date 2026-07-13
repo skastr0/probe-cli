@@ -2,11 +2,10 @@ import { Schema } from "effect"
 import {
   ActionDirection,
   ActionSelectorSchema,
+  ActionVerdict,
   FlowAssertStepSchema,
-  FlowContractSchema,
   FlowFailedStepSchema,
   FlowLogMarkStepSchema,
-  FlowResultSchema,
   FlowScreenshotStepSchema,
   FlowSleepStepSchema,
   FlowSnapshotStepSchema,
@@ -18,18 +17,17 @@ import {
   FlowTypeStepSchema,
   FlowVideoStepSchema,
   FlowWaitStepSchema,
-  decodeFlowContract,
+  flowStepToSessionAction,
   isFlowSessionActionStep,
   type ActionSelector,
-  type FlowContract,
-  type FlowResult,
   type FlowSessionActionStep,
   type FlowStep,
   type SessionAction,
-  validateFlowContract,
   validateFlowStep,
   validateSessionAction,
 } from "./action"
+import { ArtifactRecord, NullableString } from "./output"
+import { UnsupportedFlowContractError } from "./errors"
 
 const NullableNumber = Schema.Union(Schema.Number, Schema.Null)
 const PositiveIntegerSchema = Schema.Number.pipe(Schema.int(), Schema.greaterThan(0))
@@ -370,17 +368,27 @@ export const FlowV2FailedStepSchema = Schema.Struct({
 export type FlowV2FailedStep = typeof FlowV2FailedStepSchema.Type
 
 export const FlowV2ResultSchema = Schema.Struct({
-  ...FlowResultSchema.fields,
   contract: Schema.Literal("probe.session-flow/report-v2"),
+  executedAt: Schema.String,
+  sessionId: Schema.String,
+  summary: Schema.String,
+  verdict: ActionVerdict,
   executedSteps: Schema.Array(FlowV2StepResultSchema),
   failedStep: Schema.Union(FlowV2FailedStepSchema, Schema.Null),
+  retries: Schema.Number,
+  artifacts: Schema.Array(ArtifactRecord),
+  finalSnapshotId: NullableString,
+  warnings: Schema.Array(Schema.String),
 })
 export type FlowV2Result = typeof FlowV2ResultSchema.Type
 
-export const SessionFlowContractSchema = Schema.Union(FlowContractSchema, FlowV2ContractSchema)
+// The session-flow contract and its result carry a single canonical version.
+// probe.session-flow/v1 and its report-v1 counterpart were removed in PRB-082;
+// these names stay stable for callers while resolving to the v2 shape only.
+export const SessionFlowContractSchema = FlowV2ContractSchema
 export type SessionFlowContract = typeof SessionFlowContractSchema.Type
 
-export const SessionFlowResultSchema = Schema.Union(FlowResultSchema, FlowV2ResultSchema)
+export const SessionFlowResultSchema = FlowV2ResultSchema
 export type SessionFlowResult = typeof SessionFlowResultSchema.Type
 
 export const resolveFlowExecutionProfile = (
@@ -445,22 +453,7 @@ export const flowV2StepToSessionAction = (step: FlowV2SessionActionStep): Sessio
     throw new Error(`Expected a flow session-action step, received ${flowStep.kind}.`)
   }
 
-  switch (flowStep.kind) {
-    case "tap":
-    case "press":
-    case "swipe":
-    case "type":
-    case "scroll":
-    case "wait":
-    case "assert":
-    case "video":
-      return flowStep
-    case "screenshot":
-      return {
-        kind: "screenshot",
-        retryPolicy: flowStep.retryPolicy,
-      }
-  }
+  return flowStepToSessionAction(flowStep)
 }
 
 const validateSequenceAction = (action: FlowSequenceAction): string | null => {
@@ -555,17 +548,24 @@ export const validateFlowV2Contract = (flow: FlowV2Contract): string | null => {
 }
 
 export const validateSessionFlowContract = (flow: SessionFlowContract): string | null =>
-  isFlowV2Contract(flow)
-    ? validateFlowV2Contract(flow)
-    : validateFlowContract(flow)
+  validateFlowV2Contract(flow)
 
 export const decodeFlowV2Contract = (value: unknown): FlowV2Contract =>
   Schema.decodeUnknownSync(FlowV2ContractSchema)(normalizeFlowV2ContractInput(value))
 
+// probe.session-flow/v1 was removed in PRB-082 (2026-07-11 architecture review:
+// canonical flow consolidation). Old v1 input fails closed with a typed error
+// instead of silently decoding through a compatibility adapter.
 export const decodeSessionFlowContract = (value: unknown): SessionFlowContract => {
-  if (isRecord(value) && value.contract === "probe.session-flow/v2") {
-    return decodeFlowV2Contract(value)
+  if (isRecord(value) && value.contract === "probe.session-flow/v1") {
+    throw new UnsupportedFlowContractError({
+      code: "unsupported-flow-contract",
+      contract: "probe.session-flow/v1",
+      reason: "probe.session-flow/v1 was removed; the session-flow contract now has a single canonical version.",
+      nextStep: "Re-tag the flow's \"contract\" field as \"probe.session-flow/v2\" — existing v1 step shapes decode unchanged under v2.",
+      details: [],
+    })
   }
 
-  return decodeFlowContract(value)
+  return decodeFlowV2Contract(value)
 }

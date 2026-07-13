@@ -351,12 +351,6 @@ export const FlowStepSchema = Schema.Union(
 )
 export type FlowStep = typeof FlowStepSchema.Type
 
-export const FlowContractSchema = Schema.Struct({
-  contract: Schema.Literal("probe.session-flow/v1"),
-  steps: Schema.Array(FlowStepSchema),
-})
-export type FlowContract = typeof FlowContractSchema.Type
-
 export const SessionActionSchema = Schema.Union(
   TapActionSchema,
   PressActionSchema,
@@ -567,21 +561,6 @@ export const FlowFailedStepSchema = Schema.Struct({
   verdict: ActionVerdict,
 })
 export type FlowFailedStep = typeof FlowFailedStepSchema.Type
-
-export const FlowResultSchema = Schema.Struct({
-  contract: Schema.Literal("probe.session-flow/report-v1"),
-  executedAt: Schema.String,
-  sessionId: Schema.String,
-  summary: Schema.String,
-  verdict: ActionVerdict,
-  executedSteps: Schema.Array(FlowStepResultSchema),
-  failedStep: Schema.Union(FlowFailedStepSchema, Schema.Null),
-  retries: Schema.Number,
-  artifacts: Schema.Array(ArtifactRecord),
-  finalSnapshotId: NullableString,
-  warnings: Schema.Array(Schema.String),
-})
-export type FlowResult = typeof FlowResultSchema.Type
 
 export interface FlattenedStoredSnapshotNode {
   readonly ref: string
@@ -1539,22 +1518,6 @@ export const validateFlowStep = (step: FlowStep): string | null => {
   }
 }
 
-export const validateFlowContract = (flow: FlowContract): string | null => {
-  if (flow.steps.length === 0) {
-    return "Flow contracts require at least one step."
-  }
-
-  for (const [index, step] of flow.steps.entries()) {
-    const validationError = validateFlowStep(step)
-
-    if (validationError !== null) {
-      return `Step ${index + 1}: ${validationError}`
-    }
-  }
-
-  return null
-}
-
 const normalizeActionSelectorInput = (value: unknown): unknown => {
   if (typeof value !== "object" || value === null) {
     return value
@@ -1625,76 +1588,6 @@ const normalizeSessionActionInput = (value: unknown): unknown => {
   return value
 }
 
-const normalizeFlowStepInput = (value: unknown): unknown => {
-  if (typeof value !== "object" || value === null) {
-    return value
-  }
-
-  const record = value as Record<string, unknown>
-
-  if (
-    record.kind === "tap"
-    || record.kind === "press"
-    || record.kind === "swipe"
-    || record.kind === "type"
-    || record.kind === "scroll"
-  ) {
-    return {
-      ...record,
-      target: normalizeActionSelectorInput(record.target ?? record.selector),
-    }
-  }
-
-  if (record.kind === "assert") {
-    const expectation = typeof record.expectation === "object" && record.expectation !== null
-      ? record.expectation as Record<string, unknown>
-      : {}
-
-    return {
-      ...record,
-      target: normalizeActionSelectorInput(record.target ?? record.selector),
-      expectation,
-    }
-  }
-
-  if (record.kind === "wait") {
-    const hasTarget = record.target !== undefined || record.selector !== undefined
-
-    return {
-      ...record,
-      target: normalizeActionSelectorInput(record.target ?? record.selector ?? null),
-      condition: record.condition ?? (hasTarget ? "match" : "duration"),
-      text: record.text ?? null,
-    }
-  }
-
-  if (record.kind === "screenshot") {
-    return {
-      ...record,
-      label: record.label ?? null,
-    }
-  }
-
-  return value
-}
-
-const normalizeFlowContractInput = (value: unknown): unknown => {
-  if (typeof value !== "object" || value === null) {
-    return value
-  }
-
-  const record = value as Record<string, unknown>
-
-  return {
-    ...record,
-    steps: Array.isArray(record.steps)
-      ? record.steps.map((step) => normalizeFlowStepInput(step))
-      : record.steps,
-  }
-}
-
 export const decodeSessionAction = (value: unknown): SessionAction =>
   Schema.decodeUnknownSync(SessionActionSchema)(normalizeSessionActionInput(value))
-export const decodeFlowContract = (value: unknown): FlowContract =>
-  Schema.decodeUnknownSync(FlowContractSchema)(normalizeFlowContractInput(value))
 export const decodeActionRecordingScript = Schema.decodeUnknownSync(ActionRecordingScriptSchema)

@@ -60,6 +60,17 @@ export class UnsupportedCapabilityError extends Schema.TaggedError<UnsupportedCa
   },
 ) {}
 
+export class UnsupportedFlowContractError extends Schema.TaggedError<UnsupportedFlowContractError>()(
+  "UnsupportedFlowContractError",
+  {
+    code: Schema.String,
+    contract: Schema.String,
+    reason: Schema.String,
+    nextStep: Schema.String,
+    details: Schema.Array(Schema.String),
+  },
+) {}
+
 export class ChildProcessError extends Schema.TaggedError<ChildProcessError>()(
   "ChildProcessError",
   {
@@ -121,6 +132,7 @@ export type ProbeError =
   | EnvironmentError
   | DeviceInterruptionError
   | UnsupportedCapabilityError
+  | UnsupportedFlowContractError
   | ChildProcessError
   | DaemonNotRunningError
   | ProtocolMismatchError
@@ -145,6 +157,7 @@ export interface ProbeFailurePayload {
   readonly retryable: boolean
   readonly details: ReadonlyArray<string>
   readonly capability: string | null
+  readonly contract: string | null
   readonly expectedVersion: string | null
   readonly receivedVersion: string | null
   readonly command: string | null
@@ -177,6 +190,7 @@ export const isProbeError = (value: unknown): value is ProbeError => {
     || tag === "EnvironmentError"
     || tag === "DeviceInterruptionError"
     || tag === "UnsupportedCapabilityError"
+    || tag === "UnsupportedFlowContractError"
     || tag === "ChildProcessError"
     || tag === "DaemonNotRunningError"
     || tag === "ProtocolMismatchError"
@@ -196,6 +210,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         nextStep: error.nextStep,
         details: [],
         capability: error.capability,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -213,6 +228,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         nextStep: error.nextStep,
         details: [...error.details],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -231,6 +247,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         retryable: true,
         details: [...error.details],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -249,6 +266,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         retryable: true,
         details: [...error.details],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -266,6 +284,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         nextStep: error.nextStep,
         details: [...error.details],
         capability: error.capability,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -273,6 +292,24 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         sessionId: null,
         artifactKey: null,
         wall: error.wall,
+      })
+
+    case "UnsupportedFlowContractError":
+      return makeFailurePayload({
+        code: error.code,
+        category: "unsupported",
+        reason: error.reason,
+        nextStep: error.nextStep,
+        details: [...error.details],
+        capability: null,
+        contract: error.contract,
+        expectedVersion: null,
+        receivedVersion: null,
+        command: null,
+        exitCode: null,
+        sessionId: null,
+        artifactKey: null,
+        wall: true,
       })
 
     case "ChildProcessError":
@@ -284,6 +321,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         retryable: true,
         details: error.stderrExcerpt.length === 0 ? [] : [error.stderrExcerpt],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: error.command,
@@ -302,6 +340,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         retryable: true,
         details: [`socket: ${error.socketPath}`],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -320,6 +359,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         retryable: true,
         details: [],
         capability: null,
+        contract: null,
         expectedVersion: error.expectedVersion,
         receivedVersion: error.receivedVersion,
         command: null,
@@ -338,6 +378,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         retryable: true,
         details: [],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -355,6 +396,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         nextStep: error.nextStep,
         details: [],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,
@@ -372,6 +414,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         nextStep: error.nextStep,
         details: [],
         capability: null,
+        contract: null,
         expectedVersion: null,
         receivedVersion: null,
         command: null,

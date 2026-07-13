@@ -318,9 +318,6 @@ const formatReplayResult = (result: SessionReplayResult): string => {
 type FlowV2CliResult = Extract<SessionFlowResult, { readonly contract: "probe.session-flow/report-v2" }>
 type FlowV2CliStepResult = FlowV2CliResult["executedSteps"][number]
 
-const isFlowV2CliResult = (result: SessionFlowResult): result is FlowV2CliResult =>
-  result.contract === "probe.session-flow/report-v2"
-
 const formatFlowV2SequenceChildFailure = (step: FlowV2CliStepResult): string => {
   if (step.kind !== "sequence") {
     return "n/a"
@@ -371,22 +368,9 @@ const formatFlowV2Result = (result: FlowV2CliResult): string => {
   ].join("\n")
 }
 
-const formatFlowResult = (result: SessionFlowResult): string => {
-  if (isFlowV2CliResult(result)) {
-    return formatFlowV2Result(result)
-  }
-
-  return [
-    result.summary,
-    `verdict: ${result.verdict}`,
-    `executed steps: ${result.executedSteps.length}`,
-    `failed step: ${result.failedStep?.index ?? "n/a"}`,
-    `retries: ${result.retries}`,
-    `final snapshot: ${result.finalSnapshotId ?? "n/a"}`,
-    `artifacts: ${result.artifacts.length}`,
-    `warnings: ${result.warnings.length}`,
-  ].join("\n")
-}
+// SessionFlowResult has a single canonical shape (probe.session-flow/report-v2)
+// since PRB-082 removed the v1 result contract, so this always formats as v2.
+const formatFlowResult = (result: SessionFlowResult): string => formatFlowV2Result(result)
 
 const formatSummaryArtifactResult = (result: SummaryArtifactResult): string => {
   return [
