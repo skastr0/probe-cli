@@ -169,7 +169,10 @@ const sendRequest = <TResponse extends RpcFrame>(
   | ArtifactNotFoundError
 > =>
   Effect.tryPromise({
-    try: () =>
+    // `signal` is wired to fiber interruption: if the Effect running this request is interrupted
+    // (caller cancellation, command timeout upstream, process shutdown), Node fires "abort" on it
+    // before the promise has settled, giving us a hook to tear the socket down instead of leaking it.
+    try: (signal) =>
       new Promise<TResponse>((resolve, reject) => {
         const socket = net.createConnection(options.socketPath)
         socket.setEncoding("utf8")
@@ -178,12 +181,23 @@ const sendRequest = <TResponse extends RpcFrame>(
         let buffer = ""
         let settled = false
 
+        const detach = () => {
+          socket.removeListener("connect", onConnect)
+          socket.removeListener("data", onData)
+          socket.removeListener("timeout", onTimeout)
+          socket.removeListener("end", onEnd)
+          socket.removeListener("close", onClose)
+          socket.removeListener("error", onError)
+          signal.removeEventListener("abort", onAbort)
+        }
+
         const finalizeError = (error: unknown) => {
           if (settled) {
             return
           }
 
           settled = true
+          detach()
           socket.destroy()
 
           if (error instanceof ProtocolMismatchError) {
@@ -234,14 +248,43 @@ const sendRequest = <TResponse extends RpcFrame>(
           }
 
           settled = true
+          detach()
           resolve(response)
         }
 
-        socket.on("connect", () => {
-          socket.write(encodeRpcLine(request))
-        })
+        const finalizeFailureFrame = (failure: RpcFailure) => {
+          if (settled) {
+            return
+          }
 
-        socket.on("data", (chunk) => {
+          settled = true
+          detach()
+          reject(mapFailureToError(failure))
+        }
+
+        const onAbort = () => {
+          if (settled) {
+            return
+          }
+
+          settled = true
+          detach()
+          socket.destroy()
+          reject(
+            new EnvironmentError({
+              code: "rpc-client-interrupted",
+              reason: "The Probe RPC request was interrupted before the daemon responded.",
+              nextStep: "Retry the command.",
+              details: [],
+            }),
+          )
+        }
+
+        const onConnect = () => {
+          socket.write(encodeRpcLine(request))
+        }
+
+        const onData = (chunk: string) => {
           buffer += chunk
 
           while (buffer.includes("\n")) {
@@ -270,22 +313,22 @@ const sendRequest = <TResponse extends RpcFrame>(
             socket.end()
 
             if (frame.kind === "failure") {
-              settled = true
-              reject(mapFailureToError(frame))
+              finalizeFailureFrame(frame)
               return
             }
 
             finalizeSuccess(frame as TResponse)
             return
           }
-        })
+        }
 
-        socket.on("timeout", () => {
+        const onTimeout = () => {
           finalizeError(
             new Error(`Timed out waiting for daemon response after ${options.timeoutMs} ms.`),
           )
-        })
-        socket.on("end", () => {
+        }
+
+        const onTransportClosed = () => {
           if (!settled) {
             finalizeError(
               new EnvironmentError({
@@ -296,8 +339,28 @@ const sendRequest = <TResponse extends RpcFrame>(
               }),
             )
           }
-        })
-        socket.on("error", finalizeError)
+        }
+
+        // "end" (readable side closed) and "close" (socket fully torn down, sometimes without a
+        // preceding "end" -- e.g. an RST) are both terminal-without-a-response signals; either can
+        // arrive first, so both route through the same guarded finalizer.
+        const onEnd = onTransportClosed
+        const onClose = onTransportClosed
+
+        const onError = (error: unknown) => finalizeError(error)
+
+        socket.on("connect", onConnect)
+        socket.on("data", onData)
+        socket.on("timeout", onTimeout)
+        socket.on("end", onEnd)
+        socket.on("close", onClose)
+        socket.on("error", onError)
+
+        if (signal.aborted) {
+          onAbort()
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true })
+        }
       }),
     catch: (error) =>
       error instanceof DaemonNotRunningError
