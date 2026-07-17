@@ -80,7 +80,13 @@ export interface AppleProcessResult {
 export interface AppleProcessHandle {
   readonly pid: number
   readonly isRunning: () => boolean
-  /** Sends `signal` (default SIGTERM), waits the grace period, escalates to SIGKILL, and joins exit. */
+  /**
+   * Sends `signal` (default SIGTERM). A SIGTERM stop escalates straight to
+   * the TERM -> grace -> KILL ladder. Any other signal (e.g. SIGINT, to let a
+   * tool like xctrace finalize its own output) gets a full, uncontested grace
+   * window on its own before that ladder engages -- it is never raced against
+   * an immediate SIGTERM. Either way this joins exit before resolving.
+   */
   readonly stop: (signal?: NodeJS.Signals) => Promise<AppleProcessResult>
   readonly awaitExit: Promise<AppleProcessResult>
 }
@@ -201,6 +207,37 @@ const escalateIfRunning = (child: ChildProcess, gracePeriodMs: number): Effect.E
     }
 
     yield* waitForClose(child)
+  })
+
+/**
+ * Sends a non-SIGTERM "polite" signal (e.g. SIGINT to let xctrace finalize
+ * and flush its .trace bundle) and gives it a full, uncontested grace window
+ * to work before anything more aggressive is sent. Only escalates through the
+ * TERM -> grace -> KILL ladder if the process is still alive after that first
+ * window -- racing SIGTERM in immediately behind SIGINT (as a single shared
+ * grace window would) can abort a tool's SIGINT-specific graceful-shutdown
+ * routine before it finishes, which is exactly the failure this avoids.
+ */
+const stopGracefully = (
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  gracePeriodMs: number,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const pid = child.pid
+
+    if (pid === undefined || hasExited(child)) {
+      return
+    }
+
+    trySignalGroup(pid, signal)
+
+    const timer = yield* Effect.fork(Effect.sleep(Duration.millis(gracePeriodMs)))
+    yield* waitForClose(child).pipe(Effect.raceFirst(Effect.fromFiber(timer)))
+
+    if (!hasExited(child)) {
+      yield* escalateIfRunning(child, gracePeriodMs)
+    }
   })
 
 type ChildRegistry = Ref.Ref<Map<number, ChildProcess>>
@@ -419,10 +456,11 @@ const spawnHandleManaged = (
       stop: (signal = "SIGTERM") =>
         Effect.runPromise(
           Effect.gen(function* () {
-            if (pid !== undefined && !hasExited(child)) {
-              trySignalGroup(pid, signal)
+            if (signal === "SIGTERM") {
+              yield* escalateIfRunning(child, gracePeriodMs)
+            } else {
+              yield* stopGracefully(child, signal, gracePeriodMs)
             }
-            yield* escalateIfRunning(child, gracePeriodMs)
             return yield* Effect.promise(() => settle())
           }),
         ),
@@ -488,3 +526,19 @@ export const runAppleProcess = (spec: AppleProcessSpec): Promise<AppleProcessRes
 /** Promise bridge for long-lived handles (background recordings, wrapper processes). */
 export const spawnAppleProcessHandle = (spec: AppleProcessSpec): Promise<AppleProcessHandle> =>
   runPromiseUnwrapped(Effect.flatMap(AppleProcessSupervisor, (supervisor) => supervisor.spawnHandle(spec)))
+
+/**
+ * Closes the module-level runtime's scope, running `AppleProcessSupervisorLive`'s
+ * defensive finalizer (kill anything still registered) before the daemon
+ * process exits. `ManagedRuntime.make(...)` never closes its own scope on its
+ * own -- the finalizer that daemon-shutdown fault tests prove against a
+ * directly-built-and-closed layer scope only reaches a real running daemon if
+ * something in the daemon's own shutdown path calls this. `probe serve`'s
+ * shutdown (`ProbeKernel.serve`'s `onMetadataRemove`) is that caller.
+ *
+ * Not for use in request-scoped code -- this is a process-lifetime, call-once
+ * operation. Once disposed, further `runAppleProcess`/`spawnAppleProcessHandle`
+ * calls on this module fail; only call this when the daemon itself is
+ * shutting down.
+ */
+export const disposeAppleProcessSupervisorRuntime = (): Promise<void> => runtime.dispose()

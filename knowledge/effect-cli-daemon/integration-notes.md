@@ -163,3 +163,35 @@ Accessed: 2026-07-13.
 - **Open question carried forward:** whether `xcodebuild`/`xctrace` propagate
   SIGTERM to their own child processes cleanly, or need a longer grace window /
   SIGINT first -- unresolved, needs a real device/simulator lane.
+
+### 10. PRB-085 review-fix: SIGINT vs SIGTERM racing on a graceful `stop()`
+
+Accessed: 2026-07-17.
+
+- **Regression found (code-level, confirmed via `git show 9993e78^` diff
+  against the pre-migration implementation):** the pre-migration
+  `PerfService.liveStartRecording(...).stop()` sent only SIGINT and awaited
+  natural exit with no forced escalation at all (bounded only by the
+  recording's own overall `timeoutMs`). The migrated `AppleProcessHandle.stop(signal)`
+  always chained straight into `escalateIfRunning`, which unconditionally
+  sends SIGTERM -- so `stop("SIGINT")` sent SIGINT and SIGTERM to the process
+  group within the same tick, before the SIGINT-specific handler (e.g.
+  xctrace finalizing/flushing its `.trace` bundle) had any uncontested time to
+  run.
+- **Fix:** `AppleProcessSupervisor.ts` now has `stopGracefully(child, signal,
+  gracePeriodMs)`: a non-SIGTERM `stop()` signal gets a full, uncontested
+  `gracePeriodMs` window on its own, and only escalates through the existing
+  TERM -> grace -> KILL ladder (`escalateIfRunning`) if the process is still
+  running after that window. A `stop("SIGTERM")` call is unchanged (SIGTERM
+  is already rung one of that same ladder). This directly answers section 9's
+  carried-forward open question for the SIGINT-first half: Probe's own
+  signal-sequencing no longer races SIGTERM in behind SIGINT.
+- **Still not device/simulator-validated:** whether `xctrace` itself actually
+  uses its SIGINT window to finalize/flush a `.trace` bundle (vs. exiting
+  immediately either way) remains unconfirmed -- this pass had no simulator
+  hardware. What changed is Probe's own signal sequencing (verified via two
+  new `bun test` cases in `AppleProcessSupervisor.test.ts` against a real
+  `/bin/sh` child with `trap ... INT`/`trap ... INT TERM`, not against
+  `xctrace`), not xctrace's internal response to it. The open question is
+  narrowed, not closed: does `xctrace` do anything different with the grace
+  window it's now actually given.

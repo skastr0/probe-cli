@@ -18,7 +18,7 @@ import { perfTemplateChoiceText } from "../domain/perf"
 import type { ArtifactRecord, DrillQuery, SessionLogMarker } from "../domain/output"
 import { appendSessionLogMarkers, isTextArtifactKind, summarizeContent } from "../domain/output"
 import type { WorkspaceStatus } from "../domain/workspace"
-import { runAppleProcess } from "./AppleProcessSupervisor"
+import { disposeAppleProcessSupervisorRuntime, runAppleProcess } from "./AppleProcessSupervisor"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
@@ -1765,6 +1765,15 @@ export const ProbeKernelLive = Layer.effect(
             },
             onMetadataRemove: async () => {
               await Effect.runPromise(artifactStore.removeDaemonMetadata())
+              // Runs on both a clean serve() return and SIGINT/SIGTERM
+              // (server.ts's release callback calls onMetadataRemove before
+              // closing the socket). This is the one place in the daemon
+              // lifecycle that reliably closes the AppleProcessSupervisor
+              // module-level runtime's scope, so its defensive
+              // kill-any-straggler finalizer actually runs in production
+              // instead of only in tests that build+close a layer scope
+              // directly.
+              await disposeAppleProcessSupervisorRuntime()
             },
             onRequest: handleRpcRequest,
           })

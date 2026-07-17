@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Duration, Effect, Either, Fiber, Layer } from "effect"
@@ -212,6 +212,67 @@ describe("AppleProcessSupervisor", () => {
     expect(outcome.result.exitCode === 0 || outcome.result.signal !== null).toBe(true)
   })
 
+  test("stop(SIGINT) lets a polite signal exit cleanly instead of racing an immediate SIGTERM behind it", async () => {
+    // Regression coverage: stop() used to always chain straight into
+    // escalateIfRunning, which sends SIGTERM immediately regardless of which
+    // signal was just sent -- a tool that only traps SIGINT (like xctrace)
+    // would get SIGINT and SIGTERM nearly simultaneously. A generous grace
+    // period here makes the assertion meaningful: if SIGTERM were still being
+    // raced in immediately, the process would still exit quickly (since
+    // nothing traps TERM), so a long grace period alone wouldn't prove
+    // anything -- the elapsed-time bound below is what actually distinguishes
+    // "exited via its own INT trap" from "got killed".
+    const start = Date.now()
+
+    const outcome = await withSupervisor(
+      Effect.gen(function* () {
+        const supervisor = yield* AppleProcessSupervisor
+        const handle = yield* supervisor.spawnHandle({
+          command: "/bin/sh",
+          commandArgs: ["-c", "trap 'exit 0' INT; while true; do sleep 0.05; done"],
+          gracePeriodMs: 5_000,
+        })
+
+        // Give the shell time to reach and install the trap before signaling
+        // it -- otherwise this races the shell's own startup and SIGINT can
+        // arrive under its default (terminate, not caught) disposition.
+        yield* Effect.sleep(Duration.millis(150))
+
+        return yield* Effect.promise(() => handle.stop("SIGINT"))
+      }),
+    )
+
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.signal).toBeNull()
+    // Exited via its own trap almost immediately -- nowhere near the 5s grace
+    // window, which only a forced escalation would have consumed.
+    expect(Date.now() - start).toBeLessThan(2_000)
+  })
+
+  test("stop(SIGINT) still escalates through TERM -> KILL if the process ignores every signal but KILL", async () => {
+    const outcome = await withSupervisor(
+      Effect.gen(function* () {
+        const supervisor = yield* AppleProcessSupervisor
+        const handle = yield* supervisor.spawnHandle({
+          command: "/bin/sh",
+          // Ignores both the initial polite signal and the TERM escalation
+          // step, so only the final SIGKILL can end it -- proves the ladder's
+          // safety net still runs, not just its new graceful first rung.
+          commandArgs: ["-c", "trap '' INT TERM; while true; do sleep 0.05; done"],
+          gracePeriodMs: 200,
+        })
+
+        // See the previous test -- avoid racing the shell's own startup.
+        yield* Effect.sleep(Duration.millis(150))
+
+        return yield* Effect.promise(() => handle.stop("SIGINT"))
+      }),
+    )
+
+    expect(outcome.exitCode).toBeNull()
+    expect(outcome.signal).toBe("SIGKILL")
+  })
+
   test("bounded in-memory output stays capped while the artifact keeps the exact full bytes (5 MB)", async () => {
     await withTempDir(async (dir) => {
       const sourcePath = join(dir, "source.bin")
@@ -275,5 +336,40 @@ describe("AppleProcessSupervisor", () => {
         AppleProcessSupervisorLive,
       ),
     )
+  })
+
+  // Every other test in this file exercises AppleProcessSupervisorLive's
+  // finalizer through a freshly built-and-closed layer scope (withSupervisor /
+  // Effect.provide directly) -- that is the exact gap the review found: the
+  // *production* daemon path never builds/closes a layer scope, it uses the
+  // module-level ManagedRuntime that backs runAppleProcess/spawnAppleProcessHandle,
+  // which never closed on its own before disposeAppleProcessSupervisorRuntime
+  // existed. This test proves the fix on that real path -- via a subprocess,
+  // since disposing the module-level runtime is a one-shot, process-lifetime
+  // operation that would otherwise poison every other test file in this run
+  // that also imports the module-level promise bridges.
+  test("disposeAppleProcessSupervisorRuntime closes the module-level runtime and kills stragglers", async () => {
+    await withTempDir(async (dir) => {
+      const scriptPath = join(dir, "dispose-check.ts")
+      const supervisorModulePath = join(import.meta.dir, "AppleProcessSupervisor.ts")
+
+      await writeFile(
+        scriptPath,
+        [
+          `import { spawnAppleProcessHandle, disposeAppleProcessSupervisorRuntime } from ${JSON.stringify(supervisorModulePath)}`,
+          "const handle = await spawnAppleProcessHandle({ command: \"/bin/sh\", commandArgs: [\"-c\", \"sleep 30\"], gracePeriodMs: 150 })",
+          "process.stdout.write(`${handle.pid}\\n`)",
+          "await disposeAppleProcessSupervisorRuntime()",
+          "process.exit(0)",
+        ].join("\n"),
+        "utf8",
+      )
+
+      const stdout = execFileSync(process.execPath, ["run", scriptPath], { encoding: "utf8", timeout: 10_000 })
+      const pid = Number(stdout.trim())
+
+      expect(Number.isInteger(pid)).toBe(true)
+      expect(() => process.kill(pid, 0)).toThrow()
+    })
   })
 })
