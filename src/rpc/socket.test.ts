@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { access, mkdtemp, rm } from "node:fs/promises"
-import { createConnection, createServer, type Server, type Socket } from "node:net"
+import { createConnection, createServer, Socket, type Server } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Either, Fiber } from "effect"
@@ -467,6 +467,59 @@ describe("rpc socket behavior", () => {
         }
         expect(serverSawClose).toBe(true)
       } finally {
+        await closeServer(server)
+      }
+    })
+  })
+
+  test("client fiber interruption removes every socket listener it registered", async () => {
+    await withTempSocketRoot(async ({ socketPath }) => {
+      const server = await startRawServer(socketPath, () => {
+        // Deliberately never responds; the client fiber is interrupted before any reply arrives.
+      })
+
+      let capturedSocket: Socket | null = null
+      const registered: Array<{ readonly event: string | symbol; readonly listener: (...args: Array<unknown>) => void }> = []
+      const originalOn = Socket.prototype.on
+
+      // Capture the internal socket `sendRequest` creates, and every (event, listener) pair it
+      // registers on it, by hooking `.on`. The production code never exposes the socket, so this is
+      // the only vantage point from the test for asserting listener cleanup actually happened. Node
+      // attaches its own internal listeners to a socket too (e.g. half-close handling on "end"), so
+      // this asserts our specific listeners are gone rather than asserting a raw count of zero.
+      Socket.prototype.on = function (this: Socket, event: string | symbol, listener: (...args: Array<unknown>) => void) {
+        if (event === "connect" && capturedSocket === null) {
+          capturedSocket = this
+        }
+        if (this === capturedSocket) {
+          registered.push({ event, listener })
+        }
+        return originalOn.call(this, event, listener)
+      } as typeof Socket.prototype.on
+
+      try {
+        const clientFiber = Effect.runFork(
+          sendDaemonPing({ socketPath, timeoutMs: 10_000 }, daemonPingRequest),
+        )
+
+        await sleep(100)
+        await Effect.runPromise(Fiber.interrupt(clientFiber))
+
+        // TypeScript's control-flow analysis only sees `null` as a reachable assignment to
+        // `capturedSocket` on this synchronous path (the other assignment lives inside the
+        // `Socket.prototype.on` override above), so it narrows the variable to `null` at this read
+        // unless the cast below forces the declared union type back.
+        const socket = capturedSocket as Socket | null
+        expect(socket).not.toBeNull()
+        expect(registered.length).toBeGreaterThan(0)
+
+        if (socket !== null) {
+          for (const { event, listener } of registered) {
+            expect(socket.listeners(event)).not.toContain(listener)
+          }
+        }
+      } finally {
+        Socket.prototype.on = originalOn
         await closeServer(server)
       }
     })
