@@ -887,10 +887,13 @@ export const ProbeKernelLive = Layer.effect(
     )
 
     const buildStartupRecoveryReport = Effect.gen(function* () {
-      const persistedSessions = yield* artifactStore.listPersistedSessions()
+      const { sessions: persistedSessions, failures: sessionReadFailures } = yield* artifactStore.listPersistedSessions()
       const staleSessions = persistedSessions.filter((session) => session.state !== "closed")
+      const corruptSessionDetails = sessionReadFailures.map(
+        (failure) => `${failure.sessionId}: session manifest could not be read (${failure.code}): ${failure.reason}`,
+      )
 
-      if (staleSessions.length === 0) {
+      if (staleSessions.length === 0 && corruptSessionDetails.length === 0) {
         return {
           checkedAt: nowIso(),
           status: "ready",
@@ -900,8 +903,8 @@ export const ProbeKernelLive = Layer.effect(
         } satisfies StartupRecoveryReport
       }
 
-      const details: Array<string> = []
-      let hadFailure = false
+      const details: Array<string> = [...corruptSessionDetails]
+      let hadFailure = corruptSessionDetails.length > 0
 
       for (const staleSession of staleSessions) {
         const reaped = yield* simulatorHarness.reapStaleRunnerSession({
@@ -975,7 +978,9 @@ export const ProbeKernelLive = Layer.effect(
         checkedAt: nowIso(),
         status: hadFailure ? "degraded" : "degraded",
         staleSessionCount: staleSessions.length,
-        summary: `Recovered ${staleSessions.length} stale session artifact(s) from previous daemon lifecycles before starting the daemon.`,
+        summary: corruptSessionDetails.length > 0
+          ? `Recovered ${staleSessions.length} stale session artifact(s) from previous daemon lifecycles before starting the daemon; ${corruptSessionDetails.length} session manifest(s) could not be read and were skipped.`
+          : `Recovered ${staleSessions.length} stale session artifact(s) from previous daemon lifecycles before starting the daemon.`,
         details,
       } satisfies StartupRecoveryReport
     })
@@ -983,7 +988,7 @@ export const ProbeKernelLive = Layer.effect(
     const collectWorkspaceDiagnostics = Effect.gen(function* () {
       const daemonRunning = yield* artifactStore.isDaemonRunning()
       const daemonMetadata = yield* artifactStore.readDaemonMetadata()
-      const persistedSessions = yield* artifactStore.listPersistedSessions()
+      const { sessions: persistedSessions, failures: sessionReadFailures } = yield* artifactStore.listPersistedSessions()
       const staleSessions = persistedSessions.filter((session) => session.state !== "closed")
       const xcode = yield* collectXcodeDiagnostic
       const simulator = yield* collectSimulatorDiagnostic
@@ -1035,8 +1040,25 @@ export const ProbeKernelLive = Layer.effect(
             details: staleSessions.slice(0, 5).map((session) => `${session.sessionId} (${session.state ?? "unknown"}) at ${session.artifactRoot}`),
           }
 
+      const sessionCorruptionDiagnostic: DiagnosticReport | null = sessionReadFailures.length === 0
+        ? null
+        : {
+            key: "session.corruption",
+            status: "degraded",
+            summary: `${sessionReadFailures.length} persisted session manifest(s) could not be read and were excluded from session listings.`,
+            details: sessionReadFailures.slice(0, 5).map((failure) => `${failure.sessionId}: ${failure.reason}`),
+          }
+
       return {
-        diagnostics: [daemonDiagnostic, staleSessionDiagnostic, xcode, simulator, realDevice, ffmpeg],
+        diagnostics: [
+          daemonDiagnostic,
+          staleSessionDiagnostic,
+          ...(sessionCorruptionDiagnostic ? [sessionCorruptionDiagnostic] : []),
+          xcode,
+          simulator,
+          realDevice,
+          ffmpeg,
+        ],
         startupRecovery,
       }
     })
