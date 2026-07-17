@@ -124,3 +124,42 @@ const RunnerBridgeLive = Layer.scoped(
 - **Observed:** Current Effect Node command execution uses detached POSIX children and process-group killing in implementation.
 - **Inference:** This is promising for Probe because Apple utility wrappers often spawn descendants that should die with the session.
 - **Inference:** It still needs validation with the real tool seams (`xcodebuild`, `xctrace`, `log stream`, `lldb`) before the implementation assumes identical behavior across all bridges.
+
+### 9. PRB-085 outcome: AppleProcessSupervisor stayed on raw `node:child_process`
+
+Accessed: 2026-07-13.
+
+- **Decision:** `@effect/platform` is still not a workspace dependency (checked:
+  absent from `package.json` and `node_modules` as of this pass). Adding it was
+  out of scope for PRB-085 under a hard no-new-dependency constraint set for
+  that change, so `src/services/AppleProcessSupervisor.ts` uses raw
+  `node:child_process` -- the "documented, tested exception" this pack's own
+  guidance (section 6) already carves out -- but now isolated behind a single
+  adapter instead of duplicated across `SessionRegistry.ts`, `SimulatorHarness.ts`,
+  `RealDeviceHarness.ts`, `PerfService.ts`, and `ProbeKernel.ts`.
+- **Observed (this pass, generic shell children, not Apple tooling):** `spawn(...,
+  { detached: true })` makes the child its own process-group leader; killing
+  the group with `process.kill(-pid, "SIGTERM")` then a bounded grace window
+  then `process.kill(-pid, "SIGKILL")` reliably takes down a multi-process
+  descendant tree (`sh -c "sleep 30 & sleep 30 & sleep 30 & wait"` fully
+  cleared, verified via `ps -g <pgid>`) on macOS. This validates section 8's
+  "promising" note for generic POSIX process groups.
+- **Not yet validated against the real tool seams named in section 8.** This
+  pass had no simulator (`xcrun simctl` present but no booted device) and no
+  paired iOS device available, so `xcodebuild`, `xctrace`, `simctl`,
+  `devicectl`, `log stream`, and `lldb`'s actual behavior under
+  SIGTERM/SIGKILL and under a killed process group is still unconfirmed --
+  only their invocation/parsing wrappers were migrated onto the shared
+  supervisor's foreground/streamed-to-artifact path (`SessionRegistry.runHostCommand`,
+  `SimulatorHarness.runCommandWithExit/runCommand/runCommandWithCapturedStdout`,
+  `RealDeviceHarness.runCommand`, `PerfService.runCommand/runCommandToFile/liveStartRecording`,
+  `ProbeKernel.runHostCommand/runXmllint`). The long-lived runner-wrapper
+  processes in `SimulatorHarness.ts` and `RealDeviceHarness.ts` (the actual
+  `xcodebuild test-without-building` + XCUITest runner handles, with their own
+  `ps`-derived process-group detection in `terminateRunnerProcess`/`inspectProcess`)
+  and the LLDB Python bridge in `LldbBridge.ts` were deliberately left on their
+  existing bespoke termination logic rather than risking a same-pass rewrite of
+  session-critical framed IPC with no device/simulator hardware to verify against.
+- **Open question carried forward:** whether `xcodebuild`/`xctrace` propagate
+  SIGTERM to their own child processes cleanly, or need a longer grace window /
+  SIGINT first -- unresolved, needs a real device/simulator lane.

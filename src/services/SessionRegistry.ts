@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { statSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
 import { Context, Effect, Either, FiberRef, Layer, Ref } from "effect"
+import { runAppleProcess } from "./AppleProcessSupervisor"
 import {
   buildRecordedSessionAction,
   buildDirectRunnerUiActionPayload,
@@ -196,51 +196,41 @@ const resolveFfprobeExecutable = (): string => {
   return "ffprobe"
 }
 
-const runHostCommand = (args: {
+// Exported for direct process-level test coverage of the AppleProcessSupervisor
+// migration (PRB-085), in addition to its normal SessionRegistry service usage.
+export const runHostCommand = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly cwd?: string
   readonly timeoutMs?: number
-}): Promise<HostCommandResult> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      cwd: args.cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    })
+}): Promise<HostCommandResult> => {
+  let spawnError: unknown = null
 
-    let stdout = ""
-    let stderr = ""
-    let timedOut = false
-    const timeoutMs = args.timeoutMs ?? 30_000
-    const timeout = setTimeout(() => {
-      timedOut = true
-      child.kill("SIGTERM")
-      setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill("SIGKILL")
-        }
-      }, 2_000)
-    }, timeoutMs)
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
-    child.once("close", (exitCode, signal) => {
-      clearTimeout(timeout)
-      resolve({ stdout, stderr, exitCode, signal, timedOut })
-    })
-  })
+  return runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    cwd: args.cwd,
+    timeoutMs: args.timeoutMs ?? 30_000,
+    gracePeriodMs: 2_000,
+    // Preserve the original behavior of rejecting with the raw spawn error
+    // (not a ChildProcessError) so ENOENT-based optional-tool detection
+    // (ffmpeg/ffprobe/tar availability) keeps working unchanged.
+    onSpawnError: (error) => {
+      spawnError = error
+    },
+  }).then(
+    (result): HostCommandResult => ({
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+    }),
+    (error): HostCommandResult => {
+      throw spawnError ?? error
+    },
+  )
+}
 
 const formatHostCommandFailure = (command: string, result: HostCommandResult): string => {
   if (result.timedOut) {

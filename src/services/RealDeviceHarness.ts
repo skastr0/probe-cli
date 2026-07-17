@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process"
+import { createWriteStream } from "node:fs"
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
@@ -10,6 +11,7 @@ import {
   UserInputError,
 } from "../domain/errors"
 import type { SessionConnectionDetails } from "../domain/session"
+import { runAppleProcess } from "./AppleProcessSupervisor"
 import type { RunnerCommandResult } from "./SimulatorHarness"
 import {
   type RunnerCapability,
@@ -488,56 +490,32 @@ export const detectRealDeviceInterruption = async (args: {
   }
 }
 
-const runCommand = async (args: {
+// Exported for direct process-level test coverage of the AppleProcessSupervisor
+// migration (PRB-085), in addition to its normal RealDeviceHarness service usage.
+export const runRealDeviceHostCommand = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly timeoutMs?: number
-}): Promise<CommandResult> =>
-  await new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
+}): Promise<CommandResult> => {
+  let spawnError: unknown = null
 
-    let stdout = ""
-    let stderr = ""
-    let timedOut = false
-
-    const timeout = args.timeoutMs
-      ? setTimeout(() => {
-          timedOut = true
-          child.kill("SIGTERM")
-          setTimeout(() => {
-            if (child.exitCode === null) {
-              child.kill("SIGKILL")
-            }
-          }, 2_000)
-        }, args.timeoutMs)
-      : null
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", reject)
-    child.once("close", (exitCode) => {
-      if (timeout) {
-        clearTimeout(timeout)
-      }
-
-      if (timedOut) {
-        reject(new Error(`${args.command} timed out after ${args.timeoutMs ?? 0} ms.`))
-        return
-      }
-
-      resolve({ stdout, stderr, exitCode })
-    })
+  const result = await runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    timeoutMs: args.timeoutMs,
+    onSpawnError: (error) => {
+      spawnError = error
+    },
+  }).catch((error) => {
+    throw spawnError ?? error
   })
+
+  if (result.timedOut) {
+    throw new Error(`${args.command} timed out after ${args.timeoutMs ?? 0} ms.`)
+  }
+
+  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
+}
 
 const writeCommandLog = async (path: string, result: CommandResult): Promise<void> => {
   const content = [
@@ -659,7 +637,7 @@ const captureDeviceDiagnosticBundle = async (args: {
     const logOutputPath = join(args.diagnosticsDirectory, `${args.fileStem}.diagnose.log`)
     await removeFileIfExists(absolutePath)
 
-    const result = await runCommand({
+    const result = await runRealDeviceHostCommand({
       command: "/usr/bin/xcrun",
       commandArgs: [
         "devicectl",
@@ -704,7 +682,7 @@ const captureDeviceDiagnosticBundle = async (args: {
 
   await ensureDirectory(destinationDirectory)
 
-  const result = await runCommand({
+  const result = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: [
       "devicectl",
@@ -1155,7 +1133,7 @@ const resolveDeviceTunnelIp = async (args: {
   readonly jsonPath: string
   readonly logPath: string
 }): Promise<string | null> => {
-  const result = await runCommand({
+  const result = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: [
       "devicectl",
@@ -1559,7 +1537,7 @@ const inspectProcess = async (pid: number): Promise<{
   readonly processGroupId: number | null
   readonly command: string | null
 }> => {
-  const result = await runCommand({
+  const result = await runRealDeviceHostCommand({
     command: "/bin/ps",
     commandArgs: ["-o", "pgid=", "-o", "command=", "-p", String(pid)],
   })
@@ -1879,12 +1857,17 @@ const startWrapperProcess = async (args: {
     },
   )
 
+  // Append each chunk once as it arrives instead of rewriting the whole
+  // accumulated history on every chunk (that previous approach was O(n^2) in
+  // total bytes written and risked losing/corrupting output on a large or
+  // long-lived wrapper run). The file was just truncated to empty above, so
+  // opening in append mode here starts clean and stays linear.
+  const wrapperStderrStream = createWriteStream(args.wrapperStderrPath, { flags: "a" })
   child.stderr?.setEncoding("utf8")
-  const stderrChunks: Array<string> = []
   child.stderr?.on("data", (chunk) => {
-    stderrChunks.push(String(chunk))
-    void writeFile(args.wrapperStderrPath, stderrChunks.join(""), "utf8")
+    wrapperStderrStream.write(String(chunk))
   })
+  child.once("exit", () => wrapperStderrStream.end())
 
   const exit = new Promise<{ readonly code: number | null; readonly signal: string | null }>((resolve, reject) => {
     child.once("error", reject)
@@ -1949,13 +1932,13 @@ const performPreflight = async (args: {
     ensureDirectory(deviceLogsDirectory),
   ])
 
-  const preferredDdiResult = await runCommand({
+  const preferredDdiResult = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: ["devicectl", "list", "preferredDDI", "--json-output", preferredDdiJsonPath],
   })
   await writeCommandLog(preferredDdiLogPath, preferredDdiResult)
 
-  const devicesResult = await runCommand({
+  const devicesResult = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: ["devicectl", "list", "devices", "--json-output", devicesJsonPath],
   })
@@ -2044,7 +2027,7 @@ const performPreflight = async (args: {
       ],
     })
   } else {
-    const buildResult = await runCommand({
+    const buildResult = await runRealDeviceHostCommand({
       command: "/usr/bin/xcodebuild",
       commandArgs: buildRealDeviceBuildForTestingCommandArgs({
         projectPath,
@@ -2089,7 +2072,7 @@ const performPreflight = async (args: {
   let ddiServicesReady = false
 
   if (selectedDevice && preferredDdiPayload && ddiUsable && ddiCompatible) {
-    const ddiServicesResult = await runCommand({
+    const ddiServicesResult = await runRealDeviceHostCommand({
       command: "/usr/bin/xcrun",
       commandArgs: [
         "devicectl",
@@ -2183,7 +2166,7 @@ const performPreflight = async (args: {
   }
 
   const refreshConnection = async (): Promise<SessionConnectionDetails> => {
-    const refreshedResult = await runCommand({
+    const refreshedResult = await runRealDeviceHostCommand({
       command: "/usr/bin/xcrun",
       commandArgs: ["devicectl", "list", "devices", "--json-output", devicesJsonPath],
     })
@@ -2370,7 +2353,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
                 evidenceSources: overrides?.evidenceSources,
               })
 
-            const installedAppsResult = await runCommand({
+            const installedAppsResult = await runRealDeviceHostCommand({
               command: "/usr/bin/xcrun",
               commandArgs: [
                 "devicectl",
@@ -2429,7 +2412,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               })
             }
 
-            const launchResult = await runCommand({
+            const launchResult = await runRealDeviceHostCommand({
               command: "/usr/bin/xcrun",
               commandArgs: [
                 "devicectl",

@@ -10,6 +10,7 @@ import {
   UserInputError,
 } from "../domain/errors"
 import type { SimulatorSessionMode } from "../domain/session"
+import { runAppleProcess } from "./AppleProcessSupervisor"
 import {
   type RunnerCapability,
   decodeRunnerReadyFrame,
@@ -302,33 +303,27 @@ const processExists = (pid: number): boolean => {
   }
 }
 
-const runCommandWithExit = async (args: {
+// Exported for direct process-level test coverage of the AppleProcessSupervisor
+// migration (PRB-085), in addition to their normal SimulatorHarness usage.
+export const runCommandWithExit = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
-}): Promise<{ readonly stdout: string; readonly stderr: string; readonly exitCode: number | null }> =>
-  await new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
+}): Promise<{ readonly stdout: string; readonly stderr: string; readonly exitCode: number | null }> => {
+  let spawnError: unknown = null
 
-    let stdout = ""
-    let stderr = ""
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", reject)
-    child.once("close", (exitCode) => {
-      resolve({ stdout, stderr, exitCode })
-    })
-  })
+  return runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    onSpawnError: (error) => {
+      spawnError = error
+    },
+  }).then(
+    (result) => ({ stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }),
+    (error) => {
+      throw spawnError ?? error
+    },
+  )
+}
 
 const inspectProcess = async (pid: number): Promise<{
   readonly exists: boolean
@@ -547,135 +542,77 @@ const runCommand = async (args: {
   readonly commandArgs: ReadonlyArray<string>
   readonly logPath?: string
   readonly timeoutMs?: number
-}): Promise<{ readonly stdout: string; readonly stderr: string }> =>
-  await new Promise<{ readonly stdout: string; readonly stderr: string }>((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
-
-    let stdout = ""
-    let stderr = ""
-    let timedOut = false
-
-    const timeout = args.timeoutMs
-      ? setTimeout(() => {
-          timedOut = true
-          child.kill("SIGTERM")
-          setTimeout(() => {
-            if (child.exitCode === null) {
-              child.kill("SIGKILL")
-            }
-          }, 2_000)
-        }, args.timeoutMs)
-      : null
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", (error) => reject(error))
-    child.once("close", async (code) => {
-      if (timeout) {
-        clearTimeout(timeout)
-      }
-
-      if (args.logPath) {
-        await ensureDirectory(dirname(args.logPath))
-      }
-
-      if (args.logPath) {
-        await writeFile(args.logPath, `${stdout}${stderr}`, "utf8")
-      }
-
-      if (timedOut) {
-        reject(
-          new ChildProcessError({
-            code: "command-timeout",
-            command: `${args.command} ${args.commandArgs.join(" ")}`,
-            reason: `${args.command} timed out after ${args.timeoutMs ?? 0} ms.`,
-            nextStep: args.logPath
-              ? `Inspect the log at ${args.logPath} and retry.`
-              : `Retry ${args.command} with a longer timeout or inspect the host state.`,
-            exitCode: code,
-            stderrExcerpt: `${stdout}${stderr}`.split(/\r?\n/).slice(-80).join("\n"),
-          }),
-        )
-        return
-      }
-
-      if (code === 0) {
-        resolve({ stdout, stderr })
-        return
-      }
-
-      reject(
-        new ChildProcessError({
-          code: "command-failed",
-          command: `${args.command} ${args.commandArgs.join(" ")}`,
-          reason: `${args.command} exited with code ${code ?? "unknown"}.`,
-          nextStep: args.logPath
-            ? `Inspect the log at ${args.logPath} and retry.`
-            : `Inspect stderr output and retry ${args.command}.`,
-          exitCode: code,
-          stderrExcerpt: `${stdout}${stderr}`.split(/\r?\n/).slice(-80).join("\n"),
-        }),
-      )
-    })
+}): Promise<{ readonly stdout: string; readonly stderr: string }> => {
+  const result = await runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    timeoutMs: args.timeoutMs,
   })
 
-const runCommandWithCapturedStdout = async (args: {
+  if (args.logPath) {
+    await ensureDirectory(dirname(args.logPath))
+    await writeFile(args.logPath, `${result.stdout}${result.stderr}`, "utf8")
+  }
+
+  if (result.timedOut) {
+    throw new ChildProcessError({
+      code: "command-timeout",
+      command: `${args.command} ${args.commandArgs.join(" ")}`,
+      reason: `${args.command} timed out after ${args.timeoutMs ?? 0} ms.`,
+      nextStep: args.logPath
+        ? `Inspect the log at ${args.logPath} and retry.`
+        : `Retry ${args.command} with a longer timeout or inspect the host state.`,
+      exitCode: result.exitCode,
+      stderrExcerpt: `${result.stdout}${result.stderr}`.split(/\r?\n/).slice(-80).join("\n"),
+    })
+  }
+
+  if (result.exitCode === 0) {
+    return { stdout: result.stdout, stderr: result.stderr }
+  }
+
+  throw new ChildProcessError({
+    code: "command-failed",
+    command: `${args.command} ${args.commandArgs.join(" ")}`,
+    reason: `${args.command} exited with code ${result.exitCode ?? "unknown"}.`,
+    nextStep: args.logPath
+      ? `Inspect the log at ${args.logPath} and retry.`
+      : `Inspect stderr output and retry ${args.command}.`,
+    exitCode: result.exitCode,
+    stderrExcerpt: `${result.stdout}${result.stderr}`.split(/\r?\n/).slice(-80).join("\n"),
+  })
+}
+
+export const runCommandWithCapturedStdout = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly stdoutPath: string
 }): Promise<{ readonly stdout: string; readonly stderr: string }> => {
   await ensureDirectory(dirname(args.stdoutPath))
 
-  return await new Promise<{ readonly stdout: string; readonly stderr: string }>((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
+  const result = await runAppleProcess({ command: args.command, commandArgs: args.commandArgs })
+  await writeFile(args.stdoutPath, result.stdout, "utf8")
 
-    let stdout = ""
-    let stderr = ""
+  if (result.exitCode === 0) {
+    return { stdout: result.stdout, stderr: result.stderr }
+  }
 
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", reject)
-    child.once("close", async (code) => {
-      await writeFile(args.stdoutPath, stdout, "utf8")
-
-      if (code === 0) {
-        resolve({ stdout, stderr })
-        return
-      }
-
-      reject(
-        new ChildProcessError({
-          code: "command-failed",
-          command: `${args.command} ${args.commandArgs.join(" ")}`,
-          reason: `${args.command} exited with code ${code ?? "unknown"}.`,
-          nextStep: `Inspect the log capture at ${args.stdoutPath} and retry.`,
-          exitCode: code,
-          stderrExcerpt: stderr.split(/\r?\n/).slice(-80).join("\n"),
-        }),
-      )
-    })
+  throw new ChildProcessError({
+    code: "command-failed",
+    command: `${args.command} ${args.commandArgs.join(" ")}`,
+    reason: `${args.command} exited with code ${result.exitCode ?? "unknown"}.`,
+    nextStep: `Inspect the log capture at ${args.stdoutPath} and retry.`,
+    exitCode: result.exitCode,
+    stderrExcerpt: result.stderr.split(/\r?\n/).slice(-80).join("\n"),
   })
 }
+
+// Aliased re-export: `runCommand` stays the internal name (matched by the DI
+// mock property key other tests in this file already use), but the barrel at
+// src/index.ts re-exports every service module's top level, and PerfService
+// already exports its own `runCommand` -- this alias gives PRB-085's direct
+// process-level tests a collision-free import without touching the DI shape.
+export { runCommand as runSimulatorHostCommand }
 
 const captureSimulatorScreenshotWithSimctl = async (args: {
   readonly simulatorUdid: string
