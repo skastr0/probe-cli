@@ -195,3 +195,92 @@ Accessed: 2026-07-17.
   `xctrace`), not xctrace's internal response to it. The open question is
   narrowed, not closed: does `xctrace` do anything different with the grace
   window it's now actually given.
+
+### 11. PRB-085 review-fix: the long-lived runner-wrapper and LLDB bridge migrations, deferred in section 9, are now done
+
+Accessed: 2026-07-17.
+
+- **Closed:** the four raw `node:child_process.spawn` production sites
+  section 9 deliberately left unmigrated are now all supervisor-registered:
+  `SimulatorHarness.recordSimulatorVideoWithSimctl` (via a new generic
+  `startMarkedRecording` helper -- spawn, watch stderr for a caller-supplied
+  marker via the supervisor's new `onStderrChunk` hook, request a graceful
+  stop), `SimulatorHarness`/`RealDeviceHarness`'s `startWrapperProcess`/
+  `stopWrapperProcess` (the `xcodebuild test-without-building` + XCUITest
+  runner handle, now `spawnAppleProcessHandle`-backed; RealDeviceHarness's own
+  `terminateRunnerProcess`/`inspectProcess`/`killRunnerTarget`/
+  `waitForProcessExit`/`processExists` cluster is now dead code and was
+  deleted rather than left behind -- SimulatorHarness kept its own copy since
+  it is still load-bearing there for stale-pid reaping across daemon restarts,
+  a genuinely different case a live supervisor registry cannot cover), and
+  `LldbBridge.ts` (via new `AppleProcessSupervisor` support for `stdin: "pipe"`
+  and `externalStdout: true` -- the bridge's line-framed JSON-RPC protocol
+  needs a writable stdin and a raw, caller-owned stdout stream for `readline`,
+  which the supervisor did not support before this pass).
+- **Supervisor contract grew three capabilities to support this**, all
+  additive/optional on `AppleProcessSpec`: `onStderrChunk`/`onStdoutChunk`
+  (observe raw chunks without disturbing the bounded capture -- lets a wrapper
+  detect a domain marker like `simctl`'s "Recording started" while lifecycle
+  stays supervisor-owned), `stdin: "pipe"` + `stdout: Writable/Readable` on
+  `spawnHandle`'s returned handle (only when requested), and `signal?:
+  AbortSignal` on `run()` (races the owned scope the same way fiber
+  interruption already does -- aborting interrupts the loser, which runs the
+  same `escalateIfRunning` release as a direct interrupt).
+- **`externalStdout` exists to close a real race, not by accident:** the
+  supervisor's own bounded-capture listener attaches synchronously right
+  after spawn; a caller that only gets the handle back later (after at least
+  one microtask) would lose any stdout emitted in between if the supervisor's
+  own listener had already started draining it. `externalStdout: true` skips
+  attaching that listener, which keeps the stream in Node's default
+  paused/buffered mode (nothing lost, not even a race window) until the
+  caller attaches its own consumer.
+- **Observed, real hardware, this pass (booted `iPhone 16 Pro` simulator,
+  `xcrun simctl io <udid> recordVideo`):** `startMarkedRecording` against the
+  real `simctl` binary correctly detected the `Recording started` stderr
+  marker, ran for the requested duration, stopped via SIGINT (`exitCode: 0`),
+  produced a real non-empty `.mov` file, and left no orphaned `simctl`
+  process behind (`ps aux` clean immediately after). This directly narrows
+  section 9's "not yet validated against the real tool seams" gap for the
+  `simctl recordVideo` seam specifically.
+- **Still not validated against real hardware:** the `xcodebuild
+  test-without-building` + XCUITest runner-wrapper migration and the LLDB
+  Python bridge migration were verified with the same rigor as the rest of
+  this codebase's process-helper tests (real `/bin/sh`/`/usr/bin/python3`
+  children exercising the exact spawn/stdio/kill-escalation/descendant-tree
+  mechanics -- see `SimulatorHarness.processHelpers.test.ts`,
+  `RealDeviceHarness.processHelpers.test.ts`,
+  `LldbBridge.processHelpers.test.ts`), but not against a real xcodebuild
+  build + real LLDB attach, which this pass did not attempt (a real
+  device/simulator XCUITest build is a much larger, slower, provisioning-
+  dependent operation than the code-level migration this pass covers, and a
+  real LLDB attach needs a live debuggable target process). This is the same
+  boundary section 9 already drew between "Probe's own spawn/kill mechanics"
+  (now supervisor-proven) and "the real Apple tool's behavior under this
+  exact termination path" (still open) -- narrowed for `simctl`, unchanged for
+  `xcodebuild`/`lldb`.
+- **Latent gap found (not fixed, not caused by this pass, real and
+  reproducible):** `AppleProcessSupervisor`'s `escalateIfRunning` only signals
+  the owned process group if the tracked child itself has not yet exited
+  (`hasExited(child)` gates the whole ladder). If a supervised child exits on
+  its own while a *grandchild* it spawned (via a mechanism that inherits the
+  child's stdio, e.g. Python's `os.system(...)` backgrounding a job without
+  redirecting its fds) is still alive, that grandchild is never signaled --
+  it is orphaned, and if it still holds the stdout/stderr pipe open, the
+  supervisor's own `waitForClose` (which waits for the child's `'close'`
+  event, itself gated on every stdio holder closing) can hang. Reproduced
+  directly while building `LldbBridge.processHelpers.test.ts`'s descendant
+  fault test (a fake bridge script using `os.system` to fork background
+  `sleep` jobs that inherited stdio hung the test until the fix below); not
+  triggered by any of this pass's actual production code (none of the four
+  migrated call sites spawn-and-abandon a stdio-inheriting grandchild -- the
+  real LLDB bridge script does not use `os.system` at all, and `simctl`/
+  `xcodebuild` were confirmed clean via the real-hardware and fake-command
+  tests above). Worked around in the test by redirecting the fake
+  grandchildren's stdio (`</dev/null >/dev/null 2>/dev/null`) instead of
+  papering over it in the supervisor. A real fix (e.g. attempting the
+  process-group signal on every `stop()`/finalizer path regardless of
+  `hasExited`, since a pgid signal is a no-op for a genuinely empty group)
+  is a supervisor-level change with its own blast radius and deserves a
+  dedicated look, not a same-pass patch bolted onto an already-large diff --
+  flagged here as a follow-up, not filed against any of this pass's own
+  call sites.
