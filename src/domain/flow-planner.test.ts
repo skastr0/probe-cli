@@ -1,12 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { decodeFlowContract } from "./action"
 import { planFlowExecution } from "./flow-planner"
 import { decodeFlowV2Contract, validateFlowV2Contract } from "./flow-v2"
 
 describe("flow planner", () => {
-  test("plans v1 contracts into verified, checkpoint, and evidence units", () => {
-    const flow = decodeFlowContract({
-      contract: "probe.session-flow/v1",
+  test("plans canonical verified-only contracts into verified, checkpoint, and evidence units", () => {
+    const flow = decodeFlowV2Contract({
+      contract: "probe.session-flow/v2",
       steps: [
         { kind: "snapshot" },
         {

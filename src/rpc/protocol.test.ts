@@ -188,7 +188,7 @@ describe("rpc protocol", () => {
       params: {
         sessionId: "session-1",
         flow: {
-          contract: "probe.session-flow/v1",
+          contract: "probe.session-flow/v2",
           steps: [
             {
               kind: "sleep",
@@ -200,6 +200,27 @@ describe("rpc protocol", () => {
     })
 
     expect(request.method).toBe("session.run")
+  })
+
+  test("rejects a session run request carrying the removed v1 flow contract", () => {
+    expect(() => decodeRpcRequest({
+      kind: "request",
+      protocolVersion: PROBE_PROTOCOL_VERSION,
+      requestId: "req-run-v1",
+      method: "session.run",
+      params: {
+        sessionId: "session-1",
+        flow: {
+          contract: "probe.session-flow/v1",
+          steps: [
+            {
+              kind: "sleep",
+              durationMs: 100,
+            },
+          ],
+        },
+      },
+    })).toThrow()
   })
 
   test("decodes a session video request", () => {
@@ -259,7 +280,7 @@ describe("rpc protocol", () => {
         sessionId: "session-1",
         template: "logging",
         flow: {
-          contract: "probe.session-flow/v1",
+          contract: "probe.session-flow/v2",
           steps: [
             {
               kind: "sleep",

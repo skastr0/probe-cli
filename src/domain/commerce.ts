@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { FlowStepSchema } from "./action"
+import { UnsupportedFlowContractError } from "./errors"
 import {
   SessionFlowContractSchema,
   SessionFlowResultSchema,
@@ -102,7 +103,7 @@ export const EmbeddedFlowContractSchema = Schema.transform(
     decode: (input) => {
       if (Array.isArray(input)) {
         return {
-          contract: "probe.session-flow/v1" as const,
+          contract: "probe.session-flow/v2" as const,
           steps: input,
         }
       }
@@ -112,7 +113,7 @@ export const EmbeddedFlowContractSchema = Schema.transform(
       }
 
       return {
-        contract: "probe.session-flow/v1" as const,
+        contract: "probe.session-flow/v2" as const,
         steps: (input as { readonly steps: ReadonlyArray<unknown> }).steps,
       }
     },
@@ -302,16 +303,31 @@ export const CommerceValidationReportSchema = Schema.Struct({
 export type CommerceValidationReport = typeof CommerceValidationReportSchema.Type
 
 const normalizeEmbeddedFlowInput = (value: unknown): unknown => {
+  // Checked here, ahead of schema validation: EmbeddedFlowInputSchema's
+  // `{ steps }` shorthand member tolerates (and silently drops) an excess
+  // `contract` key, so a v1-tagged embedded flow would otherwise slip
+  // through as an unrecognized shape and get quietly re-tagged v2 downstream.
+  // Reject it explicitly instead — no compatibility adapter executes v1.
+  if (isRecord(value) && value.contract === "probe.session-flow/v1") {
+    throw new UnsupportedFlowContractError({
+      code: "unsupported-flow-contract",
+      contract: "probe.session-flow/v1",
+      reason: "probe.session-flow/v1 was removed; the session-flow contract now has a single canonical version.",
+      nextStep: "Re-tag the embedded flow's \"contract\" field as \"probe.session-flow/v2\" — existing v1 step shapes decode unchanged under v2.",
+      details: [],
+    })
+  }
+
   if (Array.isArray(value)) {
     return {
-      contract: "probe.session-flow/v1",
+      contract: "probe.session-flow/v2",
       steps: value,
     }
   }
 
   if (isRecord(value) && value.contract === undefined && Array.isArray(value.steps)) {
     return {
-      contract: "probe.session-flow/v1",
+      contract: "probe.session-flow/v2",
       steps: value.steps,
     }
   }

@@ -1313,7 +1313,7 @@ describe("PerfService", () => {
           Effect.sync(() => {
             events.push("run-flow")
             return {
-              contract: "probe.session-flow/report-v1",
+              contract: "probe.session-flow/report-v2",
               executedAt: "2026-04-14T00:00:00.000Z",
               sessionId: "session-1",
               summary: "bounded flow passed",
@@ -1344,7 +1344,7 @@ describe("PerfService", () => {
           sessionId: "session-1",
           template: "logging",
           flow: {
-            contract: "probe.session-flow/v1",
+            contract: "probe.session-flow/v2",
             steps: [{ kind: "sleep", durationMs: 250 }],
           },
           emitProgress: () => undefined,

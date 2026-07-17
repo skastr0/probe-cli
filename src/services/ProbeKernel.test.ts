@@ -58,7 +58,7 @@ describe("ProbeKernel", () => {
             createSessionLayout: () => Effect.die("unused createSessionLayout"),
             removeSessionLayout: () => Effect.void,
             readSessionManifest: () => Effect.succeed({ sessionId, artifactRoot: root }),
-            listPersistedSessions: () => Effect.succeed([]),
+            listPersistedSessions: () => Effect.succeed({ sessions: [], failures: [] }),
             writeSessionManifest: () => Effect.void,
             registerArtifact: (_sessionId: string, record: any) => Effect.succeed(record),
             listArtifacts: () => Effect.succeed([artifact]),
@@ -145,7 +145,7 @@ describe("ProbeKernel", () => {
             createSessionLayout: () => Effect.die("unused createSessionLayout"),
             removeSessionLayout: () => Effect.void,
             readSessionManifest: () => Effect.succeed({ sessionId, artifactRoot: root }),
-            listPersistedSessions: () => Effect.succeed([]),
+            listPersistedSessions: () => Effect.succeed({ sessions: [], failures: [] }),
             writeSessionManifest: () => Effect.void,
             registerArtifact: (_sessionId: string, record: any) => Effect.succeed(record),
             listArtifacts: () => Effect.succeed([]),
@@ -258,7 +258,7 @@ describe("ProbeKernel", () => {
             createSessionLayout: () => Effect.die("unused createSessionLayout"),
             removeSessionLayout: () => Effect.void,
             readSessionManifest: () => Effect.succeed({ sessionId, artifactRoot: root }),
-            listPersistedSessions: () => Effect.succeed([]),
+            listPersistedSessions: () => Effect.succeed({ sessions: [], failures: [] }),
             writeSessionManifest: () => Effect.void,
             registerArtifact: (_sessionId: string, record: any) => Effect.succeed(record),
             listArtifacts: () => Effect.succeed([artifact]),
@@ -314,6 +314,74 @@ describe("ProbeKernel", () => {
         if (response.result.kind === "summary+artifact") {
           expect(response.result.artifact.absolutePath).toBe(bundlePath)
           expect(response.result.summary).toContain("binary kind binary")
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("serve fails closed when a daemon is already reachable on the socket, before touching daemon directories or the RPC listener", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-test-"))
+
+    try {
+      const baseLayer = Layer.mergeAll(
+        Layer.succeed(
+          ArtifactStore,
+          ArtifactStore.of({
+            getRootDirectory: () => Effect.succeed(root),
+            getArtifactRetentionMs: () => 60_000,
+            getDaemonSocketPath: () => Effect.succeed(join(root, "probe.sock")),
+            getDaemonMetadataPath: () => Effect.succeed(join(root, "daemon.json")),
+            // The single-daemon ownership check must run and fail closed
+            // before any of these are ever touched - dying proves the guard
+            // actually runs first rather than merely happening to fail later.
+            ensureDaemonDirectories: () => Effect.die("second writer must fail closed before ensureDaemonDirectories"),
+            isDaemonRunning: () => Effect.succeed(true),
+            readDaemonMetadata: () => Effect.die("unused readDaemonMetadata"),
+            createSessionLayout: () => Effect.die("unused createSessionLayout"),
+            removeSessionLayout: () => Effect.void,
+            readSessionManifest: () => Effect.die("unused readSessionManifest"),
+            listPersistedSessions: () => Effect.die("unused listPersistedSessions"),
+            writeSessionManifest: () => Effect.void,
+            registerArtifact: (_sessionId: string, record: any) => Effect.succeed(record),
+            listArtifacts: () => Effect.succeed([]),
+            getArtifact: () => Effect.die("unused getArtifact"),
+            writeDerivedOutput: () => Effect.die("unused writeDerivedOutput"),
+            writeDerivedFile: () => Effect.die("unused writeDerivedFile"),
+            removeDaemonMetadata: () => Effect.void,
+            writeDaemonMetadata: () => Effect.die("unused writeDaemonMetadata"),
+            syncDaemonSessionMetadata: () => Effect.void,
+            pruneExpiredSessions: () => Effect.void,
+          } as any),
+        ),
+        Layer.succeed(
+          OutputPolicy,
+          OutputPolicy.of({
+            getDefaultInlineThreshold: () => ({ maxInlineBytes: 4 * 1024, maxInlineLines: 100 }),
+            shouldInline: () => true,
+            shouldInlineBinary: () => false,
+          }),
+        ),
+        Layer.succeed(PerfService, PerfService.of({ record: () => Effect.die("unused perf.record") } as any)),
+        Layer.succeed(SessionRegistry, SessionRegistry.of({} as any)),
+        Layer.succeed(SimulatorHarness, SimulatorHarness.of({} as any)),
+      )
+
+      const runtime = ManagedRuntime.make(Layer.mergeAll(baseLayer, ProbeKernelLive.pipe(Layer.provide(baseLayer))))
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+
+        const result = await runtime.runPromise(Effect.either(kernel.serve()))
+
+        expect(Either.isLeft(result)).toBe(true)
+        if (Either.isLeft(result)) {
+          expect(result.left.code).toBe("daemon-already-running")
         }
       } finally {
         await runtime.dispose()

@@ -152,7 +152,7 @@ Real publishing, tags, GitHub Releases, Homebrew formula pushes, npm setup, and 
 | Command | Purpose |
 |---------|---------|
 | `probe session action (--input-json <payload> \| --session-id <id> --file <action.json>)` | Perform a single UI action |
-| `probe session run (--input-json <payload> \| --session-id <id> (--file <flow.json> \| --stdin))` | Run a multi-step flow (`probe.session-flow/v1` or `probe.session-flow/v2`) |
+| `probe session run (--input-json <payload> \| --session-id <id> (--file <flow.json> \| --stdin))` | Run a multi-step flow (`probe.session-flow/v2`) |
 | `probe session recording export --session-id <id> [--label <name>]` | Export recorded actions as a replay script |
 | `probe session replay (--input-json <payload> \| --session-id <id> --file <recording.json>)` | Replay a recording with retries + semantic fallback |
 | `probe session result summary (--input-json <payload> \| --session-id <id>)` | Aggregate session result summary artifact |
@@ -313,9 +313,10 @@ probe session run --session-id <id> --file flow.json --output-json
 cat flow.json | probe session run --session-id <id> --stdin --output-json
 ```
 
-Flow contracts:
-- `probe.session-flow/v1` — verified-only execution, unchanged behavior, same step kinds as the original flow contract
-- `probe.session-flow/v2` — adds execution profiles (`verified` / `fast`), explicit `sequence` batching, per-step transport reporting, and checkpoint metadata
+Flow contract:
+- `probe.session-flow/v2` — the single canonical flow contract. Execution profiles (`verified` / `fast`) are optional and default to verified-only, unchanged-behavior execution when omitted; it also supports explicit `sequence` batching, per-step transport reporting, and checkpoint metadata.
+
+`probe.session-flow/v1` was removed. Old v1 input fails with a typed `unsupported-flow-contract` error naming the migration step: re-tag `contract` as `probe.session-flow/v2` — existing v1 step shapes decode unchanged.
 
 Shared step kinds: `snapshot`, `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`, `logMark`, `sleep`. Flow v2 also adds `sequence` for runner-batched fast actions. Any step may set `continueOnError: true` to keep the flow running when that step fails.
 
@@ -522,7 +523,7 @@ The script starts `probe serve`, opens a session, sends a ping, captures a snaps
 ## Supporting References
 
 - `actions-reference.md` — full action and selector schemas, `wait` conditions, assertion expectations, retry policy, recording/replay contracts
-- `docs/examples/flows/README.md` — `probe.session-flow/v1` and `probe.session-flow/v2` examples, fast/verified trade-offs, and batching patterns
+- `docs/examples/flows/README.md` — `probe.session-flow/v2` examples, fast/verified trade-offs, and batching patterns
 - `recipes.md` — end-to-end QA recipes (login, form validation, commerce, accessibility, perf-around-flow, etc.)
 - `troubleshooting.md` — session won't open, stale refs, log sources unavailable, daemon socket conflicts, perf walls
 - `V2-DIRECTION.md` — product vision and roadmap for the validation and observability workbench

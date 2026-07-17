@@ -20,6 +20,7 @@
     "transport-spike": "bun run src/spikes/runner-transport/benchmark.ts",
     "lldb-bridge-spike": "bun run src/spikes/lldb-python-bridge/validate.ts",
     "coexistence-spike": "bun run src/spikes/concurrent-attachment-coexistence/validate.ts",
+    "benchmark:investigation": "bun run src/investigations/rpc-daemon-defects/run.ts",
     "verify": "bun run generate:runtime-assets && bun run typecheck && bun run test && bun run build"
   },
   "files": [

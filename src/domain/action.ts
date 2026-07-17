@@ -351,12 +351,6 @@ export const FlowStepSchema = Schema.Union(
 )
 export type FlowStep = typeof FlowStepSchema.Type
 
-export const FlowContractSchema = Schema.Struct({
-  contract: Schema.Literal("probe.session-flow/v1"),
-  steps: Schema.Array(FlowStepSchema),
-})
-export type FlowContract = typeof FlowContractSchema.Type
-
 export const SessionActionSchema = Schema.Union(
   TapActionSchema,
   PressActionSchema,
@@ -543,6 +537,10 @@ export const SessionReplayResultSchema = Schema.Struct({
 })
 export type SessionReplayResult = typeof SessionReplayResultSchema.Type
 
+// FlowStepResultSchema and FlowFailedStepSchema carry no exported .Type alias:
+// the only result contract is FlowV2StepResult/FlowV2FailedStep (flow-v2.ts),
+// which extends these fields via spread. Keep the base schemas for that reuse;
+// do not resurrect a standalone step-result type here (PRB-082).
 export const FlowStepResultSchema = Schema.Struct({
   index: PositiveIntegerSchema,
   kind: FlowStepKind,
@@ -558,7 +556,6 @@ export const FlowStepResultSchema = Schema.Struct({
   handledMs: NullableNumber,
   warnings: Schema.Array(Schema.String),
 })
-export type FlowStepResult = typeof FlowStepResultSchema.Type
 
 export const FlowFailedStepSchema = Schema.Struct({
   index: PositiveIntegerSchema,
@@ -566,22 +563,6 @@ export const FlowFailedStepSchema = Schema.Struct({
   summary: Schema.String,
   verdict: ActionVerdict,
 })
-export type FlowFailedStep = typeof FlowFailedStepSchema.Type
-
-export const FlowResultSchema = Schema.Struct({
-  contract: Schema.Literal("probe.session-flow/report-v1"),
-  executedAt: Schema.String,
-  sessionId: Schema.String,
-  summary: Schema.String,
-  verdict: ActionVerdict,
-  executedSteps: Schema.Array(FlowStepResultSchema),
-  failedStep: Schema.Union(FlowFailedStepSchema, Schema.Null),
-  retries: Schema.Number,
-  artifacts: Schema.Array(ArtifactRecord),
-  finalSnapshotId: NullableString,
-  warnings: Schema.Array(Schema.String),
-})
-export type FlowResult = typeof FlowResultSchema.Type
 
 export interface FlattenedStoredSnapshotNode {
   readonly ref: string
@@ -1539,22 +1520,6 @@ export const validateFlowStep = (step: FlowStep): string | null => {
   }
 }
 
-export const validateFlowContract = (flow: FlowContract): string | null => {
-  if (flow.steps.length === 0) {
-    return "Flow contracts require at least one step."
-  }
-
-  for (const [index, step] of flow.steps.entries()) {
-    const validationError = validateFlowStep(step)
-
-    if (validationError !== null) {
-      return `Step ${index + 1}: ${validationError}`
-    }
-  }
-
-  return null
-}
-
 const normalizeActionSelectorInput = (value: unknown): unknown => {
   if (typeof value !== "object" || value === null) {
     return value
@@ -1625,76 +1590,6 @@ const normalizeSessionActionInput = (value: unknown): unknown => {
   return value
 }
 
-const normalizeFlowStepInput = (value: unknown): unknown => {
-  if (typeof value !== "object" || value === null) {
-    return value
-  }
-
-  const record = value as Record<string, unknown>
-
-  if (
-    record.kind === "tap"
-    || record.kind === "press"
-    || record.kind === "swipe"
-    || record.kind === "type"
-    || record.kind === "scroll"
-  ) {
-    return {
-      ...record,
-      target: normalizeActionSelectorInput(record.target ?? record.selector),
-    }
-  }
-
-  if (record.kind === "assert") {
-    const expectation = typeof record.expectation === "object" && record.expectation !== null
-      ? record.expectation as Record<string, unknown>
-      : {}
-
-    return {
-      ...record,
-      target: normalizeActionSelectorInput(record.target ?? record.selector),
-      expectation,
-    }
-  }
-
-  if (record.kind === "wait") {
-    const hasTarget = record.target !== undefined || record.selector !== undefined
-
-    return {
-      ...record,
-      target: normalizeActionSelectorInput(record.target ?? record.selector ?? null),
-      condition: record.condition ?? (hasTarget ? "match" : "duration"),
-      text: record.text ?? null,
-    }
-  }
-
-  if (record.kind === "screenshot") {
-    return {
-      ...record,
-      label: record.label ?? null,
-    }
-  }
-
-  return value
-}
-
-const normalizeFlowContractInput = (value: unknown): unknown => {
-  if (typeof value !== "object" || value === null) {
-    return value
-  }
-
-  const record = value as Record<string, unknown>
-
-  return {
-    ...record,
-    steps: Array.isArray(record.steps)
-      ? record.steps.map((step) => normalizeFlowStepInput(step))
-      : record.steps,
-  }
-}
-
 export const decodeSessionAction = (value: unknown): SessionAction =>
   Schema.decodeUnknownSync(SessionActionSchema)(normalizeSessionActionInput(value))
-export const decodeFlowContract = (value: unknown): FlowContract =>
-  Schema.decodeUnknownSync(FlowContractSchema)(normalizeFlowContractInput(value))
 export const decodeActionRecordingScript = Schema.decodeUnknownSync(ActionRecordingScriptSchema)

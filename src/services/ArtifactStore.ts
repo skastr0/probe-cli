@@ -1,16 +1,21 @@
-import { Context, Effect, Layer } from "effect"
-import { access, copyFile, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises"
+import { Context, Effect, Either, Layer, Schema } from "effect"
+import { access, copyFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, extname, join, relative } from "node:path"
 import net from "node:net"
 import { ArtifactNotFoundError, EnvironmentError } from "../domain/errors"
-import type { ArtifactKind, ArtifactRecord } from "../domain/output"
+import { ArtifactRecord } from "../domain/output"
+import type { ArtifactKind } from "../domain/output"
+
+const decodeArtifactIndex = Schema.decodeUnknownSync(Schema.Array(ArtifactRecord))
+const decodeArtifactRecordSync = Schema.decodeUnknownSync(ArtifactRecord)
 
 const PROBE_PROTOCOL_VERSION_DIRECTORY = "v1"
 const daemonDirectoryName = "daemon"
 const sessionsDirectoryName = "sessions"
 const artifactIndexFileName = "artifact-index.json"
 const sessionManifestFileName = "session-manifest.json"
+const catalogTempSuffix = ".tmp"
 const defaultArtifactRetentionMs = Number(
   process.env.PROBE_ARTIFACT_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000,
 )
@@ -33,16 +38,81 @@ const fileExists = async (path: string): Promise<boolean> => {
   }
 }
 
-const safeJsonParse = <T>(content: string, fallback: T): T => {
+const ensureParentDirectory = async (path: string): Promise<void> => {
+  await ensureDirectory(dirname(path))
+}
+
+// A catalog file (session manifest, artifact index, daemon metadata) is either
+// legitimately absent (never written yet - not corruption), holds a decodable
+// value, or exists but failed to decode (corruption). Callers must not collapse
+// "corrupt" into "absent" - that is exactly the silent-empty-fallback this type
+// exists to prevent.
+type CatalogReadOutcome<T> =
+  | { readonly kind: "absent" }
+  | { readonly kind: "value"; readonly value: T }
+  | { readonly kind: "corrupt"; readonly detail: string }
+
+const readCatalogFile = async <T>(path: string): Promise<CatalogReadOutcome<T>> => {
+  let content: string
+
   try {
-    return JSON.parse(content) as T
-  } catch {
-    return fallback
+    content = await readFile(path, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { kind: "absent" }
+    }
+
+    return { kind: "corrupt", detail: error instanceof Error ? error.message : String(error) }
+  }
+
+  try {
+    return { kind: "value", value: JSON.parse(content) as T }
+  } catch (error) {
+    return { kind: "corrupt", detail: error instanceof Error ? error.message : String(error) }
   }
 }
 
-const ensureParentDirectory = async (path: string): Promise<void> => {
-  await ensureDirectory(dirname(path))
+// The single atomic-write primitive shared by the session manifest, the
+// artifact index, and daemon metadata: write to a deterministically-named
+// sibling temp file, fsync it, then rename it over the target. POSIX rename
+// within the same directory is atomic, so a concurrent reader always sees
+// either the fully-old or fully-new content, never a partial write, and a
+// crash between the temp write and the rename leaves only an orphaned temp
+// file behind - never a truncated catalog.
+const atomicWriteFile = async (targetPath: string, content: string): Promise<void> => {
+  await ensureParentDirectory(targetPath)
+  const tempPath = `${targetPath}${catalogTempSuffix}`
+  const handle = await open(tempPath, "w")
+
+  try {
+    await handle.writeFile(content, "utf8")
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+
+  await rename(tempPath, targetPath)
+
+  // rename() makes the new name visible to concurrent readers atomically, but
+  // on most POSIX filesystems the directory-entry change itself is not
+  // guaranteed durable across a hard crash (power loss) until the containing
+  // directory's own fd is fsynced too - otherwise an unclean remount can
+  // resurrect the pre-rename directory entry even though every reader during
+  // normal operation already saw the new content.
+  const directoryHandle = await open(dirname(targetPath), "r")
+  try {
+    await directoryHandle.sync()
+  } finally {
+    await directoryHandle.close()
+  }
+}
+
+// Removes the deterministic temp sibling for a catalog path, if any. Safe to
+// call unconditionally: a leftover temp file only ever means a previous write
+// crashed between the temp write and the atomic rename, so the real catalog
+// file (if any) already holds the last successfully committed state.
+const sweepOrphanCatalogTempFile = async (targetPath: string): Promise<void> => {
+  await unlink(`${targetPath}${catalogTempSuffix}`).catch(() => undefined)
 }
 
 const createArtifactRecord = (
@@ -133,6 +203,21 @@ export interface PersistedSessionRecord {
   }
 }
 
+// A session directory whose manifest failed to decode. Surfaced per-entry
+// instead of failing listPersistedSessions() outright, so one corrupt session
+// never poisons startup recovery or `probe sessions list`/`probe doctor` for
+// every other (valid) session.
+export interface PersistedSessionReadFailure {
+  readonly sessionId: string
+  readonly code: string
+  readonly reason: string
+}
+
+export interface PersistedSessionListing {
+  readonly sessions: ReadonlyArray<PersistedSessionRecord>
+  readonly failures: ReadonlyArray<PersistedSessionReadFailure>
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null
 
@@ -192,7 +277,7 @@ export class ArtifactStore extends Context.Tag("@probe/ArtifactStore")<
     readonly createSessionLayout: (sessionId: string) => Effect.Effect<SessionLayout, EnvironmentError>
     readonly removeSessionLayout: (sessionId: string) => Effect.Effect<void>
     readonly readSessionManifest: (sessionId: string) => Effect.Effect<Record<string, unknown> | null, EnvironmentError>
-    readonly listPersistedSessions: () => Effect.Effect<ReadonlyArray<PersistedSessionRecord>, EnvironmentError>
+    readonly listPersistedSessions: () => Effect.Effect<PersistedSessionListing, EnvironmentError>
     readonly writeSessionManifest: (
       sessionId: string,
       value: Record<string, unknown>,
@@ -235,11 +320,194 @@ export class ArtifactStore extends Context.Tag("@probe/ArtifactStore")<
 export const ArtifactStoreLive = Layer.effect(
   ArtifactStore,
   Effect.gen(function* () {
-    const probeRoot = join(homedir(), ".probe")
+    const probeRoot = process.env.PROBE_ARTIFACT_ROOT ?? join(homedir(), ".probe")
     const sessionsRoot = join(probeRoot, sessionsDirectoryName)
     const daemonRoot = join(probeRoot, daemonDirectoryName, PROBE_PROTOCOL_VERSION_DIRECTORY)
     const daemonSocketPath = join(daemonRoot, "probe.sock")
     const daemonMetadataPath = join(daemonRoot, "daemon.json")
+
+    // One in-process lock per catalog file path: the daemon owns exactly one
+    // ArtifactStoreLive instance, so this map is the daemon-owned serialized
+    // writer for every session catalog (manifest, artifact index) plus daemon
+    // metadata. Readers stay lock-free (atomic rename already makes a read
+    // race-free); only read-modify-write and overwrite critical sections take
+    // the lock, keyed by the exact file they touch so unrelated sessions never
+    // contend with each other.
+    const catalogLocks = new Map<string, Effect.Semaphore>()
+
+    const catalogLockFor = (path: string): Effect.Semaphore => {
+      const existing = catalogLocks.get(path)
+
+      if (existing) {
+        return existing
+      }
+
+      const created = Effect.unsafeMakeSemaphore(1)
+      catalogLocks.set(path, created)
+      return created
+    }
+
+    const withCatalogLock = <A, E>(path: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+      catalogLockFor(path).withPermits(1)(effect)
+
+    // Unlocked write primitive - callers that need read-modify-write take the
+    // lock themselves around a read + this write so the whole cycle is one
+    // critical section; callers that only ever overwrite (writeSessionManifest,
+    // writeDaemonMetadata) go through writeCatalogFile below instead.
+    const atomicWriteCatalogEffect = (path: string, content: string, code: string, nextStep: string) =>
+      Effect.tryPromise({
+        try: () => atomicWriteFile(path, content),
+        catch: (error) =>
+          new EnvironmentError({
+            code,
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep,
+            details: [],
+          }),
+      })
+
+    const writeCatalogFile = (path: string, content: string, code: string, nextStep: string) =>
+      withCatalogLock(path, atomicWriteCatalogEffect(path, content, code, nextStep))
+
+    const readArtifactIndexAt = (indexPath: string) =>
+      Effect.tryPromise({
+        try: async (): Promise<ReadonlyArray<ArtifactRecord>> => {
+          const outcome = await readCatalogFile<unknown>(indexPath)
+
+          if (outcome.kind === "absent") {
+            return []
+          }
+
+          if (outcome.kind === "corrupt") {
+            throw new EnvironmentError({
+              code: "artifact-index-corrupt",
+              reason: `${indexPath} exists but is not valid JSON: ${outcome.detail}`,
+              nextStep: "Inspect the session artifact index for manual edits or corruption; repair or remove the file, then re-open the session.",
+              details: [],
+            })
+          }
+
+          try {
+            // Full schema decode, not just an array-shape check: every entry
+            // must actually satisfy ArtifactRecord, so a truncated or
+            // hand-edited entry surfaces as corruption too.
+            return decodeArtifactIndex(outcome.value)
+          } catch (error) {
+            throw new EnvironmentError({
+              code: "artifact-index-corrupt",
+              reason: `${indexPath} exists but did not decode as a valid artifact index: ${error instanceof Error ? error.message : String(error)}`,
+              nextStep: "Inspect the session artifact index for manual edits or corruption; repair or remove the file, then re-open the session.",
+              details: [],
+            })
+          }
+        },
+        catch: (error) =>
+          error instanceof EnvironmentError
+            ? error
+            : new EnvironmentError({
+                code: "artifact-index-read",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the session artifact root for manual edits or corruption.",
+                details: [],
+              }),
+      })
+
+    const mutateArtifactIndex = (
+      sessionId: string,
+      mutate: (existing: ReadonlyArray<ArtifactRecord>) => ReadonlyArray<ArtifactRecord>,
+    ) => {
+      const indexPath = join(sessionsRoot, sessionId, "meta", artifactIndexFileName)
+
+      return withCatalogLock(
+        indexPath,
+        Effect.gen(function* () {
+          const existing = yield* readArtifactIndexAt(indexPath)
+          const next = mutate(existing)
+          yield* atomicWriteCatalogEffect(
+            indexPath,
+            `${JSON.stringify(next, null, 2)}\n`,
+            "artifact-index-write",
+            "Check write access to the session artifact root and retry.",
+          )
+          return next
+        }),
+      )
+    }
+
+    const readObjectCatalogAt = (path: string, corruptCode: string, ioCode: string, nextStep: string) =>
+      Effect.tryPromise({
+        try: async (): Promise<Record<string, unknown> | null> => {
+          const outcome = await readCatalogFile<unknown>(path)
+
+          if (outcome.kind === "absent") {
+            return null
+          }
+
+          if (outcome.kind === "value" && isRecord(outcome.value)) {
+            return outcome.value
+          }
+
+          const detail = outcome.kind === "value" ? "decoded JSON is not an object" : outcome.detail
+          throw new EnvironmentError({
+            code: corruptCode,
+            reason: `${path} exists but did not decode as a valid JSON object: ${detail}`,
+            nextStep,
+            details: [],
+          })
+        },
+        catch: (error) =>
+          error instanceof EnvironmentError
+            ? error
+            : new EnvironmentError({
+                code: ioCode,
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep,
+                details: [],
+              }),
+      })
+
+    const readDaemonMetadataStrict = () =>
+      readObjectCatalogAt(
+        daemonMetadataPath,
+        "daemon-metadata-corrupt",
+        "daemon-metadata-read",
+        "Inspect the daemon metadata file; if it is corrupt, stop the daemon and remove or repair daemon.json before restarting.",
+      )
+
+    const readSessionManifestStrict = (sessionId: string) =>
+      readObjectCatalogAt(
+        join(sessionsRoot, sessionId, "meta", sessionManifestFileName),
+        "session-manifest-corrupt",
+        "session-manifest-read",
+        "Inspect the session manifest for manual edits or corruption; remove the session directory and re-open the session if it cannot be repaired.",
+      )
+
+    const sweepOrphanCatalogTempFiles = Effect.tryPromise({
+      try: async () => {
+        await sweepOrphanCatalogTempFile(daemonMetadataPath)
+
+        const entries = await readdir(sessionsRoot, { withFileTypes: true }).catch(() => [])
+
+        await Promise.all(
+          entries
+            .filter((entry) => entry.isDirectory())
+            .flatMap((entry) => {
+              const metaDirectory = join(sessionsRoot, entry.name, "meta")
+              return [
+                sweepOrphanCatalogTempFile(join(metaDirectory, sessionManifestFileName)),
+                sweepOrphanCatalogTempFile(join(metaDirectory, artifactIndexFileName)),
+              ]
+            }),
+        )
+      },
+      catch: (error) =>
+        new EnvironmentError({
+          code: "catalog-temp-sweep",
+          reason: error instanceof Error ? error.message : String(error),
+          nextStep: "Inspect ~/.probe for orphaned .tmp catalog files and remove them manually, then restart the daemon.",
+          details: [],
+        }),
+    }).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid)
 
     const ensureProbeRoots = Effect.tryPromise({
       try: async () => {
@@ -255,92 +523,38 @@ export const ArtifactStoreLive = Layer.effect(
         }),
     })
 
-    const readArtifactIndex = (sessionId: string) =>
-      Effect.tryPromise({
-        try: async (): Promise<Array<ArtifactRecord>> => {
-          const indexPath = join(sessionsRoot, sessionId, "meta", artifactIndexFileName)
-
-          if (!(await fileExists(indexPath))) {
-            return []
-          }
-
-          const content = await readFile(indexPath, "utf8")
-          return safeJsonParse<Array<ArtifactRecord>>(content, [])
-        },
-        catch: (error) =>
-          new EnvironmentError({
-            code: "artifact-index-read",
-            reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Inspect the session artifact root for manual edits or corruption.",
-            details: [],
-          }),
-      })
-
-    const writeArtifactIndex = (sessionId: string, records: ReadonlyArray<ArtifactRecord>) =>
-      Effect.tryPromise({
+    const pruneExpiredSessions = Effect.gen(function* () {
+      yield* ensureProbeRoots
+      yield* Effect.tryPromise({
         try: async () => {
-          const indexPath = join(sessionsRoot, sessionId, "meta", artifactIndexFileName)
-          await ensureParentDirectory(indexPath)
-          await writeFile(indexPath, `${JSON.stringify(records, null, 2)}\n`, "utf8")
+          const entries = await readdir(sessionsRoot, { withFileTypes: true })
+          const cutoff = Date.now() - defaultArtifactRetentionMs
+
+          await Promise.all(
+            entries
+              .filter((entry) => entry.isDirectory())
+              .map(async (entry) => {
+                const path = join(sessionsRoot, entry.name)
+                const info = await stat(path)
+
+                if (info.mtimeMs < cutoff) {
+                  await rm(path, { recursive: true, force: true })
+                }
+              }),
+          )
         },
         catch: (error) =>
           new EnvironmentError({
-            code: "artifact-index-write",
+            code: "session-prune",
             reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Check write access to the session artifact root and retry.",
+            nextStep: "Inspect the session artifact root and retry pruning expired sessions.",
             details: [],
           }),
       })
-
-    const readDaemonMetadataUnsafe = async (): Promise<Record<string, unknown> | null> => {
-      if (!(await fileExists(daemonMetadataPath))) {
-        return null
-      }
-
-      const content = await readFile(daemonMetadataPath, "utf8")
-      return safeJsonParse<Record<string, unknown> | null>(content, null)
-    }
-
-    const readSessionManifestUnsafe = async (sessionId: string): Promise<Record<string, unknown> | null> => {
-      const manifestPath = join(sessionsRoot, sessionId, "meta", sessionManifestFileName)
-
-      if (!(await fileExists(manifestPath))) {
-        return null
-      }
-
-      const content = await readFile(manifestPath, "utf8")
-      return safeJsonParse<Record<string, unknown> | null>(content, null)
-    }
-
-    const pruneExpiredSessions = Effect.tryPromise({
-      try: async () => {
-        await ensureProbeRoots.pipe(Effect.runPromise)
-        const entries = await readdir(sessionsRoot, { withFileTypes: true })
-        const cutoff = Date.now() - defaultArtifactRetentionMs
-
-        await Promise.all(
-          entries
-            .filter((entry) => entry.isDirectory())
-            .map(async (entry) => {
-              const path = join(sessionsRoot, entry.name)
-              const info = await stat(path)
-
-              if (info.mtimeMs < cutoff) {
-                await rm(path, { recursive: true, force: true })
-              }
-            }),
-        )
-      },
-      catch: (error) =>
-        new EnvironmentError({
-          code: "session-prune",
-          reason: error instanceof Error ? error.message : String(error),
-          nextStep: "Inspect the session artifact root and retry pruning expired sessions.",
-          details: [],
-        }),
     }).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid)
 
     yield* ensureProbeRoots
+    yield* sweepOrphanCatalogTempFiles
     yield* pruneExpiredSessions
 
     return ArtifactStore.of({
@@ -360,78 +574,70 @@ export const ArtifactStoreLive = Layer.effect(
               details: [],
             }),
         }).pipe(Effect.catchAll(() => Effect.succeed(false))),
-      readDaemonMetadata: () =>
-        Effect.tryPromise({
-          try: readDaemonMetadataUnsafe,
-          catch: (error) =>
-            new EnvironmentError({
-              code: "daemon-metadata-read",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect the daemon metadata file and retry the diagnostics request.",
-              details: [],
-            }),
-        }),
+      readDaemonMetadata: () => readDaemonMetadataStrict(),
       createSessionLayout: (sessionId) =>
-        Effect.tryPromise({
-          try: async () => {
-            await ensureProbeRoots.pipe(Effect.runPromise)
+        Effect.gen(function* () {
+          yield* ensureProbeRoots
 
-            const root = join(sessionsRoot, sessionId)
-            const metaDirectory = join(root, "meta")
-            const logsDirectory = join(root, "logs")
-            const logStreamsDirectory = join(logsDirectory, "streams")
-            const logTailsDirectory = join(logsDirectory, "tails")
-            const runnerDirectory = join(root, "runner")
-            const outputsDirectory = join(root, "outputs")
-            const snapshotsDirectory = join(root, "snapshots")
-            const tracesDirectory = join(root, "traces")
-            const screenshotsDirectory = join(root, "screenshots")
-            const debugDirectory = join(root, "debug")
+          return yield* Effect.tryPromise({
+            try: async () => {
+              const root = join(sessionsRoot, sessionId)
+              const metaDirectory = join(root, "meta")
+              const logsDirectory = join(root, "logs")
+              const logStreamsDirectory = join(logsDirectory, "streams")
+              const logTailsDirectory = join(logsDirectory, "tails")
+              const runnerDirectory = join(root, "runner")
+              const outputsDirectory = join(root, "outputs")
+              const snapshotsDirectory = join(root, "snapshots")
+              const tracesDirectory = join(root, "traces")
+              const screenshotsDirectory = join(root, "screenshots")
+              const debugDirectory = join(root, "debug")
 
-            await Promise.all([
-              metaDirectory,
-              logsDirectory,
-              logStreamsDirectory,
-              logTailsDirectory,
-              runnerDirectory,
-              outputsDirectory,
-              snapshotsDirectory,
-              tracesDirectory,
-              screenshotsDirectory,
-              debugDirectory,
-            ].map(ensureDirectory))
+              await Promise.all([
+                metaDirectory,
+                logsDirectory,
+                logStreamsDirectory,
+                logTailsDirectory,
+                runnerDirectory,
+                outputsDirectory,
+                snapshotsDirectory,
+                tracesDirectory,
+                screenshotsDirectory,
+                debugDirectory,
+              ].map(ensureDirectory))
 
-            const manifestPath = join(metaDirectory, sessionManifestFileName)
-            const artifactIndexPath = join(metaDirectory, artifactIndexFileName)
+              const manifestPath = join(metaDirectory, sessionManifestFileName)
+              const artifactIndexPath = join(metaDirectory, artifactIndexFileName)
 
-            if (!(await fileExists(artifactIndexPath))) {
-              await writeFile(artifactIndexPath, "[]\n", "utf8")
-            }
+              if (!(await fileExists(artifactIndexPath))) {
+                await atomicWriteFile(artifactIndexPath, "[]\n")
+              }
 
-            return {
-              sessionId,
-              root,
-              metaDirectory,
-              logsDirectory,
-              logStreamsDirectory,
-              logTailsDirectory,
-              runnerDirectory,
-              outputsDirectory,
-              snapshotsDirectory,
-              tracesDirectory,
-              screenshotsDirectory,
-              debugDirectory,
-              manifestPath,
-              artifactIndexPath,
-            }
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "session-layout-create",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Check write access to ~/.probe/sessions and retry opening the session.",
-              details: [],
-            }),
+              return {
+                sessionId,
+                root,
+                metaDirectory,
+                logsDirectory,
+                logStreamsDirectory,
+                logTailsDirectory,
+                runnerDirectory,
+                outputsDirectory,
+                snapshotsDirectory,
+                tracesDirectory,
+                screenshotsDirectory,
+                debugDirectory,
+                manifestPath,
+                artifactIndexPath,
+              }
+            },
+            catch: (error) =>
+              new EnvironmentError({
+                code: "session-layout-create",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Check write access to ~/.probe/sessions and retry opening the session.",
+                details: [],
+              }),
+          })
         }),
       removeSessionLayout: (sessionId) =>
         Effect.tryPromise({
@@ -446,79 +652,116 @@ export const ArtifactStoreLive = Layer.effect(
               details: [],
             }),
         }).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid),
-      readSessionManifest: (sessionId) =>
-        Effect.tryPromise({
-          try: () => readSessionManifestUnsafe(sessionId),
-          catch: (error) =>
-            new EnvironmentError({
-              code: "session-manifest-read",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect the session manifest and retry the diagnostics request.",
-              details: [],
-            }),
-        }),
+      readSessionManifest: (sessionId) => readSessionManifestStrict(sessionId),
       listPersistedSessions: () =>
-        Effect.tryPromise({
-          try: async () => {
-            await ensureProbeRoots.pipe(Effect.runPromise)
-            const entries = await readdir(sessionsRoot, { withFileTypes: true })
+        Effect.gen(function* () {
+          yield* ensureProbeRoots
+          const entries = yield* Effect.tryPromise({
+            try: () => readdir(sessionsRoot, { withFileTypes: true }),
+            catch: (error) =>
+              new EnvironmentError({
+                code: "persisted-session-list",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the Probe session artifact root and retry the diagnostics request.",
+                details: [],
+              }),
+          })
 
-            const manifests = await Promise.all(
-              entries
-                .filter((entry) => entry.isDirectory())
-                .map(async (entry) => {
-                  const sessionId = entry.name
-                  const manifestPath = join(sessionsRoot, sessionId, "meta", sessionManifestFileName)
-                  const manifest = await readSessionManifestUnsafe(sessionId)
+          // A single corrupt session manifest must not fail the whole listing -
+          // Effect.either captures it as a per-entry outcome instead of letting
+          // Effect.forEach short-circuit the entire call, so one bad session
+          // directory never poisons startup recovery or `probe sessions
+          // list`/`probe doctor` for every other (valid) session.
+          const outcomes = yield* Effect.forEach(
+            entries.filter((entry) => entry.isDirectory()),
+            (entry) =>
+              Effect.gen(function* () {
+                const sessionId = entry.name
+                const manifestPath = join(sessionsRoot, sessionId, "meta", sessionManifestFileName)
+                const manifest = yield* readSessionManifestStrict(sessionId)
 
-                  if (!manifest) {
-                    return null
-                  }
+                return manifest === null
+                  ? null
+                  : toPersistedSessionRecord(sessionsRoot, sessionId, manifestPath, manifest)
+              }).pipe(
+                Effect.either,
+                Effect.map((result) => ({ sessionId: entry.name, result })),
+              ),
+          )
 
-                  return toPersistedSessionRecord(sessionsRoot, sessionId, manifestPath, manifest)
-                }),
-            )
+          const sessions: Array<PersistedSessionRecord> = []
+          const failures: Array<PersistedSessionReadFailure> = []
 
-            return manifests
-              .filter((entry): entry is PersistedSessionRecord => entry !== null)
-              .sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""))
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "persisted-session-list",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect the Probe session artifact root and retry the diagnostics request.",
-              details: [],
-            }),
+          for (const outcome of outcomes) {
+            if (Either.isLeft(outcome.result)) {
+              failures.push({
+                sessionId: outcome.sessionId,
+                code: outcome.result.left.code,
+                reason: outcome.result.left.reason,
+              })
+              continue
+            }
+
+            if (outcome.result.right !== null) {
+              sessions.push(outcome.result.right)
+            }
+          }
+
+          sessions.sort((left, right) => Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? ""))
+
+          return { sessions, failures }
         }),
       writeSessionManifest: (sessionId, value) =>
-        Effect.tryPromise({
-          try: async () => {
-            const manifestPath = join(sessionsRoot, sessionId, "meta", sessionManifestFileName)
-            await ensureParentDirectory(manifestPath)
-            await writeFile(manifestPath, `${JSON.stringify(value, null, 2)}\n`, "utf8")
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "session-manifest-write",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Check filesystem permissions for the session artifact root and retry.",
-              details: [],
-            }),
-        }),
+        writeCatalogFile(
+          join(sessionsRoot, sessionId, "meta", sessionManifestFileName),
+          `${JSON.stringify(value, null, 2)}\n`,
+          "session-manifest-write",
+          "Check filesystem permissions for the session artifact root and retry.",
+        ),
       registerArtifact: (sessionId, record) =>
         Effect.gen(function* () {
-          const sizeBytes = record.sizeBytes ?? (yield* Effect.promise(() => readFileSize(record.absolutePath)))
-          const normalizedRecord = sizeBytes === undefined ? record : { ...record, sizeBytes }
-          const existing = yield* readArtifactIndex(sessionId)
-          const next = [...existing.filter((entry) => entry.key !== normalizedRecord.key), normalizedRecord]
-          yield* writeArtifactIndex(sessionId, next)
+          // Validate metadata and existence before commit - a record that
+          // fails to decode or whose absolutePath is not actually on disk
+          // must never reach the atomic write. A bad write here would corrupt
+          // the whole catalog for the session, since reads use a strict full
+          // ArtifactRecord decode.
+          const validatedRecord = yield* Effect.try({
+            try: () => decodeArtifactRecordSync(record),
+            catch: (error) =>
+              new EnvironmentError({
+                code: "artifact-registration-invalid",
+                reason: `Artifact record for key "${record.key}" failed schema validation: ${error instanceof Error ? error.message : String(error)}`,
+                nextStep: "Fix the artifact record fields before registering it; every field must satisfy ArtifactRecord.",
+                details: [],
+              }),
+          })
+
+          const fileInfo = yield* Effect.tryPromise({
+            try: () => stat(validatedRecord.absolutePath),
+            catch: (error) =>
+              new EnvironmentError({
+                code: "artifact-registration-missing-file",
+                reason: (error as NodeJS.ErrnoException).code === "ENOENT"
+                  ? `Artifact "${validatedRecord.key}" points at ${validatedRecord.absolutePath}, which does not exist on disk.`
+                  : `Could not stat ${validatedRecord.absolutePath} for artifact "${validatedRecord.key}": ${error instanceof Error ? error.message : String(error)}`,
+                nextStep: "Write the artifact file to disk before registering it, then retry registration.",
+                details: [],
+              }),
+          })
+
+          const sizeBytes = validatedRecord.sizeBytes ?? (fileInfo.isFile() ? fileInfo.size : undefined)
+          const normalizedRecord = sizeBytes === undefined ? validatedRecord : { ...validatedRecord, sizeBytes }
+
+          yield* mutateArtifactIndex(sessionId, (existing) => [
+            ...existing.filter((entry) => entry.key !== normalizedRecord.key),
+            normalizedRecord,
+          ])
           return normalizedRecord
         }),
-      listArtifacts: (sessionId) => readArtifactIndex(sessionId),
+      listArtifacts: (sessionId) => readArtifactIndexAt(join(sessionsRoot, sessionId, "meta", artifactIndexFileName)),
       getArtifact: (sessionId, artifactKey) =>
         Effect.gen(function* () {
-          const artifacts = yield* readArtifactIndex(sessionId)
+          const artifacts = yield* readArtifactIndexAt(join(sessionsRoot, sessionId, "meta", artifactIndexFileName))
           const artifact = artifacts.find((entry) => entry.key === artifactKey)
 
           if (!artifact) {
@@ -532,113 +775,123 @@ export const ArtifactStoreLive = Layer.effect(
           return artifact
         }),
       writeDerivedOutput: ({ sessionId, label, format, content, summary }) =>
-        Effect.tryPromise({
-          try: async () => {
-            const extension = format === "json" ? ".json" : ".txt"
-            const root = join(sessionsRoot, sessionId)
-            const outputsDirectory = join(root, "outputs")
-            await ensureDirectory(outputsDirectory)
+        Effect.gen(function* () {
+          const record = yield* Effect.tryPromise({
+            try: async () => {
+              const extension = format === "json" ? ".json" : ".txt"
+              const root = join(sessionsRoot, sessionId)
+              const outputsDirectory = join(root, "outputs")
+              await ensureDirectory(outputsDirectory)
 
-            const fileName = `${timestampForFile()}-${label}${extension}`
-            const absolutePath = join(outputsDirectory, fileName)
-            await writeFile(absolutePath, content, "utf8")
+              const fileName = `${timestampForFile()}-${label}${extension}`
+              const absolutePath = join(outputsDirectory, fileName)
+              await writeFile(absolutePath, content, "utf8")
 
-            const record = createArtifactRecord(
-              probeRoot,
-              `derived-${fileName}`,
-              label,
-              format,
-              absolutePath,
-              summary,
-              Buffer.byteLength(content, "utf8"),
-            )
+              return createArtifactRecord(
+                probeRoot,
+                `derived-${fileName}`,
+                label,
+                format,
+                absolutePath,
+                summary,
+                Buffer.byteLength(content, "utf8"),
+              )
+            },
+            catch: (error) =>
+              new EnvironmentError({
+                code: "derived-output-write",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Check write access to the session outputs directory and retry.",
+                details: [],
+              }),
+          })
 
-            const existing = await Effect.runPromise(readArtifactIndex(sessionId))
-            await Effect.runPromise(writeArtifactIndex(sessionId, [...existing, record]))
-            return record
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "derived-output-write",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Check write access to the session outputs directory and retry.",
-              details: [],
-            }),
+          yield* mutateArtifactIndex(sessionId, (existing) => [...existing, record])
+          return record
         }),
       writeDerivedFile: ({ sessionId, label, kind, sourceAbsolutePath, sourceFileName, summary }) =>
-        Effect.tryPromise({
-          try: async () => {
-            const extension = extname(sourceFileName) || extname(sourceAbsolutePath)
-            const root = join(sessionsRoot, sessionId)
-            const outputsDirectory = join(root, "outputs")
-            await ensureDirectory(outputsDirectory)
+        Effect.gen(function* () {
+          const record = yield* Effect.tryPromise({
+            try: async () => {
+              const extension = extname(sourceFileName) || extname(sourceAbsolutePath)
+              const root = join(sessionsRoot, sessionId)
+              const outputsDirectory = join(root, "outputs")
+              await ensureDirectory(outputsDirectory)
 
-            const fileName = `${timestampForFile()}-${label}${extension}`
-            const absolutePath = join(outputsDirectory, fileName)
-            await copyFile(sourceAbsolutePath, absolutePath)
+              const fileName = `${timestampForFile()}-${label}${extension}`
+              const absolutePath = join(outputsDirectory, fileName)
+              await copyFile(sourceAbsolutePath, absolutePath)
 
-            const record = createArtifactRecord(
-              probeRoot,
-              `derived-${fileName}`,
-              label,
-              kind,
-              absolutePath,
-              summary,
-              await readFileSize(absolutePath),
-            )
+              return createArtifactRecord(
+                probeRoot,
+                `derived-${fileName}`,
+                label,
+                kind,
+                absolutePath,
+                summary,
+                await readFileSize(absolutePath),
+              )
+            },
+            catch: (error) =>
+              new EnvironmentError({
+                code: "derived-file-write",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Check write access to the session outputs directory and retry.",
+                details: [],
+              }),
+          })
 
-            const existing = await Effect.runPromise(readArtifactIndex(sessionId))
-            await Effect.runPromise(writeArtifactIndex(sessionId, [...existing, record]))
-            return record
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "derived-file-write",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Check write access to the session outputs directory and retry.",
-              details: [],
-            }),
+          yield* mutateArtifactIndex(sessionId, (existing) => [...existing, record])
+          return record
         }),
       removeDaemonMetadata: () =>
-        Effect.tryPromise({
-          try: async () => {
-            await unlink(daemonMetadataPath).catch(() => undefined)
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "daemon-metadata-remove",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect the daemon metadata path and retry removing it.",
-              details: [],
-            }),
-        }).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid),
+        withCatalogLock(
+          daemonMetadataPath,
+          Effect.tryPromise({
+            try: async () => {
+              await unlink(daemonMetadataPath).catch(() => undefined)
+              await sweepOrphanCatalogTempFile(daemonMetadataPath)
+            },
+            catch: (error) =>
+              new EnvironmentError({
+                code: "daemon-metadata-remove",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the daemon metadata path and retry removing it.",
+                details: [],
+              }),
+          }),
+        ).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid),
       writeDaemonMetadata: (value) =>
-        Effect.tryPromise({
-          try: async () => {
-            await ensureProbeRoots.pipe(Effect.runPromise)
-            await writeFile(daemonMetadataPath, `${JSON.stringify(value, null, 2)}\n`, "utf8")
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "daemon-metadata-write",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Check write access to the daemon metadata directory and retry.",
-              details: [],
-            }),
+        Effect.gen(function* () {
+          yield* ensureProbeRoots
+          yield* writeCatalogFile(
+            daemonMetadataPath,
+            `${JSON.stringify(value, null, 2)}\n`,
+            "daemon-metadata-write",
+            "Check write access to the daemon metadata directory and retry.",
+          )
         }),
+      // Best-effort by design (public signature carries no error channel): if
+      // daemon.json is absent there is nothing to sync into yet, and if it is
+      // corrupt this intentionally skips the write rather than overwriting the
+      // corrupt file with a freshly-derived {} - that would destroy the
+      // evidence readDaemonMetadata() needs to surface the corruption loudly.
       syncDaemonSessionMetadata: (sessions) =>
-        Effect.tryPromise({
-          try: async () => {
-            if (!(await fileExists(daemonMetadataPath))) {
+        withCatalogLock(
+          daemonMetadataPath,
+          Effect.gen(function* () {
+            const current = yield* readObjectCatalogAt(
+              daemonMetadataPath,
+              "daemon-metadata-corrupt",
+              "daemon-metadata-read",
+              "Inspect daemon.json and retry the session lifecycle operation.",
+            )
+
+            if (current === null) {
               return
             }
 
-            const current = safeJsonParse<Record<string, unknown>>(
-              await readFile(daemonMetadataPath, "utf8"),
-              {},
-            )
-
-            await writeFile(
+            yield* atomicWriteCatalogEffect(
               daemonMetadataPath,
               `${JSON.stringify(
                 {
@@ -650,17 +903,11 @@ export const ArtifactStoreLive = Layer.effect(
                 null,
                 2,
               )}\n`,
-              "utf8",
+              "daemon-session-metadata-sync",
+              "Inspect daemon.json and retry the session lifecycle operation.",
             )
-          },
-          catch: (error) =>
-            new EnvironmentError({
-              code: "daemon-session-metadata-sync",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect daemon.json and retry the session lifecycle operation.",
-              details: [],
-            }),
-        }).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid),
+          }),
+        ).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid),
       pruneExpiredSessions: () => pruneExpiredSessions,
     })
   }),

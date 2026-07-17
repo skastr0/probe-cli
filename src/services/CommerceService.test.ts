@@ -25,7 +25,7 @@ const buildArtifactStoreStub = (capture?: { readonly derivedOutputs?: Array<{ re
     createSessionLayout: () => Effect.die("unused createSessionLayout"),
     removeSessionLayout: () => Effect.void,
     readSessionManifest: () => Effect.succeed(null),
-    listPersistedSessions: () => Effect.succeed([]),
+    listPersistedSessions: () => Effect.succeed({ sessions: [], failures: [] }),
     writeSessionManifest: () => Effect.void,
     registerArtifact: (_sessionId: string, record: any) => Effect.succeed(record),
     listArtifacts: () => Effect.succeed([]),
@@ -160,7 +160,7 @@ const buildDaemonClientStub = () =>
     captureSnapshot: () => Effect.die("unused captureSnapshot"),
     performSessionAction: () => Effect.die("unused performSessionAction"),
     runSessionFlow: () => Effect.succeed({
-      contract: "probe.session-flow/report-v1",
+      contract: "probe.session-flow/report-v2",
       executedAt: "2026-04-14T00:00:00.000Z",
       sessionId: "session-1",
       summary: "probe flow passed",
@@ -364,7 +364,7 @@ describe("CommerceService", () => {
           {
             kind: "commerce.loadProducts",
             flow: {
-              contract: "probe.session-flow/v1",
+              contract: "probe.session-flow/v2",
               steps: [
                 {
                   kind: "sleep",
