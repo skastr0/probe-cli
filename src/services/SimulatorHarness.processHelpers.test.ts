@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { ChildProcessError } from "../domain/errors"
@@ -64,6 +64,27 @@ describe("SimulatorHarness process helpers (real spawn, via AppleProcessSupervis
         stdoutPath,
       }).catch((error: unknown) => error)
       expect(failure).toBeInstanceOf(ChildProcessError)
+    })
+  })
+
+  test("runCommandWithCapturedStdout streams the full artifact past the 2 MiB in-memory cap", async () => {
+    await withTempDir(async (dir) => {
+      const stdoutPath = join(dir, "captured-large.out")
+      const totalBytes = 5 * 1024 * 1024
+
+      await runCommandWithCapturedStdout({
+        command: "/bin/sh",
+        commandArgs: ["-c", `head -c ${totalBytes} /dev/zero | tr '\\0' 'a'`],
+        stdoutPath,
+      })
+
+      // This is the regression this test guards: the old implementation wrote
+      // the bounded in-memory `result.stdout` (default cap 2 MiB) to disk
+      // instead of the supervisor's streamed artifact, silently truncating
+      // any capture -- like the `log stream` capture this backs -- larger
+      // than the cap.
+      const stats = await stat(stdoutPath)
+      expect(stats.size).toBe(totalBytes)
     })
   })
 })

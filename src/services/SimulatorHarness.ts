@@ -589,9 +589,22 @@ export const runCommandWithCapturedStdout = async (args: {
   readonly stdoutPath: string
 }): Promise<{ readonly stdout: string; readonly stderr: string }> => {
   await ensureDirectory(dirname(args.stdoutPath))
+  // The supervisor's artifact stream opens in append mode -- start from a
+  // clean file so a re-run against the same path (e.g. a retried capture)
+  // does not concatenate onto stale output.
+  await removeFileIfExists(args.stdoutPath)
 
-  const result = await runAppleProcess({ command: args.command, commandArgs: args.commandArgs })
-  await writeFile(args.stdoutPath, result.stdout, "utf8")
+  // stdout is streamed straight to `stdoutPath` by the supervisor as it
+  // arrives; `result.stdout` below is only the bounded in-memory excerpt
+  // (default cap 2 MiB) used for the thrown error's stderrExcerpt / a small
+  // caller's convenience return value. Never write `result.stdout` to the
+  // artifact file directly -- for captures like `log stream` that routinely
+  // exceed the cap, that would silently truncate the on-disk artifact.
+  const result = await runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    stdoutArtifactPath: args.stdoutPath,
+  })
 
   if (result.exitCode === 0) {
     return { stdout: result.stdout, stderr: result.stderr }
