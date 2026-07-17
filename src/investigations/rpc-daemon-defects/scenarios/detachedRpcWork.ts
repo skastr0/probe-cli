@@ -102,7 +102,9 @@ export const runDetachedRpcWorkScenario = async (): Promise<DefectFinding> => {
           ? "The in-flight request handler kept running and settled after the daemon fiber was interrupted (socket closed, metadata removed), confirming request work is detached from serveRpc's own Effect scope."
           : "The in-flight request handler did not settle after the daemon fiber was interrupted; no detachment was observed in this run.",
         evidence: [
-          "src/rpc/server.ts:148 — Effect.runPromise(Effect.either(config.onRequest(request, emit))).then(...) is invoked outside the Effect.acquireRelease/Effect.scoped block that owns serveRpc's own lifecycle (src/rpc/server.ts:49-241), so it is never a child fiber of the daemon and Fiber.interrupt on the daemon cannot reach it.",
+          reproduced
+            ? "src/rpc/server.ts:148 — Effect.runPromise(Effect.either(config.onRequest(request, emit))).then(...) was invoked outside the Effect.acquireRelease/Effect.scoped block that owns serveRpc's own lifecycle (src/rpc/server.ts:49-241), so it was never a child fiber of the daemon and Fiber.interrupt on the daemon could not reach it."
+            : "src/rpc/server.ts:329 — PRB-088 forks each accepted connection's handleConnection effect with the ambient runtime (`runFork(handleConnection(socket, config))`) and tracks the resulting fiber in the `connections` map (src/rpc/server.ts:323-331); serveRpc's release effect now interrupts every tracked connection fiber (src/rpc/server.ts:392-398), so Fiber.interrupt on the daemon reaches in-flight request handlers instead of leaving them detached.",
           `daemon fiber interrupted ${timeline.interruptedAt - state.requestStartedAt}ms after the handler started (handler configured to sleep ${handlerSleepMs}ms); handler settled ${
             state.handlerSettledAt === 0 ? "never (within observation window)" : `${state.handlerSettledAt - state.requestStartedAt}ms after start`
           }.`,
