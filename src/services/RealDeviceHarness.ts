@@ -1,5 +1,3 @@
-import { spawn, type ChildProcess } from "node:child_process"
-import { createWriteStream } from "node:fs"
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
@@ -11,7 +9,7 @@ import {
   UserInputError,
 } from "../domain/errors"
 import type { SessionConnectionDetails } from "../domain/session"
-import { runAppleProcess } from "./AppleProcessSupervisor"
+import { type AppleProcessHandle, runAppleProcess, spawnAppleProcessHandle } from "./AppleProcessSupervisor"
 import type { RunnerCommandResult } from "./SimulatorHarness"
 import {
   type RunnerCapability,
@@ -1523,136 +1521,6 @@ const injectBootstrapManifestIntoXctestrun = async (args: {
     },
   })
 
-const processExists = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
-  }
-}
-
-const inspectProcess = async (pid: number): Promise<{
-  readonly exists: boolean
-  readonly processGroupId: number | null
-  readonly command: string | null
-}> => {
-  const result = await runRealDeviceHostCommand({
-    command: "/bin/ps",
-    commandArgs: ["-o", "pgid=", "-o", "command=", "-p", String(pid)],
-  })
-
-  if (result.exitCode !== 0) {
-    return {
-      exists: false,
-      processGroupId: null,
-      command: null,
-    }
-  }
-
-  const output = result.stdout.trim()
-  const match = output.match(/^(\d+)\s+(.*)$/s)
-
-  if (!match) {
-    return {
-      exists: true,
-      processGroupId: null,
-      command: output.length > 0 ? output : null,
-    }
-  }
-
-  return {
-    exists: true,
-    processGroupId: Number(match[1]),
-    command: match[2]?.trim() || null,
-  }
-}
-
-const isRunnerWrapperCommand = (command: string | null): boolean =>
-  command?.includes("run-transport-boundary-session.py") ?? false
-
-const killRunnerTarget = (pid: number, processGroupId: number | null, signal: NodeJS.Signals): void => {
-  if (processGroupId !== null && processGroupId === pid) {
-    process.kill(-processGroupId, signal)
-    return
-  }
-
-  process.kill(pid, signal)
-}
-
-const waitForProcessExit = async (pid: number, timeoutMs: number): Promise<boolean> => {
-  const deadline = Date.now() + timeoutMs
-
-  while (Date.now() < deadline) {
-    if (!processExists(pid)) {
-      return true
-    }
-
-    await sleep(100)
-  }
-
-  return !processExists(pid)
-}
-
-const terminateRunnerProcess = async (pid: number): Promise<{
-  readonly summary: string
-  readonly details: ReadonlyArray<string>
-}> => {
-  const inspection = await inspectProcess(pid)
-
-  if (!inspection.exists) {
-    return {
-      summary: `No live runner wrapper process was found for pid ${pid}.`,
-      details: [`pid ${pid} was already gone before cleanup started.`],
-    }
-  }
-
-  if (!isRunnerWrapperCommand(inspection.command)) {
-    return {
-      summary: `Skipped pid ${pid} because it no longer looks like a Probe runner wrapper.`,
-      details: [inspection.command ? `unexpected command: ${inspection.command}` : "command line was unavailable during inspection."],
-    }
-  }
-
-  const targetDescription = inspection.processGroupId === pid
-    ? `process group ${inspection.processGroupId}`
-    : `pid ${pid}`
-
-  try {
-    killRunnerTarget(pid, inspection.processGroupId, "SIGTERM")
-  } catch {
-    return {
-      summary: `Failed to signal stale runner wrapper ${targetDescription}.`,
-      details: [inspection.command ?? "command line unavailable"],
-    }
-  }
-
-  if (await waitForProcessExit(pid, 2_000)) {
-    return {
-      summary: `Stopped stale runner wrapper ${targetDescription} with SIGTERM.`,
-      details: [inspection.command ?? "command line unavailable"],
-    }
-  }
-
-  try {
-    killRunnerTarget(pid, inspection.processGroupId, "SIGKILL")
-  } catch {
-    return {
-      summary: `Runner wrapper ${targetDescription} ignored SIGTERM and Probe could not escalate to SIGKILL.`,
-      details: [inspection.command ?? "command line unavailable"],
-    }
-  }
-
-  await waitForProcessExit(pid, 1_000)
-
-  return {
-    summary: processExists(pid)
-      ? `Probe escalated to SIGKILL for stale runner wrapper ${targetDescription}, but the process still appears live.`
-      : `Probe escalated to SIGKILL for stale runner wrapper ${targetDescription}.`,
-    details: [inspection.command ?? "command line unavailable"],
-  }
-}
-
 const waitForFreshJson = async <T>(args: {
   readonly path: string
   readonly timeoutMs: number
@@ -1808,100 +1676,62 @@ const assertReadyTransportContract = (args: {
   }
 }
 
+/**
+ * Spawns a long-lived wrapper process via the supervisor and streams its
+ * stderr straight to `wrapperStderrPath` (the supervisor's artifact stream is
+ * append-only, so no whole-history rewrite on every chunk). Generic over
+ * `command`/`commandArgs` -- the xcodebuild/XCUITest argv is built at the
+ * call site -- so this has direct test coverage against a fake command (see
+ * *.processHelpers.test.ts) without needing a real device/Xcode project.
+ */
 const startWrapperProcess = async (args: {
-  readonly projectRoot: string
-  readonly xctestrunPath: string
-  readonly destination: string
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly cwd: string
   readonly observerControlDirectory: string
   readonly wrapperStderrPath: string
-  readonly logPath: string
-  readonly stdoutEventsPath: string
-  readonly resultBundlePath: string
-  readonly developmentTeam: string
 }): Promise<{
-  readonly process: ChildProcess
-  readonly exit: Promise<{ readonly code: number | null; readonly signal: string | null }>
+  readonly handle: AppleProcessHandle
+  readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>
 }> => {
   await ensureDirectory(args.observerControlDirectory)
   await ensureDirectory(dirname(args.wrapperStderrPath))
-  await writeFile(args.wrapperStderrPath, "", "utf8")
+  // The supervisor's artifact stream opens in append mode -- start from a
+  // clean file so a re-run against the same path does not concatenate onto
+  // stale output.
+  await removeFileIfExists(args.wrapperStderrPath)
 
-  const wrapperScript = resolveProbeRunnerWrapperScriptPath(args.projectRoot)
-
-  const child = spawn(
-    "/usr/bin/python3",
-    [
-      wrapperScript,
-      "--control-dir",
-      args.observerControlDirectory,
-      "--log-path",
-      args.logPath,
-      "--stdout-events-path",
-      args.stdoutEventsPath,
-      "--",
-      "xcodebuild",
-      "-xctestrun",
-      args.xctestrunPath,
-      "-destination",
-      args.destination,
-      "-resultBundlePath",
-      args.resultBundlePath,
-      `DEVELOPMENT_TEAM=${args.developmentTeam}`,
-      "test-without-building",
-      "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
-    ],
-    {
-      cwd: args.projectRoot,
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-    },
-  )
-
-  // Append each chunk once as it arrives instead of rewriting the whole
-  // accumulated history on every chunk (that previous approach was O(n^2) in
-  // total bytes written and risked losing/corrupting output on a large or
-  // long-lived wrapper run). The file was just truncated to empty above, so
-  // opening in append mode here starts clean and stays linear.
-  const wrapperStderrStream = createWriteStream(args.wrapperStderrPath, { flags: "a" })
-  // Swallow a write-after-end race defensively: 'close' below already avoids
-  // triggering one under normal operation, but this keeps a stray late write
-  // from becoming an unhandled 'error' on a stream with no other listener.
-  wrapperStderrStream.on("error", () => undefined)
-  child.stderr?.setEncoding("utf8")
-  child.stderr?.on("data", (chunk) => {
-    wrapperStderrStream.write(String(chunk))
-  })
-  // 'close' (not 'exit') -- 'exit' can fire before the child's stdio finishes
-  // flushing, and ending the stream on 'exit' can drop a still-in-flight
-  // stderr chunk or write to an already-ended stream. 'close' only fires once
-  // every stdio stream (stderr included) has finished, so every byte the
-  // child wrote has already reached the 'data' handler above by then.
-  child.once("close", () => wrapperStderrStream.end())
-
-  const exit = new Promise<{ readonly code: number | null; readonly signal: string | null }>((resolve, reject) => {
-    child.once("error", reject)
-    child.once("exit", (code, signal) => resolve({ code, signal }))
+  const handle = await spawnAppleProcessHandle({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    cwd: args.cwd,
+    stderrArtifactPath: args.wrapperStderrPath,
   })
 
-  return {
-    process: child,
-    exit,
-  }
+  const exit = handle.awaitExit.then((result) => ({ code: result.exitCode, signal: result.signal }))
+
+  return { handle, exit }
 }
 
 const stopWrapperProcess = async (wrapper: {
-  readonly process: ChildProcess
-  readonly exit: Promise<{ readonly code: number | null; readonly signal: string | null }>
+  readonly handle: AppleProcessHandle
+  readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>
 }): Promise<void> => {
-  const pid = wrapper.process.pid
-
-  if (pid === undefined || wrapper.process.exitCode !== null || wrapper.process.killed) {
+  if (!wrapper.handle.isRunning()) {
     return
   }
 
-  await terminateRunnerProcess(pid)
-  await Promise.race([wrapper.exit, sleep(1_000)])
+  // handle.stop() sends SIGTERM, waits a bounded grace period, escalates to
+  // SIGKILL, and joins exit -- the same TERM -> grace -> KILL ladder
+  // terminateRunnerProcess used to hand-roll, now shared with every other
+  // supervisor-owned child instead of duplicated here.
+  await wrapper.handle.stop("SIGTERM")
 }
+
+// Aliased re-export for the same reason as runRealDeviceHostCommand's own
+// direct process-level tests -- coverage of the wrapper-process migration
+// without touching the RealDeviceHarness DI shape.
+export { startWrapperProcess as startRealDeviceRunnerWrapperProcess, stopWrapperProcess as stopRealDeviceRunnerWrapperProcess }
 
 const buildPreflightWarnings = (): ReadonlyArray<string> => [
   "Real-device preflight validates DDI/device/signing prerequisites without claiming a live runner transport.",
@@ -2494,15 +2324,30 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
-              projectRoot: args.projectRoot,
-              xctestrunPath: injectedXctestrunPath,
-              destination,
+              command: "/usr/bin/python3",
+              commandArgs: [
+                resolveProbeRunnerWrapperScriptPath(args.projectRoot),
+                "--control-dir",
+                observerControlDirectory,
+                "--log-path",
+                sessionLogPath,
+                "--stdout-events-path",
+                stdoutEventsPath,
+                "--",
+                "xcodebuild",
+                "-xctestrun",
+                injectedXctestrunPath,
+                "-destination",
+                destination,
+                "-resultBundlePath",
+                resultBundlePath,
+                `DEVELOPMENT_TEAM=${preflight.developmentTeam}`,
+                "test-without-building",
+                "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
+              ],
+              cwd: args.projectRoot,
               observerControlDirectory,
               wrapperStderrPath,
-              logPath: sessionLogPath,
-              stdoutEventsPath,
-              resultBundlePath,
-              developmentTeam: preflight.developmentTeam,
             })
             void wrapper.exit.finally(async () => {
               if (bootstrapPath === null) {
@@ -2514,7 +2359,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               await removeFileIfExists(completedBootstrapPath)
             })
 
-            const isWrapperRunning = () => wrapper !== null && wrapper.process.exitCode === null && !wrapper.process.killed
+            const isWrapperRunning = () => wrapper !== null && wrapper.handle.isRunning()
 
             const ready = await (async () => {
               try {
@@ -2707,7 +2552,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               sessionIdentifier: ready.sessionIdentifier,
               commandIngress: ready.ingressTransport,
               eventEgress: ready.egressTransport,
-              wrapperProcessId: wrapper.process.pid ?? -1,
+              wrapperProcessId: wrapper.handle.pid,
               testProcessId: ready.processIdentifier,
               targetProcessId,
               attachLatencyMs: ready.attachLatencyMs,
