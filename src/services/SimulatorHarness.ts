@@ -1,4 +1,3 @@
-import { spawn, type ChildProcess } from "node:child_process"
 import { access, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 import { dirname, join } from "node:path"
@@ -10,7 +9,7 @@ import {
   UserInputError,
 } from "../domain/errors"
 import type { SimulatorSessionMode } from "../domain/session"
-import { runAppleProcess } from "./AppleProcessSupervisor"
+import { type AppleProcessHandle, runAppleProcess, spawnAppleProcessHandle } from "./AppleProcessSupervisor"
 import {
   type RunnerCapability,
   decodeRunnerReadyFrame,
@@ -667,6 +666,105 @@ const captureSimulatorDiagnosticBundleWithSimctl = async (args: {
   return { absolutePath }
 }
 
+const recordingStartupTimeoutMs = 15_000
+const recordingStopGracePeriodMs = 5_000
+
+/**
+ * Spawns a long-lived recording process via the supervisor and watches its
+ * stderr for `startedMarker` to know when the requested duration window
+ * should begin -- generic so the descendant-tree/timer-cleanup guarantees
+ * below have direct test coverage against a fake command (see
+ * *.processHelpers.test.ts) without needing a real simulator.
+ * `recordSimulatorVideoWithSimctl` below is a thin `xcrun`-specific wrapper
+ * around this. Mirrors `PerfService.liveStartRecording`'s shape (spawn ->
+ * wait for a startup signal -> bounded duration -> graceful stop), swapping
+ * the notifyutil side-channel for an in-band stderr marker.
+ */
+export const startMarkedRecording = async (args: {
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly startedMarker: string
+  readonly startupTimeoutMs: number
+  readonly durationMs: number
+  readonly gracePeriodMs?: number
+}): Promise<{
+  readonly stdout: string
+  readonly stderr: string
+  readonly exitCode: number | null
+  readonly signal: NodeJS.Signals | null
+  readonly stopRequested: boolean
+}> => {
+  const gracePeriodMs = args.gracePeriodMs ?? recordingStopGracePeriodMs
+  let recordingStarted = false
+  let stderrBuffer = ""
+  let onMarker: (() => void) | undefined
+
+  const handle: AppleProcessHandle = await spawnAppleProcessHandle({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    gracePeriodMs,
+    // Absolute backstop: if the graceful SIGINT stop below never lands (a
+    // hung/unresponsive process), the supervisor's own TERM -> grace -> KILL
+    // watchdog still reclaims it by this deadline instead of running forever.
+    timeoutMs: args.startupTimeoutMs + args.durationMs + gracePeriodMs * 2,
+    onStderrChunk: (chunk) => {
+      if (recordingStarted) {
+        return
+      }
+      stderrBuffer += chunk.toString("utf8")
+      if (stderrBuffer.includes(args.startedMarker)) {
+        recordingStarted = true
+        onMarker?.()
+      }
+    },
+  })
+
+  let stopRequested = false
+  const requestStop = (): void => {
+    if (stopRequested || !handle.isRunning()) {
+      return
+    }
+    stopRequested = true
+    void handle.stop("SIGINT")
+  }
+
+  // Wait for the marker (or the startup timeout, or an early exit) before the
+  // duration window below is allowed to start -- clearing every timer it sets
+  // so an early exit never leaves one behind.
+  await new Promise<void>((resolve) => {
+    if (recordingStarted) {
+      resolve()
+      return
+    }
+    onMarker = resolve
+    const startupTimer = setTimeout(() => {
+      onMarker = undefined
+      requestStop()
+      resolve()
+    }, args.startupTimeoutMs)
+    void handle.awaitExit.finally(() => {
+      clearTimeout(startupTimer)
+      onMarker = undefined
+      resolve()
+    })
+  })
+
+  if (handle.isRunning()) {
+    const durationTimer = setTimeout(requestStop, args.durationMs)
+    void handle.awaitExit.finally(() => clearTimeout(durationTimer))
+  }
+
+  const result = await handle.awaitExit
+
+  return {
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    signal: result.signal,
+    stopRequested,
+  }
+}
+
 const recordSimulatorVideoWithSimctl = async (args: {
   readonly simulatorUdid: string
   readonly absolutePath: string
@@ -675,92 +773,26 @@ const recordSimulatorVideoWithSimctl = async (args: {
   await ensureDirectory(dirname(args.absolutePath))
   await removeFileIfExists(args.absolutePath)
 
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(
-      "xcrun",
-      ["simctl", "io", args.simulatorUdid, "recordVideo", "--force", args.absolutePath],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      },
-    )
-
-    let stdout = ""
-    let stderr = ""
-    let stopRequested = false
-    let recordingStarted = false
-
-    const requestStop = () => {
-      if (stopRequested || child.killed || child.exitCode !== null) {
-        return
-      }
-
-      stopRequested = true
-      child.kill("SIGINT")
-    }
-
-    const startupTimeout = setTimeout(() => {
-      if (!recordingStarted) {
-        requestStop()
-      }
-    }, 15_000)
-
-    let stopTimer = setTimeout(requestStop, args.durationMs)
-    const hardTimeout = setTimeout(() => {
-      requestStop()
-
-      setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill("SIGKILL")
-        }
-      }, 2_000)
-    }, args.durationMs + 30_000)
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-
-      if (!recordingStarted && stderr.includes("Recording started")) {
-        recordingStarted = true
-        clearTimeout(stopTimer)
-        stopTimer = setTimeout(requestStop, args.durationMs)
-      }
-    })
-
-    child.once("error", (error) => {
-      clearTimeout(startupTimeout)
-      clearTimeout(stopTimer)
-      clearTimeout(hardTimeout)
-      reject(error)
-    })
-    child.once("close", (exitCode, signal) => {
-      clearTimeout(startupTimeout)
-      clearTimeout(stopTimer)
-      clearTimeout(hardTimeout)
-
-      const completedGracefully = exitCode === 0 || (stopRequested && signal === "SIGINT")
-
-      if (completedGracefully) {
-        resolve()
-        return
-      }
-
-      reject(
-        new ChildProcessError({
-          code: "command-failed",
-          command: `xcrun simctl io ${args.simulatorUdid} recordVideo ${args.absolutePath}`,
-          reason: `xcrun simctl io recordVideo exited with ${exitCode ?? signal ?? "unknown"}.`,
-          nextStep: "Inspect the simulator media capture command and retry the video request.",
-          exitCode,
-          stderrExcerpt: `${stdout}${stderr}`.split(/\r?\n/).slice(-80).join("\n"),
-        }),
-      )
-    })
+  const result = await startMarkedRecording({
+    command: "xcrun",
+    commandArgs: ["simctl", "io", args.simulatorUdid, "recordVideo", "--force", args.absolutePath],
+    startedMarker: "Recording started",
+    startupTimeoutMs: recordingStartupTimeoutMs,
+    durationMs: args.durationMs,
   })
+
+  const completedGracefully = result.exitCode === 0 || (result.stopRequested && result.signal === "SIGINT")
+
+  if (!completedGracefully) {
+    throw new ChildProcessError({
+      code: "command-failed",
+      command: `xcrun simctl io ${args.simulatorUdid} recordVideo ${args.absolutePath}`,
+      reason: `xcrun simctl io recordVideo exited with ${result.exitCode ?? result.signal ?? "unknown"}.`,
+      nextStep: "Inspect the simulator media capture command and retry the video request.",
+      exitCode: result.exitCode,
+      stderrExcerpt: `${result.stdout}${result.stderr}`.split(/\r?\n/).slice(-80).join("\n"),
+    })
+  }
 
   if (!(await fileExists(args.absolutePath))) {
     throw new Error(`simctl recordVideo completed without creating ${args.absolutePath}.`)
@@ -1108,88 +1140,62 @@ const assertReadyTransportContract = (args: {
   }
 }
 
+/**
+ * Spawns a long-lived wrapper process via the supervisor and streams its
+ * stderr straight to `wrapperStderrPath` (the supervisor's artifact stream is
+ * append-only, so no whole-history rewrite on every chunk). Generic over
+ * `command`/`commandArgs` -- the xcodebuild/XCUITest argv is built at the
+ * call site -- so this has direct test coverage against a fake command (see
+ * *.processHelpers.test.ts) without needing a real Xcode project.
+ */
 const startWrapperProcess = async (args: {
-  readonly projectRoot: string
-  readonly xctestrunPath: string
-  readonly destination: string
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly cwd: string
   readonly observerControlDirectory: string
   readonly wrapperStderrPath: string
-  readonly logPath: string
-  readonly stdoutEventsPath: string
-  readonly resultBundlePath: string
 }): Promise<{
-  readonly process: ChildProcess
-  readonly exit: Promise<{ readonly code: number | null; readonly signal: string | null }>
+  readonly handle: AppleProcessHandle
+  readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>
 }> => {
   await ensureDirectory(args.observerControlDirectory)
   await ensureDirectory(dirname(args.wrapperStderrPath))
-  await writeFile(args.wrapperStderrPath, "", "utf8")
+  // The supervisor's artifact stream opens in append mode -- start from a
+  // clean file so a re-run against the same path does not concatenate onto
+  // stale output.
+  await removeFileIfExists(args.wrapperStderrPath)
 
-  const wrapperScript = resolveProbeRunnerWrapperScriptPath(args.projectRoot)
-
-  const child = spawn(
-    "/usr/bin/python3",
-    [
-      wrapperScript,
-      "--control-dir",
-      args.observerControlDirectory,
-      "--log-path",
-      args.logPath,
-      "--stdout-events-path",
-      args.stdoutEventsPath,
-      "--",
-      "xcodebuild",
-      "-xctestrun",
-      args.xctestrunPath,
-      "-destination",
-      args.destination,
-      "-resultBundlePath",
-      args.resultBundlePath,
-      "CODE_SIGNING_ALLOWED=NO",
-      "test-without-building",
-      "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
-    ],
-    {
-      cwd: args.projectRoot,
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-    },
-  )
-
-  child.stderr?.setEncoding("utf8")
-
-  const stderrChunks: Array<string> = []
-  child.stderr?.on("data", (chunk) => {
-    stderrChunks.push(String(chunk))
-    void writeFile(args.wrapperStderrPath, stderrChunks.join(""), "utf8")
+  const handle = await spawnAppleProcessHandle({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    cwd: args.cwd,
+    stderrArtifactPath: args.wrapperStderrPath,
   })
 
-  const exit = new Promise<{ readonly code: number | null; readonly signal: string | null }>(
-    (resolve, reject) => {
-      child.once("error", reject)
-      child.once("exit", (code, signal) => resolve({ code, signal }))
-    },
-  )
+  const exit = handle.awaitExit.then((result) => ({ code: result.exitCode, signal: result.signal }))
 
-  return {
-    process: child,
-    exit,
-  }
+  return { handle, exit }
 }
 
 const stopWrapperProcess = async (wrapper: {
-  readonly process: ChildProcess
-  readonly exit: Promise<{ readonly code: number | null; readonly signal: string | null }>
+  readonly handle: AppleProcessHandle
+  readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>
 }): Promise<void> => {
-  const pid = wrapper.process.pid
-
-  if (pid === undefined || wrapper.process.exitCode !== null || wrapper.process.killed) {
+  if (!wrapper.handle.isRunning()) {
     return
   }
 
-  await terminateRunnerProcess(pid)
-  await Promise.race([wrapper.exit, sleep(1_000)])
+  // handle.stop() sends SIGTERM, waits a bounded grace period, escalates to
+  // SIGKILL, and joins exit -- the same TERM -> grace -> KILL ladder
+  // terminateRunnerProcess used to hand-roll, now shared with every other
+  // supervisor-owned child instead of duplicated here.
+  await wrapper.handle.stop("SIGTERM")
 }
+
+// Aliased re-export for the same reason as runSimulatorHostCommand above --
+// direct process-level test coverage of the wrapper-process migration without
+// touching the SimulatorHarness DI shape.
+export { startWrapperProcess as startSimulatorRunnerWrapperProcess, stopWrapperProcess as stopSimulatorRunnerWrapperProcess }
 
 export class SimulatorHarness extends Context.Tag("@probe/SimulatorHarness")<
   SimulatorHarness,
@@ -1374,14 +1380,30 @@ export const SimulatorHarnessLive = Layer.succeed(
 
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
-              projectRoot: args.projectRoot,
-              xctestrunPath: injectedXctestrunPath,
-              destination: `platform=iOS Simulator,id=${selected.device.udid}`,
+              command: "/usr/bin/python3",
+              commandArgs: [
+                wrapperScriptPath,
+                "--control-dir",
+                observerControlDirectory,
+                "--log-path",
+                sessionLogPath,
+                "--stdout-events-path",
+                stdoutEventsPath,
+                "--",
+                "xcodebuild",
+                "-xctestrun",
+                injectedXctestrunPath,
+                "-destination",
+                `platform=iOS Simulator,id=${selected.device.udid}`,
+                "-resultBundlePath",
+                resultBundlePath,
+                "CODE_SIGNING_ALLOWED=NO",
+                "test-without-building",
+                "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
+              ],
+              cwd: args.projectRoot,
               observerControlDirectory,
               wrapperStderrPath,
-              logPath: sessionLogPath,
-              stdoutEventsPath,
-              resultBundlePath,
             })
             void wrapper.exit.finally(async () => {
               if (bootstrapPath === null) {
@@ -1393,7 +1415,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               await removeFileIfExists(completedBootstrapPath)
             })
 
-            const isWrapperRunning = () => wrapper !== null && wrapper.process.exitCode === null && !wrapper.process.killed
+            const isWrapperRunning = () => wrapper !== null && wrapper.handle.isRunning()
 
             const ready = await waitForFreshJson<ReadyFrame>({
               path: join(observerControlDirectory, "stdout-ready.json"),
@@ -1452,7 +1474,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               },
               bundleId: args.bundleId,
               targetProcessId,
-              wrapperProcessId: wrapper.process.pid ?? -1,
+              wrapperProcessId: wrapper.handle.pid,
               testProcessId: ready.processIdentifier,
               attachLatencyMs: ready.attachLatencyMs,
               bootstrapPath: ready.bootstrapPath,
