@@ -1,10 +1,10 @@
 import { constants, createWriteStream, statSync } from "node:fs"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
-import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { Context, Effect, Fiber, Layer } from "effect"
 import { runAppleProcess, spawnAppleProcessHandle, type AppleProcessHandle } from "./AppleProcessSupervisor"
+import { type ExportBudget, ExportBudgetExceededError, ExportBudgetTransform, formatBytes } from "./ArtifactExportPolicy"
 import {
   PerfAroundFlowResult,
   PerfRecordResult,
@@ -50,20 +50,6 @@ const recordingStartupTimeoutMs = 30_000
 const mib = 1024 * 1024
 const maxExportFileSizeBytes = 8 * mib
 const customTemplateExtension = ".tracetemplate"
-const rowTag = "<row>"
-const rowTagTailLength = rowTag.length - 1
-
-const formatBytes = (value: number): string => {
-  if (value >= mib) {
-    return `${(value / mib).toFixed(1)} MiB`
-  }
-
-  if (value >= 1024) {
-    return `${(value / 1024).toFixed(1)} KiB`
-  }
-
-  return `${value} B`
-}
 
 const formatTimeLimitMs = (value: number): string => {
   if (value % 60_000 === 0) {
@@ -77,27 +63,10 @@ const formatTimeLimitMs = (value: number): string => {
   return `${value}ms`
 }
 
-const countOccurrences = (source: string, token: string): number => {
-  let count = 0
-  let index = source.indexOf(token)
-
-  while (index !== -1) {
-    count += 1
-    index = source.indexOf(token, index + token.length)
-  }
-
-  return count
-}
-
 interface CommandResult {
   readonly stdout: string
   readonly stderr: string
   readonly exitCode: number | null
-}
-
-interface ExportBudget {
-  readonly maxBytes: number
-  readonly maxRows: number
 }
 
 interface TemplateExportSpec {
@@ -129,74 +98,10 @@ interface BackgroundRecordingHandle {
   readonly stop: () => Promise<BackgroundRecordingStopResult>
 }
 
-export class ExportBudgetExceededError extends Error {
-  readonly kind: "bytes" | "rows"
-  readonly limit: number
-  readonly observed: number
-
-  constructor(args: {
-    readonly kind: "bytes" | "rows"
-    readonly limit: number
-    readonly observed: number
-  }) {
-    super(
-      args.kind === "bytes"
-        ? `Export exceeded ${formatBytes(args.limit)}.`
-        : `Export exceeded ${args.limit} rows.`,
-    )
-    this.name = "ExportBudgetExceededError"
-    this.kind = args.kind
-    this.limit = args.limit
-    this.observed = args.observed
-  }
-}
-
-class ExportBudgetTransform extends Transform {
-  bytesWritten = 0
-  rowCount = 0
-  /** Set (once) when a budget is exceeded, so callers can inspect it after the pipeline settles. */
-  exceededError: ExportBudgetExceededError | null = null
-  private trailingText = ""
-
-  constructor(private readonly budget: ExportBudget) {
-    super()
-  }
-
-  override _transform(
-    chunk: Buffer | string,
-    _encoding: BufferEncoding,
-    callback: (error?: Error | null, data?: Buffer | string) => void,
-  ): void {
-    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
-    this.bytesWritten += Buffer.byteLength(text, "utf8")
-
-    if (this.bytesWritten > this.budget.maxBytes) {
-      this.exceededError = new ExportBudgetExceededError({
-        kind: "bytes",
-        limit: this.budget.maxBytes,
-        observed: this.bytesWritten,
-      })
-      callback(this.exceededError)
-      return
-    }
-
-    const combined = `${this.trailingText}${text}`
-    this.rowCount += countOccurrences(combined, rowTag)
-    this.trailingText = combined.slice(-rowTagTailLength)
-
-    if (this.rowCount > this.budget.maxRows) {
-      this.exceededError = new ExportBudgetExceededError({
-        kind: "rows",
-        limit: this.budget.maxRows,
-        observed: this.rowCount,
-      })
-      callback(this.exceededError)
-      return
-    }
-
-    callback(null, chunk)
-  }
-}
+// Re-exported for backward compatibility: this error's policy now lives in
+// ArtifactExportPolicy (PRB-085 gate 12), but existing callers/tests still
+// import it from PerfService.
+export { ExportBudgetExceededError }
 
 type TemplateSlug = PerfTemplate | "custom"
 
