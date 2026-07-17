@@ -1863,11 +1863,20 @@ const startWrapperProcess = async (args: {
   // long-lived wrapper run). The file was just truncated to empty above, so
   // opening in append mode here starts clean and stays linear.
   const wrapperStderrStream = createWriteStream(args.wrapperStderrPath, { flags: "a" })
+  // Swallow a write-after-end race defensively: 'close' below already avoids
+  // triggering one under normal operation, but this keeps a stray late write
+  // from becoming an unhandled 'error' on a stream with no other listener.
+  wrapperStderrStream.on("error", () => undefined)
   child.stderr?.setEncoding("utf8")
   child.stderr?.on("data", (chunk) => {
     wrapperStderrStream.write(String(chunk))
   })
-  child.once("exit", () => wrapperStderrStream.end())
+  // 'close' (not 'exit') -- 'exit' can fire before the child's stdio finishes
+  // flushing, and ending the stream on 'exit' can drop a still-in-flight
+  // stderr chunk or write to an already-ended stream. 'close' only fires once
+  // every stdio stream (stderr included) has finished, so every byte the
+  // child wrote has already reached the 'data' handler above by then.
+  child.once("close", () => wrapperStderrStream.end())
 
   const exit = new Promise<{ readonly code: number | null; readonly signal: string | null }>((resolve, reject) => {
     child.once("error", reject)
