@@ -5,6 +5,7 @@ import { perfTemplateChoiceText } from "../domain/perf"
 import { formatProbeError, isProbeError, toFailurePayload } from "../domain/errors"
 import { probeRuntime } from "../runtime"
 import { runExamplesCommand, runSchemaCommand } from "./discovery"
+import { runConfigCommand } from "./commands/config"
 import { runDrillCommand } from "./commands/drill"
 import { runCapabilitiesCommand, runDoctorCommand } from "./commands/doctor"
 import { runPerfCommand } from "./commands/perf"
@@ -29,8 +30,11 @@ Usage:
   probe serve
   probe validate accessibility (--input-json <payload> | --session-id <id> [--scope current-screen]) [--output-json|--json]
   probe validate commerce (--input-json <payload> | --session-id <id> --mode local-storekit|sandbox|testflight [--plan <commerce-plan.json>] [--provider revenuecat]) [--output-json|--json]
+  probe config show [--output-json|--json]
+  probe config set-team-id <team-id> [--output-json|--json]
+  probe config clear-team-id [--output-json|--json]
   probe session list [--output-json|--json]
-  probe session open [--input-json <payload>] [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--output-json|--json]
+  probe session open [--input-json <payload>] [--target simulator|device] [--bundle-id <bundle-id>] [--simulator-udid <udid>] [--device-id <id>] [--team-id <team-id>] [--output-json|--json]
   probe session show --session-id <id> [--output-json|--json]
   probe session health --session-id <id> [--output-json|--json]
   probe session logs (--input-json <payload> | --session-id <id> [--source runner|build|wrapper|stdout|simulator] [--lines 80] [--match <text>] [--seconds 2] [--predicate <expr>] [--process <name>] [--subsystem <name>] [--category <name>] [--output auto|inline|artifact]) [--output-json|--json]
@@ -58,6 +62,8 @@ Notes:
   - --output-json is the canonical machine-output flag; bare --json remains a compatibility alias
   - use --input-json, --file, or --stdin for domain JSON payloads; --json <payload> is no longer accepted
   - on simulator, omit --bundle-id to use Probe's built-in fixture app, or pass --bundle-id <bundle-id> to attach to an already-running installed app
+  - real-device signing team resolves --team-id (or a session-open JSON payload's signingTeamId) > \`probe config set-team-id\` > PROBE_DEVELOPMENT_TEAM; session open resolves this client-side, so a command-scoped override never needs a daemon restart
+  - real-device sessions cache signed runner build products by a composite key (runtime assets, runner sources, Xcode/SDK, team, build settings); warm opens for the same key skip build-for-testing entirely
   - built-in perf templates: ${perfTemplateChoiceText}
   - custom perf templates: pass --custom-template <path.tracetemplate> after saving a template from Instruments.app
   - perf recording defaults to 60s for metal-system-trace and 3s for time-profiler, system-trace, hangs, swift-concurrency, logging, and custom templates
@@ -160,6 +166,11 @@ const runCli = (args: ReadonlyArray<string>) =>
 
       case "session": {
         yield* runSessionCommand(rest)
+        return
+      }
+
+      case "config": {
+        yield* runConfigCommand(rest)
         return
       }
 

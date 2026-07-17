@@ -36,6 +36,7 @@ const openParams = {
 const deviceOpenParams = {
   bundleId: "dev.probe.fixture",
   deviceId: null,
+  signingTeamId: "TEAMID1234",
   projectRoot: "/tmp/probe-test",
   emitProgress: () => undefined,
 } as const
@@ -1113,6 +1114,17 @@ const createFakeRealDeviceHarness = (options?: {
   // PRB-072: default matches production truth — see the comment on the simulator
   // fake's runnerCapabilities default above.
   const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction"]
+  // PRB-095: fixed fake cache summary -- individual cache behavior (hit/miss/
+  // coalesce/revalidation) is covered directly in RunnerBuildCache.test.ts;
+  // this fake only needs to satisfy the OpenedRealDevice*Session contract.
+  const fakeRunnerBuildCache = {
+    status: "hit" as const,
+    key: "fake-cache-key",
+    invalidationReason: null,
+    signingIdentity: "Apple Development: Fake (ABCDE12345)",
+    profileIdentity: "fake-profile-uuid",
+    profileExpiresAt: "2026-12-31T00:00:00.000Z",
+  }
   let connectionIndex = 0
   let pingStatusLabelIndex = 0
   let running = true
@@ -1193,6 +1205,7 @@ const createFakeRealDeviceHarness = (options?: {
               "xcrun devicectl list devices --json-output <path>",
             ],
             warnings: ["Fake real-device preflight warning."],
+            runnerBuildCache: fakeRunnerBuildCache,
             connection: {
               status: nextStatus,
               checkedAt: "2026-04-10T00:00:00.000Z",
@@ -1296,6 +1309,7 @@ const createFakeRealDeviceHarness = (options?: {
               "xcrun devicectl device process launch --device device-1 --terminate-existing <bundle-id> --json-output <path>",
             ],
             warnings: ["Fake real-device live runner warning."],
+            runnerBuildCache: fakeRunnerBuildCache,
             connection: {
               status: nextStatus,
               checkedAt: "2026-04-10T00:00:00.000Z",

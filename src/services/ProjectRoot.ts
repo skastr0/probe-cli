@@ -7,7 +7,12 @@ import { materializeRuntimeAssets, probeRuntimeAssetHash, probeVersion } from ".
 export const probeRootPath = join(homedir(), ".probe")
 export const probeRunnerCacheRootPath = join(probeRootPath, "runner")
 export const probeRunnerSimulatorDerivedRootPath = join(probeRunnerCacheRootPath, "simulator", "derived")
-export const probeRunnerDeviceDerivedRootPath = join(probeRunnerCacheRootPath, "device", "derived")
+// PRB-095: real-device runner products are no longer built into one fixed
+// directory (that shape had no discriminator for *which* signing input
+// produced the products on disk, so it could not tell a stale build from a
+// fresh one). Each distinct build/signing key gets its own subdirectory
+// under this root instead -- see `RunnerBuildCache`.
+export const probeRunnerDeviceSignedCacheRootPath = join(probeRunnerCacheRootPath, "device", "signed-cache")
 
 export interface ProbeRuntimeRootInfo {
   readonly kind: "source" | "materialized" | "override"

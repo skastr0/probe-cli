@@ -86,6 +86,11 @@ export const SessionOpenRequest = Schema.Struct({
     sessionMode: Schema.Union(SimulatorSessionMode, Schema.Null),
     simulatorUdid: NullableString,
     deviceId: NullableString,
+    // PRB-095: the already-resolved (explicit payload > persisted config >
+    // environment) real-device signing team, resolved client-side before
+    // this request is sent -- see `DeviceSigningConfig`. Non-secret (a team
+    // id, not a certificate/key). Ignored for `target: "simulator"`.
+    signingTeamId: NullableString,
   }),
 })
 export type SessionOpenRequest = typeof SessionOpenRequest.Type

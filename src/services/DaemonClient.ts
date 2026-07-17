@@ -41,6 +41,7 @@ import type {
 } from "../domain/perf"
 import type { SessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
 import { ArtifactStore } from "./ArtifactStore"
+import { resolveDevelopmentTeamFromHost } from "./DeviceSigningConfig"
 import {
   sendArtifactDrill,
   sendPerfAround,
@@ -108,6 +109,8 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly sessionMode?: SimulatorSessionMode | null
       readonly simulatorUdid: string | null
       readonly deviceId: string | null
+      /** Explicit signing-team override for `target: "device"`; resolved against persisted config/environment before the RPC is sent. Ignored for `target: "simulator"`. */
+      readonly signingTeamId?: string | null
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
       SessionHealth,
@@ -530,9 +533,17 @@ export const DaemonClientLive = Layer.effect(
 
           return response.result
         }),
-      openSession: ({ target, bundleId, sessionMode, simulatorUdid, deviceId, onEvent }) =>
+      openSession: ({ target, bundleId, sessionMode, simulatorUdid, deviceId, signingTeamId, onEvent }) =>
         Effect.gen(function* () {
           const options = yield* buildOptions(onEvent)
+          // Resolved here (client process), not in the daemon: the daemon is
+          // long-lived and its own `process.env` is fixed at daemon start, so
+          // a command-scoped `PROBE_DEVELOPMENT_TEAM` export only reaches
+          // this open if it is resolved where the command actually runs. See
+          // `DeviceSigningConfig`'s header comment.
+          const resolvedSigningTeamId = target === "device"
+            ? yield* Effect.promise(() => resolveDevelopmentTeamFromHost(signingTeamId ?? null))
+            : null
           const response = yield* sendSessionOpen(options, {
             kind: "request",
             protocolVersion: PROBE_PROTOCOL_VERSION,
@@ -544,6 +555,7 @@ export const DaemonClientLive = Layer.effect(
               sessionMode: sessionMode ?? null,
               simulatorUdid,
               deviceId,
+              signingTeamId: resolvedSigningTeamId?.developmentTeam ?? null,
             },
           })
 
