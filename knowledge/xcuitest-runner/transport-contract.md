@@ -196,9 +196,17 @@ crash after dispatch cannot produce success" case.
   byte-identical cached result; a fault-injection-shaped
   execute-then-redeliver of a real `applyInput` mutation (one status-label
   change, not two); an epoch-mismatch rejection; a sequence-gap rejection —
-  both leaving app state untouched. Passed against `iPhone 16 Pro` /
-  iOS 18.0 on 2026-07-17 (`test-without-building
-  -only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopReplaySafety`).
+  both leaving app state untouched; and (added in the PRB-089 review-fix
+  pass) a cache-eviction case that drives 63 additional executed sequences
+  through the real server to push the 64-entry FIFO cache past capacity,
+  evicting the very first sequence, then redelivers that identity and
+  asserts the runner returns typed `result-expired` (`ok: false`) rather
+  than silently re-executing it, with app state unchanged. Passed against
+  `iPhone 16 Pro` / iOS 18.0 on 2026-07-17 (`test-without-building
+  -only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopReplaySafety`)
+  — this was the pre-existing coverage before the eviction step was added;
+  see "Not yet covered" for the status of re-running the full test
+  (including the new eviction step) in this review pass.
 - `src/investigations/rpc-daemon-defects/scenarios/ambiguousMutationDelivery.ts`
   is owned by this glyph (wave-1 handoff note) and is now green: it proved
   the daemon RPC client silently accepted a sequence gap in progress
@@ -222,6 +230,35 @@ crash after dispatch cannot produce success" case.
   `runRunnerTransportSend` call, same `ready.runnerEpoch` source), so the
   wire contract is shared; only the on-device *execution* of
   `RunnerReplayCoordinator` remains unverified against real hardware.
+- Before this review-fix pass, `testCommandLoopReplaySafety` never drove
+  enough distinct executed sequences to cross the terminal-result cache's
+  64-entry FIFO bound, so the `result-expired` rejection
+  (`RunnerReplayCoordinator.disposition(for:)`, the `sequence <=
+  executedHighWaterMark` branch) and the eviction itself
+  (`evictIfNeeded`) were verified by code review only, never exercised
+  live. A step forcing eviction and asserting the typed rejection was
+  added to `driveReplaySafetyScenario` in this pass. It could not be
+  re-run live in this review environment: two genuine attempts to execute
+  `testCommandLoopReplaySafety` against `iPhone 16 Pro` / iOS 18.0 both
+  failed before reaching the eviction step (or any step), at
+  `attachForLifecycleLoop`'s bootstrap-manifest read —
+  `resolveLifecycleControlDirectory` reports the manifest at
+  `/tmp/probe-runner-bootstrap/<udid>.json` as missing even though
+  `FileManager.fileExists` sees it and the host shell confirms it exists
+  and is readable (Xcode 26.6, `xcodebuild` 26.6/17F113 on this host). The
+  identical failure reproduces on the pre-existing, unmodified
+  `testCommandLoopLifecycle` via `validate-lifecycle.sh`, so this is not a
+  regression from this pass's diff — it is this host's current
+  Simulator/XCUITest toolchain no longer honoring cross-process
+  filesystem reads under `/tmp` for the UI test runner process the way the
+  2026-07-17 "Passed" receipt above assumes. A second attempt tried the
+  code's built-in bypass (`PROBE_BOOTSTRAP_JSON` env var, normally the
+  device-bootstrap path) via `xcodebuild`'s `TEST_RUNNER_`-prefixed
+  build-setting override; the override did not appear in the generated
+  `.xctestrun`'s `EnvironmentVariables`, so the test still fell through to
+  the same file-read path and failed the same way. The new eviction step
+  therefore stayed unexercised live in this pass — real-boundary coverage
+  for `#6`/`#11` is code-reviewed and typechecked only, not yet Simulator-run.
 
 ## Historical evidence (superseded)
 

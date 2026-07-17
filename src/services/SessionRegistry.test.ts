@@ -2201,6 +2201,92 @@ describe("SessionRegistry", () => {
     })
   }, 10_000)
 
+  test("reports indeterminate when an earlier redelivery attempt was ambiguous even though the final attempt is not", async () => {
+    await withTempRoot(async (root) => {
+      const deliveredSequences: Array<number> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              deliveredSequences.push(command.sequence)
+            }
+          },
+          // Attempt 1 is ambiguous (sent-no-response — the runner may have
+          // executed the mutation) and is retried. Attempt 2 simulates the
+          // runner crashing between attempts: unambiguous (not-sent,
+          // connection refused), which breaks the redelivery loop
+          // immediately since nothing reached the runner *this* time. The
+          // *final* error is unambiguous, but attempt 1's ambiguity must
+          // still drive the outcome to indeterminate — this is acceptance
+          // criterion #10's execute-then-crash case.
+          interceptUiAction: ({ callIndex }) => {
+            if (callIndex === 1) {
+              throw new RunnerTransportError({
+                code: "sent-no-response",
+                action: "uiAction",
+                endpoint: "fake://runner",
+                attemptedEndpoints: ["fake://runner"],
+                phase: "await-response",
+                elapsedMs: 20_000,
+                remainingDeadlineMs: 0,
+                ambiguous: true,
+                reason: "The runner did not respond within 20000 ms.",
+              })
+            }
+
+            throw new RunnerTransportError({
+              code: "not-sent",
+              action: "uiAction",
+              endpoint: "fake://runner",
+              attemptedEndpoints: ["fake://runner"],
+              phase: "dispatch",
+              elapsedMs: 5,
+              remainingDeadlineMs: 19_995,
+              ambiguous: false,
+              reason: "Connection refused.",
+            })
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(Effect.either(
+          registry.performAction({
+            sessionId: session.sessionId,
+            action: tapAction,
+          }),
+        ))
+
+        expect(Either.isLeft(result)).toBe(true)
+        if (Either.isLeft(result) && result.left instanceof EnvironmentError) {
+          // Must carry the "-indeterminate" suffix, not the plain
+          // "session-runner-uiAction" code: a consumer keying on that
+          // suffix to decide whether the mutation might have run would
+          // otherwise be misled into treating this as a clean failure.
+          expect(result.left.code).toBe("session-runner-uiAction-indeterminate")
+          expect(result.left.reason).toContain("indeterminate")
+        } else {
+          throw new Error("Expected an EnvironmentError with the indeterminate code.")
+        }
+
+        // Both attempts reused the one allocated identity; the loop stopped
+        // after the second (unambiguous, non-retryable) attempt.
+        expect(deliveredSequences.length).toBe(2)
+        expect(new Set(deliveredSequences).size).toBe(1)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
   test("rejects non-attach debug commands before starting a bridge", async () => {
     await withTempRoot(async (root) => {
       const fakeBridge = createFakeLldbBridgeFactory()

@@ -498,9 +498,11 @@ final class AttachControlSpikeUITests: XCTestCase {
   // glyph's guarantee boundary promises — a fresh epoch, a duplicate cached
   // command replaying instead of re-executing, a duplicate in-flight
   // command coalescing, an epoch mismatch and a sequence gap both being
-  // rejected before execution — is proven here against the *real* HTTP
-  // command server, at the real Simulator/XCUITest boundary, not against a
-  // Node fake.
+  // rejected before execution, and the bounded terminal-result cache's
+  // FIFO eviction correctly turning a redelivered-but-evicted identity into
+  // a typed result-expired rejection instead of a silent re-execution — is
+  // proven here against the *real* HTTP command server, at the real
+  // Simulator/XCUITest boundary, not against a Node fake.
   @MainActor
   func testCommandLoopReplaySafety() throws {
     let resolvedControlDirectory = try resolveLifecycleControlDirectory()
@@ -656,6 +658,49 @@ final class AttachControlSpikeUITests: XCTestCase {
     XCTAssertFalse(sequenceGap.ok)
     XCTAssertEqual(sequenceGap.replayStatus, "sequence-gap")
     XCTAssertEqual(sequenceGap.statusLabel, firstMutation.statusLabel, "A rejected sequence-gap command must never touch app state.")
+
+    // 6. Cache-eviction boundary, driven at the real Simulator/XCUITest
+    //    HTTP boundary (not a Swift-unit test of `RunnerReplayCoordinator`
+    //    in isolation): force the terminal-result cache past its
+    //    `cacheCapacity`-entry FIFO bound so the oldest surviving entry —
+    //    `executedSequence`, the very first ping from step 1 — is evicted,
+    //    then redeliver that exact identity. This is the branch that stops
+    //    a redelivered, executed-but-evicted command from silently
+    //    re-running: the runner must tell "definitely executed once, but
+    //    the cached result is gone" (result-expired) apart from "never
+    //    seen before" (which would wrongly execute it a second time).
+    let cacheCapacity = 64
+    let evictedSequence = executedSequence
+    let preEvictionStatusLabel = firstMutation.statusLabel
+
+    // The cache already holds 2 live entries (`evictedSequence` and
+    // `mutationSequence`, from steps 1 and 3). Execute `cacheCapacity - 1`
+    // new, distinct, non-mutating pings (ping never touches app state — see
+    // `handleLifecycleCommand`'s "ping" case) so the insertion-ordered
+    // eviction list crosses `cacheCapacity` by exactly one entry, which
+    // evicts only the single oldest one (`evictedSequence`) per the FIFO
+    // discipline — never `mutationSequence` or any of the fill entries.
+    for _ in 0..<(cacheCapacity - 1) {
+      let fillSequence = nextValidSequence()
+      let fillResponse = try send(action: "ping", payload: "replay-safety-fill", sequence: fillSequence, epoch: epoch)
+      XCTAssertTrue(fillResponse.ok, "Expected fill ping \(fillSequence) to execute.")
+      XCTAssertEqual(fillResponse.replayStatus, "executed")
+      executedHighWaterMark = fillSequence
+    }
+
+    let evictedRedelivery = try send(
+      action: "ping",
+      payload: "replay-safety-1",
+      sequence: evictedSequence,
+      epoch: epoch
+    )
+    XCTAssertFalse(evictedRedelivery.ok, "A redelivered, executed-but-evicted sequence must never report ok.")
+    XCTAssertEqual(evictedRedelivery.replayStatus, "result-expired")
+    XCTAssertEqual(
+      evictedRedelivery.statusLabel,
+      preEvictionStatusLabel,
+      "A rejected result-expired command must never touch app state."
+    )
   }
 
   /// Synchronous (semaphore-bridged) HTTP POST to the runner's own

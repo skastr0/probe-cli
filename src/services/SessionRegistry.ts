@@ -1693,6 +1693,14 @@ export const SessionRegistryLive = Layer.scoped(
 
         let attempts = 0
         let lastError: unknown = null
+        // Tracks whether ANY attempt in the loop was ambiguous, not just the
+        // final one. An interleaving like attempt 1 ambiguous
+        // (sent-no-response, retried) then attempt 2 unambiguous (not-sent,
+        // e.g. the runner crashed between attempts) breaks the loop on a
+        // non-ambiguous final error — but attempt 1 may still have executed
+        // the mutation, so the outcome must stay indeterminate regardless of
+        // what the last attempt looked like.
+        let everAmbiguous = false
 
         while (true) {
           attempts += 1
@@ -1710,9 +1718,14 @@ export const SessionRegistryLive = Layer.scoped(
 
           lastError = attempt.left
 
+          const ambiguousFailure = attempt.left instanceof RunnerTransportError && attempt.left.ambiguous
+
+          if (ambiguousFailure) {
+            everAmbiguous = true
+          }
+
           const retryable = mayRedeliver
-            && attempt.left instanceof RunnerTransportError
-            && attempt.left.ambiguous
+            && ambiguousFailure
             && attempts < mutationRedeliveryMaxAttempts
 
           if (!retryable) {
@@ -1735,17 +1748,16 @@ export const SessionRegistryLive = Layer.scoped(
           severity: classifyRunnerDispatchFailure({ error: rawError, wrapperRunning }),
         })
 
-        // Redelivery exhausted while every failure stayed ambiguous: the
-        // runner may have executed the mutation on any one of those
-        // attempts and Probe simply never got a durable result back. This
-        // is the glyph's "runner loss after dispatch without a durable
-        // result" case — report it as its own typed, explicitly
-        // indeterminate outcome (never as a bare "the command failed",
-        // which would understate what is actually known).
-        const indeterminate = mayRedeliver
-          && rawError instanceof RunnerTransportError
-          && rawError.ambiguous
-          && attempts >= mutationRedeliveryMaxAttempts
+        // The runner may have executed the mutation on ANY attempt that came
+        // back ambiguous — not only the final one — and Probe simply never
+        // got a durable result back for it. This is the glyph's "runner loss
+        // after dispatch without a durable result" case — report it as its
+        // own typed, explicitly indeterminate outcome (never as a bare "the
+        // command failed", which would understate what is actually known).
+        // `everAmbiguous` covers both the all-attempts-ambiguous exhaustion
+        // case and the interleaved case where an earlier ambiguous attempt
+        // is followed by a later unambiguous one that breaks the loop.
+        const indeterminate = mayRedeliver && everAmbiguous
 
         return yield* new EnvironmentError({
           code: indeterminate ? `session-runner-${action}-indeterminate` : `session-runner-${action}`,
