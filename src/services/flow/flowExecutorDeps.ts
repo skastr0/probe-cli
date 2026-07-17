@@ -1,5 +1,5 @@
 import type { Effect } from "effect"
-import type { SessionAction, SessionActionResult } from "../../domain/action"
+import type { SessionAction } from "../../domain/action"
 import type { ChildProcessError, EnvironmentError, SessionNotFoundError, UnsupportedCapabilityError, UserInputError } from "../../domain/errors"
 import type { ArtifactRecord } from "../../domain/output"
 import type { SessionHealth } from "../../domain/session"
@@ -85,5 +85,3 @@ export interface FlowExecutorDeps {
     readonly recordAction: boolean
   }) => Effect.Effect<ActionExecutionOutcome, SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError>
 }
-
-export type { SessionActionResult }
