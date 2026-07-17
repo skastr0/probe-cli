@@ -43,12 +43,20 @@ final class AttachControlSpikeUITests: XCTestCase {
     let runnerTransportContract: String
     let sessionIdentifier: String
     let simulatorUdid: String
+    // PRB-089: fresh random identity for this one live runner process/attach.
+    // Every command and response this runner sends for the rest of its life
+    // carries this value — see `RunnerReplayCoordinator` below for what it
+    // scopes.
+    let runnerEpoch: String
   }
 
   private struct LifecycleCommandFrame: Codable {
     let action: String
     let payload: String?
     let sequence: Int
+    // PRB-089: the epoch the host believes this runner is on. Never
+    // trusted implicitly — see `RunnerReplayCoordinator.disposition(for:)`.
+    let epoch: String
   }
 
   private struct LifecycleResponseFrame: Codable {
@@ -65,6 +73,12 @@ final class AttachControlSpikeUITests: XCTestCase {
     let sequence: Int
     let snapshotNodeCount: Int?
     let statusLabel: String
+    // PRB-089: this runner's *current* epoch (always present, even on a
+    // rejected/never-executed command) and how this particular response was
+    // produced relative to the terminal-result cache and executed
+    // high-water mark. See `RunnerReplayCoordinator.Disposition`.
+    let epoch: String
+    let replayStatus: String
   }
 
   private struct LifecycleCommandResult {
@@ -480,6 +494,239 @@ final class AttachControlSpikeUITests: XCTestCase {
     )
   }
 
+  // PRB-089: the runner is its own client for this one. Everything the
+  // glyph's guarantee boundary promises — a fresh epoch, a duplicate cached
+  // command replaying instead of re-executing, a duplicate in-flight
+  // command coalescing, an epoch mismatch and a sequence gap both being
+  // rejected before execution — is proven here against the *real* HTTP
+  // command server, at the real Simulator/XCUITest boundary, not against a
+  // Node fake.
+  @MainActor
+  func testCommandLoopReplaySafety() throws {
+    let resolvedControlDirectory = try resolveLifecycleControlDirectory()
+    let isDevice = resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
+
+    let controlDirectoryURL = isDevice
+      ? deviceLifecycleControlDirectoryURL(sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier)
+      : URL(
+          fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
+          isDirectory: true,
+        )
+    try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
+
+    var lifecycleState = try attachForLifecycleLoop(
+      resolvedControlDirectory: resolvedControlDirectory,
+      controlDirectoryURL: controlDirectoryURL,
+      foregroundFailureMessage: "Fixture app must already be running in the foreground before ProbeRunner enters its replay-safety loop.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before the replay-safety loop starts."
+    )
+
+    let httpCommandServer = try startHTTPCommandServer(
+      desiredPort: resolveRunnerPortFromEnvironment(),
+      controlDirectoryURL: controlDirectoryURL,
+      app: lifecycleState.app,
+      statusLabel: lifecycleState.statusLabel,
+      replayCoordinator: lifecycleState.replayCoordinator
+    )
+    lifecycleState.readyFrame.runnerPort = httpCommandServer.port
+    try emitLifecycleReadyFrame(lifecycleState.readyFrame, controlDirectoryURL: controlDirectoryURL)
+
+    let port = httpCommandServer.port
+    let epoch = lifecycleState.readyFrame.runnerEpoch
+    var driverError: Error?
+
+    // The driver runs on the global concurrent queue — deliberately never a
+    // `Task { @MainActor in ... }` — so it behaves exactly like the
+    // external host process this runner is actually built to talk to, and
+    // never contends with the connection-handling `Task`s that also need
+    // the MainActor executor while this method blocks below in
+    // `waitForShutdown()`. This mirrors every other command-loop test: the
+    // commands always come from something other than the blocked test
+    // method's own execution context.
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        try Self.driveReplaySafetyScenario(port: port, epoch: epoch)
+      } catch {
+        driverError = error
+      }
+    }
+
+    try httpCommandServer.waitForShutdown()
+
+    if let driverError {
+      throw driverError
+    }
+  }
+
+  /// Drives the whole replay-safety proof over real HTTP against the
+  /// already-listening runner. A plain (non-`@MainActor`) static function on
+  /// purpose: nothing here may touch `app`/`statusLabel` directly — it only
+  /// ever sees what the runner chooses to report back over the wire, same
+  /// as any other client.
+  private static func driveReplaySafetyScenario(port: Int, epoch: String) throws {
+    guard let baseUrl = URL(string: "http://127.0.0.1:\(port)/command") else {
+      throw NSError(
+        domain: "ProbeRunnerReplaySafety",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Could not build a command URL for port \(port)."]
+      )
+    }
+
+    // Mirrors the runner's own sentinel and update rule (see
+    // `RunnerReplayCoordinator`): only a command that actually executes
+    // advances this, so "the next valid sequence" stays correct across the
+    // deliberately-rejected commands below.
+    var executedHighWaterMark = 0
+    func nextValidSequence() -> Int { executedHighWaterMark + 1 }
+
+    func send(action: String, payload: String?, sequence: Int, epoch epochOverride: String) throws -> LifecycleResponseFrame {
+      try postLifecycleCommand(to: baseUrl, sequence: sequence, action: action, payload: payload, epoch: epochOverride)
+    }
+
+    defer {
+      // Best-effort, always-attempted shutdown: if an assertion above has
+      // already thrown, the test method's `waitForShutdown()` would
+      // otherwise block until XCTest's own (multi-hour) timeout instead of
+      // reporting the real failure promptly.
+      _ = try? send(action: "shutdown", payload: nil, sequence: nextValidSequence(), epoch: epoch)
+    }
+
+    // 1. A fresh command executes.
+    let executedSequence = nextValidSequence()
+    let firstPing = try send(action: "ping", payload: "replay-safety-1", sequence: executedSequence, epoch: epoch)
+    XCTAssertTrue(firstPing.ok, "Expected the first ping delivery to execute.")
+    XCTAssertEqual(firstPing.replayStatus, "executed")
+    XCTAssertEqual(firstPing.epoch, epoch)
+    executedHighWaterMark = executedSequence
+
+    // 2. One hundred redeliveries of that exact (sequence, epoch) identity
+    //    never re-execute it — every response replays the identical cached
+    //    terminal result. There is no dedicated fixture mutation counter;
+    //    response identity (`recordedAt`, byte-identical across all 100
+    //    replays) is the receipt that only one execution ever happened.
+    for attempt in 0..<100 {
+      let replay = try send(action: "ping", payload: "replay-safety-1", sequence: executedSequence, epoch: epoch)
+      XCTAssertTrue(replay.ok, "Redelivery #\(attempt) should still report ok.")
+      XCTAssertEqual(replay.replayStatus, "cached-replay", "Redelivery #\(attempt) must not re-execute.")
+      XCTAssertEqual(replay.recordedAt, firstPing.recordedAt, "Redelivery #\(attempt) must return the original execution's timestamp verbatim.")
+      XCTAssertEqual(replay.payload, firstPing.payload)
+    }
+
+    // 3. Fault injection: execute a real mutation (one that changes visible
+    //    app state), then redeliver the identical identity — modelling "the
+    //    host executed the command, its first response was dropped, and it
+    //    redelivered" — and observe exactly one mutation plus the cached
+    //    result, never a second `applyInput`.
+    let mutationSequence = nextValidSequence()
+    let firstMutation = try send(action: "applyInput", payload: "probe-replay-safety", sequence: mutationSequence, epoch: epoch)
+    XCTAssertTrue(firstMutation.ok)
+    XCTAssertEqual(firstMutation.replayStatus, "executed")
+    XCTAssertEqual(firstMutation.statusLabel, "Input applied: probe-replay-safety")
+    executedHighWaterMark = mutationSequence
+
+    let redeliveredMutation = try send(action: "applyInput", payload: "probe-replay-safety", sequence: mutationSequence, epoch: epoch)
+    XCTAssertTrue(redeliveredMutation.ok)
+    XCTAssertEqual(redeliveredMutation.replayStatus, "cached-replay")
+    XCTAssertEqual(redeliveredMutation.recordedAt, firstMutation.recordedAt)
+    XCTAssertEqual(redeliveredMutation.statusLabel, firstMutation.statusLabel)
+
+    // 4. Epoch mismatch: a command carrying a stale epoch is rejected
+    //    before it can execute, and does not consume the next valid
+    //    sequence (nothing ran, so nothing advanced).
+    let epochMismatch = try send(
+      action: "applyInput",
+      payload: "should-never-apply",
+      sequence: nextValidSequence(),
+      epoch: "\(epoch)-stale"
+    )
+    XCTAssertFalse(epochMismatch.ok)
+    XCTAssertEqual(epochMismatch.replayStatus, "epoch-mismatch")
+    XCTAssertEqual(epochMismatch.epoch, epoch, "The rejection still reports the runner's real (current) epoch.")
+    XCTAssertEqual(epochMismatch.statusLabel, firstMutation.statusLabel, "A rejected epoch-mismatch command must never touch app state.")
+
+    // 5. Sequence gap: skipping ahead of the executed high-water mark is
+    //    also rejected before execution, and also does not consume the
+    //    next valid sequence.
+    let sequenceGap = try send(
+      action: "applyInput",
+      payload: "should-never-apply-either",
+      sequence: nextValidSequence() + 5,
+      epoch: epoch
+    )
+    XCTAssertFalse(sequenceGap.ok)
+    XCTAssertEqual(sequenceGap.replayStatus, "sequence-gap")
+    XCTAssertEqual(sequenceGap.statusLabel, firstMutation.statusLabel, "A rejected sequence-gap command must never touch app state.")
+  }
+
+  /// Synchronous (semaphore-bridged) HTTP POST to the runner's own
+  /// `/command` endpoint. Kept separate from `receiveHTTPRequest`'s
+  /// `NWConnection`-based server plumbing on purpose — this is the *client*
+  /// side, modelling an ordinary external caller (like
+  /// `RunnerTransportClient` on the host), not another runner-internal seam.
+  private static func postLifecycleCommand(
+    to url: URL,
+    sequence: Int,
+    action: String,
+    payload: String?,
+    epoch: String,
+  ) throws -> LifecycleResponseFrame {
+    let command = LifecycleCommandFrame(action: action, payload: payload, sequence: sequence, epoch: epoch)
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONEncoder().encode(command)
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: Result<LifecycleResponseFrame, Error>?
+
+    let task = URLSession.shared.dataTask(with: request) { data, _, error in
+      defer { semaphore.signal() }
+
+      if let error {
+        result = .failure(error)
+        return
+      }
+
+      guard let data else {
+        result = .failure(NSError(
+          domain: "ProbeRunnerReplaySafety",
+          code: 2,
+          userInfo: [NSLocalizedDescriptionKey: "Empty response body for \(action) sequence \(sequence)."]
+        ))
+        return
+      }
+
+      do {
+        result = .success(try JSONDecoder().decode(LifecycleResponseFrame.self, from: data))
+      } catch {
+        result = .failure(error)
+      }
+    }
+    task.resume()
+
+    guard semaphore.wait(timeout: .now() + 20) == .success else {
+      task.cancel()
+      throw NSError(
+        domain: "ProbeRunnerReplaySafety",
+        code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for a response to \(action) sequence \(sequence)."]
+      )
+    }
+
+    switch result {
+    case .success(let frame):
+      return frame
+    case .failure(let error):
+      throw error
+    case .none:
+      throw NSError(
+        domain: "ProbeRunnerReplaySafety",
+        code: 4,
+        userInfo: [NSLocalizedDescriptionKey: "No result captured for \(action) sequence \(sequence)."]
+      )
+    }
+  }
+
   @MainActor
   func testLargeAxTreePerformanceSpike() throws {
     let resolvedControlDirectory = try resolveLifecycleControlDirectory()
@@ -517,6 +764,148 @@ final class AttachControlSpikeUITests: XCTestCase {
     let app: XCUIApplication
     var readyFrame: LifecycleReadyFrame
     let statusLabel: XCUIElement
+    let replayCoordinator: RunnerReplayCoordinator
+  }
+
+  /// PRB-089: at-most-once mutation execution within one live runner epoch.
+  ///
+  /// One instance is created per `attachForLifecycleLoop` call — i.e. once
+  /// per live runner process/attach, the same lifetime as `readyFrame`'s
+  /// `runnerEpoch`. It owns the only two pieces of state the guarantee
+  /// needs:
+  ///  - a bounded terminal-result cache, keyed by command sequence number
+  ///    (bounded so a long-lived runner cannot grow this without limit);
+  ///  - the executed high-water mark, the greatest sequence number this
+  ///    runner has ever executed, which is what lets it distinguish a
+  ///    duplicate whose cache entry has since been evicted ("result
+  ///    expired" — it definitely ran, but the original result is gone, so
+  ///    it must never be silently re-executed) from a sequence it has
+  ///    genuinely never seen.
+  ///
+  /// Every command this runner ever receives goes through
+  /// `disposition(for:)` *before* `handleLifecycleCommand` runs, on the same
+  /// `@MainActor`-serialized HTTP path as execution itself (see
+  /// `receiveHTTPRequest`'s `Task { @MainActor in ... }` and
+  /// `handleLifecycleCommand`, which never `await`s). That serialization is
+  /// what makes "duplicate in-flight command coalesces onto the first
+  /// execution" true without any separate in-flight bookkeeping here: two
+  /// deliveries of the same sequence cannot both be *executing* at once
+  /// (MainActor admits one job at a time), so the second one's call to
+  /// `disposition(for:)` always runs either strictly before the first
+  /// command has been dispatched (impossible — `disposition` and dispatch
+  /// happen in the same synchronous call) or strictly after the first one
+  /// has already recorded its terminal result, in which case the cache-hit
+  /// branch below returns it instead of executing again.
+  private final class RunnerReplayCoordinator {
+    enum Disposition {
+      /// Never seen before (or below the high-water mark's edge case does
+      /// not apply): safe to execute.
+      case execute
+      /// Already executed and still cached: replay the identical result,
+      /// verbatim, without executing again.
+      case replay(LifecycleResponseFrame)
+      /// Refuse to execute, and say exactly why. `replayStatus` is one of
+      /// "epoch-mismatch", "sequence-gap", or "result-expired" — see
+      /// `runnerProtocol.ts`'s `RunnerReplayStatusSchema` for the host-side
+      /// contract these three values are part of.
+      case reject(reason: String, replayStatus: String)
+    }
+
+    let epoch: String
+    private let cacheCapacity: Int
+    private var terminalCache: [Int: LifecycleResponseFrame] = [:]
+    // Insertion-ordered keys, so eviction is FIFO (oldest sequence first) —
+    // simplest bound that still favors the recent commands a redelivery is
+    // actually likely to target.
+    private var cacheEvictionOrder: [Int] = []
+    // 0 is a safe "nothing executed yet" sentinel: real sequence numbers are
+    // always >= 1 (SessionController.ts allocates them starting at 1), so
+    // `sequence > executedHighWaterMark + 1` never misfires against it.
+    private var executedHighWaterMark = 0
+
+    init(epoch: String, cacheCapacity: Int = 64) {
+      self.epoch = epoch
+      self.cacheCapacity = cacheCapacity
+    }
+
+    func disposition(for command: LifecycleCommandFrame) -> Disposition {
+      guard command.epoch == epoch else {
+        return .reject(
+          reason: "Command epoch \(command.epoch) does not match the runner's current epoch \(epoch).",
+          replayStatus: "epoch-mismatch"
+        )
+      }
+
+      if let cached = terminalCache[command.sequence] {
+        // Relabel `replayStatus` to "cached-replay" on the way out — the
+        // stored frame's own `replayStatus` is frozen at whatever it was
+        // the moment it was first executed ("executed"), and that is
+        // exactly the distinction a caller needs: every other field
+        // (`recordedAt`, `handledMs`, `payload`, `statusLabel`, `ok`,
+        // `error`, ...) stays byte-identical to the original execution —
+        // that identity *is* the proof nothing ran a second time.
+        return .replay(
+          LifecycleResponseFrame(
+            action: cached.action,
+            error: cached.error,
+            handledMs: cached.handledMs,
+            inlinePayload: cached.inlinePayload,
+            inlinePayloadEncoding: cached.inlinePayloadEncoding,
+            kind: cached.kind,
+            ok: cached.ok,
+            payload: cached.payload,
+            snapshotPayloadPath: cached.snapshotPayloadPath,
+            recordedAt: cached.recordedAt,
+            sequence: cached.sequence,
+            snapshotNodeCount: cached.snapshotNodeCount,
+            statusLabel: cached.statusLabel,
+            epoch: cached.epoch,
+            replayStatus: "cached-replay"
+          )
+        )
+      }
+
+      if command.sequence <= executedHighWaterMark {
+        return .reject(
+          reason: "Sequence \(command.sequence) was already executed but its cached result has since expired.",
+          replayStatus: "result-expired"
+        )
+      }
+
+      if command.sequence > executedHighWaterMark + 1 {
+        return .reject(
+          reason: "Sequence \(command.sequence) skips ahead of the executed high-water mark "
+            + "\(executedHighWaterMark); at least one earlier sequence was never seen by this runner.",
+          replayStatus: "sequence-gap"
+        )
+      }
+
+      return .execute
+    }
+
+    /// Records a freshly-produced terminal result. Called exactly once per
+    /// sequence, and only for a command `disposition(for:)` returned
+    /// `.execute` for — whether `handleLifecycleCommand` itself succeeded or
+    /// threw. A failed *attempt* still ran (with whatever side effects that
+    /// implies), so it is exactly as much "already executed" as a
+    /// successful one; caching it is what stops a redelivery from trying
+    /// the same doomed mutation again.
+    func recordExecuted(sequence: Int, response: LifecycleResponseFrame) {
+      if terminalCache[sequence] == nil {
+        cacheEvictionOrder.append(sequence)
+      }
+
+      terminalCache[sequence] = response
+      executedHighWaterMark = max(executedHighWaterMark, sequence)
+      evictIfNeeded()
+    }
+
+    private func evictIfNeeded() {
+      while cacheEvictionOrder.count > cacheCapacity {
+        let evicted = cacheEvictionOrder.removeFirst()
+        terminalCache.removeValue(forKey: evicted)
+      }
+    }
   }
 
   @MainActor
@@ -551,6 +940,12 @@ final class AttachControlSpikeUITests: XCTestCase {
       XCTAssertTrue(statusLabelExists, statusLabelFailureMessage)
     }
 
+    // PRB-089: a fresh, unpredictable epoch every time this runner attaches.
+    // UUID (not an incrementing counter) so nothing about a prior epoch —
+    // including how many there have been — leaks into a redelivered
+    // command's chance of colliding with the new one.
+    let runnerEpoch = UUID().uuidString
+
     let readyFrame = LifecycleReadyFrame(
       kind: "ready",
       attachLatencyMs: attachLatencyMs,
@@ -568,10 +963,16 @@ final class AttachControlSpikeUITests: XCTestCase {
       runnerPort: nil,
       runnerTransportContract: resolvedControlDirectory.config.contractVersion,
       sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier,
-      simulatorUdid: resolvedControlDirectory.config.simulatorUdid
+      simulatorUdid: resolvedControlDirectory.config.simulatorUdid,
+      runnerEpoch: runnerEpoch
     )
 
-    return LifecycleLoopState(app: app, readyFrame: readyFrame, statusLabel: statusLabel)
+    return LifecycleLoopState(
+      app: app,
+      readyFrame: readyFrame,
+      statusLabel: statusLabel,
+      replayCoordinator: RunnerReplayCoordinator(epoch: runnerEpoch)
+    )
   }
 
   private func emitLifecycleReadyFrame(_ readyFrame: LifecycleReadyFrame, controlDirectoryURL: URL) throws {
@@ -591,7 +992,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       desiredPort: resolveRunnerPortFromEnvironment(),
       controlDirectoryURL: controlDirectoryURL,
       app: lifecycleState.app,
-      statusLabel: lifecycleState.statusLabel
+      statusLabel: lifecycleState.statusLabel,
+      replayCoordinator: lifecycleState.replayCoordinator
     )
     lifecycleState.readyFrame.runnerPort = httpCommandServer.port
 
@@ -797,33 +1199,20 @@ final class AttachControlSpikeUITests: XCTestCase {
     app: XCUIApplication,
     statusLabel: XCUIElement,
     controlDirectoryURL: URL,
+    replayCoordinator: RunnerReplayCoordinator,
   ) -> LifecycleResponseFrame {
-    do {
-      let result = try handleLifecycleCommand(
-        command,
-        app: app,
-        statusLabel: statusLabel,
-        controlDirectoryURL: controlDirectoryURL
-      )
+    // PRB-089: the replay decision is made *before* touching the app at
+    // all. A `.replay` or `.reject` disposition returns without ever
+    // calling `handleLifecycleCommand` — that is the "never re-execute"
+    // half of the guarantee; `recordExecuted` below is the other half.
+    switch replayCoordinator.disposition(for: command) {
+    case .replay(let cached):
+      return cached
+
+    case .reject(let reason, let replayStatus):
       return LifecycleResponseFrame(
         action: command.action,
-        error: nil,
-        handledMs: milliseconds(since: startedAt),
-        inlinePayload: result.inlinePayload,
-        inlinePayloadEncoding: result.inlinePayloadEncoding,
-        kind: "response",
-        ok: true,
-        payload: result.payload,
-        snapshotPayloadPath: result.snapshotPayloadPath,
-        recordedAt: Self.iso8601Formatter.string(from: Date()),
-        sequence: command.sequence,
-        snapshotNodeCount: result.snapshotNodeCount,
-        statusLabel: currentStatusLabelText(app: app)
-      )
-    } catch {
-      return LifecycleResponseFrame(
-        action: command.action,
-        error: String(describing: error),
+        error: reason,
         handledMs: milliseconds(since: startedAt),
         inlinePayload: nil,
         inlinePayloadEncoding: nil,
@@ -834,8 +1223,63 @@ final class AttachControlSpikeUITests: XCTestCase {
         recordedAt: Self.iso8601Formatter.string(from: Date()),
         sequence: command.sequence,
         snapshotNodeCount: nil,
-        statusLabel: currentStatusLabelText(app: app)
+        statusLabel: currentStatusLabelText(app: app),
+        epoch: replayCoordinator.epoch,
+        replayStatus: replayStatus
       )
+
+    case .execute:
+      let response: LifecycleResponseFrame
+
+      do {
+        let result = try handleLifecycleCommand(
+          command,
+          app: app,
+          statusLabel: statusLabel,
+          controlDirectoryURL: controlDirectoryURL
+        )
+        response = LifecycleResponseFrame(
+          action: command.action,
+          error: nil,
+          handledMs: milliseconds(since: startedAt),
+          inlinePayload: result.inlinePayload,
+          inlinePayloadEncoding: result.inlinePayloadEncoding,
+          kind: "response",
+          ok: true,
+          payload: result.payload,
+          snapshotPayloadPath: result.snapshotPayloadPath,
+          recordedAt: Self.iso8601Formatter.string(from: Date()),
+          sequence: command.sequence,
+          snapshotNodeCount: result.snapshotNodeCount,
+          statusLabel: currentStatusLabelText(app: app),
+          epoch: replayCoordinator.epoch,
+          replayStatus: "executed"
+        )
+      } catch {
+        response = LifecycleResponseFrame(
+          action: command.action,
+          error: String(describing: error),
+          handledMs: milliseconds(since: startedAt),
+          inlinePayload: nil,
+          inlinePayloadEncoding: nil,
+          kind: "response",
+          ok: false,
+          payload: nil,
+          snapshotPayloadPath: nil,
+          recordedAt: Self.iso8601Formatter.string(from: Date()),
+          sequence: command.sequence,
+          snapshotNodeCount: nil,
+          statusLabel: currentStatusLabelText(app: app),
+          epoch: replayCoordinator.epoch,
+          replayStatus: "executed"
+        )
+      }
+
+      // A failed attempt still ran (and may have left side effects), so it
+      // is cached exactly like a successful one — never re-execute a
+      // sequence just because its first attempt threw.
+      replayCoordinator.recordExecuted(sequence: command.sequence, response: response)
+      return response
     }
   }
 
@@ -845,6 +1289,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
+    replayCoordinator: RunnerReplayCoordinator,
   ) throws -> HTTPCommandServer {
     let listener = try makeHTTPListener(desiredPort: desiredPort)
     let queue = DispatchQueue(label: "probe.runner.http")
@@ -893,6 +1338,7 @@ final class AttachControlSpikeUITests: XCTestCase {
         controlDirectoryURL: controlDirectoryURL,
         app: app,
         statusLabel: statusLabel,
+        replayCoordinator: replayCoordinator,
         onShutdown: {
           listener.cancel()
           finishLoopIfNeeded()
@@ -944,6 +1390,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
+    replayCoordinator: RunnerReplayCoordinator,
     onShutdown: @escaping () -> Void,
   ) {
     connection.receive(minimumIncompleteLength: 1, maximumLength: 1024 * 1024) { [weak self] data, _, _, error in
@@ -970,6 +1417,7 @@ final class AttachControlSpikeUITests: XCTestCase {
           controlDirectoryURL: controlDirectoryURL,
           app: app,
           statusLabel: statusLabel,
+          replayCoordinator: replayCoordinator,
           onShutdown: onShutdown,
         )
         return
@@ -981,6 +1429,7 @@ final class AttachControlSpikeUITests: XCTestCase {
           controlDirectoryURL: controlDirectoryURL,
           app: app,
           statusLabel: statusLabel,
+          replayCoordinator: replayCoordinator,
         )
         self.sendHTTPResponse(response.data, over: connection) {
           if response.shouldShutdown {
@@ -997,6 +1446,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
+    replayCoordinator: RunnerReplayCoordinator,
   ) -> (data: Data, shouldShutdown: Bool) {
     switch request.method.uppercased() {
     case "POST":
@@ -1016,10 +1466,16 @@ final class AttachControlSpikeUITests: XCTestCase {
           app: app,
           statusLabel: statusLabel,
           controlDirectoryURL: controlDirectoryURL,
+          replayCoordinator: replayCoordinator,
         )
         return (
           try encodeHTTPJSONResponse(status: 200, value: responseFrame),
-          command.action == "shutdown"
+          // PRB-089: a shutdown command rejected by the replay coordinator
+          // (wrong epoch, a sequence gap, an expired cache entry) never
+          // executed — `ok` is false — so it must not tear the listener
+          // down. Gate on the actual outcome, not just the requested
+          // action.
+          command.action == "shutdown" && responseFrame.ok
         )
       } catch {
         return (

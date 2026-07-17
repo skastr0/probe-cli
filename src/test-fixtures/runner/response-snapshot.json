@@ -9,5 +9,7 @@
   "statusLabel": "Ready for attach/control validation",
   "snapshotNodeCount": 94,
   "recordedAt": "2026-04-10T17:27:51.503Z",
-  "hostObservedAt": "2026-04-10T17:27:51.550792Z"
+  "hostObservedAt": "2026-04-10T17:27:51.550792Z",
+  "epoch": "epoch-fixture-1",
+  "replayStatus": "executed"
 }

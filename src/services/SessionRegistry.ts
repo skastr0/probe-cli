@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { statSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
-import { Context, Effect, Either, FiberRef, Layer, Ref } from "effect"
+import { Context, Duration, Effect, Either, FiberRef, Layer, Ref } from "effect"
 import { runAppleProcess } from "./AppleProcessSupervisor"
 import {
   buildRecordedSessionAction,
@@ -691,6 +691,8 @@ export interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
     action: RunnerAction,
     payload?: string,
   ) => Promise<RunnerCommandResult>
+  /** PRB-089: this runner process's epoch, for indeterminate-outcome diagnostics. */
+  readonly runnerEpoch: string
   readonly closeResources: () => Promise<void>
   readonly isRunnerRunning: () => boolean
   readonly waitForExit: Promise<{ readonly code: number | null; readonly signal: string | null }>
@@ -704,6 +706,8 @@ export interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
     action: RunnerAction,
     payload?: string,
   ) => Promise<RunnerCommandResult>) | null
+  /** PRB-089: this runner process's epoch, for indeterminate-outcome diagnostics. Null until a live runner has opened. */
+  readonly runnerEpoch: string | null
   readonly refreshConnection: () => Promise<SessionConnectionDetails>
   readonly closeResources: () => Promise<void>
   readonly isRunnerRunning: () => boolean
@@ -1654,6 +1658,28 @@ export const SessionRegistryLive = Layer.scoped(
         yield* syncDaemonMetadata
       })
 
+    // PRB-089: bounded, identity-reused redelivery for ambiguous mutation
+    // failures. The command sequence is allocated exactly once, before the
+    // loop, and every delivery attempt below (the first dispatch and every
+    // redelivery) reuses that same sequence number — the runner's bounded
+    // terminal-result cache is keyed by (epoch, sequence), so redelivering
+    // the identical identity after an ambiguous transport failure is safe:
+    // the runner either replays the cached result or, if it never actually
+    // ran the command, executes it exactly once.
+    //
+    // Only ambiguous `RunnerTransportError` outcomes are retryable here
+    // ("sent-no-response" / "invalid-response" — the runner may already have
+    // executed the command). An unambiguous "not-sent" failure means nothing
+    // reached the runner at all, so there is nothing to redeliver into a
+    // cache; it keeps its prior single-attempt, immediate-classification
+    // behavior. `ping` is excluded entirely — it already has its own safe
+    // idempotent retry *inside* RunnerTransportClient's one absolute
+    // deadline (see `idempotent: action === "ping"` in each harness), and
+    // redelivering it here too would double up two independent retry
+    // policies over the same health-check call.
+    const mutationRedeliveryMaxAttempts = 100
+    const mutationRedeliveryBackoffMs = 10
+
     const sendRunnerCommand = (
       sessionId: string,
       record: RunnerBackedActiveSessionRecord,
@@ -1662,18 +1688,41 @@ export const SessionRegistryLive = Layer.scoped(
     ) =>
       Effect.gen(function* () {
         const ctx = yield* requireControllerContext(sessionId)
-        const attempt = yield* Effect.either(
-          Effect.tryPromise({
-            try: () => record.sendRunnerCommand(ctx.allocateSequence(), action, payload),
-            catch: (error) => error,
-          }),
-        )
+        const sequence = ctx.allocateSequence()
+        const mayRedeliver = action !== "ping"
 
-        if (Either.isRight(attempt)) {
-          return attempt.right
+        let attempts = 0
+        let lastError: unknown = null
+
+        while (true) {
+          attempts += 1
+
+          const attempt = yield* Effect.either(
+            Effect.tryPromise({
+              try: () => record.sendRunnerCommand(sequence, action, payload),
+              catch: (error) => error,
+            }),
+          )
+
+          if (Either.isRight(attempt)) {
+            return attempt.right
+          }
+
+          lastError = attempt.left
+
+          const retryable = mayRedeliver
+            && attempt.left instanceof RunnerTransportError
+            && attempt.left.ambiguous
+            && attempts < mutationRedeliveryMaxAttempts
+
+          if (!retryable) {
+            break
+          }
+
+          yield* Effect.sleep(Duration.millis(mutationRedeliveryBackoffMs))
         }
 
-        const rawError = attempt.left
+        const rawError = lastError
         const reason = rawError instanceof Error ? rawError.message : String(rawError)
         const wrapperRunning = record.isRunnerRunning()
 
@@ -1686,9 +1735,26 @@ export const SessionRegistryLive = Layer.scoped(
           severity: classifyRunnerDispatchFailure({ error: rawError, wrapperRunning }),
         })
 
+        // Redelivery exhausted while every failure stayed ambiguous: the
+        // runner may have executed the mutation on any one of those
+        // attempts and Probe simply never got a durable result back. This
+        // is the glyph's "runner loss after dispatch without a durable
+        // result" case — report it as its own typed, explicitly
+        // indeterminate outcome (never as a bare "the command failed",
+        // which would understate what is actually known).
+        const indeterminate = mayRedeliver
+          && rawError instanceof RunnerTransportError
+          && rawError.ambiguous
+          && attempts >= mutationRedeliveryMaxAttempts
+
         return yield* new EnvironmentError({
-          code: `session-runner-${action}`,
-          reason,
+          code: indeterminate ? `session-runner-${action}-indeterminate` : `session-runner-${action}`,
+          reason: indeterminate
+            ? `${reason} Command identity (sequence=${sequence}, epoch=${record.runnerEpoch ?? "unknown"}, `
+              + `last delivery phase=${rawError instanceof RunnerTransportError ? rawError.phase : "unknown"}) `
+              + `could not be confirmed executed or not-executed after ${attempts} delivery attempts; `
+              + "treat this outcome as indeterminate, never as success."
+            : reason,
           nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
           details: [],
         })
@@ -4135,6 +4201,7 @@ export const SessionRegistryLive = Layer.scoped(
                       steps: [],
                     },
                     sendRunnerCommand: opened.sendCommand,
+                    runnerEpoch: opened.runnerEpoch,
                     refreshConnection: opened.refreshConnection,
                     closeResources: opened.close,
                     isRunnerRunning: opened.isWrapperRunning,
@@ -4360,6 +4427,7 @@ export const SessionRegistryLive = Layer.scoped(
                       steps: [],
                     },
                     sendRunnerCommand: opened.sendCommand,
+                    runnerEpoch: opened.runnerEpoch,
                     closeResources: opened.close,
                     isRunnerRunning: opened.isWrapperRunning,
                     waitForExit: opened.waitForExit,

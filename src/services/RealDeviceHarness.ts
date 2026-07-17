@@ -270,6 +270,8 @@ export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePrefli
   readonly installedAppsJsonPath: string
   readonly launchJsonPath: string
   readonly nextSequence: number
+  /** PRB-089: the fresh random epoch this runner process's ready frame advertised. */
+  readonly runnerEpoch: string
   readonly initialPingRttMs: number
   readonly capabilities: ReadonlyArray<RunnerCapability>
   readonly sendCommand: (
@@ -2429,12 +2431,18 @@ export const RealDeviceHarnessLive = Layer.succeed(
                     endpoints: deviceCommandUrls,
                     action,
                     sequence,
+                    epoch: ready.runnerEpoch,
                     payload: payload ?? null,
                     deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
                     idempotent: action === "ping",
                   })).frame
                 : await (async () => {
-                    const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
+                    const commandFrame = encodeRunnerCommandFrame({
+                      sequence,
+                      action,
+                      payload: payload ?? null,
+                      epoch: ready.runnerEpoch,
+                    })
                     const stdoutResponsePath = join(
                       observerControlDirectory,
                       `stdout-response-${String(sequence).padStart(3, "0")}.json`,
@@ -2566,6 +2574,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               installedAppsJsonPath,
               launchJsonPath,
               nextSequence: 2,
+              runnerEpoch: ready.runnerEpoch,
               initialPingRttMs: initialPing.hostRttMs,
               // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
               // that does not advertise a capability is treated as not having it.

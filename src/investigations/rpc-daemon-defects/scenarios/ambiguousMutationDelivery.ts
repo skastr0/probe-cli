@@ -19,12 +19,16 @@ const buildEvent = (requestId: string, sequence: number, stage: string): RpcProg
   data: { stage, message: `stage ${stage}` },
 })
 
-// The event frame schema carries a `sequence` field (src/rpc/protocol.ts:679)
-// but neither the server (src/rpc/server.ts, emit = (event) => writeFrame(event))
-// nor the client (src/rpc/client.ts:265-268, `if (frame.kind === "event") { options.onEvent?.(frame); continue }`)
-// ever inspects it. This scenario emits a sequence gap (1, then 5 — modelling
-// events 2-4 being dropped by a detached/late producer) and shows the request
-// still resolves successfully with no signal that delivery was incomplete.
+// The event frame schema carries a `sequence` field (src/rpc/protocol.ts:679).
+// Before PRB-089, neither the server (src/rpc/server.ts, emit = (event) =>
+// writeFrame(event)) nor the client ever inspected it, so a caller could not
+// tell a dropped/reordered progress event from a complete stream. PRB-089
+// made the client (src/rpc/client.ts, `sendRequest`'s `onData` handler) the
+// owner of that check: it tracks the last-seen event sequence and fails the
+// whole request the moment a later one skips ahead, instead of letting it
+// resolve as if nothing were missing. This scenario emits a sequence gap (1,
+// then 5 — modelling events 2-4 being dropped by a detached/late producer)
+// and now proves the request is rejected instead of silently succeeding.
 export const runAmbiguousMutationDeliveryScenario = async (): Promise<DefectFinding> => {
   try {
     return await withTempSocketRoot(async ({ socketPath, metadataPath }) => {
@@ -92,26 +96,46 @@ export const runAmbiguousMutationDeliveryScenario = async (): Promise<DefectFind
         }),
       )
 
+      // The defect this scenario reproduces is a *silent* gap: the request
+      // resolving successfully despite skipping sequence numbers. Reaching
+      // for `observedSequences` (populated only by events the client
+      // actually forwarded to `onEvent`) is deliberate rather than deriving
+      // "was a gap present" from the fixture alone — a client that now
+      // withholds the gapped event from `onEvent` (PRB-089's fix) proves the
+      // gap was caught upstream of the caller, not merely present in the
+      // fixture.
       const requestSucceeded = Either.isRight(outcome)
-      const hasGap = observedSequences.length >= 2 && observedSequences[1]! - observedSequences[0]! > 1
-      const reproduced = requestSucceeded && hasGap
+      const rejectionReason = Either.isLeft(outcome)
+        ? (outcome.left instanceof Error ? outcome.left.message : String(outcome.left))
+        : null
+      const gapRejected = rejectionReason !== null && rejectionReason.includes("skipped from sequence")
+      // Reproduced (red) iff the old defect still exists: the gap slipped
+      // through and the request resolved as if the stream were complete.
+      const reproduced = requestSucceeded
 
       return {
         id: "ambiguous-mutation-delivery-01",
         category: "ambiguous-mutation-delivery",
         verdict: reproduced ? "red" : "green",
         summary: reproduced
-          ? `The client accepted a sequence gap (${observedSequences.join(" -> ")}) in progress events and still resolved the request successfully, so a caller cannot tell dropped or reordered mutation events from a complete stream.`
-          : "The client either rejected the sequence gap or failed to resolve the request; no ambiguity was observed in this run.",
+          ? `The client accepted a sequence gap and still resolved the request successfully, so a caller cannot tell dropped or reordered mutation events from a complete stream.`
+          : gapRejected
+            ? `The client detected the sequence gap (observed events: [${observedSequences.join(", ")}], `
+              + `then rejected before a 3rd event) and failed the request instead of resolving it silently: ${rejectionReason}`
+            : `The request did not succeed, but not because of sequence-gap detection (${rejectionReason ?? "unknown reason"}); `
+              + "this scenario needs investigation, not a clean pass.",
         evidence: [
-          "src/rpc/protocol.ts:679 — RpcProgressEvent declares `sequence: Schema.Number` but no producer or consumer in src/rpc/server.ts or src/rpc/client.ts validates monotonicity or contiguity.",
-          "src/rpc/client.ts:265-268 — event frames are handed to `options.onEvent` and the loop just `continue`s; there is no tracking of the last-seen sequence number.",
-          `observed sequence stream: [${observedSequences.join(", ")}]; request settled as ${requestSucceeded ? "success" : "failure"}.`,
+          "src/rpc/protocol.ts:679 — RpcProgressEvent declares `sequence: Schema.Number`.",
+          "src/rpc/client.ts `sendRequest`'s `onData` handler tracks the last-seen event sequence per request and "
+            + "fails the request (`EnvironmentError` code `rpc-progress-sequence-gap`) the moment a later event skips "
+            + "ahead, instead of forwarding it to `onEvent` and continuing (PRB-089).",
+          `observed sequence stream forwarded to the caller: [${observedSequences.join(", ")}]; `
+            + `request settled as ${requestSucceeded ? "success" : "failure"}` + (rejectionReason ? `: ${rejectionReason}` : "."),
         ],
         metrics: {
           observedEventCount: observedSequences.length,
           requestSucceeded: requestSucceeded ? 1 : 0,
-          sequenceGapDetected: hasGap ? 1 : 0,
+          sequenceGapDetected: gapRejected ? 1 : 0,
         },
       } satisfies DefectFinding
     })

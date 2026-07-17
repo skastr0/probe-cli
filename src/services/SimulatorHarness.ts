@@ -106,6 +106,8 @@ export interface OpenedSimulatorSession {
   readonly stdinProbeStatus: string
   readonly initialPingRttMs: number
   readonly nextSequence: number
+  /** PRB-089: the fresh random epoch this runner process's ready frame advertised. */
+  readonly runnerEpoch: string
   readonly capabilities: ReadonlyArray<RunnerCapability>
   readonly sendCommand: (
     sequence: number,
@@ -501,7 +503,7 @@ const waitForFreshJson = async <T>(args: {
   })
 }
 
-export const createHttpRunnerCommandSender = (commandUrl: string) =>
+export const createHttpRunnerCommandSender = (commandUrl: string, epoch: string) =>
   async (
     sequence: number,
     action: RunnerAction,
@@ -511,6 +513,7 @@ export const createHttpRunnerCommandSender = (commandUrl: string) =>
       endpoints: [commandUrl],
       action,
       sequence,
+      epoch,
       payload: payload ?? null,
       deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
       idempotent: action === "ping",
@@ -1439,7 +1442,7 @@ export const SimulatorHarnessLive = Layer.succeed(
             })
 
             const commandUrl = `http://127.0.0.1:${ready.runnerPort}/command`
-            const sendCommand = createHttpRunnerCommandSender(commandUrl)
+            const sendCommand = createHttpRunnerCommandSender(commandUrl, ready.runnerEpoch)
 
             const initialPing = await sendCommand(1, "ping", "session-open")
 
@@ -1493,6 +1496,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               stdinProbeStatus: "not-required-http",
               initialPingRttMs: initialPing.hostRttMs,
               nextSequence: 2,
+              runnerEpoch: ready.runnerEpoch,
               // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
               // that does not advertise a capability is treated as not having it.
               capabilities: resolveAdvertisedCapabilities(ready),

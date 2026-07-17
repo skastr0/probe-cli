@@ -498,6 +498,19 @@ const createFakeHarness = (options?: {
    * network layer.
    */
   readonly pingResponses?: ReadonlyArray<"ok" | "timeout">
+  /**
+   * PRB-089: consumed in order, once per dispatched command whose action
+   * matches `mutationTransportOutcomesAction` (before any of the
+   * action-specific handling below runs). "timeout" throws the same
+   * ambiguous RunnerTransportError shape as `pingResponses`' "timeout", to
+   * prove `sendRunnerCommand`'s bounded mutation-redelivery loop reuses the
+   * exact same allocated sequence number across attempts instead of
+   * allocating a fresh one per retry. Not specified (or exhausted) defaults
+   * to normal action handling.
+   */
+  readonly mutationTransportOutcomes?: ReadonlyArray<"ok" | "timeout">
+  /** Which action `mutationTransportOutcomes` applies to. Defaults to "uiAction". */
+  readonly mutationTransportOutcomesAction?: RunnerAction
   readonly interceptSnapshot?: (
     snapshot: FakeHarnessSnapshotIntercept,
   ) => FakeHarnessSnapshotInterceptResult | null | undefined
@@ -511,6 +524,7 @@ const createFakeHarness = (options?: {
   )
   const videoFixtureBytes = Buffer.from("fake native simulator video", "utf8")
   let pingCallCount = 0
+  let mutationCallCount = 0
 
   return SimulatorHarness.of({
     openSession: (args) =>
@@ -855,6 +869,7 @@ const createFakeHarness = (options?: {
             stdinProbeStatus: "not-required-http",
             initialPingRttMs: 5,
             nextSequence: 2,
+            runnerEpoch: "fake-runner-epoch",
             capabilities: runnerCapabilities,
             sendCommand: async (_sequence, action: RunnerAction, payload) => {
               options?.captureRunnerCommand?.({
@@ -862,6 +877,27 @@ const createFakeHarness = (options?: {
                 action,
                 payload: payload ?? null,
               })
+
+              if (action === (options?.mutationTransportOutcomesAction ?? "uiAction") && options?.mutationTransportOutcomes) {
+                const outcome = options.mutationTransportOutcomes[
+                  Math.min(mutationCallCount, options.mutationTransportOutcomes.length - 1)
+                ]
+                mutationCallCount += 1
+
+                if (outcome === "timeout") {
+                  throw new RunnerTransportError({
+                    code: "sent-no-response",
+                    action,
+                    endpoint: "fake://runner",
+                    attemptedEndpoints: ["fake://runner"],
+                    phase: "await-response",
+                    elapsedMs: 20_000,
+                    remainingDeadlineMs: 0,
+                    ambiguous: true,
+                    reason: "The runner did not respond within 20000 ms.",
+                  })
+                }
+              }
 
               if (action === "snapshot") {
                 snapshotCallCount += 1
@@ -1336,6 +1372,7 @@ const createFakeRealDeviceHarness = (options?: {
             installedAppsJsonPath,
             launchJsonPath,
             nextSequence: 2,
+            runnerEpoch: "fake-device-runner-epoch",
             initialPingRttMs: 18,
             capabilities: [...runnerCapabilities],
             sendCommand: async (sequence, action: RunnerAction) => {
@@ -1997,6 +2034,172 @@ describe("SessionRegistry", () => {
       }
     })
   })
+
+  // PRB-089: an ambiguous mutation delivery failure (the runner may already
+  // have executed the command) is safe to redeliver now that the runner
+  // caches terminal results by (epoch, sequence). `sendRunnerCommand` must
+  // reuse the exact same allocated sequence number for the redelivery, not
+  // allocate a fresh one.
+  const tapAction = {
+    kind: "tap" as const,
+    target: {
+      kind: "semantic" as const,
+      identifier: "fixture.form.applyButton",
+      label: null,
+      value: null,
+      placeholder: null,
+      type: "button",
+      section: null,
+      interactive: true,
+    },
+  }
+
+  test("redelivers an ambiguous mutation failure and reuses the same command sequence", async () => {
+    await withTempRoot(async (root) => {
+      const deliveredSequences: Array<number> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          mutationTransportOutcomes: ["timeout", "ok"],
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              deliveredSequences.push(command.sequence)
+            }
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.performAction({
+          sessionId: session.sessionId,
+          action: tapAction,
+        }))
+
+        expect(result.action).toBe("tap")
+        // Exactly one *logical* command: both delivery attempts carried the
+        // same allocated sequence number, so the runner (in the real
+        // implementation) would see one identity twice, not two identities.
+        expect(deliveredSequences.length).toBe(2)
+        expect(new Set(deliveredSequences).size).toBe(1)
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(health.state).toBe("ready")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("does not redeliver an unambiguous (not-sent) mutation failure", async () => {
+    await withTempRoot(async (root) => {
+      let uiActionCalls = 0
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              uiActionCalls += 1
+            }
+          },
+          interceptUiAction: () => {
+            throw new RunnerTransportError({
+              code: "not-sent",
+              action: "uiAction",
+              endpoint: "fake://runner",
+              attemptedEndpoints: ["fake://runner"],
+              phase: "dispatch",
+              elapsedMs: 5,
+              remainingDeadlineMs: 19_995,
+              ambiguous: false,
+              reason: "Connection refused.",
+            })
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(Effect.either(
+          registry.performAction({
+            sessionId: session.sessionId,
+            action: tapAction,
+          }),
+        ))
+
+        expect(Either.isLeft(result)).toBe(true)
+        // A single attempt: "not-sent" means nothing reached the runner, so
+        // there is no cache entry to redeliver into and no reason to retry.
+        expect(uiActionCalls).toBe(1)
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("gives up after exhausting mutation redelivery and reports a typed indeterminate failure", async () => {
+    await withTempRoot(async (root) => {
+      const deliveredSequences: Array<number> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          mutationTransportOutcomes: Array.from({ length: 100 }, () => "timeout" as const),
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              deliveredSequences.push(command.sequence)
+            }
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(Effect.either(
+          registry.performAction({
+            sessionId: session.sessionId,
+            action: tapAction,
+          }),
+        ))
+
+        expect(Either.isLeft(result)).toBe(true)
+        if (Either.isLeft(result) && result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("session-runner-uiAction-indeterminate")
+          expect(result.left.reason).toContain("indeterminate")
+          expect(result.left.reason).toContain("fake-runner-epoch")
+        } else {
+          throw new Error("Expected an EnvironmentError with the indeterminate code.")
+        }
+
+        // Every redelivery attempt reused the one allocated identity.
+        expect(deliveredSequences.length).toBe(100)
+        expect(new Set(deliveredSequences).size).toBe(1)
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        // Ambiguous + wrapper still running -> degraded, same classification
+        // as the ping gate 5/6 case above; the session is not hard-failed
+        // over an outcome that might still turn out to have succeeded.
+        expect(health.state === "degraded" || health.state === "ready").toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  }, 10_000)
 
   test("rejects non-attach debug commands before starting a bridge", async () => {
     await withTempRoot(async (root) => {
