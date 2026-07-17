@@ -300,7 +300,7 @@ const createTestArtifactStore = (
             details: [],
           }),
       }),
-    listPersistedSessions: () => Effect.succeed([]),
+    listPersistedSessions: () => Effect.succeed({ sessions: [], failures: [] }),
     writeSessionManifest: (sessionId: string, value: Record<string, unknown>) =>
       Effect.tryPromise({
         try: async () => {
