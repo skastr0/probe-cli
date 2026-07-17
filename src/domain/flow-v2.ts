@@ -396,9 +396,6 @@ export const resolveFlowExecutionProfile = (
   stepExecution?: FlowExecutionProfile,
 ): FlowExecutionProfile => stepExecution ?? flowExecution ?? "verified"
 
-export const isFlowV2Contract = (flow: SessionFlowContract): flow is FlowV2Contract =>
-  flow.contract === "probe.session-flow/v2"
-
 export const isFlowSequenceStep = (step: FlowV2Step): step is FlowSequenceStep =>
   step.kind === "sequence"
 

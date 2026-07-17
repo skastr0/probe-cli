@@ -537,6 +537,10 @@ export const SessionReplayResultSchema = Schema.Struct({
 })
 export type SessionReplayResult = typeof SessionReplayResultSchema.Type
 
+// FlowStepResultSchema and FlowFailedStepSchema carry no exported .Type alias:
+// the only result contract is FlowV2StepResult/FlowV2FailedStep (flow-v2.ts),
+// which extends these fields via spread. Keep the base schemas for that reuse;
+// do not resurrect a standalone step-result type here (PRB-082).
 export const FlowStepResultSchema = Schema.Struct({
   index: PositiveIntegerSchema,
   kind: FlowStepKind,
@@ -552,7 +556,6 @@ export const FlowStepResultSchema = Schema.Struct({
   handledMs: NullableNumber,
   warnings: Schema.Array(Schema.String),
 })
-export type FlowStepResult = typeof FlowStepResultSchema.Type
 
 export const FlowFailedStepSchema = Schema.Struct({
   index: PositiveIntegerSchema,
@@ -560,7 +563,6 @@ export const FlowFailedStepSchema = Schema.Struct({
   summary: Schema.String,
   verdict: ActionVerdict,
 })
-export type FlowFailedStep = typeof FlowFailedStepSchema.Type
 
 export interface FlattenedStoredSnapshotNode {
   readonly ref: string

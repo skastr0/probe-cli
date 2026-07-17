@@ -12,17 +12,12 @@ import {
   describeRecordedActionTarget,
   describeSnapshotNode,
   evaluateAssertion,
-  flowStepToSessionAction,
-  isFlowSessionActionStep,
   isRunnerUiSessionAction,
   isRunnerUiRecordedSessionAction,
   resolveActionSelectorInSnapshot,
   resolveRecordedActionTargetInSnapshot,
   validateSessionAction,
   type ActionRecordingScript,
-  type FlowFailedStep,
-  type FlowStep,
-  type FlowStepResult,
   type RecordedSessionAction,
   type ReplayReport,
   type ReplayStepReport,
@@ -35,7 +30,6 @@ import {
 } from "../domain/action"
 import {
   flowV2StepToSessionAction,
-  isFlowV2Contract,
   isFlowV2SessionActionStep,
   validateSessionFlowContract,
   type FlowSequenceAction,
@@ -5018,7 +5012,6 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
-          const isV2SessionFlow = isFlowV2Contract(flow)
           const record = yield* requireSessionRecord(sessionId)
           yield* refreshSessionArtifacts(sessionId, record)
           const plan = planFlowExecution(flow)
@@ -5058,7 +5051,7 @@ export const SessionRegistryLive = Layer.scoped(
               : error.reason
 
           const successWarnings = (args: {
-            readonly step: FlowStep | FlowV2Step
+            readonly step: FlowV2Step
             readonly baseWarnings: ReadonlyArray<string>
             readonly resolvedBy?: SessionActionResult["resolvedBy"]
           }) => {
@@ -5077,21 +5070,12 @@ export const SessionRegistryLive = Layer.scoped(
             return dedupeStrings(warnings)
           }
 
-          const plannedExecutionProfile = (plannedStep: PlannedStep): FlowStepResult["executionProfile"] => {
-            if (!isV2SessionFlow) {
-              return null
-            }
-
-            return plannedStep.kind === "fast-single" || plannedStep.kind === "batch-sequence"
+          const plannedExecutionProfile = (plannedStep: PlannedStep): FlowV2StepResult["executionProfile"] =>
+            plannedStep.kind === "fast-single" || plannedStep.kind === "batch-sequence"
               ? "fast"
               : "verified"
-          }
 
-          const plannedTransportLane = (plannedStep: PlannedStep): FlowStepResult["transportLane"] => {
-            if (!isV2SessionFlow) {
-              return null
-            }
-
+          const plannedTransportLane = (plannedStep: PlannedStep): FlowV2StepResult["transportLane"] => {
             if (plannedStep.kind === "batch-sequence") {
               return "runner-batch"
             }
@@ -5179,12 +5163,9 @@ export const SessionRegistryLive = Layer.scoped(
             }
           }
 
-          type BuiltFlowStepResult = FlowStepResult | FlowV2StepResult
-          type BuiltFailedStep = FlowFailedStep | FlowV2FailedStep
-
           const buildFlowStepResult = (args: {
             readonly plannedStep: PlannedStep
-            readonly kind: FlowStepResult["kind"] | FlowV2StepResult["kind"]
+            readonly kind: FlowV2StepResult["kind"]
             readonly summary: string
             readonly verdict: SessionFlowResult["verdict"]
             readonly matchedRef: string | null
@@ -5195,13 +5176,10 @@ export const SessionRegistryLive = Layer.scoped(
             readonly handledMs: number | null
             readonly checkpoint?: FlowV2StepResult["checkpoint"]
             readonly sequenceChildFailure?: FlowSequenceChildFailure | null
-          }): BuiltFlowStepResult => {
-            const executionProfile = plannedExecutionProfile(args.plannedStep)
-            const transportLane = plannedTransportLane(args.plannedStep)
-
-            const base = {
+          }): FlowV2StepResult =>
+            ({
               index: args.plannedStep.index,
-              kind: args.kind as FlowStepResult["kind"],
+              kind: args.kind,
               summary: args.summary,
               verdict: args.verdict,
               matchedRef: args.matchedRef,
@@ -5209,49 +5187,25 @@ export const SessionRegistryLive = Layer.scoped(
               retryCount: args.retryCount,
               retryReasons: args.retryReasons,
               artifacts: [] as Array<ArtifactRecord>,
-              executionProfile,
-              transportLane,
+              executionProfile: plannedExecutionProfile(args.plannedStep),
+              transportLane: plannedTransportLane(args.plannedStep),
               handledMs: args.handledMs,
               warnings: args.warnings,
-            }
-
-            if (!isV2SessionFlow) {
-              return base satisfies FlowStepResult
-            }
-
-            return {
-              ...base,
-              kind: args.kind as FlowV2StepResult["kind"],
-              executionProfile: executionProfile ?? "verified",
-              transportLane: transportLane ?? "host-single",
               checkpoint: args.checkpoint ?? null,
               sequenceChildFailure: args.sequenceChildFailure ?? null,
-            } satisfies FlowV2StepResult
-          }
+            }) satisfies FlowV2StepResult
 
-          const toFailedStep = (step: BuiltFlowStepResult): BuiltFailedStep => {
-            if (!isV2SessionFlow) {
-              return {
-                index: step.index,
-                kind: step.kind as FlowFailedStep["kind"],
-                summary: step.summary,
-                verdict: step.verdict,
-              } satisfies FlowFailedStep
-            }
-
-            const stepResult = step as FlowV2StepResult
-            return {
-              index: stepResult.index,
-              kind: stepResult.kind,
-              summary: stepResult.summary,
-              verdict: stepResult.verdict,
-              executionProfile: stepResult.executionProfile,
-              transportLane: stepResult.transportLane,
-              handledMs: stepResult.handledMs,
-              checkpoint: stepResult.checkpoint,
-              sequenceChildFailure: stepResult.sequenceChildFailure,
-            } satisfies FlowV2FailedStep
-          }
+          const toFailedStep = (step: FlowV2StepResult): FlowV2FailedStep => ({
+            index: step.index,
+            kind: step.kind,
+            summary: step.summary,
+            verdict: step.verdict,
+            executionProfile: step.executionProfile,
+            transportLane: step.transportLane,
+            handledMs: step.handledMs,
+            checkpoint: step.checkpoint,
+            sequenceChildFailure: step.sequenceChildFailure,
+          })
 
           const mergeVerdict = (
             current: SessionFlowResult["verdict"],
@@ -5268,16 +5222,12 @@ export const SessionRegistryLive = Layer.scoped(
             return "passed"
           }
 
-          const toSessionAction = (step: FlowStep | FlowV2Step): SessionAction => {
-            if (isV2SessionFlow && isFlowV2SessionActionStep(step as FlowV2Step)) {
-              return flowV2StepToSessionAction(step as Parameters<typeof flowV2StepToSessionAction>[0])
+          const toSessionAction = (step: FlowV2Step): SessionAction => {
+            if (isFlowV2SessionActionStep(step)) {
+              return flowV2StepToSessionAction(step)
             }
 
-            if (isFlowSessionActionStep(step as FlowStep)) {
-              return flowStepToSessionAction(step as Parameters<typeof flowStepToSessionAction>[0])
-            }
-
-            throw new Error(`Expected a flow session-action step, received ${(step as { readonly kind: string }).kind}.`)
+            throw new Error(`Expected a flow session-action step, received ${step.kind}.`)
           }
 
           const classifyFastFailureCode = (reason: string): "session-action-target-not-found" | "session-action-failed" =>
@@ -5427,9 +5377,9 @@ export const SessionRegistryLive = Layer.scoped(
               } satisfies ActionExecutionOutcome
             })
 
-          const executedSteps: Array<BuiltFlowStepResult> = []
+          const executedSteps: Array<FlowV2StepResult> = []
           const createdArtifacts: Array<ArtifactRecord> = []
-          let failedStep: BuiltFailedStep | null = null
+          let failedStep: FlowV2FailedStep | null = null
           let overallVerdict: SessionFlowResult["verdict"] = "passed"
           let totalRetries = 0
           let stoppedEarly = false
@@ -5438,7 +5388,7 @@ export const SessionRegistryLive = Layer.scoped(
             const step = plannedStep.step
             const beforeArtifacts = [...record.health.artifacts]
             const continueOnError = step.continueOnError === true
-            let stepResult: BuiltFlowStepResult
+            let stepResult: FlowV2StepResult
 
             if (step.kind === "snapshot") {
               const captured = yield* attemptWithRetry({
@@ -5886,7 +5836,7 @@ export const SessionRegistryLive = Layer.scoped(
             yield* refreshSessionArtifacts(sessionId, record)
 
             const artifacts = diffArtifacts(beforeArtifacts, record.health.artifacts)
-            stepResult = { ...stepResult, artifacts } as BuiltFlowStepResult
+            stepResult = { ...stepResult, artifacts }
 
             executedSteps.push(stepResult)
             createdArtifacts.push(...artifacts)
@@ -5914,16 +5864,14 @@ export const SessionRegistryLive = Layer.scoped(
               ? `Flow ${overallVerdict === "timed-out" ? "timed out" : "failed"} at step ${failedStep.index} after ${executedSteps.length} executed step(s) and ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
               : `Executed ${executedSteps.length} flow step(s) with ${failedStepCount} failed step(s), continuing past failures where continueOnError was enabled.`
 
-          // isV2SessionFlow is always true post-PRB-082: SessionFlowContract has a
-          // single canonical version, so the v1 report-shape branch is gone.
           return {
             contract: "probe.session-flow/report-v2",
             executedAt: nowIso(),
             sessionId,
             summary,
             verdict: overallVerdict,
-            executedSteps: executedSteps as Array<FlowV2StepResult>,
-            failedStep: failedStep as FlowV2FailedStep | null,
+            executedSteps,
+            failedStep,
             retries: totalRetries,
             artifacts: dedupedArtifacts,
             finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
