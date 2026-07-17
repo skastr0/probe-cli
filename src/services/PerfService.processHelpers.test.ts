@@ -93,25 +93,39 @@ describe("PerfService process helpers (real spawn, via AppleProcessSupervisor)",
     })
   })
 
-  test("liveStartRecording waits for the startup signal, then stop() sends SIGINT and joins exit", async () => {
-    const startupNotificationKey = `probe.test.perf-process-helpers.${process.pid}.${Date.now()}`
+  test(
+    "liveStartRecording waits for the startup signal, then stop() sends SIGINT and joins exit",
+    async () => {
+      const startupNotificationKey = `probe.test.perf-process-helpers.${process.pid}.${Date.now()}`
 
-    const handle = await liveStartRecording({
-      command: "/bin/sh",
-      commandArgs: [
-        "-c",
-        `notifyutil -p ${startupNotificationKey}; trap 'exit 0' INT; while true; do sleep 0.05; done`,
-      ],
-      startupNotificationKey,
-      startupTimeoutMs: 5_000,
-      timeoutMs: 30_000,
-      gracePeriodMs: 1_000,
-    })
+      const handle = await liveStartRecording({
+        command: "/bin/sh",
+        commandArgs: [
+          "-c",
+          `notifyutil -p ${startupNotificationKey}; trap 'exit 0' INT; while true; do sleep 0.05; done`,
+        ],
+        startupNotificationKey,
+        // notifyutil's post/wait handshake is two independently-scheduled real
+        // processes racing a Darwin distributed-notification registration --
+        // under host contention (this file's other process-helper cases each
+        // spawn real children too) the wait side has been observed to take
+        // noticeably longer than 5s to register before the post fires,
+        // without the handshake itself being broken; 5s reproducibly timed
+        // this specific case out under contention even in this file alone.
+        startupTimeoutMs: 15_000,
+        timeoutMs: 30_000,
+        gracePeriodMs: 1_000,
+      })
 
-    const result = await handle.stop()
-    expect(result.wasRunning).toBe(true)
-    expect(result.exitCode === 0 || result.exitCode === null).toBe(true)
-  })
+      const result = await handle.stop()
+      expect(result.wasRunning).toBe(true)
+      expect(result.exitCode === 0 || result.exitCode === null).toBe(true)
+    },
+    // Covers the widened startupTimeoutMs above plus the recording/stop work
+    // that follows it -- bun's 5000ms default test timeout is otherwise the
+    // tighter wall here.
+    20_000,
+  )
 
   test("liveStartRecording rejects if the command exits before signaling startup", async () => {
     const startupNotificationKey = `probe.test.perf-process-helpers.never-posted.${process.pid}.${Date.now()}`
