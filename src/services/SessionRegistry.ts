@@ -116,6 +116,25 @@ import {
   resolveFfmpegExecutable,
   resolveFfprobeExecutable,
 } from "./VideoCapturePolicy"
+// PRB-073: runFlow's execution lanes, extracted into named executors — see
+// src/services/flow/*.
+import { executeBatchActionStep, buildBatchStepResult } from "./flow/batchActionExecutor"
+import { executeDirectRunnerActionStep } from "./flow/directRunnerActionExecutor"
+import {
+  captureScreenshotEvidenceStep,
+  captureSnapshotEvidenceStep,
+  captureVideoEvidenceStep,
+  markLogEvidenceStep,
+} from "./flow/evidenceCaptureExecutor"
+import type { FlowExecutorDeps } from "./flow/flowExecutorDeps"
+import {
+  assembleFlowResult,
+  buildActionOutcomeStepResult,
+  buildFlowStepResult,
+  diffArtifacts,
+  foldFlowStepOutcome,
+} from "./flow/flowStepResultAssembly"
+import { executeVerifiedActionStep } from "./flow/verifiedActionExecutor"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
 const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
@@ -132,7 +151,7 @@ const maxDebugEvalTimeoutMs = 30_000
 const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
 const defaultVideoDurationMs = 10_000
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
-const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
+export const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
 const nonRecoverableSessionWarning =
   "Probe fails closed when the runner exits, the daemon restarts, or runner transport is lost. Close and reopen the session instead of expecting transparent recovery."
@@ -154,7 +173,9 @@ interface RunnerVideoCaptureManifest {
   readonly framesDirectoryPath: string
 }
 
-type VideoArtifactMode = "mp4" | "mov" | "frame-sequence"
+// PRB-073: exported so the flow executors (src/services/flow/*) can type
+// their evidence-capture deps without re-declaring the mode union.
+export type VideoArtifactMode = "mp4" | "mov" | "frame-sequence"
 
 const parseDurationStringMs = (value: string): number | null => {
   const match = value.match(/^(\d+)(ms|s|m|h)$/)
@@ -342,9 +363,9 @@ const decodeRunnerVideoCaptureManifest = (
   }
 }
 
-const timestampForFile = (): string => new Date().toISOString().replace(/[:.]/g, "-")
+export const timestampForFile = (): string => new Date().toISOString().replace(/[:.]/g, "-")
 
-const sanitizeFileComponent = (value: string | null | undefined, fallback: string): string => {
+export const sanitizeFileComponent = (value: string | null | undefined, fallback: string): string => {
   const sanitized = (value ?? "")
     .trim()
     .toLowerCase()
@@ -354,7 +375,7 @@ const sanitizeFileComponent = (value: string | null | undefined, fallback: strin
   return sanitized.length > 0 ? sanitized : fallback
 }
 
-const describeVideoArtifactLabel = (mode: VideoArtifactMode, options?: { readonly includeArtifact?: boolean }): string => {
+export const describeVideoArtifactLabel = (mode: VideoArtifactMode, options?: { readonly includeArtifact?: boolean }): string => {
   const suffix = options?.includeArtifact === false ? "" : " artifact"
 
   switch (mode) {
@@ -369,7 +390,7 @@ const describeVideoArtifactLabel = (mode: VideoArtifactMode, options?: { readonl
 
 const isHittabilityFailure = (reason: string): boolean => /\bhittable\b|\boffscreen\b/i.test(reason)
 
-const withOffscreenNextStep = (base: string, reason: string): string =>
+export const withOffscreenNextStep = (base: string, reason: string): string =>
   isHittabilityFailure(reason)
     ? `${base} If the target is offscreen, add an explicit scroll step first; Probe does not auto-scroll until the element becomes hittable.`
     : base
@@ -381,16 +402,16 @@ const buildReplayWarnings = (semanticFallbackCount: number): ReadonlyArray<strin
   offscreenHittabilityWarning,
 ]
 
-const dedupeStrings = (values: ReadonlyArray<string>): Array<string> => [...new Set(values)]
+export const dedupeStrings = (values: ReadonlyArray<string>): Array<string> => [...new Set(values)]
 
-const defaultReadOnlyRetryPolicy: RetryPolicy = {
+export const defaultReadOnlyRetryPolicy: RetryPolicy = {
   maxAttempts: 3,
   backoffMs: 250,
   refreshSnapshotBetweenAttempts: true,
   retryOn: ["not-found", "not-hittable", "runner-timeout", "transient-transport", "assertion-failed"],
 }
 
-const defaultMutationRetryPolicy: RetryPolicy = {
+export const defaultMutationRetryPolicy: RetryPolicy = {
   maxAttempts: 3,
   backoffMs: 250,
   refreshSnapshotBetweenAttempts: true,
@@ -413,19 +434,19 @@ const defaultWaitRetryPolicy = (timeoutMs: number): RetryPolicy => ({
   retryOn: ["not-found", "assertion-failed"],
 })
 
-type SessionActionError =
+export type SessionActionError =
   | SessionNotFoundError
   | UserInputError
   | UnsupportedCapabilityError
   | EnvironmentError
   | ChildProcessError
 
-interface RetryAttemptMetadata {
+export interface RetryAttemptMetadata {
   readonly retryCount: number
   readonly retryReasons: Array<string>
 }
 
-type ExtendedSessionActionResult = SessionActionResult & {
+export type ExtendedSessionActionResult = SessionActionResult & {
   readonly handledMs?: number | null
 }
 
@@ -441,7 +462,7 @@ type RetryAttemptOutcome<T, E extends SessionActionError> =
       readonly retry: RetryAttemptMetadata
     }
 
-type ActionExecutionOutcome =
+export type ActionExecutionOutcome =
   | {
       readonly ok: true
       readonly result: ExtendedSessionActionResult
@@ -452,7 +473,7 @@ type ActionExecutionOutcome =
       readonly retry: RetryAttemptMetadata
     }
 
-const emptyRetryAttemptMetadata = (): RetryAttemptMetadata => ({
+export const emptyRetryAttemptMetadata = (): RetryAttemptMetadata => ({
   retryCount: 0,
   retryReasons: [],
 })
@@ -503,7 +524,7 @@ const classifyRetryableFailure = (error: SessionActionError): { readonly code: R
   return null
 }
 
-const attemptWithRetry = <T, E extends SessionActionError>(args: {
+export const attemptWithRetry = <T, E extends SessionActionError>(args: {
   readonly policy: RetryPolicy
   readonly run: () => Effect.Effect<T, E>
 }) =>
@@ -641,7 +662,7 @@ const buildReplayArtifactSummary = (args: {
     ? `Replay report with ${args.stepCount} executed steps. ${selectorDriftContractWarning} ${offscreenHittabilityWarning}`
     : `Replay failure report for step ${args.failureStepIndex ?? "unknown"} after retry exhaustion. ${selectorDriftContractWarning} ${offscreenHittabilityWarning}`
 
-interface BaseActiveSessionRecord {
+export interface BaseActiveSessionRecord {
   kind: "simulator" | "device"
   health: SessionHealth
   baseWarnings: ReadonlyArray<string>
@@ -663,7 +684,7 @@ interface BaseActiveSessionRecord {
   readonly controller: SessionController
 }
 
-interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
+export interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "simulator"
   readonly sendRunnerCommand: (
     sequence: number,
@@ -675,7 +696,7 @@ interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
   readonly waitForExit: Promise<{ readonly code: number | null; readonly signal: string | null }>
 }
 
-interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
+export interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "device"
   integrationPoints: ReadonlyArray<string>
   readonly sendRunnerCommand: ((
@@ -689,8 +710,8 @@ interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
   readonly waitForExit: Promise<{ readonly code: number | null; readonly signal: string | null }> | null
 }
 
-type ActiveSessionRecord = SimulatorActiveSessionRecord | RealDeviceActiveSessionRecord
-type RunnerBackedActiveSessionRecord = SimulatorActiveSessionRecord | (RealDeviceActiveSessionRecord & {
+export type ActiveSessionRecord = SimulatorActiveSessionRecord | RealDeviceActiveSessionRecord
+export type RunnerBackedActiveSessionRecord = SimulatorActiveSessionRecord | (RealDeviceActiveSessionRecord & {
   readonly sendRunnerCommand: NonNullable<RealDeviceActiveSessionRecord["sendRunnerCommand"]>
   readonly waitForExit: NonNullable<RealDeviceActiveSessionRecord["waitForExit"]>
 })
@@ -1234,14 +1255,55 @@ const composeWarnings = (
   extras: ReadonlyArray<string>,
 ): ReadonlyArray<string> => dedupeStrings([...record.baseWarnings, ...extras])
 
-const isSimulatorRecord = (record: ActiveSessionRecord): record is SimulatorActiveSessionRecord =>
+export const isSimulatorRecord = (record: ActiveSessionRecord): record is SimulatorActiveSessionRecord =>
   record.kind === "simulator"
 
 const isRealDeviceRecord = (record: ActiveSessionRecord): record is RealDeviceActiveSessionRecord =>
   record.kind === "device"
 
-const isRunnerBackedRecord = (record: ActiveSessionRecord): record is RunnerBackedActiveSessionRecord =>
+export const isRunnerBackedRecord = (record: ActiveSessionRecord): record is RunnerBackedActiveSessionRecord =>
   isSimulatorRecord(record) || record.sendRunnerCommand !== null
+
+// PRB-073: hoisted out of `SessionRegistryLive`'s Effect.gen body — this has
+// no dependency on any layer-scoped service (ArtifactStore, harnesses, …),
+// only on the module-level `nowIso`/`expiresAtIso`/`deriveSessionPhase`
+// helpers above, so it is safe as a plain top-level function. Exported so
+// the flow executors (src/services/flow/*) can call it as an explicit
+// dependency without closing over `SessionRegistryLive`'s internals.
+export const updateHealthCheck = (record: ActiveSessionRecord, command: string, ok: boolean) => {
+  const nextHealth: SessionHealth = {
+    ...record.health,
+    updatedAt: nowIso(),
+    expiresAt: expiresAtIso(),
+    healthCheck: {
+      ...record.health.healthCheck,
+      checkedAt: nowIso(),
+      wrapperRunning: record.isRunnerRunning(),
+      lastCommand: command,
+      lastOk: ok,
+    },
+  }
+
+  record.health = {
+    ...nextHealth,
+    state: deriveSessionPhase(nextHealth),
+  }
+}
+
+// PRB-073: hoisted alongside `updateHealthCheck` for the same reason — pure,
+// no layer-scoped dependency.
+export const buildActionResultMetadata = (
+  retry: RetryAttemptMetadata,
+  verdict: SessionActionResult["verdict"] = null,
+  waitedMs: number | null = null,
+  polledCount: number | null = null,
+) => ({
+  retryCount: retry.retryCount,
+  retryReasons: retry.retryReasons,
+  verdict,
+  waitedMs,
+  polledCount,
+})
 
 export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
   SessionRegistry,
@@ -1644,19 +1706,6 @@ export const SessionRegistryLive = Layer.scoped(
         yield* persistHealth(sessionId, record.health)
         yield* syncDaemonMetadata
       })
-
-    const buildActionResultMetadata = (
-      retry: RetryAttemptMetadata,
-      verdict: SessionActionResult["verdict"] = null,
-      waitedMs: number | null = null,
-      polledCount: number | null = null,
-    ) => ({
-      retryCount: retry.retryCount,
-      retryReasons: retry.retryReasons,
-      verdict,
-      waitedMs,
-      polledCount,
-    })
 
     const persistActionFailure = (sessionId: string, record: ActiveSessionRecord, kind: SessionAction["kind"]) =>
       Effect.gen(function* () {
@@ -3351,26 +3400,6 @@ export const SessionRegistryLive = Layer.scoped(
 
         return bridge
       })
-
-    const updateHealthCheck = (record: ActiveSessionRecord, command: string, ok: boolean) => {
-      const nextHealth: SessionHealth = {
-        ...record.health,
-        updatedAt: nowIso(),
-        expiresAt: expiresAtIso(),
-        healthCheck: {
-          ...record.health.healthCheck,
-          checkedAt: nowIso(),
-          wrapperRunning: record.isRunnerRunning(),
-          lastCommand: command,
-          lastOk: ok,
-        },
-      }
-
-      record.health = {
-        ...nextHealth,
-        state: deriveSessionPhase(nextHealth),
-      }
-    }
 
     const assertRunnerActionsAvailable = (
       record: ActiveSessionRecord,
@@ -5184,347 +5213,35 @@ export const SessionRegistryLive = Layer.scoped(
           yield* refreshSessionArtifacts(sessionId, record)
           const plan = planFlowExecution(flow)
 
-          const diffArtifacts = (before: ReadonlyArray<ArtifactRecord>, after: ReadonlyArray<ArtifactRecord>) => {
-            const knownKeys = new Set(before.map((artifact) => artifact.key))
-            return after.filter((artifact) => !knownKeys.has(artifact.key))
+          // PRB-073: the port bag every extracted executor takes instead of
+          // closing over this closure's locals. Built once per flow run —
+          // `registry` is already fully assigned by the time `runFlow`
+          // actually executes (it is only referenced here, not called, at
+          // module-construction time), exactly like the `registry.markLog`
+          // self-reference this replaces.
+          const deps: FlowExecutorDeps = {
+            sendRunnerCommand,
+            captureSnapshotArtifactInternal,
+            captureScreenshotArtifact,
+            captureVideoArtifact,
+            markLog: registry.markLog,
+            updateHealthCheck,
+            persistHealth,
+            persistRecordHealth,
+            refreshSessionArtifacts,
+            persistActionFailure,
+            syncDaemonMetadata,
+            executeSessionAction,
           }
 
-          const failureVerdict = (error: SessionActionError | SessionNotFoundError): SessionFlowResult["verdict"] =>
-            error instanceof EnvironmentError && error.code === "session-wait-timeout" ? "timed-out" : "failed"
-
-          const failureWarnings = (args: {
-            readonly error: SessionActionError | SessionNotFoundError
-            readonly continued: boolean
-          }): Array<string> => {
-            const warnings: Array<string> = []
-
-            if ("nextStep" in args.error && typeof args.error.nextStep === "string") {
-              warnings.push(args.error.nextStep)
-            }
-
-            if ("details" in args.error && Array.isArray(args.error.details)) {
-              warnings.push(...args.error.details)
-            }
-
-            if (args.continued) {
-              warnings.push("Step failed but flow continued because continueOnError was enabled.")
-            }
-
-            return dedupeStrings(warnings)
-          }
-
-          const errorSummary = (error: SessionActionError | SessionNotFoundError): string =>
-            error instanceof SessionNotFoundError
-              ? `Session ${error.sessionId} was not found.`
-              : error.reason
-
-          const successWarnings = (args: {
-            readonly step: FlowV2Step
-            readonly baseWarnings: ReadonlyArray<string>
-            readonly resolvedBy?: SessionActionResult["resolvedBy"]
-          }) => {
-            const warnings = [...args.baseWarnings]
-            const target = "target" in args.step ? args.step.target : null
-
-            if (
-              args.resolvedBy === "semantic"
-              && target !== null
-              && target.kind === "ref"
-              && target.fallback !== null
-            ) {
-              warnings.push(selectorDriftContractWarning)
-            }
-
-            return dedupeStrings(warnings)
-          }
-
-          const plannedExecutionProfile = (plannedStep: PlannedStep): FlowV2StepResult["executionProfile"] =>
-            plannedStep.kind === "fast-single" || plannedStep.kind === "batch-sequence"
-              ? "fast"
-              : "verified"
-
-          const plannedTransportLane = (plannedStep: PlannedStep): FlowV2StepResult["transportLane"] => {
-            if (plannedStep.kind === "batch-sequence") {
-              return "runner-batch"
-            }
-
-            if (plannedStep.kind !== "fast-single") {
-              return "host-single"
-            }
-
-            return plannedStep.step.kind === "wait" ? "host-single" : "runner-single"
-          }
-
-          type RunnerBatchWaitActionPayload = {
-            readonly kind: "wait"
-            readonly timeoutMs: number
-          }
-
-          type RunnerBatchSequenceActionPayload = ReturnType<typeof buildDirectRunnerUiActionPayload> | RunnerBatchWaitActionPayload
-
-          type RunnerBatchSequencePayload = {
-            readonly actions: ReadonlyArray<RunnerBatchSequenceActionPayload>
-          }
-
-          const buildRunnerBatchSequencePayload = (actions: ReadonlyArray<FlowSequenceAction>): RunnerBatchSequencePayload => ({
-            actions: actions.map((action) => {
-              switch (action.kind) {
-                case "wait":
-                  return {
-                    kind: "wait",
-                    timeoutMs: action.timeoutMs,
-                  }
-                case "tap":
-                case "press":
-                case "swipe":
-                case "type":
-                case "scroll":
-                  return buildDirectRunnerUiActionPayload(action, action.target)
-              }
-            }),
-          })
-
-          const toFlowSequenceActionKind = (value: string | null | undefined): FlowSequenceAction["kind"] | null => {
-            switch (value) {
-              case "tap":
-              case "press":
-              case "swipe":
-              case "type":
-              case "scroll":
-              case "wait":
-                return value
-              default:
-                return null
-            }
-          }
-
-          const buildBatchSequenceChildFailure = (args: {
-            readonly step: FlowSequenceStep
-            readonly response: RunnerCommandResult
-            readonly failureReason: string
-          }): FlowSequenceChildFailure | null => {
-            const rawIndex = args.response.failedActionIndex
-
-            if (rawIndex === null || rawIndex === undefined || !Number.isInteger(rawIndex) || rawIndex < 0) {
-              return null
-            }
-
-            const plannedChild = args.step.actions[rawIndex]
-            const fallbackKind = toFlowSequenceActionKind(args.response.failedActionKind)
-
-            return {
-              index: rawIndex + 1,
-              kind: plannedChild?.kind ?? fallbackKind ?? "tap",
-              summary: args.failureReason,
-            }
-          }
-
-          const buildFlowStepResult = (args: {
-            readonly plannedStep: PlannedStep
-            readonly kind: FlowV2StepResult["kind"]
-            readonly summary: string
-            readonly verdict: SessionFlowResult["verdict"]
-            readonly matchedRef: string | null
-            readonly latestSnapshotId: string | null
-            readonly retryCount: number
-            readonly retryReasons: Array<string>
-            readonly warnings: Array<string>
-            readonly handledMs: number | null
-            readonly checkpoint?: FlowV2StepResult["checkpoint"]
-            readonly sequenceChildFailure?: FlowSequenceChildFailure | null
-          }): FlowV2StepResult =>
-            ({
-              index: args.plannedStep.index,
-              kind: args.kind,
-              summary: args.summary,
-              verdict: args.verdict,
-              matchedRef: args.matchedRef,
-              latestSnapshotId: args.latestSnapshotId,
-              retryCount: args.retryCount,
-              retryReasons: args.retryReasons,
-              artifacts: [] as Array<ArtifactRecord>,
-              executionProfile: plannedExecutionProfile(args.plannedStep),
-              transportLane: plannedTransportLane(args.plannedStep),
-              handledMs: args.handledMs,
-              warnings: args.warnings,
-              checkpoint: args.checkpoint ?? null,
-              sequenceChildFailure: args.sequenceChildFailure ?? null,
-            }) satisfies FlowV2StepResult
-
-          const toFailedStep = (step: FlowV2StepResult): FlowV2FailedStep => ({
-            index: step.index,
-            kind: step.kind,
-            summary: step.summary,
-            verdict: step.verdict,
-            executionProfile: step.executionProfile,
-            transportLane: step.transportLane,
-            handledMs: step.handledMs,
-            checkpoint: step.checkpoint,
-            sequenceChildFailure: step.sequenceChildFailure,
-          })
-
-          const mergeVerdict = (
-            current: SessionFlowResult["verdict"],
-            next: SessionFlowResult["verdict"],
-          ): SessionFlowResult["verdict"] => {
-            if (current === "timed-out" || next === "timed-out") {
-              return "timed-out"
-            }
-
-            if (current === "failed" || next === "failed") {
-              return "failed"
-            }
-
-            return "passed"
-          }
-
-          const toSessionAction = (step: FlowV2Step): SessionAction => {
-            if (isFlowV2SessionActionStep(step)) {
-              return flowV2StepToSessionAction(step)
-            }
-
-            throw new Error(`Expected a flow session-action step, received ${step.kind}.`)
-          }
-
-          const classifyFastFailureCode = (reason: string): "session-action-target-not-found" | "session-action-failed" =>
-            /\bnot found\b|\bno element\b|\bmissing\b|\bcould not resolve\b/i.test(reason)
-              ? "session-action-target-not-found"
-              : "session-action-failed"
-
-          const executeFastSingleStep = (
-            step: FlowV2FastSingleStep,
-          ) =>
-            Effect.gen(function* () {
-              const runnerRecord = yield* requireRunnerCapability({
-                record,
-                isRunnerBacked: isRunnerBackedRecord,
-                advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
-                capability: "uiAction",
-                capabilityTag: "session.run.fast",
-                usageDescription: "fast single-step flow execution",
-                notRunnerBacked: {
-                  code: "session-action-real-device-runner",
-                  reason: "This session does not currently expose a live runner transport for fast flow actions.",
-                  nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-                },
-                missingCapabilityNextStep: "Open a session against a runner that reports uiAction capability, or switch the flow step back to verified execution.",
-              })
-
-              if (step.kind === "wait") {
-                yield* Effect.sleep(step.timeoutMs)
-                updateHealthCheck(record, step.kind, true)
-                yield* persistHealth(sessionId, record.health)
-                yield* syncDaemonMetadata
-
-                return {
-                  ok: true as const,
-                  result: {
-                    summary: `Waited ${step.timeoutMs}ms before continuing.`,
-                    action: step.kind,
-                    matchedRef: null,
-                    resolvedBy: "none",
-                    statusLabel: record.snapshotState.latest?.statusLabel ?? null,
-                    latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                    artifact: null,
-                    recordingLength: record.recording.steps.length,
-                    handledMs: null,
-                    ...buildActionResultMetadata(emptyRetryAttemptMetadata(), "passed", step.timeoutMs, 1),
-                  } satisfies ExtendedSessionActionResult,
-                } satisfies ActionExecutionOutcome
-              }
-
-              const action = flowV2StepToSessionAction(step)
-
-              if (!isRunnerUiSessionAction(action)) {
-                return yield* new EnvironmentError({
-                  code: "session-action-invalid",
-                  reason: `Fast runner execution only supports tap, press, swipe, type, scroll, and duration waits; received ${step.kind}.`,
-                  nextStep: "Use verified execution for unsupported steps, or adjust the flow contract before retrying.",
-                  details: [],
-                })
-              }
-
-              const resolvedBy: SessionActionResult["resolvedBy"] = step.target.kind === "point" ? "point" : "semantic"
-              const actionResult = yield* attemptWithRetry({
-                policy: action.retryPolicy ?? defaultMutationRetryPolicy,
-                run: () =>
-                  Effect.gen(function* () {
-                    const payload = yield* Effect.try({
-                      try: () => buildDirectRunnerUiActionPayload(action, step.target),
-                      catch: (error) =>
-                        new EnvironmentError({
-                          code: "session-action-target-not-found",
-                          reason: error instanceof Error ? error.message : String(error),
-                          nextStep: "Use a semantic selector, point selector, or ref selector with a semantic fallback for fast runner steps.",
-                          details: [],
-                        }),
-                    })
-
-                    const response = yield* sendRunnerCommand(
-                      sessionId,
-                      runnerRecord,
-                      "uiAction",
-                      JSON.stringify(payload),
-                    )
-
-                    if (!response.ok) {
-                      const failureReason = response.error
-                        ?? response.payload
-                        ?? `Runner ${action.kind} failed with status ${response.statusLabel}.`
-
-                      return yield* new EnvironmentError({
-                        code: classifyFastFailureCode(failureReason),
-                        reason: failureReason,
-                        nextStep: withOffscreenNextStep(
-                          "Inspect the latest runner log artifacts, refine the direct selector, and retry the fast step.",
-                          failureReason,
-                        ),
-                        details: [],
-                      })
-                    }
-
-                    return { response }
-                  }),
-              })
-
-              if (!actionResult.ok) {
-                yield* Effect.either(captureSnapshotArtifactInternal(sessionId, record))
-                yield* persistActionFailure(sessionId, record, step.kind)
-
-                return {
-                  ok: false,
-                  error: actionResult.error,
-                  retry: actionResult.retry,
-                } satisfies ActionExecutionOutcome
-              }
-
-              updateHealthCheck(record, step.kind, true)
-              yield* persistHealth(sessionId, record.health)
-              yield* syncDaemonMetadata
-
-              const summary = step.target.kind === "point"
-                ? `Executed fast ${step.kind} at point(${step.target.x}, ${step.target.y}) without host snapshots.`
-                : `Executed fast ${step.kind} on ${describeActionSelector(step.target)} without host snapshots.`
-
-              return {
-                ok: true,
-                result: {
-                  summary,
-                  action: step.kind,
-                  matchedRef: null,
-                  resolvedBy,
-                  statusLabel: actionResult.value.response.statusLabel,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  artifact: null,
-                  recordingLength: record.recording.steps.length,
-                  handledMs: actionResult.value.response.handledMs,
-                  ...buildActionResultMetadata(actionResult.retry),
-                } satisfies ExtendedSessionActionResult,
-              } satisfies ActionExecutionOutcome
-            })
-
-          const executedSteps: Array<FlowV2StepResult> = []
-          const createdArtifacts: Array<ArtifactRecord> = []
+          // PRB-073: `runFlow` itself is now a bounded orchestration loop —
+          // per-step dispatch lives in the named executors under
+          // src/services/flow/*; this loop only sequences them and folds
+          // their results. Its size no longer grows per execution lane: a
+          // new step kind adds one more executor and one more branch here,
+          // not more inline logic.
+          let executedSteps: ReadonlyArray<FlowV2StepResult> = []
+          let createdArtifacts: ReadonlyArray<ArtifactRecord> = []
           let failedStep: FlowV2FailedStep | null = null
           let overallVerdict: SessionFlowResult["verdict"] = "passed"
           let totalRetries = 0
@@ -5534,197 +5251,17 @@ export const SessionRegistryLive = Layer.scoped(
             const step = plannedStep.step
             const beforeArtifacts = [...record.health.artifacts]
             const continueOnError = step.continueOnError === true
+            const latestSnapshotIdBefore = record.snapshotState.latest?.snapshotId ?? null
             let stepResult: FlowV2StepResult
 
             if (step.kind === "snapshot") {
-              const captured = yield* attemptWithRetry({
-                policy: defaultReadOnlyRetryPolicy,
-                run: () => captureSnapshotArtifactInternal(sessionId, record),
-              })
-
-              if (captured.ok) {
-                const snapshotResult = buildSessionSnapshotResult({
-                  artifact: captured.value.artifact,
-                  artifactRecord: captured.value.artifactRecord,
-                  outputMode: step.output ?? "artifact",
-                  retry: captured.retry,
-                })
-
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: snapshotResult.summary,
-                  verdict: "passed",
-                  matchedRef: null,
-                  latestSnapshotId: snapshotResult.snapshotId,
-                  retryCount: captured.retry.retryCount,
-                  retryReasons: captured.retry.retryReasons,
-                  handledMs: captured.value.handledMs,
-                  warnings: successWarnings({
-                    step,
-                    baseWarnings: snapshotResult.warnings,
-                  }),
-                })
-              } else {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: captured.error.reason,
-                  verdict: failureVerdict(captured.error),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: captured.retry.retryCount,
-                  retryReasons: captured.retry.retryReasons,
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: captured.error,
-                    continued: continueOnError,
-                  }),
-                })
-              }
+              stepResult = yield* captureSnapshotEvidenceStep({ sessionId, record, plannedStep, step, continueOnError, deps })
             } else if (step.kind === "screenshot") {
-              const labelStem = sanitizeFileComponent(step.label ?? null, "screenshot")
-              const fileStem = `${timestampForFile()}-${labelStem}`
-              const captured = yield* attemptWithRetry({
-                policy: step.retryPolicy ?? defaultReadOnlyRetryPolicy,
-                run: () => captureScreenshotArtifact({
-                  sessionId,
-                  record,
-                  fileStem,
-                  artifactKey: `screenshot-${fileStem}`,
-                  artifactLabel: step.label ?? "screenshot",
-                  summary: `Screenshot captured for session ${sessionId}.`,
-                }),
-              })
-
-              if (captured.ok) {
-                updateHealthCheck(record, step.kind, true)
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: `Captured screenshot artifact ${captured.value.artifact.absolutePath}.`,
-                  verdict: "passed",
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: captured.retry.retryCount,
-                  retryReasons: captured.retry.retryReasons,
-                  handledMs: captured.value.handledMs,
-                  warnings: successWarnings({
-                    step,
-                    baseWarnings: [],
-                  }),
-                })
-              } else {
-                updateHealthCheck(record, step.kind, false)
-                yield* persistRecordHealth(sessionId, record)
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: captured.error.reason,
-                  verdict: failureVerdict(captured.error),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: captured.retry.retryCount,
-                  retryReasons: captured.retry.retryReasons,
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: captured.error,
-                    continued: continueOnError,
-                  }),
-                })
-              }
+              stepResult = yield* captureScreenshotEvidenceStep({ sessionId, record, plannedStep, step, continueOnError, deps })
             } else if (step.kind === "video") {
-              const durationMs = normalizeVideoDurationMs(step.durationMs)
-              const fileStem = `${timestampForFile()}-video`
-              const captured = yield* Effect.either(captureVideoArtifact({
-                sessionId,
-                record,
-                durationMs,
-                fileStem,
-                artifactKey: `video-${fileStem}`,
-                artifactLabel: "video",
-              }))
-
-              if (captured._tag === "Right") {
-                updateHealthCheck(record, step.kind, true)
-                const modeSummary = describeVideoArtifactLabel(captured.right.mode)
-                const clampNote = durationMs !== step.durationMs
-                  ? ` Requested duration ${step.durationMs}ms was clamped to ${durationMs}ms.`
-                  : ""
-
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: `Captured ${modeSummary} at ${captured.right.artifact.absolutePath}.${clampNote}`,
-                  verdict: "passed",
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: 0,
-                  retryReasons: [],
-                  handledMs: captured.right.handledMs,
-                  warnings: successWarnings({
-                    step,
-                    baseWarnings: [],
-                  }),
-                })
-              } else {
-                updateHealthCheck(record, step.kind, false)
-                yield* persistRecordHealth(sessionId, record)
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: captured.left.reason,
-                  verdict: failureVerdict(captured.left),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: 0,
-                  retryReasons: [],
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: captured.left,
-                    continued: continueOnError,
-                  }),
-                })
-              }
+              stepResult = yield* captureVideoEvidenceStep({ sessionId, record, plannedStep, step, continueOnError, deps })
             } else if (step.kind === "logMark") {
-              const marked = yield* Effect.either(registry.markLog({
-                sessionId,
-                label: step.label,
-              }))
-
-              if (marked._tag === "Right") {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: marked.right.summary,
-                  verdict: "passed",
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: 0,
-                  retryReasons: [],
-                  handledMs: null,
-                  warnings: successWarnings({
-                    step,
-                    baseWarnings: [],
-                  }),
-                })
-              } else {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: errorSummary(marked.left),
-                  verdict: failureVerdict(marked.left),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: 0,
-                  retryReasons: [],
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: marked.left,
-                    continued: continueOnError,
-                  }),
-                })
-              }
+              stepResult = yield* markLogEvidenceStep({ sessionId, record, plannedStep, step, continueOnError, deps })
             } else if (step.kind === "sleep") {
               yield* Effect.sleep(step.durationMs)
               stepResult = buildFlowStepResult({
@@ -5733,288 +5270,81 @@ export const SessionRegistryLive = Layer.scoped(
                 summary: `Slept for ${step.durationMs}ms.`,
                 verdict: "passed",
                 matchedRef: null,
-                latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+                latestSnapshotId: latestSnapshotIdBefore,
                 retryCount: 0,
                 retryReasons: [],
                 handledMs: null,
                 warnings: [],
               })
             } else if (plannedStep.kind === "batch-sequence") {
-              const checkpoint = plannedStep.step.checkpoint ?? "none"
-              const batchEffect = yield* Effect.either(
-                Effect.gen(function* () {
-                  const runnerRecord = yield* requireRunnerCapability({
-                    record,
-                    isRunnerBacked: isRunnerBackedRecord,
-                    advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
-                    capability: "uiActionBatch",
-                    capabilityTag: "session.run.sequence.batch",
-                    usageDescription: "fast sequence execution",
-                    notRunnerBacked: {
-                      code: "session-action-real-device-runner",
-                      reason: "This session does not currently expose a live runner transport for batch sequence flow steps.",
-                      nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-                    },
-                    missingCapabilityNextStep: "Open a session against a runner that reports uiActionBatch capability, or rewrite the flow as verified single steps.",
-                  })
-
-                  const payload = yield* Effect.try({
-                    try: () => buildRunnerBatchSequencePayload(plannedStep.step.actions),
-                    catch: (error) =>
-                      new EnvironmentError({
-                        code: "session-action-target-not-found",
-                        reason: error instanceof Error ? error.message : String(error),
-                        nextStep: "Use semantic selectors, point selectors, or ref selectors with semantic fallbacks for batched sequence actions.",
-                        details: [],
-                      }),
-                  })
-
-                  const response = yield* sendRunnerCommand(
-                    sessionId,
-                    runnerRecord,
-                    "uiActionBatch",
-                    JSON.stringify(payload),
-                  )
-                  updateHealthCheck(record, response.action, response.ok)
-
-                  const checkpointCapture = checkpoint === "end"
-                    ? yield* Effect.either(captureSnapshotArtifactInternal(sessionId, record))
-                    : null
-
-                  if (checkpoint === "none") {
-                    yield* persistRecordHealth(sessionId, record)
-                  }
-
-                  return {
-                    response,
-                    checkpointCapture,
-                  }
-                }),
-              )
-
-              if (batchEffect._tag === "Left") {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: plannedStep.step.kind,
-                  summary: errorSummary(batchEffect.left),
-                  verdict: failureVerdict(batchEffect.left),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: 0,
-                  retryReasons: [],
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: batchEffect.left,
-                    continued: continueOnError,
-                  }),
-                  checkpoint,
-                  sequenceChildFailure: null,
-                })
-              } else {
-                const { response, checkpointCapture } = batchEffect.right
-                const checkpointSnapshot = checkpointCapture !== null && checkpointCapture._tag === "Right"
-                  ? checkpointCapture.right
-                  : null
-                const checkpointError = checkpointCapture !== null && checkpointCapture._tag === "Left"
-                  ? checkpointCapture.left
-                  : null
-                const batchHandledMs = response.totalHandledMs ?? response.handledMs
-                const latestSnapshotId = checkpointSnapshot?.artifact.snapshotId
-                  ?? record.snapshotState.latest?.snapshotId
-                  ?? null
-
-                if (!response.ok) {
-                  const failureReason = response.error
-                    ?? response.payload
-                    ?? `Runner batch sequence failed with status ${response.statusLabel}.`
-                  const sequenceChildFailure = buildBatchSequenceChildFailure({
-                    step: plannedStep.step,
-                    response,
-                    failureReason,
-                  })
-                  const batchFailure = new EnvironmentError({
-                    code: classifyFastFailureCode(failureReason),
-                    reason: failureReason,
-                    nextStep: withOffscreenNextStep(
-                      "Inspect the latest runner log artifacts, refine the direct selectors, and retry the batch sequence step.",
-                      failureReason,
-                    ),
-                    details: [],
-                  })
-                  const warnings = failureWarnings({
-                    error: batchFailure,
-                    continued: continueOnError,
-                  })
-
-                  if (checkpointError) {
-                    warnings.push(
-                      `Requested end checkpoint failed after the batch error: ${checkpointError.reason}`,
-                      ...("details" in checkpointError && Array.isArray(checkpointError.details) ? checkpointError.details : []),
-                    )
-                  }
-
-                  stepResult = buildFlowStepResult({
-                    plannedStep,
-                    kind: plannedStep.step.kind,
-                    summary: sequenceChildFailure
-                      ? `Sequence child ${sequenceChildFailure.index} (${sequenceChildFailure.kind}) failed in runner batch lane: ${sequenceChildFailure.summary}`
-                      : failureReason,
-                    verdict: failureVerdict(batchFailure),
-                    matchedRef: null,
-                    latestSnapshotId,
-                    retryCount: 0,
-                    retryReasons: [],
-                    handledMs: batchHandledMs,
-                    warnings: dedupeStrings(warnings),
-                    checkpoint,
-                    sequenceChildFailure,
-                  })
-                } else if (checkpointError) {
-                  stepResult = buildFlowStepResult({
-                    plannedStep,
-                    kind: plannedStep.step.kind,
-                    summary: `Batch sequence executed, but the requested end checkpoint failed: ${checkpointError.reason}`,
-                    verdict: failureVerdict(checkpointError),
-                    matchedRef: null,
-                    latestSnapshotId,
-                    retryCount: 0,
-                    retryReasons: [],
-                    handledMs: batchHandledMs,
-                    warnings: failureWarnings({
-                      error: checkpointError,
-                      continued: continueOnError,
-                    }),
-                    checkpoint,
-                    sequenceChildFailure: null,
-                  })
-                } else {
-                  stepResult = buildFlowStepResult({
-                    plannedStep,
-                    kind: plannedStep.step.kind,
-                    summary: checkpoint === "end"
-                      ? `Executed fast sequence step with ${plannedStep.step.actions.length} child action(s) through the runner batch lane; captured ${latestSnapshotId}.`
-                      : `Executed fast sequence step with ${plannedStep.step.actions.length} child action(s) through the runner batch lane without host checkpoints.`,
-                    verdict: "passed",
-                    matchedRef: null,
-                    latestSnapshotId,
-                    retryCount: 0,
-                    retryReasons: [],
-                    handledMs: batchHandledMs,
-                    warnings: successWarnings({
-                      step,
-                      baseWarnings: [],
-                    }),
-                    checkpoint,
-                    sequenceChildFailure: null,
-                  })
-                }
-              }
+              const outcome = yield* executeBatchActionStep({ sessionId, record, step: plannedStep.step, deps })
+              // Read after dispatch, not before: the batch executor may have
+              // captured a fresh snapshot (checkpoint, or none at all), and
+              // `buildBatchStepResult` also falls back to
+              // `record.snapshotState.latest` when there is no checkpoint —
+              // exactly like the original inline branch read it post-dispatch.
+              stepResult = buildBatchStepResult({
+                plannedStep,
+                step: plannedStep.step,
+                continueOnError,
+                outcome,
+                latestSnapshotIdBefore: record.snapshotState.latest?.snapshotId ?? null,
+              })
             } else {
-              const actionEffect = plannedStep.kind === "fast-single"
-                ? yield* Effect.either(executeFastSingleStep(plannedStep.step as FlowV2FastSingleStep))
-                : yield* Effect.either(executeSessionAction({
-                    sessionId,
-                    action: toSessionAction(step),
-                    recordAction: false,
-                  }))
+              const outcome = plannedStep.kind === "fast-single"
+                ? yield* Effect.either(executeDirectRunnerActionStep({ sessionId, record, step: plannedStep.step as FlowV2FastSingleStep, deps }))
+                : yield* Effect.either(executeVerifiedActionStep({ sessionId, step, deps }))
 
-              if (actionEffect._tag === "Left") {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: errorSummary(actionEffect.left),
-                  verdict: failureVerdict(actionEffect.left),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: 0,
-                  retryReasons: [],
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: actionEffect.left,
-                    continued: continueOnError,
-                  }),
-                })
-              } else if (!actionEffect.right.ok) {
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: actionEffect.right.error.reason,
-                  verdict: failureVerdict(actionEffect.right.error),
-                  matchedRef: null,
-                  latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-                  retryCount: actionEffect.right.retry.retryCount,
-                  retryReasons: actionEffect.right.retry.retryReasons,
-                  handledMs: null,
-                  warnings: failureWarnings({
-                    error: actionEffect.right.error,
-                    continued: continueOnError,
-                  }),
-                })
-              } else {
-                const actionResult = actionEffect.right.result
-                stepResult = buildFlowStepResult({
-                  plannedStep,
-                  kind: step.kind,
-                  summary: actionResult.summary,
-                  verdict: actionResult.verdict ?? "passed",
-                  matchedRef: actionResult.matchedRef,
-                  latestSnapshotId: actionResult.latestSnapshotId,
-                  retryCount: actionResult.retryCount,
-                  retryReasons: actionResult.retryReasons,
-                  handledMs: actionResult.handledMs ?? null,
-                  warnings: successWarnings({
-                    step,
-                    baseWarnings: [],
-                    resolvedBy: actionResult.resolvedBy,
-                  }),
-                })
-              }
+              // Read after dispatch, not before: a failed direct-runner
+              // action captures a failure snapshot as part of its own
+              // executor, so `record.snapshotState.latest` can change during
+              // dispatch — the original inline branch read it after too.
+              stepResult = buildActionOutcomeStepResult({
+                plannedStep,
+                step,
+                continueOnError,
+                latestSnapshotIdBefore: record.snapshotState.latest?.snapshotId ?? null,
+                outcome,
+              })
             }
 
             yield* refreshSessionArtifacts(sessionId, record)
 
-            const artifacts = diffArtifacts(beforeArtifacts, record.health.artifacts)
-            stepResult = { ...stepResult, artifacts }
+            const stepArtifacts = diffArtifacts(beforeArtifacts, record.health.artifacts)
+            const folded = foldFlowStepOutcome({
+              executedSteps,
+              createdArtifacts,
+              overallVerdict,
+              totalRetries,
+              failedStep,
+              stepResult,
+              stepArtifacts,
+              continueOnError,
+            })
 
-            executedSteps.push(stepResult)
-            createdArtifacts.push(...artifacts)
-            totalRetries += stepResult.retryCount
+            executedSteps = folded.executedSteps
+            createdArtifacts = folded.createdArtifacts
+            overallVerdict = folded.overallVerdict
+            totalRetries = folded.totalRetries
+            failedStep = folded.failedStep
 
-            if (stepResult.verdict !== "passed") {
-              overallVerdict = mergeVerdict(overallVerdict, stepResult.verdict)
-              failedStep = toFailedStep(stepResult)
-
-              if (!continueOnError) {
-                stoppedEarly = true
-                break
-              }
+            if (folded.stoppedEarly) {
+              stoppedEarly = true
+              break
             }
           }
 
-          const dedupedArtifacts = createdArtifacts.filter((artifact, index, all) =>
-            all.findIndex((candidate) => candidate.key === artifact.key) === index,
-          )
-          const overallWarnings = dedupeStrings(executedSteps.flatMap((step) => step.warnings))
-          const failedStepCount = executedSteps.filter((step) => step.verdict !== "passed").length
-          const summary = failedStep === null
-            ? `Executed ${executedSteps.length} flow step(s) successfully with ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
-            : stoppedEarly
-              ? `Flow ${overallVerdict === "timed-out" ? "timed out" : "failed"} at step ${failedStep.index} after ${executedSteps.length} executed step(s) and ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
-              : `Executed ${executedSteps.length} flow step(s) with ${failedStepCount} failed step(s), continuing past failures where continueOnError was enabled.`
-
-          return {
-            contract: "probe.session-flow/report-v2",
-            executedAt: nowIso(),
+          return assembleFlowResult({
             sessionId,
-            summary,
-            verdict: overallVerdict,
+            executedAt: nowIso(),
             executedSteps,
+            createdArtifacts,
+            overallVerdict,
+            totalRetries,
             failedStep,
-            retries: totalRetries,
-            artifacts: dedupedArtifacts,
+            stoppedEarly,
             finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-            warnings: overallWarnings,
-          } satisfies FlowV2Result
+          })
           })))
         }),
       exportRecording: ({ sessionId, label }) =>
