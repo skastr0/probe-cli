@@ -360,6 +360,37 @@ describe("ensureRealDeviceRunnerBuildCached", () => {
     })
   })
 
+  test("a cached product deleted out from under the cache (e.g. derived-data pruned by hand) is invalidated and rebuilt", async () => {
+    await withTempDir(async (cacheRoot) => {
+      const { deps, buildCallCount } = makeFakeDeps()
+      const key = computeRunnerBuildCacheKey(baseKeyInput)
+
+      const first = await ensureRealDeviceRunnerBuildCached({
+        cacheRoot,
+        keyInput: baseKeyInput,
+        sessionBuildLogPath: join(cacheRoot, "session-1", "build.log"),
+        deps,
+      })
+      expect(buildCallCount()).toBe(1)
+
+      // Simulate an operator (or another tool) deleting the published
+      // target app out from under the cache entry directly on disk.
+      await rm(first.products.targetAppPath, { recursive: true, force: true })
+      expect(await readFile(join(cacheRoot, key.hash, "entry.json"), "utf8")).toBeTruthy()
+
+      const second = await ensureRealDeviceRunnerBuildCached({
+        cacheRoot,
+        keyInput: baseKeyInput,
+        sessionBuildLogPath: join(cacheRoot, "session-2", "build.log"),
+        deps,
+      })
+
+      expect(second.status).toBe("miss")
+      expect(second.invalidationReason).toContain("target app is missing")
+      expect(buildCallCount()).toBe(2)
+    })
+  })
+
   test("different keys (e.g. a different team) get independent cache entries", async () => {
     await withTempDir(async (cacheRoot) => {
       const { deps, buildCallCount } = makeFakeDeps()

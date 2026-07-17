@@ -4514,6 +4514,19 @@ describe("SessionRegistry", () => {
         // PRB-072: matches the fake's production-truth default (see runnerCapabilities.ts);
         // this test is about session-open health, not the batch lane.
         expect(session.runner.capabilities).toEqual(["uiAction"])
+        // PRB-095: RealDeviceHarness's cache summary must survive the trip
+        // into session health untouched -- the fake's fixed cache summary
+        // (see `fakeRunnerBuildCache` in `createFakeRealDeviceHarness`).
+        if (session.runner.kind === "real-device-live") {
+          expect(session.runner.runnerBuildCache).toEqual({
+            status: "hit",
+            key: "fake-cache-key",
+            invalidationReason: null,
+            signingIdentity: "Apple Development: Fake (ABCDE12345)",
+            profileIdentity: "fake-profile-uuid",
+            profileExpiresAt: "2026-12-31T00:00:00.000Z",
+          })
+        }
 
         const realDeviceCapability = session.capabilities.find((capability) => capability.area === "real-device")
         const simulatorCapability = session.capabilities.find((capability) => capability.area === "simulator")
@@ -4524,6 +4537,37 @@ describe("SessionRegistry", () => {
         expect(simulatorCapability?.status).toBe("unsupported")
         expect(runnerCapability?.status).toBe("supported")
         expect(perfCapability?.status).toBe("supported")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("PRB-095: emits a compact runner-cache progress event during device session open", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness(), {
+        realDeviceHarness: createFakeRealDeviceHarness(),
+      })
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const progressCalls: Array<{ readonly stage: string; readonly message: string }> = []
+        const session = await runtime.runPromise(registry.openDeviceSession({
+          ...deviceOpenParams,
+          emitProgress: (stage, message) => {
+            progressCalls.push({ stage, message })
+          },
+        }))
+
+        const cacheEvent = progressCalls.find((call) => call.stage === "runner-cache")
+        expect(cacheEvent).toBeDefined()
+        expect(cacheEvent?.message).toContain("hit")
+        expect(cacheEvent?.message).toContain("fake-cache-key")
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {
