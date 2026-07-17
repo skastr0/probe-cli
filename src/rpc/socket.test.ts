@@ -525,15 +525,19 @@ describe("rpc socket behavior", () => {
     })
   })
 
-  test("daemon shutdown closes an idle accepted socket and completes within a bounded deadline", async () => {
+  test("daemon shutdown closes an idle accepted socket, removes metadata and the socket file, and completes within a bounded deadline", async () => {
     await withTempSocketRoot(async ({ socketPath, metadataPath }) => {
+      let metadataRemoved = false
+
       const fiber = Effect.runFork(
         serveRpc({
           socketPath,
           metadataPath,
           onRequest: () => Effect.die("unexpected request dispatch"),
           onMetadataWrite: async () => undefined,
-          onMetadataRemove: async () => undefined,
+          onMetadataRemove: async () => {
+            metadataRemoved = true
+          },
         }),
       )
 
@@ -567,6 +571,10 @@ describe("rpc socket behavior", () => {
         await sleep(5)
       }
       expect(idleSocketClosed).toBe(true)
+      expect(metadataRemoved).toBe(true)
+
+      const socketFileStillPresent = await access(socketPath).then(() => true, () => false)
+      expect(socketFileStillPresent).toBe(false)
     })
   })
 
