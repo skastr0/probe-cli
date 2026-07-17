@@ -1143,7 +1143,7 @@ describe("cli user input handling", () => {
     expect(captured.current.action.expectation?.interactive).toBe(false)
   })
 
-  test("session run dispatches flow contracts from files", async () => {
+  test("session run rejects the removed v1 flow contract from files with a typed unsupported-contract error", async () => {
     const captured = { current: null as CapturedFlowParams | null }
     const root = await mkdtemp(join(tmpdir(), "probe-flow-"))
     const flowPath = join(root, "flow.json")
@@ -1163,7 +1163,7 @@ describe("cli user input handling", () => {
         "utf8",
       )
 
-      await Effect.runPromise(
+      const result = await Effect.runPromise(
         Effect.either(
           runSessionCommand(["run", "--session-id", "session-1", "--file", flowPath, "--json"]).pipe(
             Effect.provideService(DaemonClient, buildCapturedFlowClient((params) => {
@@ -1173,15 +1173,14 @@ describe("cli user input handling", () => {
         ),
       )
 
-      expect(captured.current).not.toBeNull()
+      expect(captured.current).toBeNull()
+      expect(Either.isLeft(result)).toBe(true)
 
-      if (captured.current === null) {
-        throw new Error("Expected flow params to be captured")
+      if (Either.isRight(result)) {
+        throw new Error("Expected the removed v1 flow contract to fail")
       }
 
-      expect(captured.current.sessionId).toBe("session-1")
-      expect(captured.current.flow.contract).toBe("probe.session-flow/v1")
-      expect(captured.current.flow.steps[0]?.kind).toBe("sleep")
+      expect(result.left._tag).toBe("UserInputError")
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1250,10 +1249,10 @@ describe("cli user input handling", () => {
     }
   })
 
-  test("session run accepts flow contracts from stdin", async () => {
+  test("session run rejects the removed v1 flow contract from stdin with a typed unsupported-contract error", async () => {
     const captured = { current: null as CapturedFlowParams | null }
 
-    await Effect.runPromise(
+    const result = await Effect.runPromise(
       Effect.either(
         runSessionCommand(
           ["run", "--session-id", "session-1", "--stdin", "--json"],
@@ -1277,15 +1276,14 @@ describe("cli user input handling", () => {
       ),
     )
 
-    expect(captured.current).not.toBeNull()
+    expect(captured.current).toBeNull()
+    expect(Either.isLeft(result)).toBe(true)
 
-    if (captured.current === null) {
-      throw new Error("Expected stdin flow params to be captured")
+    if (Either.isRight(result)) {
+      throw new Error("Expected the removed v1 flow contract to fail")
     }
 
-    expect(captured.current.sessionId).toBe("session-1")
-    expect(captured.current.flow.steps[0]?.kind).toBe("sleep")
-    expect(captured.current.flow.steps[0]?.continueOnError).toBe(true)
+    expect(result.left._tag).toBe("UserInputError")
   })
 
   test("session run accepts v2 flow contracts from stdin", async () => {
@@ -1518,7 +1516,7 @@ describe("cli user input handling", () => {
       await writeFile(
         flowPath,
         `${JSON.stringify({
-          contract: "probe.session-flow/v1",
+          contract: "probe.session-flow/v2",
           steps: [
             {
               kind: "sleep",
@@ -1547,7 +1545,7 @@ describe("cli user input handling", () => {
 
       expect(captured.current.sessionId).toBe("session-1")
       expect(captured.current.template).toBe("logging")
-      expect(captured.current.flow.contract).toBe("probe.session-flow/v1")
+      expect(captured.current.flow.contract).toBe("probe.session-flow/v2")
       expect(captured.current.flow.steps[0]?.kind).toBe("sleep")
     } finally {
       await rm(root, { recursive: true, force: true })

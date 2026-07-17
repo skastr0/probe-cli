@@ -1,5 +1,5 @@
 {
-  "contract": "probe.session-flow/v1",
+  "contract": "probe.session-flow/v2",
   "steps": [
     {
       "kind": "snapshot"

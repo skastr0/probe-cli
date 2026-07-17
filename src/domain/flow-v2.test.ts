@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { decodeFlowContract } from "./action"
+import { UnsupportedFlowContractError } from "./errors"
 import {
   decodeFlowV2Contract,
   decodeSessionFlowContract,
@@ -7,21 +7,7 @@ import {
 } from "./flow-v2"
 
 describe("flow v2 contract", () => {
-  test("parses both v1 and v2 flow contracts", () => {
-    const v1 = decodeSessionFlowContract({
-      contract: "probe.session-flow/v1",
-      steps: [
-        { kind: "snapshot" },
-      ],
-    })
-
-    const directV1 = decodeFlowContract({
-      contract: "probe.session-flow/v1",
-      steps: [
-        { kind: "snapshot" },
-      ],
-    })
-
+  test("parses v2 flow contracts", () => {
     const v2 = decodeSessionFlowContract({
       contract: "probe.session-flow/v2",
       execution: "fast",
@@ -42,9 +28,31 @@ describe("flow v2 contract", () => {
       ],
     })
 
-    expect(v1).toEqual(directV1)
-    expect(v1.contract).toBe("probe.session-flow/v1")
     expect(v2.contract).toBe("probe.session-flow/v2")
+  })
+
+  test("rejects the removed v1 contract with a typed unsupported-contract error and a concrete migration step", () => {
+    const decodeV1 = () =>
+      decodeSessionFlowContract({
+        contract: "probe.session-flow/v1",
+        steps: [
+          { kind: "snapshot" },
+        ],
+      })
+
+    expect(decodeV1).toThrow(UnsupportedFlowContractError)
+
+    try {
+      decodeV1()
+      throw new Error("Expected decodeV1 to throw")
+    } catch (error) {
+      if (!(error instanceof UnsupportedFlowContractError)) {
+        throw error
+      }
+
+      expect(error.contract).toBe("probe.session-flow/v1")
+      expect(error.nextStep).toContain("probe.session-flow/v2")
+    }
   })
 
   test("rejects nested sequence children", () => {

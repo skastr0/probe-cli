@@ -1,4 +1,3 @@
-import { spawn, type ChildProcess } from "node:child_process"
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
@@ -10,6 +9,7 @@ import {
   UserInputError,
 } from "../domain/errors"
 import type { SessionConnectionDetails } from "../domain/session"
+import { type AppleProcessHandle, runAppleProcess, spawnAppleProcessHandle } from "./AppleProcessSupervisor"
 import type { RunnerCommandResult } from "./SimulatorHarness"
 import {
   type RunnerCapability,
@@ -24,6 +24,8 @@ import {
   type RunnerReadyFrame,
   type RunnerResponseFrame,
 } from "./runnerProtocol"
+import { resolveAdvertisedCapabilities } from "./runnerCapabilities"
+import { resolveRunnerCommandTimeoutMs, runRunnerTransportSend } from "./RunnerTransportClient"
 import {
   probeRunnerDeviceDerivedRootPath,
   resolveProbeFixtureProjectPath,
@@ -33,10 +35,6 @@ import {
 const runnerScheme = "ProbeRunner"
 const commandPollIntervalMs = 50
 const runnerReadyTimeoutMs = 120_000
-const commandTimeoutMs = 20_000
-const recordVideoTimeoutBufferMs = 30_000
-const maxRecordVideoDurationMs = 120_000
-const defaultRecordVideoDurationMs = 10_000
 const runnerArtifactDownloadTimeoutMs = 15_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
@@ -285,19 +283,6 @@ export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePrefli
 
 export type OpenedRealDeviceSession = OpenedRealDevicePreflightSession | OpenedRealDeviceLiveSession
 
-const resolveCommandTimeoutMs = (action: RunnerAction, payload?: string): number => {
-  if (action !== "recordVideo") {
-    return commandTimeoutMs
-  }
-
-  const parsedDurationMs = Number(payload ?? "")
-  const durationMs = Number.isFinite(parsedDurationMs) && parsedDurationMs > 0
-    ? Math.min(parsedDurationMs, maxRecordVideoDurationMs)
-    : defaultRecordVideoDurationMs
-
-  return Math.max(commandTimeoutMs, durationMs + recordVideoTimeoutBufferMs)
-}
-
 const nowIso = (): string => new Date().toISOString()
 
 const ensureDirectory = async (path: string): Promise<void> => {
@@ -503,56 +488,32 @@ export const detectRealDeviceInterruption = async (args: {
   }
 }
 
-const runCommand = async (args: {
+// Exported for direct process-level test coverage of the AppleProcessSupervisor
+// migration (PRB-085), in addition to its normal RealDeviceHarness service usage.
+export const runRealDeviceHostCommand = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly timeoutMs?: number
-}): Promise<CommandResult> =>
-  await new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
+}): Promise<CommandResult> => {
+  let spawnError: unknown = null
 
-    let stdout = ""
-    let stderr = ""
-    let timedOut = false
-
-    const timeout = args.timeoutMs
-      ? setTimeout(() => {
-          timedOut = true
-          child.kill("SIGTERM")
-          setTimeout(() => {
-            if (child.exitCode === null) {
-              child.kill("SIGKILL")
-            }
-          }, 2_000)
-        }, args.timeoutMs)
-      : null
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", reject)
-    child.once("close", (exitCode) => {
-      if (timeout) {
-        clearTimeout(timeout)
-      }
-
-      if (timedOut) {
-        reject(new Error(`${args.command} timed out after ${args.timeoutMs ?? 0} ms.`))
-        return
-      }
-
-      resolve({ stdout, stderr, exitCode })
-    })
+  const result = await runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    timeoutMs: args.timeoutMs,
+    onSpawnError: (error) => {
+      spawnError = error
+    },
+  }).catch((error) => {
+    throw spawnError ?? error
   })
+
+  if (result.timedOut) {
+    throw new Error(`${args.command} timed out after ${args.timeoutMs ?? 0} ms.`)
+  }
+
+  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
+}
 
 const writeCommandLog = async (path: string, result: CommandResult): Promise<void> => {
   const content = [
@@ -674,7 +635,7 @@ const captureDeviceDiagnosticBundle = async (args: {
     const logOutputPath = join(args.diagnosticsDirectory, `${args.fileStem}.diagnose.log`)
     await removeFileIfExists(absolutePath)
 
-    const result = await runCommand({
+    const result = await runRealDeviceHostCommand({
       command: "/usr/bin/xcrun",
       commandArgs: [
         "devicectl",
@@ -719,7 +680,7 @@ const captureDeviceDiagnosticBundle = async (args: {
 
   await ensureDirectory(destinationDirectory)
 
-  const result = await runCommand({
+  const result = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: [
       "devicectl",
@@ -1170,7 +1131,7 @@ const resolveDeviceTunnelIp = async (args: {
   readonly jsonPath: string
   readonly logPath: string
 }): Promise<string | null> => {
-  const result = await runCommand({
+  const result = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: [
       "devicectl",
@@ -1560,136 +1521,6 @@ const injectBootstrapManifestIntoXctestrun = async (args: {
     },
   })
 
-const processExists = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
-  }
-}
-
-const inspectProcess = async (pid: number): Promise<{
-  readonly exists: boolean
-  readonly processGroupId: number | null
-  readonly command: string | null
-}> => {
-  const result = await runCommand({
-    command: "/bin/ps",
-    commandArgs: ["-o", "pgid=", "-o", "command=", "-p", String(pid)],
-  })
-
-  if (result.exitCode !== 0) {
-    return {
-      exists: false,
-      processGroupId: null,
-      command: null,
-    }
-  }
-
-  const output = result.stdout.trim()
-  const match = output.match(/^(\d+)\s+(.*)$/s)
-
-  if (!match) {
-    return {
-      exists: true,
-      processGroupId: null,
-      command: output.length > 0 ? output : null,
-    }
-  }
-
-  return {
-    exists: true,
-    processGroupId: Number(match[1]),
-    command: match[2]?.trim() || null,
-  }
-}
-
-const isRunnerWrapperCommand = (command: string | null): boolean =>
-  command?.includes("run-transport-boundary-session.py") ?? false
-
-const killRunnerTarget = (pid: number, processGroupId: number | null, signal: NodeJS.Signals): void => {
-  if (processGroupId !== null && processGroupId === pid) {
-    process.kill(-processGroupId, signal)
-    return
-  }
-
-  process.kill(pid, signal)
-}
-
-const waitForProcessExit = async (pid: number, timeoutMs: number): Promise<boolean> => {
-  const deadline = Date.now() + timeoutMs
-
-  while (Date.now() < deadline) {
-    if (!processExists(pid)) {
-      return true
-    }
-
-    await sleep(100)
-  }
-
-  return !processExists(pid)
-}
-
-const terminateRunnerProcess = async (pid: number): Promise<{
-  readonly summary: string
-  readonly details: ReadonlyArray<string>
-}> => {
-  const inspection = await inspectProcess(pid)
-
-  if (!inspection.exists) {
-    return {
-      summary: `No live runner wrapper process was found for pid ${pid}.`,
-      details: [`pid ${pid} was already gone before cleanup started.`],
-    }
-  }
-
-  if (!isRunnerWrapperCommand(inspection.command)) {
-    return {
-      summary: `Skipped pid ${pid} because it no longer looks like a Probe runner wrapper.`,
-      details: [inspection.command ? `unexpected command: ${inspection.command}` : "command line was unavailable during inspection."],
-    }
-  }
-
-  const targetDescription = inspection.processGroupId === pid
-    ? `process group ${inspection.processGroupId}`
-    : `pid ${pid}`
-
-  try {
-    killRunnerTarget(pid, inspection.processGroupId, "SIGTERM")
-  } catch {
-    return {
-      summary: `Failed to signal stale runner wrapper ${targetDescription}.`,
-      details: [inspection.command ?? "command line unavailable"],
-    }
-  }
-
-  if (await waitForProcessExit(pid, 2_000)) {
-    return {
-      summary: `Stopped stale runner wrapper ${targetDescription} with SIGTERM.`,
-      details: [inspection.command ?? "command line unavailable"],
-    }
-  }
-
-  try {
-    killRunnerTarget(pid, inspection.processGroupId, "SIGKILL")
-  } catch {
-    return {
-      summary: `Runner wrapper ${targetDescription} ignored SIGTERM and Probe could not escalate to SIGKILL.`,
-      details: [inspection.command ?? "command line unavailable"],
-    }
-  }
-
-  await waitForProcessExit(pid, 1_000)
-
-  return {
-    summary: processExists(pid)
-      ? `Probe escalated to SIGKILL for stale runner wrapper ${targetDescription}, but the process still appears live.`
-      : `Probe escalated to SIGKILL for stale runner wrapper ${targetDescription}.`,
-    details: [inspection.command ?? "command line unavailable"],
-  }
-}
-
 const waitForFreshJson = async <T>(args: {
   readonly path: string
   readonly timeoutMs: number
@@ -1744,59 +1575,6 @@ const waitForFreshJson = async <T>(args: {
     exitCode: null,
     stderrExcerpt: await readLastLines(args.logPath, 80),
   })
-}
-
-const sendRunnerHttpCommand = async (args: {
-  readonly commandUrls: ReadonlyArray<string>
-  readonly commandFrame: string
-  readonly action: RunnerAction
-  readonly payload?: string
-}): Promise<RunnerResponseFrame> => {
-  const totalTimeoutMs = resolveCommandTimeoutMs(args.action, args.payload)
-  const perEndpointTimeoutMs = Math.max(1_000, Math.ceil(totalTimeoutMs / Math.max(args.commandUrls.length, 1)))
-  const failures: Array<string> = []
-
-  for (const commandUrl of args.commandUrls) {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), perEndpointTimeoutMs)
-
-    try {
-      const response = await fetch(commandUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: args.commandFrame,
-        signal: controller.signal,
-      })
-      const responseText = await response.text()
-
-      if (!response.ok) {
-        failures.push(`${commandUrl} returned ${response.status}: ${responseText.trim() || "<empty-body>"}`)
-        continue
-      }
-
-      try {
-        return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
-      } catch (error) {
-        failures.push(
-          `${commandUrl} returned an invalid response frame: ${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        failures.push(`${commandUrl} timed out after ${perEndpointTimeoutMs} ms`)
-      } else {
-        failures.push(`${commandUrl} failed: ${error instanceof Error ? error.message : String(error)}`)
-      }
-    } finally {
-      clearTimeout(timeout)
-    }
-  }
-
-  throw new Error(
-    `Runner HTTP ${args.action} failed for ${args.commandUrls.join(", ")}: ${failures.join(" | ") || "unknown failure"}`,
-  )
 }
 
 const assertReadyTransportContract = (args: {
@@ -1898,86 +1676,62 @@ const assertReadyTransportContract = (args: {
   }
 }
 
+/**
+ * Spawns a long-lived wrapper process via the supervisor and streams its
+ * stderr straight to `wrapperStderrPath` (the supervisor's artifact stream is
+ * append-only, so no whole-history rewrite on every chunk). Generic over
+ * `command`/`commandArgs` -- the xcodebuild/XCUITest argv is built at the
+ * call site -- so this has direct test coverage against a fake command (see
+ * *.processHelpers.test.ts) without needing a real device/Xcode project.
+ */
 const startWrapperProcess = async (args: {
-  readonly projectRoot: string
-  readonly xctestrunPath: string
-  readonly destination: string
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly cwd: string
   readonly observerControlDirectory: string
   readonly wrapperStderrPath: string
-  readonly logPath: string
-  readonly stdoutEventsPath: string
-  readonly resultBundlePath: string
-  readonly developmentTeam: string
 }): Promise<{
-  readonly process: ChildProcess
-  readonly exit: Promise<{ readonly code: number | null; readonly signal: string | null }>
+  readonly handle: AppleProcessHandle
+  readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>
 }> => {
   await ensureDirectory(args.observerControlDirectory)
   await ensureDirectory(dirname(args.wrapperStderrPath))
-  await writeFile(args.wrapperStderrPath, "", "utf8")
+  // The supervisor's artifact stream opens in append mode -- start from a
+  // clean file so a re-run against the same path does not concatenate onto
+  // stale output.
+  await removeFileIfExists(args.wrapperStderrPath)
 
-  const wrapperScript = resolveProbeRunnerWrapperScriptPath(args.projectRoot)
-
-  const child = spawn(
-    "/usr/bin/python3",
-    [
-      wrapperScript,
-      "--control-dir",
-      args.observerControlDirectory,
-      "--log-path",
-      args.logPath,
-      "--stdout-events-path",
-      args.stdoutEventsPath,
-      "--",
-      "xcodebuild",
-      "-xctestrun",
-      args.xctestrunPath,
-      "-destination",
-      args.destination,
-      "-resultBundlePath",
-      args.resultBundlePath,
-      `DEVELOPMENT_TEAM=${args.developmentTeam}`,
-      "test-without-building",
-      "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
-    ],
-    {
-      cwd: args.projectRoot,
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-    },
-  )
-
-  child.stderr?.setEncoding("utf8")
-  const stderrChunks: Array<string> = []
-  child.stderr?.on("data", (chunk) => {
-    stderrChunks.push(String(chunk))
-    void writeFile(args.wrapperStderrPath, stderrChunks.join(""), "utf8")
+  const handle = await spawnAppleProcessHandle({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    cwd: args.cwd,
+    stderrArtifactPath: args.wrapperStderrPath,
   })
 
-  const exit = new Promise<{ readonly code: number | null; readonly signal: string | null }>((resolve, reject) => {
-    child.once("error", reject)
-    child.once("exit", (code, signal) => resolve({ code, signal }))
-  })
+  const exit = handle.awaitExit.then((result) => ({ code: result.exitCode, signal: result.signal }))
 
-  return {
-    process: child,
-    exit,
-  }
+  return { handle, exit }
 }
 
 const stopWrapperProcess = async (wrapper: {
-  readonly process: ChildProcess
-  readonly exit: Promise<{ readonly code: number | null; readonly signal: string | null }>
+  readonly handle: AppleProcessHandle
+  readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>
 }): Promise<void> => {
-  const pid = wrapper.process.pid
-
-  if (pid === undefined || wrapper.process.exitCode !== null || wrapper.process.killed) {
+  if (!wrapper.handle.isRunning()) {
     return
   }
 
-  await terminateRunnerProcess(pid)
-  await Promise.race([wrapper.exit, sleep(1_000)])
+  // handle.stop() sends SIGTERM, waits a bounded grace period, escalates to
+  // SIGKILL, and joins exit -- the same TERM -> grace -> KILL ladder
+  // terminateRunnerProcess used to hand-roll, now shared with every other
+  // supervisor-owned child instead of duplicated here.
+  await wrapper.handle.stop("SIGTERM")
 }
+
+// Aliased re-export for the same reason as runRealDeviceHostCommand's own
+// direct process-level tests -- coverage of the wrapper-process migration
+// without touching the RealDeviceHarness DI shape.
+export { startWrapperProcess as startRealDeviceRunnerWrapperProcess, stopWrapperProcess as stopRealDeviceRunnerWrapperProcess }
 
 const buildPreflightWarnings = (): ReadonlyArray<string> => [
   "Real-device preflight validates DDI/device/signing prerequisites without claiming a live runner transport.",
@@ -2017,13 +1771,13 @@ const performPreflight = async (args: {
     ensureDirectory(deviceLogsDirectory),
   ])
 
-  const preferredDdiResult = await runCommand({
+  const preferredDdiResult = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: ["devicectl", "list", "preferredDDI", "--json-output", preferredDdiJsonPath],
   })
   await writeCommandLog(preferredDdiLogPath, preferredDdiResult)
 
-  const devicesResult = await runCommand({
+  const devicesResult = await runRealDeviceHostCommand({
     command: "/usr/bin/xcrun",
     commandArgs: ["devicectl", "list", "devices", "--json-output", devicesJsonPath],
   })
@@ -2112,7 +1866,7 @@ const performPreflight = async (args: {
       ],
     })
   } else {
-    const buildResult = await runCommand({
+    const buildResult = await runRealDeviceHostCommand({
       command: "/usr/bin/xcodebuild",
       commandArgs: buildRealDeviceBuildForTestingCommandArgs({
         projectPath,
@@ -2157,7 +1911,7 @@ const performPreflight = async (args: {
   let ddiServicesReady = false
 
   if (selectedDevice && preferredDdiPayload && ddiUsable && ddiCompatible) {
-    const ddiServicesResult = await runCommand({
+    const ddiServicesResult = await runRealDeviceHostCommand({
       command: "/usr/bin/xcrun",
       commandArgs: [
         "devicectl",
@@ -2251,7 +2005,7 @@ const performPreflight = async (args: {
   }
 
   const refreshConnection = async (): Promise<SessionConnectionDetails> => {
-    const refreshedResult = await runCommand({
+    const refreshedResult = await runRealDeviceHostCommand({
       command: "/usr/bin/xcrun",
       commandArgs: ["devicectl", "list", "devices", "--json-output", devicesJsonPath],
     })
@@ -2438,7 +2192,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
                 evidenceSources: overrides?.evidenceSources,
               })
 
-            const installedAppsResult = await runCommand({
+            const installedAppsResult = await runRealDeviceHostCommand({
               command: "/usr/bin/xcrun",
               commandArgs: [
                 "devicectl",
@@ -2497,7 +2251,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               })
             }
 
-            const launchResult = await runCommand({
+            const launchResult = await runRealDeviceHostCommand({
               command: "/usr/bin/xcrun",
               commandArgs: [
                 "devicectl",
@@ -2570,15 +2324,30 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
             const startedAt = Date.now()
             wrapper = await startWrapperProcess({
-              projectRoot: args.projectRoot,
-              xctestrunPath: injectedXctestrunPath,
-              destination,
+              command: "/usr/bin/python3",
+              commandArgs: [
+                resolveProbeRunnerWrapperScriptPath(args.projectRoot),
+                "--control-dir",
+                observerControlDirectory,
+                "--log-path",
+                sessionLogPath,
+                "--stdout-events-path",
+                stdoutEventsPath,
+                "--",
+                "xcodebuild",
+                "-xctestrun",
+                injectedXctestrunPath,
+                "-destination",
+                destination,
+                "-resultBundlePath",
+                resultBundlePath,
+                `DEVELOPMENT_TEAM=${preflight.developmentTeam}`,
+                "test-without-building",
+                "-only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopTransportBoundary",
+              ],
+              cwd: args.projectRoot,
               observerControlDirectory,
               wrapperStderrPath,
-              logPath: sessionLogPath,
-              stdoutEventsPath,
-              resultBundlePath,
-              developmentTeam: preflight.developmentTeam,
             })
             void wrapper.exit.finally(async () => {
               if (bootstrapPath === null) {
@@ -2590,7 +2359,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               await removeFileIfExists(completedBootstrapPath)
             })
 
-            const isWrapperRunning = () => wrapper !== null && wrapper.process.exitCode === null && !wrapper.process.killed
+            const isWrapperRunning = () => wrapper !== null && wrapper.handle.isRunning()
 
             const ready = await (async () => {
               try {
@@ -2655,15 +2424,17 @@ export const RealDeviceHarnessLive = Layer.succeed(
               payload?: string,
             ): Promise<RunnerCommandResult> => {
               const commandStartedAt = Date.now()
-              const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
               const responseFrame = isDeviceSession
-                ? await sendRunnerHttpCommand({
-                    commandUrls: deviceCommandUrls,
-                    commandFrame,
+                ? (await runRunnerTransportSend({
+                    endpoints: deviceCommandUrls,
                     action,
-                    payload,
-                  })
+                    sequence,
+                    payload: payload ?? null,
+                    deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
+                    idempotent: action === "ping",
+                  })).frame
                 : await (async () => {
+                    const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
                     const stdoutResponsePath = join(
                       observerControlDirectory,
                       `stdout-response-${String(sequence).padStart(3, "0")}.json`,
@@ -2673,7 +2444,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
                     return await waitForFreshJson<RunnerResponseFrame>({
                       path: stdoutResponsePath,
-                      timeoutMs: resolveCommandTimeoutMs(action, payload),
+                      timeoutMs: resolveRunnerCommandTimeoutMs(action, payload),
                       minMtimeMs: commandStartedAt,
                       isRunning: isWrapperRunning,
                       decode: decodeRunnerResponseFrame,
@@ -2781,7 +2552,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               sessionIdentifier: ready.sessionIdentifier,
               commandIngress: ready.ingressTransport,
               eventEgress: ready.egressTransport,
-              wrapperProcessId: wrapper.process.pid ?? -1,
+              wrapperProcessId: wrapper.handle.pid,
               testProcessId: ready.processIdentifier,
               targetProcessId,
               attachLatencyMs: ready.attachLatencyMs,
@@ -2796,7 +2567,9 @@ export const RealDeviceHarnessLive = Layer.succeed(
               launchJsonPath,
               nextSequence: 2,
               initialPingRttMs: initialPing.hostRttMs,
-              capabilities: ready.capabilities ?? ["uiAction"],
+              // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
+              // that does not advertise a capability is treated as not having it.
+              capabilities: resolveAdvertisedCapabilities(ready),
               sendCommand,
               isWrapperRunning,
               waitForExit: wrapper.exit,

@@ -489,6 +489,10 @@ probe session run --session-id <id> --stdin
 
 ### Contract shape
 
+Historical example, predates the v2-only consolidation (PRB-082). The
+canonical implemented contract is `probe.session-flow/v2`; the shape below
+is otherwise unchanged.
+
 ```json
 {
   "contract": "probe.session-flow/v1",

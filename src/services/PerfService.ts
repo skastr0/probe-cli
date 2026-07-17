@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process"
 import { constants, createWriteStream, statSync } from "node:fs"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
-import { Transform } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { Context, Effect, Fiber, Layer } from "effect"
+import { runAppleProcess, spawnAppleProcessHandle, type AppleProcessHandle } from "./AppleProcessSupervisor"
+import { type ExportBudget, ExportBudgetExceededError, ExportBudgetTransform, formatBytes } from "./ArtifactExportPolicy"
 import {
   PerfAroundFlowResult,
   PerfRecordResult,
@@ -50,20 +50,6 @@ const recordingStartupTimeoutMs = 30_000
 const mib = 1024 * 1024
 const maxExportFileSizeBytes = 8 * mib
 const customTemplateExtension = ".tracetemplate"
-const rowTag = "<row>"
-const rowTagTailLength = rowTag.length - 1
-
-const formatBytes = (value: number): string => {
-  if (value >= mib) {
-    return `${(value / mib).toFixed(1)} MiB`
-  }
-
-  if (value >= 1024) {
-    return `${(value / 1024).toFixed(1)} KiB`
-  }
-
-  return `${value} B`
-}
 
 const formatTimeLimitMs = (value: number): string => {
   if (value % 60_000 === 0) {
@@ -77,27 +63,10 @@ const formatTimeLimitMs = (value: number): string => {
   return `${value}ms`
 }
 
-const countOccurrences = (source: string, token: string): number => {
-  let count = 0
-  let index = source.indexOf(token)
-
-  while (index !== -1) {
-    count += 1
-    index = source.indexOf(token, index + token.length)
-  }
-
-  return count
-}
-
 interface CommandResult {
   readonly stdout: string
   readonly stderr: string
   readonly exitCode: number | null
-}
-
-interface ExportBudget {
-  readonly maxBytes: number
-  readonly maxRows: number
 }
 
 interface TemplateExportSpec {
@@ -129,74 +98,10 @@ interface BackgroundRecordingHandle {
   readonly stop: () => Promise<BackgroundRecordingStopResult>
 }
 
-export class ExportBudgetExceededError extends Error {
-  readonly kind: "bytes" | "rows"
-  readonly limit: number
-  readonly observed: number
-
-  constructor(args: {
-    readonly kind: "bytes" | "rows"
-    readonly limit: number
-    readonly observed: number
-  }) {
-    super(
-      args.kind === "bytes"
-        ? `Export exceeded ${formatBytes(args.limit)}.`
-        : `Export exceeded ${args.limit} rows.`,
-    )
-    this.name = "ExportBudgetExceededError"
-    this.kind = args.kind
-    this.limit = args.limit
-    this.observed = args.observed
-  }
-}
-
-class ExportBudgetTransform extends Transform {
-  bytesWritten = 0
-  rowCount = 0
-  private trailingText = ""
-
-  constructor(private readonly budget: ExportBudget) {
-    super()
-  }
-
-  override _transform(
-    chunk: Buffer | string,
-    _encoding: BufferEncoding,
-    callback: (error?: Error | null, data?: Buffer | string) => void,
-  ): void {
-    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
-    this.bytesWritten += Buffer.byteLength(text, "utf8")
-
-    if (this.bytesWritten > this.budget.maxBytes) {
-      callback(
-        new ExportBudgetExceededError({
-          kind: "bytes",
-          limit: this.budget.maxBytes,
-          observed: this.bytesWritten,
-        }),
-      )
-      return
-    }
-
-    const combined = `${this.trailingText}${text}`
-    this.rowCount += countOccurrences(combined, rowTag)
-    this.trailingText = combined.slice(-rowTagTailLength)
-
-    if (this.rowCount > this.budget.maxRows) {
-      callback(
-        new ExportBudgetExceededError({
-          kind: "rows",
-          limit: this.budget.maxRows,
-          observed: this.rowCount,
-        }),
-      )
-      return
-    }
-
-    callback(null, chunk)
-  }
-}
+// Re-exported for backward compatibility: this error's policy now lives in
+// ArtifactExportPolicy (PRB-085 gate 12), but existing callers/tests still
+// import it from PerfService.
+export { ExportBudgetExceededError }
 
 type TemplateSlug = PerfTemplate | "custom"
 
@@ -474,226 +379,182 @@ const parseAvailableSchemaNames = (tocXml: string): ReadonlySet<string> =>
       .filter((schema) => schema.length > 0),
   )
 
-const runCommand = (args: {
+// Process spawning, registration, continuous stdio draining, and TERM -> grace
+// -> KILL escalation all live in AppleProcessSupervisor now. These helpers keep
+// only PerfService's own policy: how each command's success/failure/timeout is
+// worded, and (for runCommandToFile) how the xctrace export-budget guard is
+// wired into the stdout pipeline.
+
+const remapSpawnFailure = (args: {
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly error: ChildProcessError
+}): ChildProcessError =>
+  new ChildProcessError({
+    code: "command-spawn-failed",
+    command: `${args.command} ${args.commandArgs.join(" ")}`,
+    reason: args.error.reason,
+    nextStep: "Verify the local toolchain installation and retry the command.",
+    exitCode: null,
+    stderrExcerpt: args.error.stderrExcerpt,
+  })
+
+const rethrowSupervisorError = (args: {
+  readonly command: string
+  readonly commandArgs: ReadonlyArray<string>
+  readonly error: unknown
+}): never => {
+  if (args.error instanceof ChildProcessError && args.error.code === "command-spawn-failed") {
+    throw remapSpawnFailure({ ...args, error: args.error })
+  }
+  throw args.error
+}
+
+// Exported (in addition to being wired into `liveCommandRunner` below) so their
+// real AppleProcessSupervisor-backed behavior -- not just the PerfCommandRunner
+// mock seam most of this file's tests use -- has direct test coverage.
+export const runCommand = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly timeoutMs: number
   readonly gracePeriodMs?: number
   readonly allowFailure?: boolean
+  /** Aborting kills the process group (TERM -> grace -> KILL) and rejects with a `command-cancelled` ChildProcessError. */
+  readonly signal?: AbortSignal
 }): Promise<CommandResult> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
+  runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    timeoutMs: args.timeoutMs,
+    gracePeriodMs: args.gracePeriodMs,
+    signal: args.signal,
+  }).then((result) => {
+    if (result.cancelled) {
+      throw new ChildProcessError({
+        code: "command-cancelled",
+        command: `${args.command} ${args.commandArgs.join(" ")}`,
+        reason: `${args.command} was cancelled before it completed.`,
+        nextStep: "Retry the request if the cancellation was unintended.",
+        exitCode: result.exitCode,
+        stderrExcerpt: result.stderr.trim() || result.stdout.trim(),
+      })
+    }
+
+    if (result.timedOut) {
+      throw new ChildProcessError({
+        code: "command-timeout",
+        command: `${args.command} ${args.commandArgs.join(" ")}`,
+        reason: `${args.command} exceeded the ${args.timeoutMs} ms timeout window.`,
+        nextStep: "Reduce the trace duration or inspect host load, then retry.",
+        exitCode: result.exitCode,
+        stderrExcerpt: result.stderr.trim() || result.stdout.trim(),
+      })
+    }
+
+    const commandResult = { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode } satisfies CommandResult
+
+    if (result.exitCode === 0 || args.allowFailure) {
+      return commandResult
+    }
+
+    throw new ChildProcessError({
+      code: "command-failed",
+      command: `${args.command} ${args.commandArgs.join(" ")}`,
+      reason: `${args.command} exited with code ${result.exitCode ?? "unknown"}.`,
+      nextStep: "Inspect stderr and the generated trace artifacts, then retry the request.",
+      exitCode: result.exitCode,
+      stderrExcerpt: result.stderr.trim() || result.stdout.trim(),
     })
-
-    let stdout = ""
-    let stderr = ""
-    let timedOut = false
-
-    const timeout = setTimeout(() => {
-      timedOut = true
-      stopChildProcess(child, args.gracePeriodMs)
-    }, args.timeoutMs)
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", (error) => {
-      clearTimeout(timeout)
-      reject(
-        new ChildProcessError({
-          code: "command-spawn-failed",
-          command: `${args.command} ${args.commandArgs.join(" ")}`,
-          reason: error instanceof Error ? error.message : String(error),
-          nextStep: "Verify the local toolchain installation and retry the command.",
-          exitCode: null,
-          stderrExcerpt: stderr.trim(),
-        }),
-      )
-    })
-
-    child.once("close", (code) => {
-      clearTimeout(timeout)
-
-      if (timedOut) {
-        reject(
-          new ChildProcessError({
-            code: "command-timeout",
-            command: `${args.command} ${args.commandArgs.join(" ")}`,
-            reason: `${args.command} exceeded the ${args.timeoutMs} ms timeout window.`,
-            nextStep: "Reduce the trace duration or inspect host load, then retry.",
-            exitCode: code,
-            stderrExcerpt: stderr.trim() || stdout.trim(),
-          }),
-        )
-        return
-      }
-
-      const result = {
-        stdout,
-        stderr,
-        exitCode: code,
-      } satisfies CommandResult
-
-      if (code === 0 || args.allowFailure) {
-        resolve(result)
-        return
-      }
-
-      reject(
-        new ChildProcessError({
-          code: "command-failed",
-          command: `${args.command} ${args.commandArgs.join(" ")}`,
-          reason: `${args.command} exited with code ${code ?? "unknown"}.`,
-          nextStep: "Inspect stderr and the generated trace artifacts, then retry the request.",
-          exitCode: code,
-          stderrExcerpt: stderr.trim() || stdout.trim(),
-        }),
-      )
-    })
-  })
+  }, (error) => rethrowSupervisorError({ command: args.command, commandArgs: args.commandArgs, error }))
 
 const cleanupOutputFile = async (path: string): Promise<void> => {
   await rm(path, { force: true }).catch(() => undefined)
 }
 
-const stopChildProcess = (
-  child: ReturnType<typeof spawn>,
-  gracePeriodMs = 2_000,
-) => {
-  child.kill("SIGTERM")
-  setTimeout(() => {
-    if (child.exitCode === null) {
-      child.kill("SIGKILL")
-    }
-  }, gracePeriodMs)
-}
-
-const runCommandToFile = (args: {
+export const runCommandToFile = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly timeoutMs: number
   readonly gracePeriodMs?: number
   readonly outputPath: string
   readonly budget: ExportBudget
-}): Promise<StreamedCommandResult> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    })
+  /** Aborting kills the process group (TERM -> grace -> KILL), removes the partial output file, and rejects with a `command-cancelled` ChildProcessError. */
+  readonly signal?: AbortSignal
+}): Promise<StreamedCommandResult> => {
+  const outputGuard = new ExportBudgetTransform(args.budget)
 
-    const outputGuard = new ExportBudgetTransform(args.budget)
-    const outputStream = createWriteStream(args.outputPath, { encoding: "utf8" })
-    let stderr = ""
-    let timedOut = false
-    let pipelineError: unknown = null
+  return runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    timeoutMs: args.timeoutMs,
+    gracePeriodMs: args.gracePeriodMs,
+    stdoutArtifactPath: args.outputPath,
+    stdoutTransform: outputGuard,
+    signal: args.signal,
+  }).then(
+    async (result) => {
+      if (outputGuard.exceededError) {
+        await cleanupOutputFile(args.outputPath)
+        throw outputGuard.exceededError
+      }
 
-    const timeout = setTimeout(() => {
-      timedOut = true
-      stopChildProcess(child, args.gracePeriodMs)
-    }, args.timeoutMs)
-
-    child.stderr?.setEncoding("utf8")
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    const outputPromise = pipeline(child.stdout!, outputGuard, outputStream).catch((error) => {
-      pipelineError = error
-      stopChildProcess(child, args.gracePeriodMs)
-    })
-
-    child.once("error", (error) => {
-      clearTimeout(timeout)
-
-      void outputPromise.finally(() => {
-        void cleanupOutputFile(args.outputPath).finally(() => {
-          reject(
-            new ChildProcessError({
-              code: "command-spawn-failed",
-              command: `${args.command} ${args.commandArgs.join(" ")}`,
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Verify the local toolchain installation and retry the command.",
-              exitCode: null,
-              stderrExcerpt: stderr.trim(),
-            }),
-          )
+      if (result.cancelled) {
+        await cleanupOutputFile(args.outputPath)
+        throw new ChildProcessError({
+          code: "command-cancelled",
+          command: `${args.command} ${args.commandArgs.join(" ")}`,
+          reason: `${args.command} was cancelled before it completed.`,
+          nextStep: "Retry the request if the cancellation was unintended.",
+          exitCode: result.exitCode,
+          stderrExcerpt: result.stderr.trim(),
         })
-      })
-    })
+      }
 
-    child.once("close", (code) => {
-      clearTimeout(timeout)
-
-      void outputPromise.finally(() => {
-        if (timedOut) {
-          void cleanupOutputFile(args.outputPath).finally(() => {
-            reject(
-              new ChildProcessError({
-                code: "command-timeout",
-                command: `${args.command} ${args.commandArgs.join(" ")}`,
-                reason: `${args.command} exceeded the ${args.timeoutMs} ms timeout window.`,
-                nextStep: "Reduce the trace duration or inspect host load, then retry.",
-                exitCode: code,
-                stderrExcerpt: stderr.trim(),
-              }),
-            )
-          })
-          return
-        }
-
-        if (pipelineError instanceof ExportBudgetExceededError) {
-          void cleanupOutputFile(args.outputPath).finally(() => {
-            reject(pipelineError)
-          })
-          return
-        }
-
-        if (pipelineError) {
-          void cleanupOutputFile(args.outputPath).finally(() => {
-            reject(pipelineError)
-          })
-          return
-        }
-
-        const result = {
-          stdout: "",
-          stderr,
-          exitCode: code,
-          bytesWritten: outputGuard.bytesWritten,
-          rowCount: outputGuard.rowCount,
-        } satisfies StreamedCommandResult
-
-        if (code === 0) {
-          resolve(result)
-          return
-        }
-
-        void cleanupOutputFile(args.outputPath).finally(() => {
-          reject(
-            new ChildProcessError({
-              code: "command-failed",
-              command: `${args.command} ${args.commandArgs.join(" ")}`,
-              reason: `${args.command} exited with code ${code ?? "unknown"}.`,
-              nextStep: "Inspect stderr and the generated trace artifacts, then retry the request.",
-              exitCode: code,
-              stderrExcerpt: stderr.trim(),
-            }),
-          )
+      if (result.timedOut) {
+        await cleanupOutputFile(args.outputPath)
+        throw new ChildProcessError({
+          code: "command-timeout",
+          command: `${args.command} ${args.commandArgs.join(" ")}`,
+          reason: `${args.command} exceeded the ${args.timeoutMs} ms timeout window.`,
+          nextStep: "Reduce the trace duration or inspect host load, then retry.",
+          exitCode: result.exitCode,
+          stderrExcerpt: result.stderr.trim(),
         })
-      })
-    })
-  })
+      }
 
-const liveStartRecording = async (args: {
+      const streamedResult = {
+        stdout: "",
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        bytesWritten: outputGuard.bytesWritten,
+        rowCount: outputGuard.rowCount,
+      } satisfies StreamedCommandResult
+
+      if (result.exitCode === 0) {
+        return streamedResult
+      }
+
+      await cleanupOutputFile(args.outputPath)
+      throw new ChildProcessError({
+        code: "command-failed",
+        command: `${args.command} ${args.commandArgs.join(" ")}`,
+        reason: `${args.command} exited with code ${result.exitCode ?? "unknown"}.`,
+        nextStep: "Inspect stderr and the generated trace artifacts, then retry the request.",
+        exitCode: result.exitCode,
+        stderrExcerpt: result.stderr.trim(),
+      })
+    },
+    async (error) => {
+      await cleanupOutputFile(args.outputPath)
+      if (outputGuard.exceededError) {
+        throw outputGuard.exceededError
+      }
+      return rethrowSupervisorError({ command: args.command, commandArgs: args.commandArgs, error })
+    },
+  )
+}
+
+export const liveStartRecording = async (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly startupNotificationKey: string
@@ -708,68 +569,19 @@ const liveStartRecording = async (args: {
     gracePeriodMs: 1_000,
   })
 
-  const child = spawn(args.command, [...args.commandArgs], {
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
+  const handle: AppleProcessHandle = await spawnAppleProcessHandle({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    timeoutMs: args.timeoutMs,
+    gracePeriodMs: args.gracePeriodMs,
+  }).catch((error) => {
+    return rethrowSupervisorError({ command: args.command, commandArgs: args.commandArgs, error })
   })
 
-  let stdout = ""
-  let stderr = ""
-  let timedOut = false
-
-  const timeout = setTimeout(() => {
-    timedOut = true
-    stopChildProcess(child, args.gracePeriodMs)
-  }, args.timeoutMs)
-
-  child.stdout?.setEncoding("utf8")
-  child.stderr?.setEncoding("utf8")
-  child.stdout?.on("data", (chunk) => {
-    stdout += chunk
-  })
-  child.stderr?.on("data", (chunk) => {
-    stderr += chunk
-  })
-
-  const exitPromise = new Promise<CommandResult>((resolve, reject) => {
-    child.once("error", (error) => {
-      clearTimeout(timeout)
-      reject(
-        new ChildProcessError({
-          code: "command-spawn-failed",
-          command: `${args.command} ${args.commandArgs.join(" ")}`,
-          reason: error instanceof Error ? error.message : String(error),
-          nextStep: "Verify the local toolchain installation and retry the command.",
-          exitCode: null,
-          stderrExcerpt: stderr.trim(),
-        }),
-      )
-    })
-
-    child.once("close", (code) => {
-      clearTimeout(timeout)
-
-      if (timedOut) {
-        reject(
-          new ChildProcessError({
-            code: "command-timeout",
-            command: `${args.command} ${args.commandArgs.join(" ")}`,
-            reason: `${args.command} exceeded the ${args.timeoutMs} ms timeout window.`,
-            nextStep: "Reduce the trace duration or inspect host load, then retry.",
-            exitCode: code,
-            stderrExcerpt: stderr.trim() || stdout.trim(),
-          }),
-        )
-        return
-      }
-
-      resolve({
-        stdout,
-        stderr,
-        exitCode: code,
-      })
-    })
-  })
+  const exitPromise = handle.awaitExit.then(
+    (result): CommandResult => ({ stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }),
+    (error) => rethrowSupervisorError({ command: args.command, commandArgs: args.commandArgs, error }),
+  )
 
   await new Promise<void>((resolve, reject) => {
     let settled = false
@@ -807,7 +619,7 @@ const liveStartRecording = async (args: {
       }
     })
   }).catch(async (error) => {
-    stopChildProcess(child, args.gracePeriodMs)
+    await handle.stop("SIGTERM")
 
     try {
       await exitPromise
@@ -820,15 +632,12 @@ const liveStartRecording = async (args: {
 
   return {
     stop: async () => {
-      const wasRunning = child.exitCode === null
-
-      if (wasRunning) {
-        child.kill("SIGINT")
-      }
-
-      const result = await exitPromise
+      const wasRunning = handle.isRunning()
+      const result = wasRunning ? await handle.stop("SIGINT") : await exitPromise.then((r) => ({ ...r, signal: null }))
       return {
-        ...result,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
         wasRunning,
       }
     },
@@ -987,6 +796,12 @@ interface PerfCommandRunner {
     readonly timeoutMs: number
     readonly gracePeriodMs?: number
     readonly allowFailure?: boolean
+    // Required (not optional) so every call site is forced to thread the
+    // Effect.tryPromise-provided AbortSignal through -- a client disconnect
+    // (gate 10) interrupts the RPC request fiber, which aborts this signal,
+    // which kills the owned process group. Omitting it at a call site is a
+    // compile error, not a silent gap.
+    readonly signal: AbortSignal
   }) => Promise<CommandResult>
   readonly exportToFile: (args: {
     readonly command: string
@@ -995,6 +810,7 @@ interface PerfCommandRunner {
     readonly gracePeriodMs?: number
     readonly outputPath: string
     readonly budget: ExportBudget
+    readonly signal: AbortSignal
   }) => Promise<StreamedCommandResult>
   readonly startRecording?: (args: {
     readonly command: string
@@ -1088,11 +904,12 @@ export const createPerfService = (dependencies: {
       emitProgress(progressStage, `Checking xctrace template availability for ${spec.displayName}.`)
 
       const templateList = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "list", "templates"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1119,11 +936,12 @@ export const createPerfService = (dependencies: {
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1189,11 +1007,12 @@ export const createPerfService = (dependencies: {
       emitProgress("perf.export", `Exporting TOC for ${basename(tracePath)}.`)
 
       const tocResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "export", "--input", tracePath, "--toc"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1359,11 +1178,12 @@ export const createPerfService = (dependencies: {
         emitProgress("perf.record", `Checking xctrace template availability for ${spec.displayName}.`)
 
         const templateList = yield* Effect.tryPromise({
-          try: () =>
+          try: (signal) =>
             commandRunner.capture({
               command: "xcrun",
               commandArgs: ["xctrace", "list", "templates"],
               timeoutMs: defaultCommandOverheadMs,
+              signal,
             }),
           catch: (error) =>
             error instanceof ChildProcessError
@@ -1391,11 +1211,12 @@ export const createPerfService = (dependencies: {
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1443,7 +1264,7 @@ export const createPerfService = (dependencies: {
       )
 
       yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: [
@@ -1465,6 +1286,7 @@ export const createPerfService = (dependencies: {
             ],
             timeoutMs: timeLimitMs + recordingOverheadMs,
             gracePeriodMs: recordingGracePeriodMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1566,7 +1388,7 @@ export const createPerfService = (dependencies: {
         )
 
         const exportAttempt: ExportAttempt = yield* Effect.tryPromise({
-          try: async () => {
+          try: async (signal) => {
             try {
               const result = await commandRunner.exportToFile({
                 command: "xcrun",
@@ -1581,6 +1403,7 @@ export const createPerfService = (dependencies: {
                 timeoutMs: defaultCommandOverheadMs,
                 outputPath: exportPath,
                 budget,
+                signal,
               })
 
               return {
@@ -1946,11 +1769,12 @@ export const createPerfService = (dependencies: {
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -2017,7 +1841,7 @@ export const createPerfService = (dependencies: {
       )
 
       const exportResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.exportToFile({
             command: "xcrun",
             commandArgs: [
@@ -2031,6 +1855,7 @@ export const createPerfService = (dependencies: {
             timeoutMs: defaultCommandOverheadMs,
             outputPath: exportPath,
             budget,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError

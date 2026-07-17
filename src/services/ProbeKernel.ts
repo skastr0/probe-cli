@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process"
 import { mkdtemp, readFile, readdir, rm, unlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
@@ -19,6 +18,7 @@ import { perfTemplateChoiceText } from "../domain/perf"
 import type { ArtifactRecord, DrillQuery, SessionLogMarker } from "../domain/output"
 import { appendSessionLogMarkers, isTextArtifactKind, summarizeContent } from "../domain/output"
 import type { WorkspaceStatus } from "../domain/workspace"
+import { disposeAppleProcessSupervisorRuntime, runAppleProcess } from "./AppleProcessSupervisor"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
@@ -268,29 +268,25 @@ const workspaceKnownWalls: ReadonlyArray<KnownWall> = [
   },
 ]
 
-const runHostCommand = (command: string, commandArgs: ReadonlyArray<string>): Promise<HostCommandResult> =>
+// Exported for direct process-level test coverage of the AppleProcessSupervisor
+// migration (PRB-085), in addition to its normal ProbeKernel service usage.
+export const runProbeKernelHostCommand = (command: string, commandArgs: ReadonlyArray<string>): Promise<HostCommandResult> =>
   new Promise((resolve, reject) => {
-    const child = spawn(command, [...commandArgs], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
+    let spawnError: unknown = null
 
-    let stdout = ""
-    let stderr = ""
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", reject)
-    child.once("close", (exitCode) => {
-      resolve({ stdout, stderr, exitCode })
-    })
+    runAppleProcess({
+      command,
+      commandArgs,
+      // Preserve the original behavior of rejecting with the raw spawn error
+      // (not a ChildProcessError) so callers that inspect Node's error.code
+      // (e.g. detecting a missing ffmpeg via ENOENT) keep working unchanged.
+      onSpawnError: (error) => {
+        spawnError = error
+      },
+    }).then(
+      (result) => resolve({ stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }),
+      (error) => reject(spawnError ?? error),
+    )
   })
 
 const resolveFfmpegExecutable = (): string => process.env.PROBE_FFMPEG_PATH ?? "ffmpeg"
@@ -336,41 +332,35 @@ const parseJsonPointer = (content: unknown, pointer: string): unknown => {
   return current
 }
 
-const runXmllint = (absolutePath: string, xpath: string): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/xmllint", ["--xpath", xpath, absolutePath], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    })
-
-    let stdout = ""
-    let stderr = ""
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-    child.once("error", reject)
-    child.once("close", (code) => {
-      if (code === 0) {
-        resolve(stdout)
-        return
+export const runXmllint = (absolutePath: string, xpath: string): Promise<string> =>
+  runAppleProcess({
+    command: "/usr/bin/xmllint",
+    commandArgs: ["--xpath", xpath, absolutePath],
+  }).then(
+    (result) => {
+      if (result.exitCode === 0) {
+        return result.stdout
       }
 
-      reject(
-        new EnvironmentError({
+      throw new EnvironmentError({
+        code: "xmllint-failed",
+        reason: result.stderr.trim() || `xmllint exited with code ${result.exitCode ?? "unknown"}.`,
+        nextStep: "Verify the XPath expression and ensure xmllint is available on this host.",
+        details: [],
+      })
+    },
+    (error) => {
+      if (error instanceof ChildProcessError) {
+        throw new EnvironmentError({
           code: "xmllint-failed",
-          reason: stderr.trim() || `xmllint exited with code ${code ?? "unknown"}.`,
+          reason: error.reason,
           nextStep: "Verify the XPath expression and ensure xmllint is available on this host.",
           details: [],
-        }),
-      )
-    })
-  })
+        })
+      }
+      throw error
+    },
+  )
 
 export class ProbeKernel extends Context.Tag("@probe/ProbeKernel")<
   ProbeKernel,
@@ -660,8 +650,8 @@ export const ProbeKernelLive = Layer.effect(
 
     const collectXcodeDiagnostic = Effect.tryPromise({
       try: async (): Promise<DiagnosticReport> => {
-        const selected = await runHostCommand("/usr/bin/xcode-select", ["-p"])
-        const version = await runHostCommand("/usr/bin/xcodebuild", ["-version"])
+        const selected = await runProbeKernelHostCommand("/usr/bin/xcode-select", ["-p"])
+        const version = await runProbeKernelHostCommand("/usr/bin/xcodebuild", ["-version"])
 
         if (selected.exitCode !== 0 || version.exitCode !== 0) {
           return {
@@ -702,7 +692,7 @@ export const ProbeKernelLive = Layer.effect(
 
     const collectSimulatorDiagnostic = Effect.tryPromise({
       try: async (): Promise<DiagnosticReport> => {
-        const result = await runHostCommand("/usr/bin/xcrun", ["simctl", "list", "devices", "available", "-j"])
+        const result = await runProbeKernelHostCommand("/usr/bin/xcrun", ["simctl", "list", "devices", "available", "-j"])
 
         if (result.exitCode !== 0) {
           return {
@@ -764,8 +754,8 @@ export const ProbeKernelLive = Layer.effect(
         const devicesPath = `${root}/devices.json`
 
         try {
-          const ddi = await runHostCommand("/usr/bin/xcrun", ["devicectl", "list", "preferredDDI", "--json-output", preferredDdiPath])
-          const devices = await runHostCommand("/usr/bin/xcrun", ["devicectl", "list", "devices", "--json-output", devicesPath])
+          const ddi = await runProbeKernelHostCommand("/usr/bin/xcrun", ["devicectl", "list", "preferredDDI", "--json-output", preferredDdiPath])
+          const devices = await runProbeKernelHostCommand("/usr/bin/xcrun", ["devicectl", "list", "devices", "--json-output", devicesPath])
 
           if (ddi.exitCode !== 0 || devices.exitCode !== 0) {
             return {
@@ -837,7 +827,7 @@ export const ProbeKernelLive = Layer.effect(
         const ffmpegExecutable = resolveFfmpegExecutable()
 
         try {
-          const result = await runHostCommand(ffmpegExecutable, ["-version"])
+          const result = await runProbeKernelHostCommand(ffmpegExecutable, ["-version"])
 
           if (result.exitCode !== 0) {
             return {
@@ -1350,7 +1340,7 @@ export const ProbeKernelLive = Layer.effect(
                 inspectXcresultSummary({
                   bundlePath,
                   sessionArtifacts,
-                  runCommand: runHostCommand,
+                  runCommand: runProbeKernelHostCommand,
                 }),
             })
 
@@ -1371,7 +1361,7 @@ export const ProbeKernelLive = Layer.effect(
               inspect: (bundlePath) =>
                 inspectXcresultAttachments({
                   bundlePath,
-                  runCommand: runHostCommand,
+                  runCommand: runProbeKernelHostCommand,
                 }),
             })
 
@@ -1525,7 +1515,7 @@ export const ProbeKernelLive = Layer.effect(
                   bundlePath: artifact.absolutePath,
                   query: xcresultQuery,
                   sessionArtifacts,
-                  runCommand: runHostCommand,
+                  runCommand: runProbeKernelHostCommand,
                 }),
                 catch: (error) =>
                   error instanceof UserInputError || error instanceof EnvironmentError || error instanceof ChildProcessError
@@ -1797,6 +1787,15 @@ export const ProbeKernelLive = Layer.effect(
             },
             onMetadataRemove: async () => {
               await Effect.runPromise(artifactStore.removeDaemonMetadata())
+              // Runs on both a clean serve() return and SIGINT/SIGTERM
+              // (server.ts's release callback calls onMetadataRemove before
+              // closing the socket). This is the one place in the daemon
+              // lifecycle that reliably closes the AppleProcessSupervisor
+              // module-level runtime's scope, so its defensive
+              // kill-any-straggler finalizer actually runs in production
+              // instead of only in tests that build+close a layer scope
+              // directly.
+              await disposeAppleProcessSupervisorRuntime()
             },
             onRequest: handleRpcRequest,
           })

@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { Effect, Either, Layer, ManagedRuntime } from "effect"
-import type { ActionRecordingScript, FlowContract, ReplayReport } from "../domain/action"
+import type { ActionRecordingScript, ReplayReport } from "../domain/action"
 import type { SessionDebuggerDetails } from "../domain/debug"
 import type { FlowV2Contract } from "../domain/flow-v2"
 import {
@@ -18,6 +18,7 @@ import { PROBE_PROTOCOL_VERSION } from "../rpc/protocol"
 import { ArtifactStore } from "./ArtifactStore"
 import { OutputPolicy } from "./OutputPolicy"
 import { RealDeviceHarness } from "./RealDeviceHarness"
+import { RunnerTransportError } from "./RunnerTransportClient"
 import type { RunnerAction } from "./runnerProtocol"
 import { buildSessionCoordination, SessionRegistry, SessionRegistryLive } from "./SessionRegistry"
 import { SimulatorHarness } from "./SimulatorHarness"
@@ -487,6 +488,16 @@ const createFakeHarness = (options?: {
   readonly runnerCapabilities?: ReadonlyArray<"uiAction" | "uiActionBatch">
   readonly captureSessionControl?: (control: FakeHarnessSessionControl) => void
   readonly captureRunnerCommand?: (command: FakeHarnessRunnerCommand) => void
+  /**
+   * Consumed in order, once per "ping" action; not specified (or exhausted)
+   * defaults to a normal successful pong, matching every pre-PRB-083 test's
+   * expectations unchanged. "timeout" throws an ambiguous
+   * RunnerTransportError (the shape a real transport timeout produces) so
+   * gate 5/6 (degraded-not-failed on an ambiguous live-wrapper failure,
+   * ready restored on the next success) can be exercised without a real
+   * network layer.
+   */
+  readonly pingResponses?: ReadonlyArray<"ok" | "timeout">
   readonly interceptSnapshot?: (
     snapshot: FakeHarnessSnapshotIntercept,
   ) => FakeHarnessSnapshotInterceptResult | null | undefined
@@ -499,6 +510,7 @@ const createFakeHarness = (options?: {
     "base64",
   )
   const videoFixtureBytes = Buffer.from("fake native simulator video", "utf8")
+  let pingCallCount = 0
 
   return SimulatorHarness.of({
     openSession: (args) =>
@@ -577,7 +589,11 @@ const createFakeHarness = (options?: {
           let inputValue = ""
           let uiActionCallCount = 0
           let snapshotCallCount = 0
-          const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction", "uiActionBatch"]
+          // PRB-072: default matches production truth (see RUNNER_CAPABILITY_REGISTRY in
+          // src/services/runnerCapabilities.ts) — the compiled Swift ready frame only
+          // implements uiAction today, so the fake must not advertise uiActionBatch unless
+          // a test opts in explicitly. Tests exercising the batch lane pass runnerCapabilities.
+          const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction"]
 
           const buildSnapshotPayload = () => ({
             capturedAt: "2026-04-10T00:00:00.000Z",
@@ -968,6 +984,25 @@ const createFakeHarness = (options?: {
                 }
               }
 
+              if (action === "ping" && options?.pingResponses) {
+                const outcome = options.pingResponses[Math.min(pingCallCount, options.pingResponses.length - 1)]
+                pingCallCount += 1
+
+                if (outcome === "timeout") {
+                  throw new RunnerTransportError({
+                    code: "sent-no-response",
+                    action: "ping",
+                    endpoint: "fake://runner",
+                    attemptedEndpoints: ["fake://runner"],
+                    phase: "await-response",
+                    elapsedMs: 20_000,
+                    remainingDeadlineMs: 0,
+                    ambiguous: true,
+                    reason: "The runner did not respond within 20000 ms.",
+                  })
+                }
+              }
+
               return {
                 ok: true,
                 action,
@@ -1073,8 +1108,11 @@ const createFakeRealDeviceHarness = (options?: {
   readonly failWith?: Error
   readonly connectionStates?: ReadonlyArray<"connected" | "disconnected">
   readonly pingStatusLabels?: ReadonlyArray<string>
+  readonly runnerCapabilities?: ReadonlyArray<"uiAction" | "uiActionBatch">
 }) => {
-  const runnerCapabilities = ["uiAction", "uiActionBatch"] as const
+  // PRB-072: default matches production truth — see the comment on the simulator
+  // fake's runnerCapabilities default above.
+  const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction"]
   let connectionIndex = 0
   let pingStatusLabelIndex = 0
   let running = true
@@ -1682,7 +1720,17 @@ describe("SessionRegistry", () => {
     })
   })
 
-  test("publishes failed session metadata when the runner exits", async () => {
+  // PRB-083 superseding gate 3: runner exit is one of the four triggers
+  // (alongside explicit close, TTL expiry, and daemon shutdown) that must
+  // route through the same coalesced SessionController close instead of
+  // only marking the session "failed" and leaving it registered. Before
+  // this fix a runner exit left the session parked in "failed" for up to
+  // the full session TTL, occupying an active-session slot and returning a
+  // sticky-failed health snapshot on every subsequent read — the exact
+  // defect this glyph's Notes section calls out. This test now asserts the
+  // session fully closes on runner exit, and that a follow-up explicit
+  // close is idempotent (gate 10) rather than SessionNotFoundError.
+  test("fully closes the session (not sticky-failed) when the runner exits", async () => {
     await withTempRoot(async (root) => {
       let harnessControl: FakeHarnessSessionControl | null = null
 
@@ -1719,22 +1767,30 @@ describe("SessionRegistry", () => {
         harnessControl!.triggerExit({ code: 1, signal: null })
 
         const daemonMetadataPath = await runtime.runPromise(artifactStore.getDaemonMetadataPath())
-        const failedMetadata = await waitFor(
+        const closedMetadata = await waitFor(
           async () => JSON.parse(await readFile(daemonMetadataPath, "utf8")) as {
             readonly activeSessions: number
-            readonly sessions: Array<{ readonly sessionId: string; readonly state: string; readonly warnings: ReadonlyArray<string> }>
+            readonly sessions: Array<{ readonly sessionId: string; readonly state: string }>
           },
-          (metadata) => metadata.sessions[0]?.state === "failed",
+          (metadata) => metadata.activeSessions === 0,
         )
 
-        expect(failedMetadata.activeSessions).toBe(1)
-        expect(failedMetadata.sessions[0]?.sessionId).toBe(session.sessionId)
-        expect(failedMetadata.sessions[0]?.state).toBe("failed")
+        expect(closedMetadata.activeSessions).toBe(0)
+        expect(closedMetadata.sessions).toHaveLength(0)
 
-        const failedHealth = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
-        expect(failedHealth.warnings.some((warning) => warning.includes("Close and reopen the session"))).toBe(true)
+        const missingHealth = await runtime.runPromise(Effect.either(registry.getSessionHealth(session.sessionId)))
+        expect(missingHealth._tag).toBe("Left")
+        if (missingHealth._tag === "Left") {
+          expect(missingHealth.left).toBeInstanceOf(SessionNotFoundError)
+        }
 
-        await runtime.runPromise(registry.closeSession(session.sessionId))
+        // Gate 10: a follow-up explicit close against the same session id
+        // is idempotent — it returns the already-closed result rather than
+        // SessionNotFoundError, because runner-exit already ran the one
+        // coalesced teardown.
+        const repeatedClose = await runtime.runPromise(registry.closeSession(session.sessionId))
+        expect(repeatedClose.sessionId).toBe(session.sessionId)
+        expect(repeatedClose.state).toBe("closed")
       } finally {
         await runtime.dispose()
       }
@@ -1848,6 +1904,92 @@ describe("SessionRegistry", () => {
         expect(health.debugger.attachState).toBe("attached")
         expect(health.debugger.targetScope).toBe("external-host-process")
         expect(health.debugger.attachedPid).toBe(4321)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  // PRB-083 superseding gate 2: 100 concurrent runner commands against one
+  // session receive one ordered, gap-free, duplicate-free sequence range —
+  // the SessionController allocates sequence numbers exclusively on its own
+  // fiber, so no two concurrent dispatches can ever read the same value.
+  test("100 concurrent runner commands receive an ordered, gap-free, duplicate-free sequence range", async () => {
+    await withTempRoot(async (root) => {
+      const capturedCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          captureRunnerCommand: (command) => {
+            capturedCommands.push(command)
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+
+        await runtime.runPromise(
+          Effect.all(
+            Array.from({ length: 100 }, () => registry.sendRunnerKeepalive(session.sessionId)),
+            { concurrency: "unbounded" },
+          ),
+        )
+
+        const keepaliveSequences = capturedCommands
+          .filter((command) => command.action === "ping" && command.payload === "perf-keepalive")
+          .map((command) => command.sequence)
+
+        expect(keepaliveSequences).toHaveLength(100)
+
+        const sorted = [...keepaliveSequences].sort((a, b) => a - b)
+        const expectedRange = Array.from({ length: 100 }, (_, index) => sorted[0]! + index)
+        expect(sorted).toEqual(expectedRange)
+        expect(new Set(keepaliveSequences).size).toBe(100)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  // PRB-083 superseding gates 5/6: an ambiguous transport failure (timeout)
+  // against a wrapper that is still running degrades the session instead of
+  // hard-failing it, and a subsequent successful ping against that same
+  // live wrapper restores "ready" instead of staying stuck.
+  test("degrades (not fails) on an ambiguous ping timeout, then restores ready on the next successful ping", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          pingResponses: ["timeout", "ok"],
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        expect(session.state).toBe("ready")
+
+        const degraded = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(degraded.state).toBe("degraded")
+        expect(degraded.healthCheck.lastOk).toBeNull()
+        expect(degraded.resources.runner).toBe("degraded")
+
+        const recovered = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(recovered.state).toBe("ready")
+        expect(recovered.healthCheck.lastOk).toBe(true)
+        expect(recovered.resources.runner).toBe("ready")
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {
@@ -3054,8 +3196,8 @@ describe("SessionRegistry", () => {
           }))
 
           const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
-          const flow: FlowContract = {
-            contract: "probe.session-flow/v1",
+          const flow: FlowV2Contract = {
+            contract: "probe.session-flow/v2",
             steps: [
               { kind: "snapshot" },
               {
@@ -3229,7 +3371,7 @@ describe("SessionRegistry", () => {
         const result = await runtime.runPromise(registry.runFlow({
           sessionId: session.sessionId,
           flow: {
-            contract: "probe.session-flow/v1",
+            contract: "probe.session-flow/v2",
             steps: [
               {
                 kind: "tap",
@@ -3419,7 +3561,10 @@ describe("SessionRegistry", () => {
   test("executes fast v2 sequence steps through the runner batch lane", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      // PRB-072: uiActionBatch is not production's default; opt this fake in explicitly
+      // since this test exercises the batch lane on purpose.
       const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction", "uiActionBatch"],
         captureRunnerCommand: (command) => {
           runnerCommands.push(command)
         },
@@ -3512,7 +3657,10 @@ describe("SessionRegistry", () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
       const attemptedTargets: Array<string | null> = []
+      // PRB-072: uiActionBatch is not production's default; opt this fake in explicitly
+      // since this test exercises the batch lane on purpose.
       const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction", "uiActionBatch"],
         captureRunnerCommand: (command) => {
           runnerCommands.push(command)
         },
@@ -3751,7 +3899,10 @@ describe("SessionRegistry", () => {
   test("runs mixed verified and batched v2 flows", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      // PRB-072: uiActionBatch is not production's default; opt this fake in explicitly
+      // since this test exercises the batch lane on purpose.
       const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction", "uiActionBatch"],
         captureRunnerCommand: (command) => {
           runnerCommands.push(command)
         },
@@ -4346,7 +4497,9 @@ describe("SessionRegistry", () => {
         expect(session.resources.runner).toBe("ready")
         expect(session.transport.kind).toBe("real-device-live")
         expect(session.runner.kind).toBe("real-device-live")
-        expect(session.runner.capabilities).toContain("uiActionBatch")
+        // PRB-072: matches the fake's production-truth default (see runnerCapabilities.ts);
+        // this test is about session-open health, not the batch lane.
+        expect(session.runner.capabilities).toEqual(["uiAction"])
 
         const realDeviceCapability = session.capabilities.find((capability) => capability.area === "real-device")
         const simulatorCapability = session.capabilities.find((capability) => capability.area === "simulator")

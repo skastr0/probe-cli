@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { statSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
-import { Context, Effect, Either, Layer, Ref } from "effect"
+import { Context, Effect, Either, FiberRef, Layer, Ref } from "effect"
+import { runAppleProcess } from "./AppleProcessSupervisor"
 import {
   buildRecordedSessionAction,
   buildDirectRunnerUiActionPayload,
@@ -12,19 +12,12 @@ import {
   describeRecordedActionTarget,
   describeSnapshotNode,
   evaluateAssertion,
-  flowStepToSessionAction,
-  isFlowSessionActionStep,
   isRunnerUiSessionAction,
   isRunnerUiRecordedSessionAction,
   resolveActionSelectorInSnapshot,
   resolveRecordedActionTargetInSnapshot,
-  validateFlowContract,
   validateSessionAction,
   type ActionRecordingScript,
-  type FlowFailedStep,
-  type FlowResult,
-  type FlowStep,
-  type FlowStepResult,
   type RecordedSessionAction,
   type ReplayReport,
   type ReplayStepReport,
@@ -37,7 +30,6 @@ import {
 } from "../domain/action"
 import {
   flowV2StepToSessionAction,
-  isFlowV2Contract,
   isFlowV2SessionActionStep,
   validateSessionFlowContract,
   type FlowSequenceAction,
@@ -85,7 +77,6 @@ import type {
 import { appendSessionLogMarkers, summarizeContent } from "../domain/output"
 import {
   SessionHealth,
-  isLiveRunnerDetails,
   type SessionConnectionDetails,
   type SessionHealthCheck,
   type SessionListEntry,
@@ -103,19 +94,43 @@ import {
   type OpenedRealDeviceSession,
   RealDeviceHarness,
 } from "./RealDeviceHarness"
+import { RunnerTransportError } from "./RunnerTransportClient"
+import {
+  makeSessionController,
+  type SessionCloseReason,
+  type SessionController,
+  type SessionControllerContext,
+} from "./SessionController"
+import { advertisedRunnerCapabilities, requireRunnerCapability } from "./runnerCapabilities"
 import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
 import type { RunnerAction } from "./runnerProtocol"
+import {
+  defaultVideoCaptureFps,
+  describeRunnerFrameSequenceFallback,
+  describeRunnerMp4Artifact,
+  describeSimulatorMovFallback,
+  describeSimulatorMp4Remux,
+  formatFpsLabel,
+  normalizeVideoDurationMs,
+  parseRationalNumber,
+  resolveFfmpegExecutable,
+  resolveFfprobeExecutable,
+} from "./VideoCapturePolicy"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
 const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
+// PRB-083: bounded operation queue per SessionController. Comfortably above
+// any realistic in-flight command burst (batched UI actions, retries) so
+// legitimate traffic never trips queue saturation; a caller issuing more
+// than this many concurrent commands against one session gets a typed
+// session-busy error instead of unbounded memory growth.
+const sessionControllerQueueCapacity = Number(process.env.PROBE_SESSION_QUEUE_CAPACITY ?? 512)
 const maxSessionLogCaptureSeconds = 30
 const defaultDebugCommandTimeoutMs = Number(process.env.PROBE_LLDB_COMMAND_TIMEOUT_MS ?? 60_000)
 const maxDebugFrameLimit = 200
 const maxDebugEvalTimeoutMs = 30_000
 const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
-const maxVideoDurationMs = 120_000
 const defaultVideoDurationMs = 10_000
-const videoCaptureFps = 10
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
 const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
@@ -169,73 +184,41 @@ const parseDurationStringMs = (value: string): number | null => {
   }
 }
 
-const normalizeVideoDurationMs = (durationMs: number): number =>
-  Math.min(Math.max(Math.round(durationMs), 1), maxVideoDurationMs)
-
-const resolveFfmpegExecutable = (): string => process.env.PROBE_FFMPEG_PATH ?? "ffmpeg"
-
-const resolveFfprobeExecutable = (): string => {
-  const configured = process.env.PROBE_FFPROBE_PATH
-
-  if (configured) {
-    return configured
-  }
-
-  const ffmpegExecutable = resolveFfmpegExecutable()
-  const executableName = basename(ffmpegExecutable)
-
-  if (executableName.includes("ffmpeg")) {
-    return join(dirname(ffmpegExecutable), executableName.replace("ffmpeg", "ffprobe"))
-  }
-
-  return "ffprobe"
-}
-
-const runHostCommand = (args: {
+// Exported for direct process-level test coverage of the AppleProcessSupervisor
+// migration (PRB-085), in addition to its normal SessionRegistry service usage.
+export const runHostCommand = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
   readonly cwd?: string
   readonly timeoutMs?: number
-}): Promise<HostCommandResult> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(args.command, [...args.commandArgs], {
-      cwd: args.cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    })
+}): Promise<HostCommandResult> => {
+  let spawnError: unknown = null
 
-    let stdout = ""
-    let stderr = ""
-    let timedOut = false
-    const timeoutMs = args.timeoutMs ?? 30_000
-    const timeout = setTimeout(() => {
-      timedOut = true
-      child.kill("SIGTERM")
-      setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill("SIGKILL")
-        }
-      }, 2_000)
-    }, timeoutMs)
-
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk
-    })
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk
-    })
-
-    child.once("error", (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
-    child.once("close", (exitCode, signal) => {
-      clearTimeout(timeout)
-      resolve({ stdout, stderr, exitCode, signal, timedOut })
-    })
-  })
+  return runAppleProcess({
+    command: args.command,
+    commandArgs: args.commandArgs,
+    cwd: args.cwd,
+    timeoutMs: args.timeoutMs ?? 30_000,
+    gracePeriodMs: 2_000,
+    // Preserve the original behavior of rejecting with the raw spawn error
+    // (not a ChildProcessError) so ENOENT-based optional-tool detection
+    // (ffmpeg/ffprobe/tar availability) keeps working unchanged.
+    onSpawnError: (error) => {
+      spawnError = error
+    },
+  }).then(
+    (result): HostCommandResult => ({
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+    }),
+    (error): HostCommandResult => {
+      throw spawnError ?? error
+    },
+  )
+}
 
 const formatHostCommandFailure = (command: string, result: HostCommandResult): string => {
   if (result.timedOut) {
@@ -274,44 +257,6 @@ const isFfmpegAvailable = async (): Promise<boolean> => {
 
     throw error
   }
-}
-
-const parseRationalNumber = (value: string): number | null => {
-  const trimmed = value.trim()
-
-  if (trimmed.length === 0) {
-    return null
-  }
-
-  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
-    const numeric = Number(trimmed)
-    return Number.isFinite(numeric) ? numeric : null
-  }
-
-  const match = trimmed.match(/^(-?\d+)\/(-?\d+)$/)
-
-  if (!match) {
-    return null
-  }
-
-  const numerator = Number(match[1])
-  const denominator = Number(match[2])
-
-  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) {
-    return null
-  }
-
-  const numeric = numerator / denominator
-  return Number.isFinite(numeric) ? numeric : null
-}
-
-const formatFpsLabel = (value: number): string => {
-  if (!Number.isFinite(value)) {
-    return "unknown"
-  }
-
-  const rounded = Math.round(value * 100) / 100
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2)
 }
 
 const probeSimulatorVideoFrameRate = async (absolutePath: string): Promise<{
@@ -709,11 +654,17 @@ interface BaseActiveSessionRecord {
   recording: {
     steps: Array<RecordedSessionAction>
   }
+  // PRB-083: the controller is the sole writer of `health` (reassigned as a
+  // whole object, never mutated in place) and the sole allocator of runner
+  // command sequence numbers. Every other field above stays a plain mutable
+  // property because nothing outside the controller's serialized execution
+  // ever writes it concurrently; see SessionController.ts for the invariant
+  // this buys.
+  readonly controller: SessionController
 }
 
 interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "simulator"
-  nextSequence: number
   readonly sendRunnerCommand: (
     sequence: number,
     action: RunnerAction,
@@ -727,7 +678,6 @@ interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
 interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "device"
   integrationPoints: ReadonlyArray<string>
-  nextSequence: number
   readonly sendRunnerCommand: ((
     sequence: number,
     action: RunnerAction,
@@ -1443,8 +1393,51 @@ export const SessionRegistryLive = Layer.scoped(
     const simulatorHarness = yield* SimulatorHarness
     const lldbBridgeFactory = yield* LldbBridgeFactory
     const sessionsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
+    // PRB-083 gate 10: `closeSessionInternal` removes a session from
+    // `sessionsRef` once it is fully closed (so it stops counting as
+    // active and stops showing up in listings), but a *repeat* close call
+    // for that same session id must still return the already-closed result
+    // rather than SessionNotFoundError. This small side-table is what makes
+    // that possible: it keeps just the closed record's controller (already
+    // memoized/terminal) reachable by session id after removal from the
+    // main table.
+    const closedRecordsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
     const openingRef = yield* Ref.make<OpeningSessionReservation | null>(null)
     const openMutex = yield* Effect.makeSemaphore(1)
+
+    // PRB-083: the ambient handle for "we are currently executing inside
+    // this session's controller fiber". Every top-level entry point that
+    // mutates health or allocates a runner command sequence number wraps
+    // its body with `withControllerContext`; everything nested underneath
+    // (sendRunnerCommand, snapshot capture, etc.) recovers the same context
+    // via `requireControllerContext` instead of threading it through every
+    // call signature. It is a FiberRef, not a plain module variable,
+    // because each session's controller fiber runs its own submitted
+    // operation with its own context value, and operations for different
+    // sessions (or concurrent operations serialized one after another on
+    // the same session) must never see each other's allocator.
+    const controllerContextRef = yield* FiberRef.make<SessionControllerContext | null>(null)
+
+    const requireControllerContext = (sessionId: string) =>
+      Effect.gen(function* () {
+        const ctx = yield* FiberRef.get(controllerContextRef)
+
+        if (ctx === null) {
+          return yield* new EnvironmentError({
+            code: "session-controller-context-missing",
+            reason:
+              `Internal error: a runner dispatch for session ${sessionId} ran outside its SessionController's `
+              + "exclusive execution.",
+            nextStep: "This indicates a Probe defect. File a bug with the session id and command attempted.",
+            details: [],
+          })
+        }
+
+        return ctx
+      })
+
+    const withControllerContext = <A, E>(ctx: SessionControllerContext, effect: Effect.Effect<A, E>) =>
+      effect.pipe(Effect.locally(controllerContextRef, ctx))
 
     const persistHealth = (sessionId: string, health: SessionHealth) =>
       Effect.gen(function* () {
@@ -1514,6 +1507,29 @@ export const SessionRegistryLive = Layer.scoped(
         return record
       })
 
+    // PRB-083 gate 5/6: a transport failure against a wrapper that is still
+    // running is ambiguous, not proof the runner died — `RunnerTransportError`
+    // already carries that fact (`ambiguous`, populated for timeouts and
+    // decode failures; false for a dispatch that never reached the runner,
+    // e.g. connection refused). `waitForFreshJson`'s stdout-transport
+    // fallback signals the same ambiguity as `ChildProcessError` with code
+    // "runner-timeout". Treat either as recoverable ("degraded") exactly
+    // when the wrapper process itself is still alive; everything else is a
+    // hard failure.
+    const isAmbiguousTransportFailure = (error: unknown): boolean => {
+      if (error instanceof RunnerTransportError) {
+        return error.ambiguous
+      }
+
+      return error instanceof ChildProcessError && error.code === "runner-timeout"
+    }
+
+    const classifyRunnerDispatchFailure = (args: {
+      readonly error: unknown
+      readonly wrapperRunning: boolean
+    }): "degraded" | "failed" =>
+      args.wrapperRunning && isAmbiguousTransportFailure(args.error) ? "degraded" : "failed"
+
     const markSessionRunnerFailed = (args: {
       readonly sessionId: string
       readonly record: ActiveSessionRecord
@@ -1521,26 +1537,31 @@ export const SessionRegistryLive = Layer.scoped(
       readonly reason: string
       readonly wrapperRunning: boolean
       readonly pingRttMs?: number | null
+      /** "degraded": ambiguous/transient, wrapper still live — recoverable by a later successful same-controller ping.
+       *  "failed" (default): hard failure — Probe's fail-closed policy applies (`nonRecoverableSessionWarning`). */
+      readonly severity?: "degraded" | "failed"
     }) =>
       Effect.gen(function* () {
         if (args.record.health.state === "closing" || args.record.health.state === "closed") {
           return
         }
 
+        const severity = args.severity ?? "failed"
+        const liveRunner = severity === "degraded"
+
         const capabilities = isRealDeviceRecord(args.record)
           ? [...buildRealDeviceCapabilities({
               connection: args.record.health.connection,
               integrationPoints: args.record.integrationPoints,
-              liveRunner: false,
+              liveRunner,
             })]
           : args.record.health.capabilities
 
-        args.record.health = {
+        const nextHealthBase: SessionHealth = {
           ...args.record.health,
-          state: "failed",
           updatedAt: nowIso(),
           expiresAt: expiresAtIso(),
-          resources: setRunnerResourceState(args.record.health.resources, "failed"),
+          resources: setRunnerResourceState(args.record.health.resources, severity),
           capabilities,
           healthCheck: {
             ...args.record.health.healthCheck,
@@ -1548,13 +1569,23 @@ export const SessionRegistryLive = Layer.scoped(
             wrapperRunning: args.wrapperRunning,
             pingRttMs: args.pingRttMs ?? null,
             lastCommand: args.lastCommand,
-            lastOk: false,
+            // "degraded" is deliberately indeterminate (`null`), not `false`:
+            // the transport attempt was ambiguous, so Probe does not know
+            // whether the runner executed the command.
+            lastOk: severity === "degraded" ? null : false,
           },
           warnings: dedupeStrings([
             ...args.record.health.warnings,
-            `${args.reason} ${nonRecoverableSessionWarning}`,
+            severity === "degraded"
+              ? `${args.reason} The runner wrapper is still running; Probe marked the session degraded rather than failed and will recover automatically on the next successful ping.`
+              : `${args.reason} ${nonRecoverableSessionWarning}`,
           ]),
           artifacts: [...(yield* refreshArtifacts(args.sessionId))],
+        }
+
+        args.record.health = {
+          ...nextHealthBase,
+          state: severity === "degraded" ? deriveSessionPhase(nextHealthBase) : "failed",
         }
 
         yield* persistHealth(args.sessionId, args.record.health)
@@ -1567,26 +1598,39 @@ export const SessionRegistryLive = Layer.scoped(
       action: RunnerAction,
       payload?: string,
     ) =>
-      Effect.tryPromise({
-        try: () => record.sendRunnerCommand(record.nextSequence, action, payload),
-        catch: (error) =>
-          new EnvironmentError({
-            code: `session-runner-${action}`,
-            reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
-            details: [],
+      Effect.gen(function* () {
+        const ctx = yield* requireControllerContext(sessionId)
+        const attempt = yield* Effect.either(
+          Effect.tryPromise({
+            try: () => record.sendRunnerCommand(ctx.allocateSequence(), action, payload),
+            catch: (error) => error,
           }),
-      }).pipe(
-        Effect.tapError((error) =>
-          markSessionRunnerFailed({
-            sessionId,
-            record,
-            lastCommand: action,
-            reason: error.reason,
-            wrapperRunning: record.isRunnerRunning(),
-          }),
-        ),
-      )
+        )
+
+        if (Either.isRight(attempt)) {
+          return attempt.right
+        }
+
+        const rawError = attempt.left
+        const reason = rawError instanceof Error ? rawError.message : String(rawError)
+        const wrapperRunning = record.isRunnerRunning()
+
+        yield* markSessionRunnerFailed({
+          sessionId,
+          record,
+          lastCommand: action,
+          reason,
+          wrapperRunning,
+          severity: classifyRunnerDispatchFailure({ error: rawError, wrapperRunning }),
+        })
+
+        return yield* new EnvironmentError({
+          code: `session-runner-${action}`,
+          reason,
+          nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
+          details: [],
+        })
+      })
 
     const refreshSessionArtifacts = (sessionId: string, record: ActiveSessionRecord) =>
       Effect.gen(function* () {
@@ -2008,7 +2052,6 @@ export const SessionRegistryLive = Layer.scoped(
                 "uiAction",
                 JSON.stringify(buildRunnerUiActionPayload(action, resolvedTarget, preSnapshot?.artifact ?? null)),
               )
-              record.nextSequence += 1
 
               if (!response.ok) {
                 const failureReason = response.error
@@ -2282,7 +2325,6 @@ export const SessionRegistryLive = Layer.scoped(
     }) =>
       Effect.gen(function* () {
         const response = yield* sendRunnerCommand(args.sessionId, args.record, "screenshot")
-        args.record.nextSequence += 1
 
         if (!response.ok) {
           return yield* new EnvironmentError({
@@ -2505,10 +2547,8 @@ export const SessionRegistryLive = Layer.scoped(
           artifactRoot: args.artifactRoot,
           key: args.artifactKey,
           label: args.artifactLabel,
-          kind: "directory",
+          ...describeRunnerFrameSequenceFallback({ frameCount: args.manifest.frameCount, fps: args.manifest.fps }),
           absolutePath: bundlePath,
-          summary:
-            `Frame-sequence bundle with ${args.manifest.frameCount} frame(s) at ${args.manifest.fps} fps because ffmpeg was not available for MP4 stitching.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -2525,7 +2565,6 @@ export const SessionRegistryLive = Layer.scoped(
     }) =>
       Effect.gen(function* () {
         const response = yield* sendRunnerCommand(args.sessionId, args.record, "recordVideo", String(args.durationMs))
-        args.record.nextSequence += 1
 
         if (!response.ok) {
           return yield* new EnvironmentError({
@@ -2643,7 +2682,7 @@ export const SessionRegistryLive = Layer.scoped(
               commandArgs: [
                 "-y",
                 "-framerate",
-                String(manifest.fps || videoCaptureFps),
+                String(manifest.fps || defaultVideoCaptureFps),
                 "-i",
                 "frame-%05d.png",
                 "-c:v",
@@ -2677,9 +2716,8 @@ export const SessionRegistryLive = Layer.scoped(
           artifactRoot: args.record.health.artifactRoot,
           key: args.artifactKey,
           label: args.artifactLabel,
-          kind: "mp4",
+          ...describeRunnerMp4Artifact({ frameCount: manifest.frameCount, fps: manifest.fps }),
           absolutePath,
-          summary: `MP4 video with ${manifest.frameCount} frame(s) at ${manifest.fps} fps stitched from runner screenshots via ffmpeg.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -2726,10 +2764,8 @@ export const SessionRegistryLive = Layer.scoped(
             artifactRoot: args.record.health.artifactRoot,
             key: args.artifactKey,
             label: args.artifactLabel,
-            kind: "mov",
+            ...describeSimulatorMovFallback({ durationMs: args.durationMs }),
             absolutePath: movPath,
-            summary:
-              `Native simulator QuickTime video captured over simctl with requested duration ${args.durationMs}ms because ffmpeg was not available to remux it to MP4.`,
           })
 
           yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -2806,12 +2842,11 @@ export const SessionRegistryLive = Layer.scoped(
           artifactRoot: args.record.health.artifactRoot,
           key: args.artifactKey,
           label: args.artifactLabel,
-          kind: "mp4",
+          ...describeSimulatorMp4Remux({
+            durationMs: args.durationMs,
+            sourceFrameRateLabel: sourceFrameRate === null ? null : sourceFrameRate.label,
+          }),
           absolutePath,
-          summary:
-            sourceFrameRate === null
-              ? `Native simulator video captured over simctl and transcoded to MP4 via ffmpeg using the source timing for requested duration ${args.durationMs}ms.`
-              : `Native simulator video captured over simctl and normalized to captured simulator rate ${sourceFrameRate.label} fps MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -3370,7 +3405,6 @@ export const SessionRegistryLive = Layer.scoped(
         }
 
         const response = yield* sendRunnerCommand(sessionId, record, "snapshot")
-        record.nextSequence += 1
 
         if (!response.ok) {
           updateHealthCheck(record, response.action, false)
@@ -3609,90 +3643,142 @@ export const SessionRegistryLive = Layer.scoped(
         return true
       })
 
+    // PRB-083 gate 3/4/10: explicit close, TTL expiry, runner exit, and
+    // daemon shutdown all call this. Every one of those triggers routes
+    // through the *same* `record.controller.close(...)` call, so whichever
+    // one reaches the controller first is the only one that ever runs the
+    // teardown body below — the others (concurrent or later, including a
+    // caller that arrives after the session is already fully closed) all
+    // receive that exact same terminal health back. `closeResources()` is
+    // best-effort inside teardown (a warning, not a failure the caller must
+    // handle) because teardown itself cannot fail: a close that failed
+    // outright would leave the session stuck in "closing" forever with no
+    // way to retry cleanly, which is worse than a closed session carrying a
+    // cleanup warning.
     const closeSessionInternal = (
       sessionId: string,
-      reason: "explicit-close" | "ttl-expired" | "daemon-shutdown" | "runner-exit",
-    ) =>
+      reason: SessionCloseReason,
+    ): Effect.Effect<SessionHealth | null> =>
       Effect.gen(function* () {
         const sessions = yield* Ref.get(sessionsRef)
         const record = sessions.get(sessionId)
 
         if (!record) {
-          return false
-        }
+          const closedSessions = yield* Ref.get(closedRecordsRef)
+          const closedRecord = closedSessions.get(sessionId)
 
-        if (record.health.state !== "closed") {
-          record.health = {
-            ...record.health,
-            state: "closing",
-            updatedAt: nowIso(),
-            expiresAt: expiresAtIso(),
-            resources: setSessionResourceStates(record.health.resources, {
-              runner: "stopping",
-              debugger: record.health.resources.debugger === "not-requested"
-                ? "not-requested"
-                : "stopping",
-            }),
+          if (!closedRecord) {
+            return null
           }
-          yield* persistHealth(sessionId, record.health)
+
+          // Already fully closed and removed from `sessionsRef`; the
+          // controller is terminal, so this just replays the cached
+          // terminal result instead of re-running teardown or claiming
+          // the session was never found.
+          return yield* closedRecord.controller.close(reason, () => Effect.succeed(closedRecord.health))
         }
 
-        yield* closeDebuggerBridgeInternal(sessionId, record)
+        yield* record.controller.close(reason, (closeReason, ctx) =>
+          Effect.gen(function* () {
+            if (record.health.state !== "closed") {
+              record.health = {
+                ...record.health,
+                state: "closing",
+                updatedAt: nowIso(),
+                expiresAt: expiresAtIso(),
+                resources: setSessionResourceStates(record.health.resources, {
+                  runner: "stopping",
+                  debugger: record.health.resources.debugger === "not-requested"
+                    ? "not-requested"
+                    : "stopping",
+                }),
+              }
+              yield* persistHealth(sessionId, record.health)
+            }
 
-        if (reason !== "runner-exit" && isRunnerBackedRecord(record) && record.isRunnerRunning()) {
-          yield* Effect.tryPromise({
-            try: async () => {
-              await record.sendRunnerCommand(record.nextSequence, "shutdown")
-            },
-            catch: () => new EnvironmentError({
-              code: "session-close-shutdown",
-              reason: `Failed to send shutdown to session ${sessionId}; falling back to wrapper termination.`,
-              nextStep: "Inspect the session log artifact if the runner did not exit cleanly.",
-              details: [],
-            }),
-          }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
-        }
+            yield* closeDebuggerBridgeInternal(sessionId, record).pipe(Effect.catchAll(() => Effect.succeed(false)))
 
-        yield* Effect.tryPromise({
-          try: () => record.closeResources(),
-          catch: (error) =>
-            new EnvironmentError({
-              code: "session-close-resources",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect the session artifacts and retry closing the session.",
-              details: [],
-            }),
-        })
+            if (closeReason !== "runner-exit" && isRunnerBackedRecord(record) && record.isRunnerRunning()) {
+              yield* Effect.tryPromise({
+                try: async () => {
+                  await record.sendRunnerCommand(ctx.allocateSequence(), "shutdown")
+                },
+                catch: () => new EnvironmentError({
+                  code: "session-close-shutdown",
+                  reason: `Failed to send shutdown to session ${sessionId}; falling back to wrapper termination.`,
+                  nextStep: "Inspect the session log artifact if the runner did not exit cleanly.",
+                  details: [],
+                }),
+              }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
+            }
 
-        record.health = {
-          ...record.health,
-          state: "closed",
-          updatedAt: nowIso(),
-          expiresAt: expiresAtIso(),
-          resources: setSessionResourceStates(record.health.resources, {
-            runner: "stopped",
-            debugger: record.health.resources.debugger === "not-requested"
-              ? "not-requested"
-              : "stopped",
-          }),
-          healthCheck: {
-            ...record.health.healthCheck,
-            checkedAt: nowIso(),
-            wrapperRunning: false,
-            lastCommand: reason === "runner-exit" ? "runner-exit" : "shutdown",
-            lastOk: reason === "runner-exit" ? false : true,
-          },
-        }
-        yield* persistHealth(sessionId, record.health)
+            const closeResourcesFailure = yield* Effect.tryPromise({
+              try: () => record.closeResources(),
+              catch: (error) => (error instanceof Error ? error.message : String(error)),
+            }).pipe(Effect.either)
+
+            record.health = {
+              ...record.health,
+              state: "closed",
+              updatedAt: nowIso(),
+              expiresAt: expiresAtIso(),
+              resources: setSessionResourceStates(record.health.resources, {
+                runner: "stopped",
+                debugger: record.health.resources.debugger === "not-requested"
+                  ? "not-requested"
+                  : "stopped",
+              }),
+              healthCheck: {
+                ...record.health.healthCheck,
+                checkedAt: nowIso(),
+                wrapperRunning: false,
+                lastCommand: closeReason === "runner-exit" ? "runner-exit" : "shutdown",
+                lastOk: closeReason === "runner-exit" ? false : true,
+              },
+              warnings: Either.isLeft(closeResourcesFailure)
+                ? dedupeStrings([
+                    ...record.health.warnings,
+                    `Session resource cleanup reported an error and may be incomplete: ${closeResourcesFailure.left}`,
+                  ])
+                : record.health.warnings,
+            }
+            yield* persistHealth(sessionId, record.health)
+
+            return record.health
+          }).pipe(
+            // teardown's contract is Effect<SessionHealth, never>: it must
+            // always settle to a terminal health so every observer waiting
+            // on the coalesced close gets a value, never a hung deferred.
+            // An artifact-manifest write failure mid-teardown (the only
+            // remaining fallible step here) becomes a warning on the
+            // closed health snapshot rather than a close that never
+            // finishes.
+            Effect.catchAll((error) =>
+              Effect.sync(() => {
+                record.health = {
+                  ...record.health,
+                  state: "closed",
+                  updatedAt: nowIso(),
+                  warnings: dedupeStrings([
+                    ...record.health.warnings,
+                    `Session close teardown reported an error and health persistence may be incomplete: ${error.reason}`,
+                  ]),
+                }
+                return record.health
+              }),
+            ),
+          ),
+        )
 
         yield* Ref.update(sessionsRef, (current) => {
           const next = new Map(current)
           next.delete(sessionId)
           return next
         })
+        yield* Ref.update(closedRecordsRef, (current) => new Map(current).set(sessionId, record))
         yield* syncDaemonMetadata
 
-        return true
+        return record.health
       })
 
     const sweeper = Effect.forever(
@@ -3998,12 +4084,18 @@ export const SessionRegistryLive = Layer.scoped(
                     artifacts: [...(yield* refreshArtifacts(opening.sessionId))],
                   }
 
+                  const controller = yield* makeSessionController({
+                    sessionId: opening.sessionId,
+                    initialSequence: opened.nextSequence,
+                    opQueueCapacity: sessionControllerQueueCapacity,
+                  })
+
                   const record: RealDeviceActiveSessionRecord = {
                     kind: "device",
                     health,
                     baseWarnings: warnings,
                     integrationPoints: opened.integrationPoints,
-                    nextSequence: opened.nextSequence,
+                    controller,
                     debuggerBridge: null,
                     snapshotState: {
                       latest: null,
@@ -4023,19 +4115,15 @@ export const SessionRegistryLive = Layer.scoped(
                   yield* persistHealth(opening.sessionId, health)
                   yield* Ref.update(sessionsRef, (current) => new Map(current).set(opening.sessionId, record))
 
+                  // PRB-083 gate 3: runner exit is one of the four triggers
+                  // that must go through the same coalesced close as
+                  // explicit close / TTL expiry / daemon shutdown, instead
+                  // of only marking the session "failed" and leaving it
+                  // registered (the prior sticky-failure behavior this
+                  // glyph fixes).
                   record.waitForExit?.then(() => {
-                    if (record.health.state === "closing" || record.health.state === "closed") {
-                      return
-                    }
-
                     void Effect.runPromise(
-                      markSessionRunnerFailed({
-                        sessionId: opening.sessionId,
-                        record,
-                        lastCommand: "runner-exit",
-                        reason: "The real-device runner wrapper exited unexpectedly.",
-                        wrapperRunning: false,
-                      }).pipe(
+                      closeSessionInternal(opening.sessionId, "runner-exit").pipe(
                         Effect.catchAll(() => Effect.void),
                       ),
                     )
@@ -4222,11 +4310,17 @@ export const SessionRegistryLive = Layer.scoped(
                     artifacts: [...(yield* refreshArtifacts(opening.sessionId))],
                   }
 
+                  const controller = yield* makeSessionController({
+                    sessionId: opening.sessionId,
+                    initialSequence: opened.nextSequence,
+                    opQueueCapacity: sessionControllerQueueCapacity,
+                  })
+
                   const record: SimulatorActiveSessionRecord = {
                     kind: "simulator",
                     health,
                     baseWarnings: warnings,
-                    nextSequence: opened.nextSequence,
+                    controller,
                     debuggerBridge: null,
                     snapshotState: {
                       latest: null,
@@ -4245,19 +4339,11 @@ export const SessionRegistryLive = Layer.scoped(
                   yield* persistHealth(opening.sessionId, health)
                   yield* Ref.update(sessionsRef, (current) => new Map(current).set(opening.sessionId, record))
 
+                  // PRB-083 gate 3: see the matching comment in the device
+                  // open flow above.
                   record.waitForExit.then(() => {
-                    if (record.health.state === "closing" || record.health.state === "closed") {
-                      return
-                    }
-
                     void Effect.runPromise(
-                      markSessionRunnerFailed({
-                        sessionId: opening.sessionId,
-                        record,
-                        lastCommand: "runner-exit",
-                        reason: "The runner wrapper exited unexpectedly.",
-                        wrapperRunning: false,
-                      }).pipe(
+                      closeSessionInternal(opening.sessionId, "runner-exit").pipe(
                         Effect.catchAll(() => Effect.void),
                       ),
                     )
@@ -4284,6 +4370,12 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          // PRB-083: the whole health-check body (both the ping dispatch
+          // and every health mutation it makes) runs as one operation on
+          // this session's controller fiber, serialized against every
+          // other command, TTL sweep, runner exit, and close on the same
+          // session.
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           if (isRealDeviceRecord(record)) {
             const connection = yield* Effect.tryPromise({
               try: () => record.refreshConnection(),
@@ -4399,7 +4491,7 @@ export const SessionRegistryLive = Layer.scoped(
 
             const pingAttempt = yield* Effect.either(
               Effect.tryPromise({
-                try: () => record.sendRunnerCommand(record.nextSequence, "ping", "health-check"),
+                try: () => record.sendRunnerCommand(ctx.allocateSequence(), "ping", "health-check"),
                 catch: (error) =>
                   new EnvironmentError({
                     code: "device-session-health-ping",
@@ -4482,7 +4574,6 @@ export const SessionRegistryLive = Layer.scoped(
             }
 
             const response = pingAttempt.right
-            record.nextSequence += 1
             const interruptionIsActive = interruption?.evidenceKind === "direct"
             const warningExtras = [
               ...(interruptionWarning ? [interruptionWarning] : []),
@@ -4548,16 +4639,59 @@ export const SessionRegistryLive = Layer.scoped(
             "Continue or detach the debugger before retrying session health, then retry.",
           )
 
-          const response = yield* sendRunnerCommand(sessionId, record, "ping", "health-check")
-          record.nextSequence += 1
-          record.health = {
+          // PRB-083 gate 5: dispatched directly (not through the shared
+          // `sendRunnerCommand` helper, which always fails the calling
+          // Effect on any transport error) so an ambiguous/degraded outcome
+          // can return successfully with a degraded health snapshot,
+          // mirroring the real-device ping branch above instead of
+          // surfacing a hard failure for what may just be a transient
+          // timeout against a still-live wrapper.
+          const pingAttempt = yield* Effect.either(
+            Effect.tryPromise({
+              try: () => record.sendRunnerCommand(ctx.allocateSequence(), "ping", "health-check"),
+              catch: (error) => error,
+            }),
+          )
+
+          if (Either.isLeft(pingAttempt)) {
+            const wrapperRunning = record.isRunnerRunning()
+            const severity = classifyRunnerDispatchFailure({ error: pingAttempt.left, wrapperRunning })
+            const reason = pingAttempt.left instanceof Error ? pingAttempt.left.message : String(pingAttempt.left)
+
+            yield* markSessionRunnerFailed({
+              sessionId,
+              record,
+              lastCommand: "ping",
+              reason,
+              wrapperRunning,
+              severity,
+            })
+
+            if (severity === "degraded") {
+              return record.health
+            }
+
+            return yield* new EnvironmentError({
+              code: "session-runner-ping",
+              reason,
+              nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
+              details: [],
+            })
+          }
+
+          const response = pingAttempt.right
+
+          // PRB-083 gate 6: a successful ping against the same live wrapper
+          // restores `resources.runner` to "ready" (rather than carrying
+          // forward whatever it was, which is how a prior "failed" used to
+          // stick forever) and re-derives `state` from that instead of
+          // hard-coding it — so a session genuinely recovers instead of
+          // staying stuck failed after the runner answers again.
+          const nextHealthBase: SessionHealth = {
             ...record.health,
-            state: response.ok ? record.health.state : "failed",
             updatedAt: nowIso(),
             expiresAt: expiresAtIso(),
-            resources: response.ok
-              ? record.health.resources
-              : setRunnerResourceState(record.health.resources, "failed"),
+            resources: setRunnerResourceState(record.health.resources, response.ok ? "ready" : "failed"),
             healthCheck: {
               checkedAt: nowIso(),
               wrapperRunning: record.isRunnerRunning(),
@@ -4574,9 +4708,15 @@ export const SessionRegistryLive = Layer.scoped(
             artifacts: [...(yield* refreshArtifacts(sessionId))],
           }
 
+          record.health = {
+            ...nextHealthBase,
+            state: deriveSessionPhase(nextHealthBase),
+          }
+
           yield* persistHealth(sessionId, record.health)
           yield* syncDaemonMetadata
           return record.health
+          })))
         }),
       sendRunnerKeepalive: (sessionId) =>
         Effect.gen(function* () {
@@ -4586,8 +4726,9 @@ export const SessionRegistryLive = Layer.scoped(
             return
           }
 
-          yield* sendRunnerCommand(sessionId, record, "ping", "perf-keepalive")
-          record.nextSequence += 1
+          yield* record.controller.submit((ctx) =>
+            withControllerContext(ctx, sendRunnerCommand(sessionId, record, "ping", "perf-keepalive")),
+          ).pipe(Effect.asVoid)
         }),
       getSessionLogs: ({
         sessionId,
@@ -4979,13 +5120,18 @@ export const SessionRegistryLive = Layer.scoped(
       captureSnapshot: ({ sessionId, outputMode }) =>
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
-          const captured = yield* (runWithRetry({
-            policy: defaultReadOnlyRetryPolicy,
-            run: () => captureSnapshotArtifactInternal(sessionId, record),
-          }) as Effect.Effect<
-            { readonly value: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord }; readonly retry: RetryAttemptMetadata },
-            UnsupportedCapabilityError | EnvironmentError | ChildProcessError
-          >)
+          const captured = yield* record.controller.submit((ctx) =>
+            withControllerContext(
+              ctx,
+              runWithRetry({
+                policy: defaultReadOnlyRetryPolicy,
+                run: () => captureSnapshotArtifactInternal(sessionId, record),
+              }) as Effect.Effect<
+                { readonly value: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord }; readonly retry: RetryAttemptMetadata },
+                UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+              >,
+            ),
+          )
           return buildSessionSnapshotResult({
             artifact: captured.value.artifact,
             artifactRecord: captured.value.artifactRecord,
@@ -4995,11 +5141,17 @@ export const SessionRegistryLive = Layer.scoped(
         }),
       performAction: ({ sessionId, action }) =>
         Effect.gen(function* () {
-          const outcome = yield* executeSessionAction({
-            sessionId,
-            action,
-            recordAction: true,
-          })
+          const record = yield* requireSessionRecord(sessionId)
+          const outcome = yield* record.controller.submit((ctx) =>
+            withControllerContext(
+              ctx,
+              executeSessionAction({
+                sessionId,
+                action,
+                recordAction: true,
+              }),
+            ),
+          )
 
           if (!outcome.ok) {
             return yield* outcome.error
@@ -5020,8 +5172,15 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
-          const isV2SessionFlow = isFlowV2Contract(flow)
           const record = yield* requireSessionRecord(sessionId)
+
+          // PRB-083: the whole flow run — every step it dispatches — is one
+          // operation on this session's controller fiber, exactly like a
+          // single action. This is a mechanical integration (routing the
+          // flow's existing runner dispatches through the shared
+          // controller context), not a change to flow planning/execution
+          // itself, which stays out of PRB-083's scope per the glyph notes.
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           yield* refreshSessionArtifacts(sessionId, record)
           const plan = planFlowExecution(flow)
 
@@ -5060,7 +5219,7 @@ export const SessionRegistryLive = Layer.scoped(
               : error.reason
 
           const successWarnings = (args: {
-            readonly step: FlowStep | FlowV2Step
+            readonly step: FlowV2Step
             readonly baseWarnings: ReadonlyArray<string>
             readonly resolvedBy?: SessionActionResult["resolvedBy"]
           }) => {
@@ -5079,21 +5238,12 @@ export const SessionRegistryLive = Layer.scoped(
             return dedupeStrings(warnings)
           }
 
-          const plannedExecutionProfile = (plannedStep: PlannedStep): FlowStepResult["executionProfile"] => {
-            if (!isV2SessionFlow) {
-              return null
-            }
-
-            return plannedStep.kind === "fast-single" || plannedStep.kind === "batch-sequence"
+          const plannedExecutionProfile = (plannedStep: PlannedStep): FlowV2StepResult["executionProfile"] =>
+            plannedStep.kind === "fast-single" || plannedStep.kind === "batch-sequence"
               ? "fast"
               : "verified"
-          }
 
-          const plannedTransportLane = (plannedStep: PlannedStep): FlowStepResult["transportLane"] => {
-            if (!isV2SessionFlow) {
-              return null
-            }
-
+          const plannedTransportLane = (plannedStep: PlannedStep): FlowV2StepResult["transportLane"] => {
             if (plannedStep.kind === "batch-sequence") {
               return "runner-batch"
             }
@@ -5104,18 +5254,6 @@ export const SessionRegistryLive = Layer.scoped(
 
             return plannedStep.step.kind === "wait" ? "host-single" : "runner-single"
           }
-
-          const runnerSupportsCapability = (
-            activeRecord: ActiveSessionRecord,
-            capability: "uiAction" | "uiActionBatch",
-          ): boolean =>
-            isLiveRunnerDetails(activeRecord.health.runner)
-            && (activeRecord.health.runner.capabilities ?? []).includes(capability)
-
-          const describeRunnerCapabilities = (activeRecord: ActiveSessionRecord): string =>
-            isLiveRunnerDetails(activeRecord.health.runner)
-              ? (activeRecord.health.runner.capabilities ?? []).join(", ") || "none"
-              : "none"
 
           type RunnerBatchWaitActionPayload = {
             readonly kind: "wait"
@@ -5181,12 +5319,9 @@ export const SessionRegistryLive = Layer.scoped(
             }
           }
 
-          type BuiltFlowStepResult = FlowStepResult | FlowV2StepResult
-          type BuiltFailedStep = FlowFailedStep | FlowV2FailedStep
-
           const buildFlowStepResult = (args: {
             readonly plannedStep: PlannedStep
-            readonly kind: FlowStepResult["kind"] | FlowV2StepResult["kind"]
+            readonly kind: FlowV2StepResult["kind"]
             readonly summary: string
             readonly verdict: SessionFlowResult["verdict"]
             readonly matchedRef: string | null
@@ -5197,13 +5332,10 @@ export const SessionRegistryLive = Layer.scoped(
             readonly handledMs: number | null
             readonly checkpoint?: FlowV2StepResult["checkpoint"]
             readonly sequenceChildFailure?: FlowSequenceChildFailure | null
-          }): BuiltFlowStepResult => {
-            const executionProfile = plannedExecutionProfile(args.plannedStep)
-            const transportLane = plannedTransportLane(args.plannedStep)
-
-            const base = {
+          }): FlowV2StepResult =>
+            ({
               index: args.plannedStep.index,
-              kind: args.kind as FlowStepResult["kind"],
+              kind: args.kind,
               summary: args.summary,
               verdict: args.verdict,
               matchedRef: args.matchedRef,
@@ -5211,49 +5343,25 @@ export const SessionRegistryLive = Layer.scoped(
               retryCount: args.retryCount,
               retryReasons: args.retryReasons,
               artifacts: [] as Array<ArtifactRecord>,
-              executionProfile,
-              transportLane,
+              executionProfile: plannedExecutionProfile(args.plannedStep),
+              transportLane: plannedTransportLane(args.plannedStep),
               handledMs: args.handledMs,
               warnings: args.warnings,
-            }
-
-            if (!isV2SessionFlow) {
-              return base satisfies FlowStepResult
-            }
-
-            return {
-              ...base,
-              kind: args.kind as FlowV2StepResult["kind"],
-              executionProfile: executionProfile ?? "verified",
-              transportLane: transportLane ?? "host-single",
               checkpoint: args.checkpoint ?? null,
               sequenceChildFailure: args.sequenceChildFailure ?? null,
-            } satisfies FlowV2StepResult
-          }
+            }) satisfies FlowV2StepResult
 
-          const toFailedStep = (step: BuiltFlowStepResult): BuiltFailedStep => {
-            if (!isV2SessionFlow) {
-              return {
-                index: step.index,
-                kind: step.kind as FlowFailedStep["kind"],
-                summary: step.summary,
-                verdict: step.verdict,
-              } satisfies FlowFailedStep
-            }
-
-            const stepResult = step as FlowV2StepResult
-            return {
-              index: stepResult.index,
-              kind: stepResult.kind,
-              summary: stepResult.summary,
-              verdict: stepResult.verdict,
-              executionProfile: stepResult.executionProfile,
-              transportLane: stepResult.transportLane,
-              handledMs: stepResult.handledMs,
-              checkpoint: stepResult.checkpoint,
-              sequenceChildFailure: stepResult.sequenceChildFailure,
-            } satisfies FlowV2FailedStep
-          }
+          const toFailedStep = (step: FlowV2StepResult): FlowV2FailedStep => ({
+            index: step.index,
+            kind: step.kind,
+            summary: step.summary,
+            verdict: step.verdict,
+            executionProfile: step.executionProfile,
+            transportLane: step.transportLane,
+            handledMs: step.handledMs,
+            checkpoint: step.checkpoint,
+            sequenceChildFailure: step.sequenceChildFailure,
+          })
 
           const mergeVerdict = (
             current: SessionFlowResult["verdict"],
@@ -5270,16 +5378,12 @@ export const SessionRegistryLive = Layer.scoped(
             return "passed"
           }
 
-          const toSessionAction = (step: FlowStep | FlowV2Step): SessionAction => {
-            if (isV2SessionFlow && isFlowV2SessionActionStep(step as FlowV2Step)) {
-              return flowV2StepToSessionAction(step as Parameters<typeof flowV2StepToSessionAction>[0])
+          const toSessionAction = (step: FlowV2Step): SessionAction => {
+            if (isFlowV2SessionActionStep(step)) {
+              return flowV2StepToSessionAction(step)
             }
 
-            if (isFlowSessionActionStep(step as FlowStep)) {
-              return flowStepToSessionAction(step as Parameters<typeof flowStepToSessionAction>[0])
-            }
-
-            throw new Error(`Expected a flow session-action step, received ${(step as { readonly kind: string }).kind}.`)
+            throw new Error(`Expected a flow session-action step, received ${step.kind}.`)
           }
 
           const classifyFastFailureCode = (reason: string): "session-action-target-not-found" | "session-action-failed" =>
@@ -5291,29 +5395,20 @@ export const SessionRegistryLive = Layer.scoped(
             step: FlowV2FastSingleStep,
           ) =>
             Effect.gen(function* () {
-              if (!isRunnerBackedRecord(record)) {
-                return yield* new UnsupportedCapabilityError({
+              const runnerRecord = yield* requireRunnerCapability({
+                record,
+                isRunnerBacked: isRunnerBackedRecord,
+                advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
+                capability: "uiAction",
+                capabilityTag: "session.run.fast",
+                usageDescription: "fast single-step flow execution",
+                notRunnerBacked: {
                   code: "session-action-real-device-runner",
-                  capability: "session.run.fast",
                   reason: "This session does not currently expose a live runner transport for fast flow actions.",
                   nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-                  details: [],
-                  wall: false,
-                })
-              }
-
-              if (!runnerSupportsCapability(record, "uiAction")) {
-                return yield* new UnsupportedCapabilityError({
-                  code: "session-runner-capability-ui-action",
-                  capability: "session.run.fast",
-                  reason: "The connected runner does not advertise uiAction support required for fast single-step flow execution.",
-                  nextStep: "Open a session against a runner that reports uiAction capability, or switch the flow step back to verified execution.",
-                  details: [`runner capabilities: ${describeRunnerCapabilities(record)}`],
-                  wall: false,
-                })
-              }
-
-              const runnerRecord = record
+                },
+                missingCapabilityNextStep: "Open a session against a runner that reports uiAction capability, or switch the flow step back to verified execution.",
+              })
 
               if (step.kind === "wait") {
                 yield* Effect.sleep(step.timeoutMs)
@@ -5371,7 +5466,6 @@ export const SessionRegistryLive = Layer.scoped(
                       "uiAction",
                       JSON.stringify(payload),
                     )
-                    record.nextSequence += 1
 
                     if (!response.ok) {
                       const failureReason = response.error
@@ -5429,9 +5523,9 @@ export const SessionRegistryLive = Layer.scoped(
               } satisfies ActionExecutionOutcome
             })
 
-          const executedSteps: Array<BuiltFlowStepResult> = []
+          const executedSteps: Array<FlowV2StepResult> = []
           const createdArtifacts: Array<ArtifactRecord> = []
-          let failedStep: BuiltFailedStep | null = null
+          let failedStep: FlowV2FailedStep | null = null
           let overallVerdict: SessionFlowResult["verdict"] = "passed"
           let totalRetries = 0
           let stoppedEarly = false
@@ -5440,7 +5534,7 @@ export const SessionRegistryLive = Layer.scoped(
             const step = plannedStep.step
             const beforeArtifacts = [...record.health.artifacts]
             const continueOnError = step.continueOnError === true
-            let stepResult: BuiltFlowStepResult
+            let stepResult: FlowV2StepResult
 
             if (step.kind === "snapshot") {
               const captured = yield* attemptWithRetry({
@@ -5649,27 +5743,20 @@ export const SessionRegistryLive = Layer.scoped(
               const checkpoint = plannedStep.step.checkpoint ?? "none"
               const batchEffect = yield* Effect.either(
                 Effect.gen(function* () {
-                  if (!isRunnerBackedRecord(record)) {
-                    return yield* new UnsupportedCapabilityError({
+                  const runnerRecord = yield* requireRunnerCapability({
+                    record,
+                    isRunnerBacked: isRunnerBackedRecord,
+                    advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
+                    capability: "uiActionBatch",
+                    capabilityTag: "session.run.sequence.batch",
+                    usageDescription: "fast sequence execution",
+                    notRunnerBacked: {
                       code: "session-action-real-device-runner",
-                      capability: "session.run.sequence.batch",
                       reason: "This session does not currently expose a live runner transport for batch sequence flow steps.",
                       nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-                      details: [],
-                      wall: false,
-                    })
-                  }
-
-                  if (!runnerSupportsCapability(record, "uiActionBatch")) {
-                    return yield* new UnsupportedCapabilityError({
-                      code: "session-runner-capability-ui-action-batch",
-                      capability: "session.run.sequence.batch",
-                      reason: "The connected runner does not advertise uiActionBatch support required for fast sequence execution.",
-                      nextStep: "Open a session against a runner that reports uiActionBatch capability, or rewrite the flow as verified single steps.",
-                      details: [`runner capabilities: ${describeRunnerCapabilities(record)}`],
-                      wall: false,
-                    })
-                  }
+                    },
+                    missingCapabilityNextStep: "Open a session against a runner that reports uiActionBatch capability, or rewrite the flow as verified single steps.",
+                  })
 
                   const payload = yield* Effect.try({
                     try: () => buildRunnerBatchSequencePayload(plannedStep.step.actions),
@@ -5684,11 +5771,10 @@ export const SessionRegistryLive = Layer.scoped(
 
                   const response = yield* sendRunnerCommand(
                     sessionId,
-                    record,
+                    runnerRecord,
                     "uiActionBatch",
                     JSON.stringify(payload),
                   )
-                  record.nextSequence += 1
                   updateHealthCheck(record, response.action, response.ok)
 
                   const checkpointCapture = checkpoint === "end"
@@ -5888,7 +5974,7 @@ export const SessionRegistryLive = Layer.scoped(
             yield* refreshSessionArtifacts(sessionId, record)
 
             const artifacts = diffArtifacts(beforeArtifacts, record.health.artifacts)
-            stepResult = { ...stepResult, artifacts } as BuiltFlowStepResult
+            stepResult = { ...stepResult, artifacts }
 
             executedSteps.push(stepResult)
             createdArtifacts.push(...artifacts)
@@ -5916,35 +6002,20 @@ export const SessionRegistryLive = Layer.scoped(
               ? `Flow ${overallVerdict === "timed-out" ? "timed out" : "failed"} at step ${failedStep.index} after ${executedSteps.length} executed step(s) and ${totalRetries} retr${totalRetries === 1 ? "y" : "ies"}.`
               : `Executed ${executedSteps.length} flow step(s) with ${failedStepCount} failed step(s), continuing past failures where continueOnError was enabled.`
 
-          if (isV2SessionFlow) {
-            return {
-              contract: "probe.session-flow/report-v2",
-              executedAt: nowIso(),
-              sessionId,
-              summary,
-              verdict: overallVerdict,
-              executedSteps: executedSteps as Array<FlowV2StepResult>,
-              failedStep: failedStep as FlowV2FailedStep | null,
-              retries: totalRetries,
-              artifacts: dedupedArtifacts,
-              finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
-              warnings: overallWarnings,
-            } satisfies FlowV2Result
-          }
-
           return {
-            contract: "probe.session-flow/report-v1",
+            contract: "probe.session-flow/report-v2",
             executedAt: nowIso(),
             sessionId,
             summary,
             verdict: overallVerdict,
-            executedSteps: executedSteps as Array<FlowStepResult>,
-            failedStep: failedStep as FlowFailedStep | null,
+            executedSteps,
+            failedStep,
             retries: totalRetries,
             artifacts: dedupedArtifacts,
             finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
             warnings: overallWarnings,
-          } satisfies FlowResult
+          } satisfies FlowV2Result
+          })))
         }),
       exportRecording: ({ sessionId, label }) =>
         Effect.gen(function* () {
@@ -6022,6 +6093,9 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          // PRB-083: the whole replay run is one operation on this
+          // session's controller fiber, mirroring runFlow above.
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           const reports: Array<ReplayStepReport> = []
           let retriedStepCount = 0
           let semanticFallbackCount = 0
@@ -6194,7 +6268,6 @@ export const SessionRegistryLive = Layer.scoped(
                   ),
                 ),
               )
-              record.nextSequence += 1
 
               if (!response.ok) {
                 lastFailure = response.error ?? response.payload ?? `Runner ${step.kind} failed with status ${response.statusLabel}.`
@@ -6331,6 +6404,7 @@ export const SessionRegistryLive = Layer.scoped(
             semanticFallbackCount,
             finalSnapshotId,
           } satisfies SessionReplayResult
+          })))
         }),
       captureScreenshot: ({ sessionId, label, outputMode }) =>
         Effect.gen(function* () {
@@ -6338,6 +6412,7 @@ export const SessionRegistryLive = Layer.scoped(
 
           yield* assertRunnerActionsAvailable(record)
 
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           const labelStem = sanitizeFileComponent(label, "screenshot")
           const fileStem = `${timestampForFile()}-${labelStem}`
           const capture = yield* Effect.either(runWithRetry({
@@ -6376,6 +6451,7 @@ export const SessionRegistryLive = Layer.scoped(
             retryCount: capture.right.retry.retryCount,
             retryReasons: capture.right.retry.retryReasons,
           } satisfies SessionScreenshotResult
+          })))
         }),
       recordVideo: ({ sessionId, duration }) =>
         Effect.gen(function* () {
@@ -6394,6 +6470,7 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           const durationMs = normalizeVideoDurationMs(parsedDurationMs)
           const fileStem = `${timestampForFile()}-${sanitizeFileComponent(duration, "video")}`
           const capture = yield* Effect.either(captureVideoArtifact({
@@ -6425,22 +6502,26 @@ export const SessionRegistryLive = Layer.scoped(
             summary: `Captured ${modeSummary} at ${capture.right.artifact.absolutePath}.${clampNote}`,
             artifact: capture.right.artifact,
           } satisfies SummaryArtifactResult
+          })))
         }),
       closeSession: (sessionId) =>
         Effect.gen(function* () {
-          const closed = yield* closeSessionInternal(sessionId, "explicit-close")
+          const closedHealth = yield* closeSessionInternal(sessionId, "explicit-close")
 
-          if (!closed) {
+          if (closedHealth === null) {
             return yield* new SessionNotFoundError({
               sessionId,
               nextStep: "Open a new session before attempting to close it.",
             })
           }
 
+          // PRB-083 gate 10: `closedAt` comes from the terminal health
+          // itself, so a repeat close call reports the moment the session
+          // actually closed rather than a fresh timestamp on every call.
           return {
             sessionId,
             state: "closed",
-            closedAt: nowIso(),
+            closedAt: closedHealth.updatedAt,
           }
         }),
       runDebugCommand: ({ sessionId, outputMode, command }) =>

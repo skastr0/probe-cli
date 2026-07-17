@@ -1,6 +1,5 @@
-import type { FlowContract, FlowSessionActionStep, FlowStep } from "./action"
+import type { FlowSessionActionStep, FlowStep } from "./action"
 import {
-  isFlowV2Contract,
   isFlowV2SessionActionStep,
   resolveFlowExecutionProfile,
   type FlowSequenceStep,
@@ -30,18 +29,6 @@ const isCheckpointStep = (step: PlannableFlowStep): boolean =>
 const isEvidenceStep = (step: PlannableFlowStep): boolean =>
   step.kind === "screenshot" || step.kind === "video"
 
-const planFlowV1Step = (step: FlowStep, index: number): PlannedStep => {
-  if (isCheckpointStep(step)) {
-    return { kind: "checkpoint", step, index }
-  }
-
-  if (isEvidenceStep(step)) {
-    return { kind: "evidence", step, index }
-  }
-
-  return { kind: "verified", step, index }
-}
-
 const planFlowV2Step = (flow: FlowV2Contract, step: FlowV2Step, index: number): PlannedStep => {
   if (step.kind === "sequence") {
     return { kind: "batch-sequence", step, index }
@@ -65,9 +52,7 @@ const planFlowV2Step = (flow: FlowV2Contract, step: FlowV2Step, index: number): 
 }
 
 export const planFlowExecution = (flow: SessionFlowContract): ExecutionPlan => ({
-  steps: isFlowV2Contract(flow)
-    ? flow.steps.map((step, index) => planFlowV2Step(flow, step, index + 1))
-    : flow.steps.map((step, index) => planFlowV1Step(step, index + 1)),
+  steps: flow.steps.map((step, index) => planFlowV2Step(flow, step, index + 1)),
 })
 
 export const isVerifiedPlannedStep = (
