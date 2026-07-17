@@ -372,4 +372,161 @@ describe("AppleProcessSupervisor", () => {
       expect(() => process.kill(pid, 0)).toThrow()
     })
   })
+
+  test("onStderrChunk observes raw chunks without disturbing the supervisor's own bounded capture", async () => {
+    const observed: Array<string> = []
+
+    const result = await withSupervisor(
+      Effect.flatMap(AppleProcessSupervisor, (supervisor) =>
+        supervisor.run({
+          command: "/bin/sh",
+          commandArgs: ["-c", "echo mark-one 1>&2; echo mark-two 1>&2"],
+          onStderrChunk: (chunk) => observed.push(chunk.toString("utf8")),
+        })),
+    )
+
+    expect(observed.join("")).toContain("mark-one")
+    expect(observed.join("")).toContain("mark-two")
+    // The hook is additive -- the supervisor's own bounded capture is unaffected.
+    expect(result.stderr).toContain("mark-one")
+    expect(result.stderr).toContain("mark-two")
+  })
+
+  test("spawnHandle with stdin: \"pipe\" exposes a writable stdin the caller can drive", async () => {
+    const outcome = await withSupervisor(
+      Effect.gen(function* () {
+        const supervisor = yield* AppleProcessSupervisor
+        const handle = yield* supervisor.spawnHandle({
+          command: "/bin/cat",
+          commandArgs: [],
+          stdin: "pipe",
+          gracePeriodMs: 300,
+        })
+
+        expect(handle.stdin).not.toBeNull()
+        handle.stdin?.write("hello-from-parent\n")
+        handle.stdin?.end()
+
+        return yield* Effect.promise(() => handle.awaitExit)
+      }),
+    )
+
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.stdout.trim()).toBe("hello-from-parent")
+  })
+
+  test(
+    "spawnHandle with externalStdout: true leaves stdout paused for the caller -- no chunk lost to an eager default listener",
+    async () => {
+      const outcome = await withSupervisor(
+        Effect.gen(function* () {
+          const supervisor = yield* AppleProcessSupervisor
+          const handle = yield* supervisor.spawnHandle({
+            command: "/bin/sh",
+            commandArgs: ["-c", "echo line-one; echo line-two"],
+            externalStdout: true,
+            gracePeriodMs: 300,
+          })
+
+          expect(handle.stdout).not.toBeNull()
+
+          const collected: ReadonlyArray<string> = yield* Effect.promise(() =>
+            new Promise<ReadonlyArray<string>>((resolve) => {
+              const chunks: Array<string> = []
+              // Attaching this listener only now (after spawn already returned)
+              // is exactly the race an eager default listener would lose --
+              // externalStdout guarantees the stream stayed paused until here.
+              handle.stdout?.on("data", (chunk: Buffer) => chunks.push(chunk.toString("utf8")))
+              handle.stdout?.on("end", () => resolve(chunks))
+            }))
+
+          return { joined: collected.join(""), result: yield* Effect.promise(() => handle.awaitExit) }
+        }),
+      )
+
+      expect(outcome.joined).toContain("line-one")
+      expect(outcome.joined).toContain("line-two")
+      // externalStdout means the supervisor's own capture stays empty --
+      // the caller owns the stream instead.
+      expect(outcome.result.stdout).toBe("")
+    },
+  )
+
+  test("run() cancels via AbortSignal -- resolves cancelled: true and leaves zero surviving descendants", async () => {
+    const controller = new AbortController()
+
+    const observed = await withSupervisor(
+      Effect.gen(function* () {
+        const supervisor = yield* AppleProcessSupervisor
+        const runFiber = yield* Effect.fork(
+          supervisor.run({
+            command: "/bin/sh",
+            // A process-group leader that forks two descendants and waits on
+            // them -- the same shape the descendant fault tests above use.
+            commandArgs: ["-c", "echo partial; sleep 30 & sleep 30 & wait"],
+            signal: controller.signal,
+            gracePeriodMs: 150,
+          }),
+        )
+
+        yield* Effect.sleep(Duration.millis(150))
+        const during = yield* supervisor.activeChildCount
+        controller.abort()
+        const result = yield* Fiber.join(runFiber)
+        const after = yield* supervisor.activeChildCount
+
+        return { during, after, result }
+      }),
+    )
+
+    expect(observed.during).toBe(1)
+    expect(observed.after).toBe(0)
+    expect(observed.result.cancelled).toBe(true)
+    expect(observed.result.timedOut).toBe(false)
+    expect(observed.result.stdout.trim()).toBe("partial")
+    expect(observed.result.exitCode).not.toBe(0)
+  })
+
+  test("run() never triggers cancellation when the signal never aborts", async () => {
+    const controller = new AbortController()
+
+    const result = await withSupervisor(
+      Effect.flatMap(AppleProcessSupervisor, (supervisor) =>
+        supervisor.run({
+          command: "/bin/sh",
+          commandArgs: ["-c", "echo done; exit 0"],
+          signal: controller.signal,
+        })),
+    )
+
+    expect(result.cancelled).toBe(false)
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe("done")
+  })
+
+  test("stdin/stdout pipe handle still leaves zero surviving descendants after stop()", async () => {
+    const pgid = await withSupervisor(
+      Effect.gen(function* () {
+        const supervisor = yield* AppleProcessSupervisor
+        const handle = yield* supervisor.spawnHandle({
+          command: "/bin/sh",
+          commandArgs: ["-c", "sleep 30 & sleep 30 & wait"],
+          stdin: "pipe",
+          externalStdout: true,
+          gracePeriodMs: 150,
+        })
+
+        // Drain stdout so the child can never block on pipe backpressure.
+        handle.stdout?.resume()
+
+        yield* Effect.sleep(Duration.millis(150))
+        const membersBeforeStop = processGroupMembers(handle.pid)
+        yield* Effect.promise(() => handle.stop())
+        return { pgid: handle.pid, membersBeforeStop }
+      }),
+    )
+
+    expect(pgid.membersBeforeStop.length).toBeGreaterThan(0)
+    expect(processGroupMembers(pgid.pgid).length).toBe(0)
+  })
 })

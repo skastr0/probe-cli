@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process"
 import { createWriteStream, type WriteStream } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
-import type { Transform } from "node:stream"
+import type { Readable, Transform, Writable } from "node:stream"
 import { Context, Duration, Effect, Layer, ManagedRuntime, Ref } from "effect"
 import { ChildProcessError } from "../domain/errors"
 
@@ -37,6 +37,15 @@ export interface AppleProcessSpec {
   readonly env?: NodeJS.ProcessEnv
   /** Kills the process group and fails with a `command-timeout` ChildProcessError. */
   readonly timeoutMs?: number
+  /**
+   * `run()` only: when this signal aborts, the process group is torn down
+   * through the same TERM -> grace -> KILL ladder fiber interruption already
+   * uses (aborting races the underlying scope, interrupting it) and the
+   * result resolves with `cancelled: true` instead of throwing. Lets a caller
+   * thread an external cancellation source (e.g. an RPC client disconnect)
+   * through to the owned child without inventing a second kill path.
+   */
+  readonly signal?: AbortSignal
   /** Grace window between SIGTERM and SIGKILL on interruption/timeout. Default 2000ms. */
   readonly gracePeriodMs?: number
   /** When set, the full stdout stream is also appended to this path, never rewritten. */
@@ -55,6 +64,35 @@ export interface AppleProcessSpec {
    * its own typed error contract.
    */
   readonly onSpawnError?: (error: unknown) => void
+  /**
+   * Observes each raw stdout/stderr chunk as it arrives, in addition to (not
+   * instead of) the supervisor's own bounded capture/artifact write. This is
+   * for a caller that needs to react to output as it streams -- e.g.
+   * detecting a tool's "recording started" marker on stderr to know when a
+   * bounded duration window should begin -- while the supervisor keeps owning
+   * draining, registration, and kill escalation. Output parsing stays the
+   * wrapper's job; only lifecycle stays here.
+   */
+  readonly onStdoutChunk?: (chunk: Buffer) => void
+  readonly onStderrChunk?: (chunk: Buffer) => void
+  /**
+   * `spawnHandle` only: requests a writable stdin pipe on the child (default
+   * "ignore", matching every other call site). Only meaningful for a
+   * long-lived handle that needs to send input after spawn (e.g. LldbBridge's
+   * line-framed JSON-RPC protocol over stdin/stdout).
+   */
+  readonly stdin?: "ignore" | "pipe"
+  /**
+   * `spawnHandle` only: when true, the supervisor does not attach its own
+   * stdout capture listener -- the caller drives `AppleProcessHandle.stdout`
+   * directly instead (e.g. piping it through `readline` for a line-framed
+   * protocol). The child's stdout stream stays in paused/buffered mode until
+   * the caller attaches its own consumer, so nothing is lost to the race an
+   * eagerly-attached default listener would create by consuming chunks before
+   * the caller has a chance to add its own. `AppleProcessResult.stdout` is
+   * always empty for a call made with this set.
+   */
+  readonly externalStdout?: boolean
 }
 
 export interface AppleProcessResult {
@@ -75,6 +113,13 @@ export interface AppleProcessResult {
    * logging/artifact policy instead of only a truncated excerpt.
    */
   readonly timedOut: boolean
+  /**
+   * True when `spec.signal` aborted before the process closed on its own.
+   * `run()` still resolves (never throws for a cancellation, only for a
+   * genuine spawn failure) with whatever stdout/stderr had been captured up
+   * to the kill, mirroring `timedOut`.
+   */
+  readonly cancelled: boolean
 }
 
 export interface AppleProcessHandle {
@@ -89,6 +134,10 @@ export interface AppleProcessHandle {
    */
   readonly stop: (signal?: NodeJS.Signals) => Promise<AppleProcessResult>
   readonly awaitExit: Promise<AppleProcessResult>
+  /** Present only when the spec set `stdin: "pipe"`; `null` otherwise. */
+  readonly stdin: Writable | null
+  /** Present only when the spec set `externalStdout: true`; `null` otherwise. */
+  readonly stdout: Readable | null
 }
 
 const defaultGracePeriodMs = 2_000
@@ -299,22 +348,34 @@ const attachSinks = (
   stdoutSink: BoundedSink,
   stderrSink: BoundedSink,
 ): void => {
-  const stdoutSource = spec.stdoutTransform ? child.stdout?.pipe(spec.stdoutTransform) : child.stdout
-  stdoutSource?.on("data", (chunk: Buffer | string) => {
-    stdoutSink.write(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk)
+  // `externalStdout` callers (LldbBridge's line-framed stdin/stdout protocol)
+  // drive `child.stdout` themselves via the handle -- leaving it unattached
+  // here keeps the stream in paused/buffered mode until they do, instead of
+  // this listener eagerly consuming (and discarding) chunks emitted before
+  // the caller has a chance to attach its own reader.
+  if (!spec.externalStdout) {
+    const stdoutSource = spec.stdoutTransform ? child.stdout?.pipe(spec.stdoutTransform) : child.stdout
+    stdoutSource?.on("data", (chunk: Buffer | string) => {
+      const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk
+      stdoutSink.write(buffer)
+      spec.onStdoutChunk?.(buffer)
+    })
+    // A transform-driven pipeline can emit 'error' (e.g. an export-budget guard
+    // rejecting more output than the caller wants to accept). The transform's own
+    // failure reason surfaces through the caller's post-processing of the result;
+    // this listener's job is only to stop treating the child as worth keeping
+    // alive -- TERM it immediately instead of waiting for its natural exit or the
+    // full timeout window.
+    stdoutSource?.on("error", () => {
+      if (spec.stdoutTransform && child.pid !== undefined && !hasExited(child)) {
+        trySignalGroup(child.pid, "SIGTERM")
+      }
+    })
+  }
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrSink.write(chunk)
+    spec.onStderrChunk?.(chunk)
   })
-  // A transform-driven pipeline can emit 'error' (e.g. an export-budget guard
-  // rejecting more output than the caller wants to accept). The transform's own
-  // failure reason surfaces through the caller's post-processing of the result;
-  // this listener's job is only to stop treating the child as worth keeping
-  // alive -- TERM it immediately instead of waiting for its natural exit or the
-  // full timeout window.
-  stdoutSource?.on("error", () => {
-    if (spec.stdoutTransform && child.pid !== undefined && !hasExited(child)) {
-      trySignalGroup(child.pid, "SIGTERM")
-    }
-  })
-  child.stderr?.on("data", (chunk: Buffer) => stderrSink.write(chunk))
 }
 
 const buildResult = (args: {
@@ -323,6 +384,7 @@ const buildResult = (args: {
   readonly stderrSink: BoundedSink
   readonly startedAt: number
   readonly timedOut: boolean
+  readonly cancelled?: boolean
 }): AppleProcessResult => ({
   stdout: args.stdoutSink.text(),
   stderr: args.stderrSink.text(),
@@ -333,7 +395,18 @@ const buildResult = (args: {
   signal: args.closeResult.signal,
   durationMs: Date.now() - args.startedAt,
   timedOut: args.timedOut,
+  cancelled: args.cancelled ?? false,
 })
+
+/** Resolves once `signal` aborts (or immediately if it already has). */
+const awaitAbort = (signal: AbortSignal): Effect.Effect<void> =>
+  signal.aborted
+    ? Effect.void
+    : Effect.async<void>((resume) => {
+      const onAbort = () => resume(Effect.void)
+      signal.addEventListener("abort", onAbort, { once: true })
+      return Effect.sync(() => signal.removeEventListener("abort", onAbort))
+    })
 
 const ensureArtifactDirectories = (spec: AppleProcessSpec): Effect.Effect<void> =>
   Effect.promise(async () => {
@@ -376,7 +449,7 @@ const runManaged = (
       }),
     )
 
-    const raced = spec.timeoutMs === undefined
+    const timed = spec.timeoutMs === undefined
       ? scoped.pipe(Effect.map((closeResult) => ({ timedOut: false as const, closeResult })))
       : scoped.pipe(
         Effect.timeoutFail({
@@ -390,15 +463,37 @@ const runManaged = (
             : Effect.fail(failure)),
       )
 
+    // `spec.signal` races the whole timed/scoped computation the same way
+    // `Fiber.interrupt` already does in the fiber-interruption test below --
+    // aborting interrupts the loser (`timed`, wrapping `scoped`), which runs
+    // the acquireRelease release above (TERM -> grace -> KILL) exactly like a
+    // direct interrupt would. No second kill path to keep in sync.
+    const raced = spec.signal === undefined
+      ? timed.pipe(Effect.map((outcome) => ({ ...outcome, cancelled: false as const })))
+      : Effect.raceFirst(
+        timed.pipe(Effect.map((outcome) => ({ ...outcome, cancelled: false as const }))),
+        awaitAbort(spec.signal).pipe(
+          Effect.as({ timedOut: false as const, cancelled: true as const, closeResult: { code: null, signal: null } }),
+        ),
+      )
+
     const outcome = yield* raced
     yield* stdoutSink.close()
     yield* stderrSink.close()
 
-    // A timeout never fails `run` -- the process is already killed by this
-    // point (the scope's release ran via interruption), and the caller keeps
-    // full access to whatever stdout/stderr was captured before the kill to
-    // build its own typed error / log artifact instead of only a tail excerpt.
-    return buildResult({ closeResult: outcome.closeResult, stdoutSink, stderrSink, startedAt, timedOut: outcome.timedOut })
+    // A timeout/cancellation never fails `run` -- the process is already
+    // killed by this point (the scope's release ran via interruption), and
+    // the caller keeps full access to whatever stdout/stderr was captured
+    // before the kill to build its own typed error / log artifact instead of
+    // only a tail excerpt.
+    return buildResult({
+      closeResult: outcome.closeResult,
+      stdoutSink,
+      stderrSink,
+      startedAt,
+      timedOut: outcome.timedOut,
+      cancelled: outcome.cancelled,
+    })
   })
 
 const spawnHandleManaged = (
@@ -413,7 +508,7 @@ const spawnHandleManaged = (
 
     yield* ensureArtifactDirectories(spec)
 
-    const child = yield* spawnChild(spec, "ignore")
+    const child = yield* spawnChild(spec, spec.stdin ?? "ignore")
     const pid = child.pid
 
     yield* registerChild(registry, pid, child)
@@ -465,6 +560,8 @@ const spawnHandleManaged = (
           }),
         ),
       awaitExit: settle(),
+      stdin: spec.stdin === "pipe" ? (child.stdin ?? null) : null,
+      stdout: spec.externalStdout ? (child.stdout ?? null) : null,
     } satisfies AppleProcessHandle
   })
 
