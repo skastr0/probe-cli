@@ -104,6 +104,18 @@ import {
 import { advertisedRunnerCapabilities, requireRunnerCapability } from "./runnerCapabilities"
 import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
 import type { RunnerAction } from "./runnerProtocol"
+import {
+  defaultVideoCaptureFps,
+  describeRunnerFrameSequenceFallback,
+  describeRunnerMp4Artifact,
+  describeSimulatorMovFallback,
+  describeSimulatorMp4Remux,
+  formatFpsLabel,
+  normalizeVideoDurationMs,
+  parseRationalNumber,
+  resolveFfmpegExecutable,
+  resolveFfprobeExecutable,
+} from "./VideoCapturePolicy"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
 const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
@@ -118,9 +130,7 @@ const defaultDebugCommandTimeoutMs = Number(process.env.PROBE_LLDB_COMMAND_TIMEO
 const maxDebugFrameLimit = 200
 const maxDebugEvalTimeoutMs = 30_000
 const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
-const maxVideoDurationMs = 120_000
 const defaultVideoDurationMs = 10_000
-const videoCaptureFps = 10
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
 const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
@@ -172,28 +182,6 @@ const parseDurationStringMs = (value: string): number | null => {
     default:
       return null
   }
-}
-
-const normalizeVideoDurationMs = (durationMs: number): number =>
-  Math.min(Math.max(Math.round(durationMs), 1), maxVideoDurationMs)
-
-const resolveFfmpegExecutable = (): string => process.env.PROBE_FFMPEG_PATH ?? "ffmpeg"
-
-const resolveFfprobeExecutable = (): string => {
-  const configured = process.env.PROBE_FFPROBE_PATH
-
-  if (configured) {
-    return configured
-  }
-
-  const ffmpegExecutable = resolveFfmpegExecutable()
-  const executableName = basename(ffmpegExecutable)
-
-  if (executableName.includes("ffmpeg")) {
-    return join(dirname(ffmpegExecutable), executableName.replace("ffmpeg", "ffprobe"))
-  }
-
-  return "ffprobe"
 }
 
 // Exported for direct process-level test coverage of the AppleProcessSupervisor
@@ -269,44 +257,6 @@ const isFfmpegAvailable = async (): Promise<boolean> => {
 
     throw error
   }
-}
-
-const parseRationalNumber = (value: string): number | null => {
-  const trimmed = value.trim()
-
-  if (trimmed.length === 0) {
-    return null
-  }
-
-  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
-    const numeric = Number(trimmed)
-    return Number.isFinite(numeric) ? numeric : null
-  }
-
-  const match = trimmed.match(/^(-?\d+)\/(-?\d+)$/)
-
-  if (!match) {
-    return null
-  }
-
-  const numerator = Number(match[1])
-  const denominator = Number(match[2])
-
-  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) {
-    return null
-  }
-
-  const numeric = numerator / denominator
-  return Number.isFinite(numeric) ? numeric : null
-}
-
-const formatFpsLabel = (value: number): string => {
-  if (!Number.isFinite(value)) {
-    return "unknown"
-  }
-
-  const rounded = Math.round(value * 100) / 100
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2)
 }
 
 const probeSimulatorVideoFrameRate = async (absolutePath: string): Promise<{
@@ -2597,10 +2547,8 @@ export const SessionRegistryLive = Layer.scoped(
           artifactRoot: args.artifactRoot,
           key: args.artifactKey,
           label: args.artifactLabel,
-          kind: "directory",
+          ...describeRunnerFrameSequenceFallback({ frameCount: args.manifest.frameCount, fps: args.manifest.fps }),
           absolutePath: bundlePath,
-          summary:
-            `Frame-sequence bundle with ${args.manifest.frameCount} frame(s) at ${args.manifest.fps} fps because ffmpeg was not available for MP4 stitching.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -2734,7 +2682,7 @@ export const SessionRegistryLive = Layer.scoped(
               commandArgs: [
                 "-y",
                 "-framerate",
-                String(manifest.fps || videoCaptureFps),
+                String(manifest.fps || defaultVideoCaptureFps),
                 "-i",
                 "frame-%05d.png",
                 "-c:v",
@@ -2768,9 +2716,8 @@ export const SessionRegistryLive = Layer.scoped(
           artifactRoot: args.record.health.artifactRoot,
           key: args.artifactKey,
           label: args.artifactLabel,
-          kind: "mp4",
+          ...describeRunnerMp4Artifact({ frameCount: manifest.frameCount, fps: manifest.fps }),
           absolutePath,
-          summary: `MP4 video with ${manifest.frameCount} frame(s) at ${manifest.fps} fps stitched from runner screenshots via ffmpeg.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -2817,10 +2764,8 @@ export const SessionRegistryLive = Layer.scoped(
             artifactRoot: args.record.health.artifactRoot,
             key: args.artifactKey,
             label: args.artifactLabel,
-            kind: "mov",
+            ...describeSimulatorMovFallback({ durationMs: args.durationMs }),
             absolutePath: movPath,
-            summary:
-              `Native simulator QuickTime video captured over simctl with requested duration ${args.durationMs}ms because ffmpeg was not available to remux it to MP4.`,
           })
 
           yield* artifactStore.registerArtifact(args.sessionId, artifact)
@@ -2897,12 +2842,11 @@ export const SessionRegistryLive = Layer.scoped(
           artifactRoot: args.record.health.artifactRoot,
           key: args.artifactKey,
           label: args.artifactLabel,
-          kind: "mp4",
+          ...describeSimulatorMp4Remux({
+            durationMs: args.durationMs,
+            sourceFrameRateLabel: sourceFrameRate === null ? null : sourceFrameRate.label,
+          }),
           absolutePath,
-          summary:
-            sourceFrameRate === null
-              ? `Native simulator video captured over simctl and transcoded to MP4 via ffmpeg using the source timing for requested duration ${args.durationMs}ms.`
-              : `Native simulator video captured over simctl and normalized to captured simulator rate ${sourceFrameRate.label} fps MP4 via ffmpeg for requested duration ${args.durationMs}ms.`,
         })
 
         yield* artifactStore.registerArtifact(args.sessionId, artifact)
