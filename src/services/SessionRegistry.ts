@@ -77,7 +77,6 @@ import type {
 import { appendSessionLogMarkers, summarizeContent } from "../domain/output"
 import {
   SessionHealth,
-  isLiveRunnerDetails,
   type SessionConnectionDetails,
   type SessionHealthCheck,
   type SessionListEntry,
@@ -102,6 +101,7 @@ import {
   type SessionController,
   type SessionControllerContext,
 } from "./SessionController"
+import { advertisedRunnerCapabilities, requireRunnerCapability } from "./runnerCapabilities"
 import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
 import type { RunnerAction } from "./runnerProtocol"
 
@@ -5321,18 +5321,6 @@ export const SessionRegistryLive = Layer.scoped(
             return plannedStep.step.kind === "wait" ? "host-single" : "runner-single"
           }
 
-          const runnerSupportsCapability = (
-            activeRecord: ActiveSessionRecord,
-            capability: "uiAction" | "uiActionBatch",
-          ): boolean =>
-            isLiveRunnerDetails(activeRecord.health.runner)
-            && (activeRecord.health.runner.capabilities ?? []).includes(capability)
-
-          const describeRunnerCapabilities = (activeRecord: ActiveSessionRecord): string =>
-            isLiveRunnerDetails(activeRecord.health.runner)
-              ? (activeRecord.health.runner.capabilities ?? []).join(", ") || "none"
-              : "none"
-
           type RunnerBatchWaitActionPayload = {
             readonly kind: "wait"
             readonly timeoutMs: number
@@ -5473,29 +5461,20 @@ export const SessionRegistryLive = Layer.scoped(
             step: FlowV2FastSingleStep,
           ) =>
             Effect.gen(function* () {
-              if (!isRunnerBackedRecord(record)) {
-                return yield* new UnsupportedCapabilityError({
+              const runnerRecord = yield* requireRunnerCapability({
+                record,
+                isRunnerBacked: isRunnerBackedRecord,
+                advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
+                capability: "uiAction",
+                capabilityTag: "session.run.fast",
+                usageDescription: "fast single-step flow execution",
+                notRunnerBacked: {
                   code: "session-action-real-device-runner",
-                  capability: "session.run.fast",
                   reason: "This session does not currently expose a live runner transport for fast flow actions.",
                   nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-                  details: [],
-                  wall: false,
-                })
-              }
-
-              if (!runnerSupportsCapability(record, "uiAction")) {
-                return yield* new UnsupportedCapabilityError({
-                  code: "session-runner-capability-ui-action",
-                  capability: "session.run.fast",
-                  reason: "The connected runner does not advertise uiAction support required for fast single-step flow execution.",
-                  nextStep: "Open a session against a runner that reports uiAction capability, or switch the flow step back to verified execution.",
-                  details: [`runner capabilities: ${describeRunnerCapabilities(record)}`],
-                  wall: false,
-                })
-              }
-
-              const runnerRecord = record
+                },
+                missingCapabilityNextStep: "Open a session against a runner that reports uiAction capability, or switch the flow step back to verified execution.",
+              })
 
               if (step.kind === "wait") {
                 yield* Effect.sleep(step.timeoutMs)
@@ -5830,27 +5809,20 @@ export const SessionRegistryLive = Layer.scoped(
               const checkpoint = plannedStep.step.checkpoint ?? "none"
               const batchEffect = yield* Effect.either(
                 Effect.gen(function* () {
-                  if (!isRunnerBackedRecord(record)) {
-                    return yield* new UnsupportedCapabilityError({
+                  const runnerRecord = yield* requireRunnerCapability({
+                    record,
+                    isRunnerBacked: isRunnerBackedRecord,
+                    advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
+                    capability: "uiActionBatch",
+                    capabilityTag: "session.run.sequence.batch",
+                    usageDescription: "fast sequence execution",
+                    notRunnerBacked: {
                       code: "session-action-real-device-runner",
-                      capability: "session.run.sequence.batch",
                       reason: "This session does not currently expose a live runner transport for batch sequence flow steps.",
                       nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
-                      details: [],
-                      wall: false,
-                    })
-                  }
-
-                  if (!runnerSupportsCapability(record, "uiActionBatch")) {
-                    return yield* new UnsupportedCapabilityError({
-                      code: "session-runner-capability-ui-action-batch",
-                      capability: "session.run.sequence.batch",
-                      reason: "The connected runner does not advertise uiActionBatch support required for fast sequence execution.",
-                      nextStep: "Open a session against a runner that reports uiActionBatch capability, or rewrite the flow as verified single steps.",
-                      details: [`runner capabilities: ${describeRunnerCapabilities(record)}`],
-                      wall: false,
-                    })
-                  }
+                    },
+                    missingCapabilityNextStep: "Open a session against a runner that reports uiActionBatch capability, or rewrite the flow as verified single steps.",
+                  })
 
                   const payload = yield* Effect.try({
                     try: () => buildRunnerBatchSequencePayload(plannedStep.step.actions),
@@ -5865,7 +5837,7 @@ export const SessionRegistryLive = Layer.scoped(
 
                   const response = yield* sendRunnerCommand(
                     sessionId,
-                    record,
+                    runnerRecord,
                     "uiActionBatch",
                     JSON.stringify(payload),
                   )

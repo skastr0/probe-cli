@@ -589,7 +589,11 @@ const createFakeHarness = (options?: {
           let inputValue = ""
           let uiActionCallCount = 0
           let snapshotCallCount = 0
-          const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction", "uiActionBatch"]
+          // PRB-072: default matches production truth (see RUNNER_CAPABILITY_REGISTRY in
+          // src/services/runnerCapabilities.ts) — the compiled Swift ready frame only
+          // implements uiAction today, so the fake must not advertise uiActionBatch unless
+          // a test opts in explicitly. Tests exercising the batch lane pass runnerCapabilities.
+          const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction"]
 
           const buildSnapshotPayload = () => ({
             capturedAt: "2026-04-10T00:00:00.000Z",
@@ -1104,8 +1108,11 @@ const createFakeRealDeviceHarness = (options?: {
   readonly failWith?: Error
   readonly connectionStates?: ReadonlyArray<"connected" | "disconnected">
   readonly pingStatusLabels?: ReadonlyArray<string>
+  readonly runnerCapabilities?: ReadonlyArray<"uiAction" | "uiActionBatch">
 }) => {
-  const runnerCapabilities = ["uiAction", "uiActionBatch"] as const
+  // PRB-072: default matches production truth — see the comment on the simulator
+  // fake's runnerCapabilities default above.
+  const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction"]
   let connectionIndex = 0
   let pingStatusLabelIndex = 0
   let running = true
@@ -3554,7 +3561,10 @@ describe("SessionRegistry", () => {
   test("executes fast v2 sequence steps through the runner batch lane", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      // PRB-072: uiActionBatch is not production's default; opt this fake in explicitly
+      // since this test exercises the batch lane on purpose.
       const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction", "uiActionBatch"],
         captureRunnerCommand: (command) => {
           runnerCommands.push(command)
         },
@@ -3647,7 +3657,10 @@ describe("SessionRegistry", () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
       const attemptedTargets: Array<string | null> = []
+      // PRB-072: uiActionBatch is not production's default; opt this fake in explicitly
+      // since this test exercises the batch lane on purpose.
       const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction", "uiActionBatch"],
         captureRunnerCommand: (command) => {
           runnerCommands.push(command)
         },
@@ -3886,7 +3899,10 @@ describe("SessionRegistry", () => {
   test("runs mixed verified and batched v2 flows", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      // PRB-072: uiActionBatch is not production's default; opt this fake in explicitly
+      // since this test exercises the batch lane on purpose.
       const runtime = makeRuntime(root, createFakeHarness({
+        runnerCapabilities: ["uiAction", "uiActionBatch"],
         captureRunnerCommand: (command) => {
           runnerCommands.push(command)
         },
@@ -4481,7 +4497,9 @@ describe("SessionRegistry", () => {
         expect(session.resources.runner).toBe("ready")
         expect(session.transport.kind).toBe("real-device-live")
         expect(session.runner.kind).toBe("real-device-live")
-        expect(session.runner.capabilities).toContain("uiActionBatch")
+        // PRB-072: matches the fake's production-truth default (see runnerCapabilities.ts);
+        // this test is about session-open health, not the batch lane.
+        expect(session.runner.capabilities).toEqual(["uiAction"])
 
         const realDeviceCapability = session.capabilities.find((capability) => capability.area === "real-device")
         const simulatorCapability = session.capabilities.find((capability) => capability.area === "simulator")

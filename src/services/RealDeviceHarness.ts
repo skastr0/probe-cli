@@ -24,6 +24,7 @@ import {
   type RunnerReadyFrame,
   type RunnerResponseFrame,
 } from "./runnerProtocol"
+import { resolveAdvertisedCapabilities } from "./runnerCapabilities"
 import { resolveRunnerCommandTimeoutMs, runRunnerTransportSend } from "./RunnerTransportClient"
 import {
   probeRunnerDeviceDerivedRootPath,
@@ -2729,7 +2730,9 @@ export const RealDeviceHarnessLive = Layer.succeed(
               launchJsonPath,
               nextSequence: 2,
               initialPingRttMs: initialPing.hostRttMs,
-              capabilities: ready.capabilities ?? ["uiAction"],
+              // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
+              // that does not advertise a capability is treated as not having it.
+              capabilities: resolveAdvertisedCapabilities(ready),
               sendCommand,
               isWrapperRunning,
               waitForExit: wrapper.exit,

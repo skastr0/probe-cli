@@ -12,11 +12,25 @@ final class AttachControlSpikeUITests: XCTestCase {
   private let runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
   private let runnerTransportContract = "probe.runner.transport/hybrid-v1"
 
+  // PRB-072: the single source of truth for which capability flags this runner
+  // advertises in its ready frame. This must track handleLifecycleCommand's action
+  // switch exactly — one entry per capability-gated case that is actually
+  // implemented below. Today that switch has `case "uiAction"` but no
+  // `case "uiActionBatch"` (an unimplemented action falls through to the default
+  // "Unsupported lifecycle action" throw), so uiActionBatch must not appear here.
+  // The host never upgrades an absent or unlisted flag by assumption (see
+  // requireRunnerCapability / RUNNER_CAPABILITY_REGISTRY in
+  // src/services/runnerCapabilities.ts) — adding a new gated case here without also
+  // implementing it in handleLifecycleCommand would make the host trust a capability
+  // this binary cannot actually perform.
+  private static let advertisedRunnerCapabilities: [String] = ["uiAction"]
+
   private struct LifecycleReadyFrame: Codable {
     let kind: String
     let attachLatencyMs: Int
     let bootstrapPath: String
     let bootstrapSource: String
+    let capabilities: [String]
     let controlDirectoryPath: String
     let currentDirectoryPath: String
     let egressTransport: String
@@ -542,6 +556,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       attachLatencyMs: attachLatencyMs,
       bootstrapPath: resolvedControlDirectory.bootstrapPath,
       bootstrapSource: resolvedControlDirectory.bootstrapSource.rawValue,
+      capabilities: Self.advertisedRunnerCapabilities,
       controlDirectoryPath: controlDirectoryURL.path,
       currentDirectoryPath: FileManager.default.currentDirectoryPath,
       egressTransport: resolvedControlDirectory.config.egressTransport,

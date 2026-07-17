@@ -20,6 +20,7 @@ import {
   type RunnerReadyFrame,
 } from "./runnerProtocol"
 import { injectEnvironmentVariablesIntoXctestrunPlist } from "./RealDeviceHarness"
+import { resolveAdvertisedCapabilities } from "./runnerCapabilities"
 import { resolveRunnerCommandTimeoutMs, runRunnerTransportSend } from "./RunnerTransportClient"
 import {
   probeRunnerSimulatorDerivedRootPath,
@@ -1520,7 +1521,9 @@ export const SimulatorHarnessLive = Layer.succeed(
               stdinProbeStatus: "not-required-http",
               initialPingRttMs: initialPing.hostRttMs,
               nextSequence: 2,
-              capabilities: ready.capabilities ?? ["uiAction"],
+              // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
+              // that does not advertise a capability is treated as not having it.
+              capabilities: resolveAdvertisedCapabilities(ready),
               sendCommand,
               isWrapperRunning,
               waitForExit: wrapper.exit,
