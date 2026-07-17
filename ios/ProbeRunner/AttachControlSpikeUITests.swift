@@ -25,6 +25,11 @@ final class AttachControlSpikeUITests: XCTestCase {
   // this binary cannot actually perform.
   private static let advertisedRunnerCapabilities: [String] = ["uiAction"]
 
+  // PRB-091 review follow-up: mirrors ProbeFixture's
+  // `FixtureViewController.sectionCollisionToken` exactly — see
+  // `testUIActionSectionTokenIdentifierCollisionResolvesSafely`.
+  private static let sectionCollisionToken = "PRB-091 Section Collision Token"
+
   private struct LifecycleReadyFrame: Codable {
     let kind: String
     let attachLatencyMs: Int
@@ -195,6 +200,48 @@ final class AttachControlSpikeUITests: XCTestCase {
         "Snapshot profile ready: large (48 generated cards)"
       }
     }
+  }
+
+  // PRB-091 acceptance criterion 7 ("large-fixture identifier resolution
+  // meets the benchmarked release budget over one hundred warm actions
+  // without duplicate-target correctness regression"). One target per
+  // `identifier`; `expectedLabel`, when non-nil, is a second, independent
+  // proof that resolution landed on the exact card named by the identifier
+  // rather than a sibling that shares the same element-kind suffix
+  // (`.primaryButton`, `.toggle`, ...) across all 48 Large-profile cards —
+  // `ProbeFixture`'s `FixtureViewController` gives every primary button a
+  // card-unique title ("Primary Action <section>-<card>"), so a label
+  // mismatch here can only mean the query planner resolved the wrong card.
+  private struct LargeFixtureResolutionTarget {
+    let identifier: String
+    let expectedLabel: String?
+  }
+
+  // Generates one target per primary button, secondary button, and toggle
+  // across every section/card of the Large snapshot profile — 3 * 48 = 144
+  // distinct, always-present, side-effect-free identifiers (none of the
+  // three element kinds has a wired `addTarget` action in
+  // `FixtureViewController`, so tapping them does not mutate fixture state
+  // that other tests or assertions depend on). 144 comfortably covers the
+  // "one hundred warm actions" the acceptance criterion asks for with no
+  // repeats.
+  private static func largeFixtureResolutionTargets(sectionCount: Int, cardsPerSection: Int) -> [LargeFixtureResolutionTarget] {
+    var targets: [LargeFixtureResolutionTarget] = []
+
+    for sectionIndex in 0..<sectionCount {
+      for cardIndex in 0..<cardsPerSection {
+        let prefix = "fixture.snapshot.large.section.\(sectionIndex).card.\(cardIndex)"
+
+        targets.append(LargeFixtureResolutionTarget(
+          identifier: "\(prefix).primaryButton",
+          expectedLabel: "Primary Action \(sectionIndex + 1)-\(cardIndex + 1)"
+        ))
+        targets.append(LargeFixtureResolutionTarget(identifier: "\(prefix).secondaryButton", expectedLabel: nil))
+        targets.append(LargeFixtureResolutionTarget(identifier: "\(prefix).toggle", expectedLabel: nil))
+      }
+    }
+
+    return targets
   }
 
   private struct SnapshotBenchmarkSummary: Codable {
@@ -786,6 +833,100 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
   }
 
+  /// PRB-091 review follow-up. The theorized risk: `boundedSectionMatches`
+  /// resolves a `section` token identifier-first and only falls back to a
+  /// `label ==` predicate when zero identifier matches exist, so a token
+  /// that is simultaneously the accessibility *label* of the intended
+  /// container and the accessibility *identifier* of an unrelated element
+  /// elsewhere might narrow to that unrelated decoy instead of the intended
+  /// container.
+  ///
+  /// This test builds exactly that collision against a real
+  /// `ProbeFixture` screen (`sectionCollisionContainer`'s label and
+  /// `sectionCollisionDecoyLabel`'s identifier both equal
+  /// `sectionCollisionToken` — see `FixtureViewController`) and the
+  /// measured, real-Simulator outcome is that it does **not** misresolve:
+  /// `XCUIElementQuery.matching(identifier:)`, evaluated here against a
+  /// live app, matches `sectionCollisionContainer` too — even though its
+  /// own `identifier` is the distinct string
+  /// `"fixture.problem.sectionCollision.container"`, not the token. For a
+  /// non-accessibility-element container (`isAccessibilityElement == false`,
+  /// the default for a plain `UIView`/`UIStackView`, which is what every
+  /// section-token container in this codebase actually is —
+  /// `\(prefix).stack` / `\(prefix).container` throughout this file),
+  /// Apple's own `matching(identifier:)` predicate is evidently *not*
+  /// strict identifier-only equality; it also matches on label. See
+  /// `knowledge/xcuitest-runner/api-notes.md`'s `XCUIElementQuery` section
+  /// for the full caveat.
+  ///
+  /// The practical consequence: `identifierMatches` here comes back with
+  /// *two* elements (the container via this label fallback, the decoy via
+  /// its own identifier) — `boundedMatchingElements`'s 2-match ambiguity
+  /// stop catches exactly that, `sectionMatchCount` is 2, and
+  /// `matchingUIActionElements` correctly treats the section token as
+  /// ambiguous and broadens `queryRoot` to `app`, so the button still
+  /// resolves. This test pins that *safe* outcome down — for the section-
+  /// token container shape this codebase actually uses, the theorized
+  /// mis-narrowing does not reproduce, and any future change to
+  /// `boundedSectionMatches` or its ambiguity threshold that broke this
+  /// safety net would fail this test.
+  @MainActor
+  func testUIActionSectionTokenIdentifierCollisionResolvesSafely() throws {
+    let attached = try attachToFixture(
+      foregroundFailureMessage: "Expected fixture app to be foreground before the section-collision regression check.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before the section-collision regression check."
+    )
+    let app = attached.app
+
+    // The collision fixture sits below the "Problem shapes" spacer (same
+    // scroll band as `offscreenButton`) so adding it never shifts anything
+    // above it — every other test in this file depends on the vertical
+    // position of the elements above that spacer staying hittable without
+    // a scroll. Scroll it into view before either resolution attempt below.
+    // Scrolls until hittable rather than a fixed swipe count so this does
+    // not depend on whatever scroll position an earlier test in the same
+    // run left the (attached-to, not relaunched) fixture app in.
+    let innerButtonElement = app.buttons["fixture.problem.sectionCollision.innerButton"]
+    XCTAssertTrue(
+      innerButtonElement.waitForExistence(timeout: interactionTimeout),
+      "Expected the collision inner button to exist before scrolling to it."
+    )
+    var scrollAttempts = 0
+    while !innerButtonElement.isHittable, scrollAttempts < 8 {
+      app.swipeUp()
+      scrollAttempts += 1
+    }
+    XCTAssertTrue(innerButtonElement.isHittable, "Expected the collision inner button to become hittable after scrolling.")
+
+    // Positive control: the inner button is reachable on its own once
+    // scrolled into view, so any failure below is isolated to section-token
+    // scoping, not to the button itself being missing or unhittable.
+    let directPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.problem.sectionCollision.innerButton","type":"button"}}"#.utf8)
+    )
+    let directOutcome = try performRunnerUIAction(directPayload, app: app)
+    XCTAssertTrue(directOutcome.summary.contains("tapped"), "Expected the inner button to be directly reachable without a section token.")
+
+    // With the colliding section token, `boundedSectionMatches` finds two
+    // identifier-query matches (the label-matched container and the
+    // identifier-matched decoy — see the doc comment above), so
+    // `matchingUIActionElements` treats the section as ambiguous and
+    // broadens to `app` rather than narrowing to either one. The scoped
+    // lookup for the same button therefore still succeeds.
+    let scopedPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(
+        #"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.problem.sectionCollision.innerButton","type":"button","section":"\#(Self.sectionCollisionToken)"}}"#.utf8
+      )
+    )
+    let scopedOutcome = try performRunnerUIAction(scopedPayload, app: app)
+    XCTAssertTrue(
+      scopedOutcome.summary.contains("tapped"),
+      "Expected the colliding section token to be treated as ambiguous and broadened to app, still resolving the button."
+    )
+  }
+
   /// Synchronous (semaphore-bridged) HTTP POST to the runner's own
   /// `/command` endpoint. Kept separate from `receiveHTTPRequest`'s
   /// `NWConnection`-based server plumbing on purpose — this is the *client*
@@ -886,6 +1027,133 @@ final class AttachControlSpikeUITests: XCTestCase {
     )
 
     try writeJSON(summary, to: controlDirectoryURL.appendingPathComponent("ax-tree-performance-summary.json"))
+  }
+
+  // PRB-091 acceptance criterion 7's release-budget gate, established from a
+  // real Simulator run — see `testLargeFixtureIdentifierResolutionMeetsReleaseBudget`
+  // below for the methodology and `knowledge/xcuitest-runner/integration-notes.md`'s
+  // "PRB-091: large-fixture identifier-resolution benchmark" section for the
+  // full run this number came from (iPhone 17 Pro, iOS 26.4, 2026-07-17:
+  // avg 989.97 ms / p95 1029 ms / max 1088 ms over 100 warm actions against
+  // the Large profile's 48 cards; repeated runs during development stayed in
+  // the same ~950-1090 ms band). That cost is dominated by XCUITest's own
+  // fixed cross-process synchronization/quiescence wait on every element
+  // query — not by the bounded query itself, which is O(1) regardless of
+  // fixture size (`matching(identifier:)` + a single `element(boundBy: 0)`)
+  // — so it does not grow with a larger fixture the way the pre-PRB-091
+  // `descendants(matching: .any).allElementsBoundByIndex` full
+  // materialization would have. Budget is set at 1500 ms: comfortable
+  // headroom (~40% over the observed p95, ~33% over the observed max) to
+  // absorb host/Simulator scheduling variance across machines and CI runs,
+  // while still catching a real regression — reintroducing full-tree
+  // materialization against a 405-interactive-node fixture would push this
+  // well past a couple of seconds, not a few hundred milliseconds. This is
+  // a warm, Simulator-only, per-action p95 for `resolveUIActionElement`
+  // against the Large snapshot profile — not an end-to-end host round trip,
+  // which is what criterion 8's separate, device-gated Ripple p95 budget
+  // covers.
+  private static let largeFixtureIdentifierResolutionReleaseBudgetMs = 1500
+
+  @MainActor
+  func testLargeFixtureIdentifierResolutionMeetsReleaseBudget() throws {
+    let attached = try attachToFixture(
+      foregroundFailureMessage: "Expected fixture app to be foreground before the large-fixture identifier-resolution benchmark.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before the large-fixture identifier-resolution benchmark."
+    )
+    let app = attached.app
+
+    // The fixture app is attached-to, not relaunched, between test methods
+    // in a full run, so selecting "Large" here is process-lifetime state
+    // that would otherwise leak into whatever test runs next (a much taller
+    // generated card stack pushes every element below the snapshot-profile
+    // section further down, off-screen). Restore "Base" on every exit path.
+    defer {
+      let profileControl = app.segmentedControls["fixture.snapshot.profile.control"]
+      if profileControl.waitForExistence(timeout: interactionTimeout) {
+        let baseButton = profileControl.buttons["Base"]
+        if baseButton.waitForExistence(timeout: interactionTimeout), !baseButton.isSelected {
+          baseButton.tap()
+        }
+      }
+    }
+
+    _ = try selectSnapshotBenchmarkProfile(.large, app: app)
+
+    let allTargets = Self.largeFixtureResolutionTargets(sectionCount: 6, cardsPerSection: 8)
+    try requireActionCondition(
+      allTargets.count >= 100,
+      "Expected the Large profile to generate at least one hundred distinct resolvable targets, got \(allTargets.count)."
+    )
+
+    func locator(for target: LargeFixtureResolutionTarget) -> RunnerUIActionLocator {
+      RunnerUIActionLocator(
+        kind: "semantic",
+        identifier: target.identifier,
+        label: nil,
+        value: nil,
+        placeholder: nil,
+        type: nil,
+        section: nil,
+        interactive: nil,
+        ordinal: nil,
+        x: nil,
+        y: nil
+      )
+    }
+
+    // Warm-up: prime XCUITest's own query machinery before measuring — not
+    // counted toward the release-budget statistics below. The acceptance
+    // criterion asks for "warm" actions specifically because a cold first
+    // query pays one-time XCUITest/AX setup cost that is not representative
+    // of steady-state usage.
+    for target in allTargets.prefix(10) {
+      _ = try resolveUIActionElement(locator: locator(for: target), app: app)
+    }
+
+    let measuredTargets = Array(allTargets.prefix(100))
+    var resolutionSamplesMs: [Int] = []
+    resolutionSamplesMs.reserveCapacity(measuredTargets.count)
+
+    for target in measuredTargets {
+      let startedAt = Date()
+      let resolved = try resolveUIActionElement(locator: locator(for: target), app: app)
+      resolutionSamplesMs.append(milliseconds(since: startedAt))
+
+      // Duplicate-target correctness at scale: the resolved element must be
+      // the exact card this identifier names, not a sibling card that
+      // happens to share a suffix (".primaryButton", ".toggle", ...) across
+      // all 48 Large-profile cards.
+      XCTAssertEqual(
+        resolved.identifier,
+        target.identifier,
+        "Expected identifier resolution to hit the exact target among 48 Large-profile cards."
+      )
+
+      if let expectedLabel = target.expectedLabel {
+        XCTAssertEqual(
+          resolved.label,
+          expectedLabel,
+          "Expected the resolved element's label to match its own card, not a sibling's — a label mismatch here is a duplicate-target regression."
+        )
+      }
+    }
+
+    let sortedSamplesMs = resolutionSamplesMs.sorted()
+    let avgMs = Double(sortedSamplesMs.reduce(0, +)) / Double(sortedSamplesMs.count)
+    let p95Index = min(sortedSamplesMs.count - 1, Int((Double(sortedSamplesMs.count) * 0.95).rounded(.up)) - 1)
+    let p95Ms = sortedSamplesMs[p95Index]
+    let maxMs = sortedSamplesMs.last ?? 0
+
+    print(
+      "PROBE_METRIC large_fixture_identifier_resolution_samples=\(sortedSamplesMs.count) avg_ms=\(avgMs) p95_ms=\(p95Ms) max_ms=\(maxMs) budget_ms=\(Self.largeFixtureIdentifierResolutionReleaseBudgetMs)"
+    )
+
+    XCTAssertLessThanOrEqual(
+      p95Ms,
+      Self.largeFixtureIdentifierResolutionReleaseBudgetMs,
+      "Large-fixture (48-card) warm identifier-resolution p95 (\(p95Ms) ms) exceeded the release budget of "
+        + "\(Self.largeFixtureIdentifierResolutionReleaseBudgetMs) ms over \(sortedSamplesMs.count) warm actions."
+    )
   }
 
   private struct LifecycleLoopState {

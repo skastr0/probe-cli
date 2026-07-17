@@ -254,7 +254,70 @@ used):
 
 Still open after this pass (see `open-questions.md`):
 
-- The Ripple-incident-scale (iPhone 13 Pro, 20/20, ≥5× p95 or <2s p95) and
-  hundred-warm-action large-fixture release-budget gates are device-gated —
-  this pass could not close them; see the glyph's acceptance-criteria
-  report for the signing blocker.
+- The Ripple-incident-scale gate (iPhone 13 Pro, 20/20, ≥5× p95 or <2s p95)
+  is genuinely device-gated — this pass could not close it; see the glyph's
+  acceptance-criteria report for the signing blocker. The hundred-warm-action
+  large-fixture release-budget gate is **not** device-gated (it runs entirely
+  on Simulator) and was closed in a review follow-up pass — see the next
+  section.
+
+## PRB-091 review follow-up: large-fixture identifier-resolution benchmark
+
+Acceptance criterion 7 ("large-fixture identifier resolution meets the
+benchmarked release budget over one hundred warm actions without
+duplicate-target correctness regression") was originally left open on the
+premise that it depended on an unlanded "PRB-087 benchmark" dependency. That
+premise does not hold: the glyph ID `PRB-087` that actually landed in this
+repository is the `rpc-daemon-defects` investigation harness (see
+`knowledge/rpc-daemon-defects/`), unrelated to XCUITest selector-resolution
+timing. No prerequisite benchmark existed, and — unlike criterion 8 — this
+gate requires no physical device, so it was built and closed directly here.
+
+Validated on 2026-07-17 against `ios/ProbeFixture/` on Simulator (iPhone 17
+Pro, iOS 26.4) via `xcodebuild build-for-testing` +
+`test-without-building -only-testing:...testLargeFixtureIdentifierResolutionMeetsReleaseBudget`
+(passed, ~150-155s per run across four repeated runs during development).
+
+Methodology (`AttachControlSpikeUITests.swift`,
+`testLargeFixtureIdentifierResolutionMeetsReleaseBudget`):
+
+- Selects the Large snapshot profile (48 generated cards, 6 sections × 8
+  cards/section — see `FixtureViewController.SnapshotProfile`).
+- Generates 144 distinct, always-present, side-effect-free identifier
+  targets (primary button / secondary button / toggle per card — none of
+  the three has a wired `addTarget` action, so resolving/tapping them does
+  not mutate fixture state other tests depend on).
+- Runs 10 unmeasured warm-up resolutions, then measures 100 calls to the
+  production `resolveUIActionElement` (the exact method `performRunnerUIAction`
+  uses for a real `uiAction` request), recording wall-clock ms per call.
+- Asserts, per action, that the resolved element's `identifier` (and, for
+  primary buttons, its card-unique `label`) matches the requested target
+  exactly — the "no duplicate-target correctness regression" half of the
+  gate, proven across 48 cards' worth of suffix-sharing siblings
+  (`.primaryButton`, `.secondaryButton`, `.toggle` repeat on every card).
+- Computes p95/avg/max and asserts p95 against a release-budget constant.
+
+Measured result (most recent run backing the committed budget): 100/100
+correct resolutions, `avg_ms=989.97 p95_ms=1029 max_ms=1088`. Repeated runs
+during development stayed in the same ~950-1090 ms band. This cost is
+dominated by XCUITest's own fixed cross-process synchronization/quiescence
+wait on every element query, not by the bounded query itself (a single
+`matching(identifier:)` + `element(boundBy: 0)`, which is O(1) regardless of
+fixture size) — the pre-PRB-091
+`descendants(matching: .any).allElementsBoundByIndex` full materialization
+this replaced would have scaled with fixture size instead of staying flat.
+
+Release budget: `largeFixtureIdentifierResolutionReleaseBudgetMs = 1500` (in
+`AttachControlSpikeUITests.swift`, next to the test) — roughly 40% headroom
+over the observed p95 to absorb host/CI scheduling variance while still
+catching a real regression (reintroducing full materialization against the
+405-interactive-node Large profile would push this well past a couple of
+seconds).
+
+A related discovery while building this benchmark's companion regression
+test (`testUIActionSectionTokenIdentifierCollisionResolvesSafely`):
+`XCUIElementQuery.matching(identifier:)`, for a non-accessibility-element
+container, empirically also matches on accessibility *label* — see
+`api-notes.md`'s `XCUIElementQuery` section for the full caveat and why
+`boundedSectionMatches`'s 2-match ambiguity stop is what actually protects
+correctness here, not identifier-only precision.
