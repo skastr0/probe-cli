@@ -147,7 +147,7 @@ export const runArtifactRaceAndEagerExportScenario = async (): Promise<
         : `Every trial with data loss also surfaced a thrown error, so callers were not misled by an eager success in this run.`,
       evidence: [
         "src/services/ArtifactStore.ts:509-517 — registerArtifact always resolves with `normalizedRecord` on the happy path; it never re-reads the index after writing to confirm its own entry survived a concurrent writer.",
-        "src/services/SessionRegistry.ts:5982-5993 (exportRecording) and :534-558 (writeDerivedOutput) both treat a resolved registerArtifact call as export success and return that result to the RPC caller without a post-write verification read.",
+        "src/services/SessionRegistry.ts:5949-5999 (exportRecording) delegates to the shared writeJsonArtifact helper (SessionRegistry.ts:2215-2254), which resolves on a single registerArtifact call (line 2252); src/services/ArtifactStore.ts:534-558 (writeDerivedOutput) duplicates registerArtifact's own read-modify-write index update inline (readArtifactIndex then writeArtifactIndex at lines 556-557). Both return their artifact record to the RPC caller as export success without a post-write verification read.",
         `reproduction: ${eagerLossTrials.length}/${trialCount} trials returned success for a registration that did not survive (${(eagerRate * 100).toFixed(0)}%).`,
       ],
       metrics: {

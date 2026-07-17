@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "glyphId": "PRB-087",
   "provenance": {
-    "generatedAt": "2026-07-13T20:33:29.044Z",
-    "gitSha": "ac8f6b022d41474ecf19de7d3f86955042dbb91b",
+    "generatedAt": "2026-07-17T08:01:02.308Z",
+    "gitSha": "aeed24d3e45dd8ba6f755674ebddcfc62a18ba36",
     "gitBranch": "prb/prb-087",
     "gitDirty": true,
     "host": {
@@ -37,7 +37,7 @@
         "known device: iPhone (2) (00008110-0006293936C0401E)"
       ],
       "receipts": [
-        "$ xcrun devicectl list devices --json-output /var/folders/f5/yx3b1gkj4fz_8wc5mjk3pl180000gn/T/probe-investigation-devicectl-wq1i8Q/devices.json -> exit 0"
+        "$ xcrun devicectl list devices --json-output /var/folders/f5/yx3b1gkj4fz_8wc5mjk3pl180000gn/T/probe-investigation-devicectl-1EcyS9/devices.json -> exit 0"
       ]
     }
   },
@@ -49,7 +49,7 @@
       "summary": "The in-flight request handler kept running and settled after the daemon fiber was interrupted (socket closed, metadata removed), confirming request work is detached from serveRpc's own Effect scope.",
       "evidence": [
         "src/rpc/server.ts:148 — Effect.runPromise(Effect.either(config.onRequest(request, emit))).then(...) is invoked outside the Effect.acquireRelease/Effect.scoped block that owns serveRpc's own lifecycle (src/rpc/server.ts:49-241), so it is never a child fiber of the daemon and Fiber.interrupt on the daemon cannot reach it.",
-        "daemon fiber interrupted 43ms after the handler started (handler configured to sleep 150ms); handler settled 152ms after start."
+        "daemon fiber interrupted 41ms after the handler started (handler configured to sleep 150ms); handler settled 151ms after start."
       ],
       "metrics": {
         "handlerSleepMs": 150,
@@ -98,7 +98,7 @@
       "summary": "In 16/16 trials, both concurrent registrations reported success with no thrown error even though only one was actually persisted — a caller that receives the \"artifact registered\" result has no guarantee the artifact is durably discoverable via a subsequent list/drill call.",
       "evidence": [
         "src/services/ArtifactStore.ts:509-517 — registerArtifact always resolves with `normalizedRecord` on the happy path; it never re-reads the index after writing to confirm its own entry survived a concurrent writer.",
-        "src/services/SessionRegistry.ts:5982-5993 (exportRecording) and :534-558 (writeDerivedOutput) both treat a resolved registerArtifact call as export success and return that result to the RPC caller without a post-write verification read.",
+        "src/services/SessionRegistry.ts:5949-5999 (exportRecording) delegates to the shared writeJsonArtifact helper (SessionRegistry.ts:2215-2254), which resolves on a single registerArtifact call (line 2252); src/services/ArtifactStore.ts:534-558 (writeDerivedOutput) duplicates registerArtifact's own read-modify-write index update inline (readArtifactIndex then writeArtifactIndex at lines 556-557). Both return their artifact record to the RPC caller as export success without a post-write verification read.",
         "reproduction: 16/16 trials returned success for a registration that did not survive (100%)."
       ],
       "metrics": {
