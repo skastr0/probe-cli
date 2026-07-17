@@ -1,6 +1,6 @@
 import { createServer } from "node:net"
 import { unlink } from "node:fs/promises"
-import { Effect, Either } from "effect"
+import { Cause, Effect, Either, Exit, Fiber } from "effect"
 import {
   EnvironmentError,
   isProbeError,
@@ -52,13 +52,36 @@ export const serveRpc = (config: RpcServerConfig): Effect.Effect<void, Environme
         try: async () => {
           const server = createServer((socket) => {
             socket.setEncoding("utf8")
+            // Defensive: a write racing an already-closing socket (e.g. the
+            // client disconnected while a response frame was in flight) must
+            // not crash the daemon -- an unhandled 'error' event does.
+            socket.on("error", () => undefined)
 
             let buffer = ""
             let handled = false
+            // The fiber running the in-flight `config.onRequest(...)` for
+            // this connection, so a client disconnect (gate 10) can interrupt
+            // it instead of leaving it to run to completion unobserved. Effect
+            // propagates that interruption down through every `yield*` in the
+            // request handler, including `Effect.tryPromise`'s AbortSignal --
+            // which is what actually reaches the owned child process via
+            // AppleProcessSupervisor's `signal` racing.
+            let activeFiber: Fiber.RuntimeFiber<Either.Either<RpcResponse, ProbeError>, never> | null = null
 
             const writeFrame = (frame: RpcProgressEvent | RpcResponse | ReturnType<typeof createFailureFrame>) => {
+              if (socket.destroyed) {
+                return
+              }
               socket.write(encodeRpcLine(frame))
             }
+
+            socket.on("close", () => {
+              const fiber = activeFiber
+              if (fiber !== null) {
+                activeFiber = null
+                Effect.runFork(Fiber.interrupt(fiber))
+              }
+            })
 
             socket.on("data", (chunk) => {
               if (handled) {
@@ -147,65 +170,66 @@ export const serveRpc = (config: RpcServerConfig): Effect.Effect<void, Environme
 
                 const emit = (event: RpcProgressEvent) => writeFrame(event)
 
-                Effect.runPromise(Effect.either(config.onRequest(request, emit))).then(
-                  (result) => {
-                    if (Either.isLeft(result)) {
-                      const error = result.left
+                const writeUnhandledFailure = (error: unknown) =>
+                  writeFrame(
+                    createFailureFrame(request, {
+                      code: "unhandled-server-error",
+                      category: "environment",
+                      reason: error instanceof Error ? error.message : String(error),
+                      nextStep: "Inspect the daemon process output and retry the request.",
+                      details: [],
+                      capability: null,
+                      contract: null,
+                      expectedVersion: null,
+                      receivedVersion: null,
+                      command: null,
+                      exitCode: null,
+                      sessionId: null,
+                      artifactKey: null,
+                      wall: false,
+                    }),
+                  )
 
-                      if (isProbeError(error)) {
-                        writeFrame(createFailureFrame(request, toFailurePayload(error)))
-                      } else {
-                        writeFrame(
-                        createFailureFrame(request, {
-                          code: "unhandled-server-error",
-                          category: "environment",
-                          reason: String(error),
-                          nextStep: "Inspect the daemon process output and retry the request.",
-                            details: [],
-                            capability: null,
-                            contract: null,
-                            expectedVersion: null,
-                            receivedVersion: null,
-                            command: null,
-                            exitCode: null,
-                            sessionId: null,
-                            artifactKey: null,
-                            wall: false,
-                          }),
-                        )
-                      }
+                // Tracked via runFork (not runPromise) so the socket's own
+                // 'close' listener above can interrupt this fiber on a client
+                // disconnect (gate 10) instead of only observing whatever
+                // Promise it eventually settles to.
+                const fiber = Effect.runFork(Effect.either(config.onRequest(request, emit)))
+                activeFiber = fiber
 
-                      socket.end()
+                fiber.addObserver((exit) => {
+                  activeFiber = null
+
+                  if (Exit.isFailure(exit)) {
+                    if (Cause.isInterruptedOnly(exit.cause)) {
+                      // The socket already closed (that's what triggered the
+                      // interrupt) -- nothing left to write to.
                       return
                     }
 
-                    const response = result.right
-                    writeFrame(response)
+                    writeUnhandledFailure(Cause.pretty(exit.cause))
                     socket.end()
-                  },
-                  (error) => {
-                    writeFrame(
-                      createFailureFrame(request, {
-                        code: "unhandled-server-error",
-                        category: "environment",
-                        reason: error instanceof Error ? error.message : String(error),
-                        nextStep: "Inspect the daemon process output and retry the request.",
-                        details: [],
-                        capability: null,
-                        contract: null,
-                        expectedVersion: null,
-                        receivedVersion: null,
-                        command: null,
-                        exitCode: null,
-                        sessionId: null,
-                        artifactKey: null,
-                        wall: false,
-                      }),
-                    )
+                    return
+                  }
+
+                  const result = exit.value
+
+                  if (Either.isLeft(result)) {
+                    const error = result.left
+
+                    if (isProbeError(error)) {
+                      writeFrame(createFailureFrame(request, toFailurePayload(error)))
+                    } else {
+                      writeUnhandledFailure(error)
+                    }
 
                     socket.end()
-                  },
-                )
+                    return
+                  }
+
+                  writeFrame(result.right)
+                  socket.end()
+                })
               }
             })
           })

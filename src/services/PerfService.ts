@@ -419,13 +419,27 @@ export const runCommand = (args: {
   readonly timeoutMs: number
   readonly gracePeriodMs?: number
   readonly allowFailure?: boolean
+  /** Aborting kills the process group (TERM -> grace -> KILL) and rejects with a `command-cancelled` ChildProcessError. */
+  readonly signal?: AbortSignal
 }): Promise<CommandResult> =>
   runAppleProcess({
     command: args.command,
     commandArgs: args.commandArgs,
     timeoutMs: args.timeoutMs,
     gracePeriodMs: args.gracePeriodMs,
+    signal: args.signal,
   }).then((result) => {
+    if (result.cancelled) {
+      throw new ChildProcessError({
+        code: "command-cancelled",
+        command: `${args.command} ${args.commandArgs.join(" ")}`,
+        reason: `${args.command} was cancelled before it completed.`,
+        nextStep: "Retry the request if the cancellation was unintended.",
+        exitCode: result.exitCode,
+        stderrExcerpt: result.stderr.trim() || result.stdout.trim(),
+      })
+    }
+
     if (result.timedOut) {
       throw new ChildProcessError({
         code: "command-timeout",
@@ -464,6 +478,8 @@ export const runCommandToFile = (args: {
   readonly gracePeriodMs?: number
   readonly outputPath: string
   readonly budget: ExportBudget
+  /** Aborting kills the process group (TERM -> grace -> KILL), removes the partial output file, and rejects with a `command-cancelled` ChildProcessError. */
+  readonly signal?: AbortSignal
 }): Promise<StreamedCommandResult> => {
   const outputGuard = new ExportBudgetTransform(args.budget)
 
@@ -474,11 +490,24 @@ export const runCommandToFile = (args: {
     gracePeriodMs: args.gracePeriodMs,
     stdoutArtifactPath: args.outputPath,
     stdoutTransform: outputGuard,
+    signal: args.signal,
   }).then(
     async (result) => {
       if (outputGuard.exceededError) {
         await cleanupOutputFile(args.outputPath)
         throw outputGuard.exceededError
+      }
+
+      if (result.cancelled) {
+        await cleanupOutputFile(args.outputPath)
+        throw new ChildProcessError({
+          code: "command-cancelled",
+          command: `${args.command} ${args.commandArgs.join(" ")}`,
+          reason: `${args.command} was cancelled before it completed.`,
+          nextStep: "Retry the request if the cancellation was unintended.",
+          exitCode: result.exitCode,
+          stderrExcerpt: result.stderr.trim(),
+        })
       }
 
       if (result.timedOut) {
@@ -767,6 +796,12 @@ interface PerfCommandRunner {
     readonly timeoutMs: number
     readonly gracePeriodMs?: number
     readonly allowFailure?: boolean
+    // Required (not optional) so every call site is forced to thread the
+    // Effect.tryPromise-provided AbortSignal through -- a client disconnect
+    // (gate 10) interrupts the RPC request fiber, which aborts this signal,
+    // which kills the owned process group. Omitting it at a call site is a
+    // compile error, not a silent gap.
+    readonly signal: AbortSignal
   }) => Promise<CommandResult>
   readonly exportToFile: (args: {
     readonly command: string
@@ -775,6 +810,7 @@ interface PerfCommandRunner {
     readonly gracePeriodMs?: number
     readonly outputPath: string
     readonly budget: ExportBudget
+    readonly signal: AbortSignal
   }) => Promise<StreamedCommandResult>
   readonly startRecording?: (args: {
     readonly command: string
@@ -868,11 +904,12 @@ export const createPerfService = (dependencies: {
       emitProgress(progressStage, `Checking xctrace template availability for ${spec.displayName}.`)
 
       const templateList = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "list", "templates"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -899,11 +936,12 @@ export const createPerfService = (dependencies: {
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -969,11 +1007,12 @@ export const createPerfService = (dependencies: {
       emitProgress("perf.export", `Exporting TOC for ${basename(tracePath)}.`)
 
       const tocResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "export", "--input", tracePath, "--toc"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1139,11 +1178,12 @@ export const createPerfService = (dependencies: {
         emitProgress("perf.record", `Checking xctrace template availability for ${spec.displayName}.`)
 
         const templateList = yield* Effect.tryPromise({
-          try: () =>
+          try: (signal) =>
             commandRunner.capture({
               command: "xcrun",
               commandArgs: ["xctrace", "list", "templates"],
               timeoutMs: defaultCommandOverheadMs,
+              signal,
             }),
           catch: (error) =>
             error instanceof ChildProcessError
@@ -1171,11 +1211,12 @@ export const createPerfService = (dependencies: {
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1223,7 +1264,7 @@ export const createPerfService = (dependencies: {
       )
 
       yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: [
@@ -1245,6 +1286,7 @@ export const createPerfService = (dependencies: {
             ],
             timeoutMs: timeLimitMs + recordingOverheadMs,
             gracePeriodMs: recordingGracePeriodMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1346,7 +1388,7 @@ export const createPerfService = (dependencies: {
         )
 
         const exportAttempt: ExportAttempt = yield* Effect.tryPromise({
-          try: async () => {
+          try: async (signal) => {
             try {
               const result = await commandRunner.exportToFile({
                 command: "xcrun",
@@ -1361,6 +1403,7 @@ export const createPerfService = (dependencies: {
                 timeoutMs: defaultCommandOverheadMs,
                 outputPath: exportPath,
                 budget,
+                signal,
               })
 
               return {
@@ -1726,11 +1769,12 @@ export const createPerfService = (dependencies: {
       }
 
       const xctraceVersionResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.capture({
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1797,7 +1841,7 @@ export const createPerfService = (dependencies: {
       )
 
       const exportResult = yield* Effect.tryPromise({
-        try: () =>
+        try: (signal) =>
           commandRunner.exportToFile({
             command: "xcrun",
             commandArgs: [
@@ -1811,6 +1855,7 @@ export const createPerfService = (dependencies: {
             timeoutMs: defaultCommandOverheadMs,
             outputPath: exportPath,
             budget,
+            signal,
           }),
         catch: (error) =>
           error instanceof ChildProcessError
