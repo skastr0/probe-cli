@@ -29,6 +29,10 @@ Updated: 2026-04-09
       - a clean real-device equivalent for the shared file-ingress seam
       - whether a future cleaner egress path can replace mixed-log stdout without losing the current public-tooling honesty
 
+7. **PRB-091: device-scale selector-resolution benchmark**
+   - **Simulator:** the bounded query planner's identifier/ambiguity/ordinal/no-match paths are contract-tested against `ios/ProbeFixture/` (see `integration-notes.md`'s PRB-091 section).
+   - **Still open:** the glyph's device-gated acceptance gates — the Ripple-incident-scale selector path at 20/20 on a physical iPhone 13 Pro with a ≥5× p95 reduction (or p95 <2s), and the hundred-warm-action large-fixture release budget — were not exercised here. This host has two connected devices visible to `devicectl` but no `DEVELOPMENT_TEAM` signing configured, so a physical-device XCUITest run cannot be signed/launched from here. Closing this needs either signing configured on a host with device access, or a follow-up pass once that blocker is cleared.
+
 ## Immediate risks for later Probe items
 
 - Probe could overfit to `launch()` and accidentally destroy target-app continuity when a foreground/resume operation was intended.

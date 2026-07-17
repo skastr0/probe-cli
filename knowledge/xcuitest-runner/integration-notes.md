@@ -196,3 +196,65 @@ Recommended defaults after this simulator-only fixture evidence pass:
   3. collapsed hierarchy view for structural inspection
   4. pruned full tree only on explicit deep-inspection request
   5. raw dictionary output only as a diagnostic/debug path
+
+## PRB-091: bounded `uiAction` query planner
+
+Validated on 2026-07-17 against `ios/ProbeFixture/` on Simulator (iPhone 17
+Pro, iOS 26.4) via `xcodebuild build-for-testing` +
+`test-without-building -only-testing:...testUIActionQueryPlannerResolvesIdentifiersAndDetectsAmbiguity`
+(passed, 3.311s) and the pre-existing
+`testAttachSnapshotAndControlWithoutRelaunch` (passed, 32.447s — unchanged
+behavior for the attach/control + generic finalization path).
+
+Prior state and the problem this closes:
+
+- `resolveUIActionElement`'s candidate resolution called
+  `app.descendants(matching: .any).allElementsBoundByIndex` to resolve a
+  locator's `section` token (a full-app AX enumeration, on every semantic
+  action that used a `section`), and `query.matching(identifier:)
+  .allElementsBoundByIndex` / `query.allElementsBoundByIndex` to resolve the
+  candidate set itself — both force eager, full materialization of every
+  matching `XCUIElement` regardless of how many the caller actually needed.
+- Every response — including `ping`, which touches no UI at all — ran
+  `currentStatusLabelText`, three sequential ProbeFixture-only static-text
+  existence probes (`fixture.status.label`, `fixture.detail.label`,
+  `fixture.detail.summaryLabel`) as part of *generic* response finalization,
+  regardless of target app or command outcome.
+
+Design after PRB-091 (see `api-notes.md`'s new "`XCUIElementQuery` (PRB-091:
+the public-XCUI query planner surface)" section for the exact public methods
+used):
+
+- Point locators resolve to a coordinate with zero AX enumeration (unchanged
+  — this was already true; PRB-091 also removed the last per-response
+  fixture-status probe that used to run *after* a point action too).
+- Identifier locators resolve identifier-first via
+  `XCUIElementQuery.matching(identifier:)`, never
+  `app.descendants(matching: .any).allElementsBoundByIndex`.
+- Label/placeholder locators narrow via a compound `NSPredicate` pushed into
+  the query itself (`label == %@ AND placeholderValue == %@`), the narrowest
+  public query for those fields; `value` stays a post-filter (see
+  `api-notes.md` for why).
+- Ambiguity/ordinal resolution reads a query strictly through
+  `element(boundBy:)`, stopping at 2 matches (enough to prove "ambiguous")
+  or at the requested ordinal — never the full match set. A bounded scan cap
+  (512, documented at `uiActionBoundedScanCap` in
+  `AttachControlSpikeUITests.swift`) bounds the pathological case of a
+  locator that never resolves.
+- `currentStatusLabelText`'s three fixture-identifier probes are gone from
+  generic response finalization; the generic fallback is `app.label`
+  (already-resolved attribute data on the `app` handle the caller already
+  holds — not a fresh query). Fixture-specific status assertions inside the
+  XCTest methods themselves are unaffected.
+- Response telemetry (`LifecycleResponseFrame`) now separates
+  `resolutionMs` / `waitMs` / `interactionMs` (populated for `uiAction`
+  responses only — there is no such phase breakdown for `ping`, `snapshot`,
+  etc.) from a `finalizationMs` that is always populated, since every
+  response goes through the same generic finalization step.
+
+Still open after this pass (see `open-questions.md`):
+
+- The Ripple-incident-scale (iPhone 13 Pro, 20/20, ≥5× p95 or <2s p95) and
+  hundred-warm-action large-fixture release-budget gates are device-gated —
+  this pass could not close them; see the glyph's acceptance-criteria
+  report for the signing blocker.

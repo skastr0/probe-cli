@@ -167,6 +167,10 @@ export const executeDirectRunnerActionStep = (args: {
         artifact: null,
         recordingLength: record.recording.steps.length,
         handledMs: actionResult.value.response.handledMs,
+        resolutionMs: actionResult.value.response.resolutionMs ?? null,
+        waitMs: actionResult.value.response.waitMs ?? null,
+        interactionMs: actionResult.value.response.interactionMs ?? null,
+        finalizationMs: actionResult.value.response.finalizationMs ?? null,
         ...buildActionResultMetadata(actionResult.retry),
       } satisfies ExtendedSessionActionResult,
     } satisfies ActionExecutionOutcome

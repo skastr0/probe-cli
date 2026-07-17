@@ -137,6 +137,47 @@ describe("runner protocol", () => {
     expect(response.childHandledMs).toEqual([4, 8, null])
   })
 
+  // PRB-091: `resolutionMs`/`waitMs`/`interactionMs`/`finalizationMs` are the
+  // runner's phase breakdown of `handledMs` for a `uiAction` response — see
+  // ios/ProbeRunner/AttachControlSpikeUITests.swift's `LifecycleResponseFrame`.
+  test("decodes the uiAction phase telemetry breakdown", () => {
+    const response = decodeRunnerResponseFrame({
+      kind: "response",
+      sequence: 3,
+      ok: true,
+      action: "uiAction",
+      error: null,
+      payload: "tapped identifier=fixture.form.applyButton",
+      snapshotPayloadPath: null,
+      inlinePayload: null,
+      inlinePayloadEncoding: null,
+      handledMs: 42,
+      statusLabel: "ok",
+      resolutionMs: 5,
+      waitMs: 12,
+      interactionMs: 20,
+      finalizationMs: 1,
+      snapshotNodeCount: null,
+      recordedAt: "2026-04-14T00:00:00.000Z",
+      epoch: "epoch-sim-1",
+      replayStatus: "executed",
+    })
+
+    expect(response.resolutionMs).toBe(5)
+    expect(response.waitMs).toBe(12)
+    expect(response.interactionMs).toBe(20)
+    expect(response.finalizationMs).toBe(1)
+  })
+
+  test("decodes response frames that predate the uiAction phase telemetry breakdown", () => {
+    const response = decodeRunnerResponseFrame(loadFixture("runner", "response-snapshot.json"))
+
+    expect(response.resolutionMs).toBeUndefined()
+    expect(response.waitMs).toBeUndefined()
+    expect(response.interactionMs).toBeUndefined()
+    expect(response.finalizationMs).toBeUndefined()
+  })
+
   test("fails with a focused error when a ready frame loses session identity", () => {
     const broken = structuredClone(makeSimulatorReadyFrame())
     delete broken.sessionIdentifier

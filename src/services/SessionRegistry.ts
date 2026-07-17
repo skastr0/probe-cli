@@ -448,6 +448,15 @@ export interface RetryAttemptMetadata {
 
 export type ExtendedSessionActionResult = SessionActionResult & {
   readonly handledMs?: number | null
+  // PRB-091: `handledMs` broken into the runner's uiAction phases —
+  // resolution/wait/interaction — plus generic response finalization.
+  // Populated by the fast direct-runner-action lane (the one lane whose
+  // response comes straight from a `uiAction` command); `null`/absent
+  // everywhere else, matching `RunnerCommandResult`'s same fields.
+  readonly resolutionMs?: number | null
+  readonly waitMs?: number | null
+  readonly interactionMs?: number | null
+  readonly finalizationMs?: number | null
 }
 
 type RetryAttemptOutcome<T, E extends SessionActionError> =

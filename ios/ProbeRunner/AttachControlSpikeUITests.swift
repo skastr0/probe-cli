@@ -73,6 +73,20 @@ final class AttachControlSpikeUITests: XCTestCase {
     let sequence: Int
     let snapshotNodeCount: Int?
     let statusLabel: String
+    // PRB-091: `handledMs` stays the one total; these four are that total
+    // broken into the phases a caller actually wants to reason about
+    // independently (e.g. "resolution got slow" vs "the tap itself got
+    // slow"). All four are nil for actions that don't go through
+    // `performRunnerUIAction` (ping, snapshot, screenshot, recordVideo,
+    // shutdown) — there is no resolution/wait/interaction phase to report
+    // for those, and reporting a fabricated 0 would be less honest than
+    // reporting nothing. `finalizationMs` is the exception: it is always
+    // populated, since every response goes through the same generic
+    // finalization step in `executeLifecycleCommandFrame`.
+    let resolutionMs: Int?
+    let waitMs: Int?
+    let interactionMs: Int?
+    let finalizationMs: Int
     // PRB-089: this runner's *current* epoch (always present, even on a
     // rejected/never-executed command) and how this particular response was
     // produced relative to the terminal-result cache and executed
@@ -87,6 +101,12 @@ final class AttachControlSpikeUITests: XCTestCase {
     let payload: String?
     let snapshotPayloadPath: String?
     let snapshotNodeCount: Int?
+    // PRB-091: populated only by the `uiAction` case — see
+    // `LifecycleResponseFrame`'s matching fields for why these stay nil
+    // elsewhere instead of a fabricated 0.
+    var resolutionMs: Int? = nil
+    var waitMs: Int? = nil
+    var interactionMs: Int? = nil
   }
 
   private struct ParsedHTTPRequest {
@@ -703,6 +723,69 @@ final class AttachControlSpikeUITests: XCTestCase {
     )
   }
 
+  // PRB-091: contract coverage for the bounded public-XCUI query planner —
+  // identifier-first resolution, bounded ambiguity detection, deterministic
+  // ordinal resolution, and a clean no-match — driven straight through
+  // `performRunnerUIAction`/`resolveUIActionElement` against the live
+  // fixture, the same entry points a real `uiAction` command uses.
+  @MainActor
+  func testUIActionQueryPlannerResolvesIdentifiersAndDetectsAmbiguity() throws {
+    let attached = try attachToFixture(
+      foregroundFailureMessage: "Expected fixture app to be foreground before uiAction query planner checks.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before uiAction query planner checks."
+    )
+    let app = attached.app
+
+    // A strong identifier locator resolves through the identifier-first
+    // typed query with no ambiguity.
+    let tapPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.form.applyButton"}}"#.utf8)
+    )
+    let tapOutcome = try performRunnerUIAction(tapPayload, app: app)
+    XCTAssertTrue(tapOutcome.summary.contains("tapped"), "Expected the identifier locator to resolve and tap.")
+    XCTAssertGreaterThanOrEqual(tapOutcome.resolutionMs, 0)
+    XCTAssertGreaterThanOrEqual(tapOutcome.waitMs, 0)
+    XCTAssertGreaterThanOrEqual(tapOutcome.interactionMs, 0)
+
+    // A weak `type: button` locator with no identifier/label matches many
+    // buttons on the fixture screen (Reset, apply, snapshot profile
+    // segments, ...). The bounded planner must still detect the ambiguity
+    // without ever enumerating the full match set.
+    let ambiguousPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","type":"button"}}"#.utf8)
+    )
+    XCTAssertThrowsError(try performRunnerUIAction(ambiguousPayload, app: app)) { error in
+      let message = String(describing: error)
+      XCTAssertTrue(message.contains("matched more than one element"), "Expected an ambiguity error, got: \(message)")
+    }
+
+    // The same weak locator with an explicit ordinal resolves
+    // deterministically to the same element across repeated calls.
+    let ordinalPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","type":"button","ordinal":1}}"#.utf8)
+    )
+    let firstOrdinalMatch = try resolveUIActionElement(locator: ordinalPayload.locator, app: app)
+    let secondOrdinalMatch = try resolveUIActionElement(locator: ordinalPayload.locator, app: app)
+    XCTAssertEqual(
+      firstOrdinalMatch.identifier,
+      secondOrdinalMatch.identifier,
+      "Expected ordinal resolution to be deterministic across calls."
+    )
+
+    // An identifier absent from the fixture screen resolves to zero matches.
+    let missingPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.does.not.exist"}}"#.utf8)
+    )
+    XCTAssertThrowsError(try performRunnerUIAction(missingPayload, app: app)) { error in
+      let message = String(describing: error)
+      XCTAssertTrue(message.contains("No element matched"), "Expected a no-match error, got: \(message)")
+    }
+  }
+
   /// Synchronous (semaphore-bridged) HTTP POST to the runner's own
   /// `/command` endpoint. Kept separate from `receiveHTTPRequest`'s
   /// `NWConnection`-based server plumbing on purpose — this is the *client*
@@ -904,6 +987,10 @@ final class AttachControlSpikeUITests: XCTestCase {
             sequence: cached.sequence,
             snapshotNodeCount: cached.snapshotNodeCount,
             statusLabel: cached.statusLabel,
+            resolutionMs: cached.resolutionMs,
+            waitMs: cached.waitMs,
+            interactionMs: cached.interactionMs,
+            finalizationMs: cached.finalizationMs,
             epoch: cached.epoch,
             replayStatus: "cached-replay"
           )
@@ -1255,6 +1342,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       return cached
 
     case .reject(let reason, let replayStatus):
+      let finalizationStartedAt = Date()
+      let statusLabelText = Self.genericResponseStatusLabel(app: app)
       return LifecycleResponseFrame(
         action: command.action,
         error: reason,
@@ -1268,7 +1357,11 @@ final class AttachControlSpikeUITests: XCTestCase {
         recordedAt: Self.iso8601Formatter.string(from: Date()),
         sequence: command.sequence,
         snapshotNodeCount: nil,
-        statusLabel: currentStatusLabelText(app: app),
+        statusLabel: statusLabelText,
+        resolutionMs: nil,
+        waitMs: nil,
+        interactionMs: nil,
+        finalizationMs: milliseconds(since: finalizationStartedAt),
         epoch: replayCoordinator.epoch,
         replayStatus: replayStatus
       )
@@ -1283,6 +1376,8 @@ final class AttachControlSpikeUITests: XCTestCase {
           statusLabel: statusLabel,
           controlDirectoryURL: controlDirectoryURL
         )
+        let finalizationStartedAt = Date()
+        let statusLabelText = Self.genericResponseStatusLabel(app: app)
         response = LifecycleResponseFrame(
           action: command.action,
           error: nil,
@@ -1296,11 +1391,17 @@ final class AttachControlSpikeUITests: XCTestCase {
           recordedAt: Self.iso8601Formatter.string(from: Date()),
           sequence: command.sequence,
           snapshotNodeCount: result.snapshotNodeCount,
-          statusLabel: currentStatusLabelText(app: app),
+          statusLabel: statusLabelText,
+          resolutionMs: result.resolutionMs,
+          waitMs: result.waitMs,
+          interactionMs: result.interactionMs,
+          finalizationMs: milliseconds(since: finalizationStartedAt),
           epoch: replayCoordinator.epoch,
           replayStatus: "executed"
         )
       } catch {
+        let finalizationStartedAt = Date()
+        let statusLabelText = Self.genericResponseStatusLabel(app: app)
         response = LifecycleResponseFrame(
           action: command.action,
           error: String(describing: error),
@@ -1314,7 +1415,11 @@ final class AttachControlSpikeUITests: XCTestCase {
           recordedAt: Self.iso8601Formatter.string(from: Date()),
           sequence: command.sequence,
           snapshotNodeCount: nil,
-          statusLabel: currentStatusLabelText(app: app),
+          statusLabel: statusLabelText,
+          resolutionMs: nil,
+          waitMs: nil,
+          interactionMs: nil,
+          finalizationMs: milliseconds(since: finalizationStartedAt),
           epoch: replayCoordinator.epoch,
           replayStatus: "executed"
         )
@@ -2392,8 +2497,122 @@ final class AttachControlSpikeUITests: XCTestCase {
     return true
   }
 
-  private func elementMatchesSectionToken(_ element: XCUIElement, token: String) -> Bool {
-    Self.normalizedText(element.identifier) == token || Self.normalizedText(element.label) == token
+  // PRB-091: the bounded scan ceiling for the query planner below. Every
+  // bounded probe (`boundedMatchingElements`, and the section-token lookups
+  // in `boundedSectionMatches`) walks a query strictly by index via
+  // `element(boundBy:)` and stops the moment it has proven what it needs
+  // (zero, one, more-than-one, or the requested ordinal) — this cap only
+  // bounds the pathological case where a locator never resolves (e.g. an
+  // `interactive` post-filter over a large non-matching subtree), so the
+  // scan is provably bounded rather than an unbounded tree walk. It is sized
+  // generously above the largest fixture-benchmarked interactive/matching
+  // set observed in knowledge/xcuitest-runner (the `Large` AX-tree profile's
+  // interactive-only view: 405 entries) so a legitimate ordinal request
+  // against that scale still resolves within the cap.
+  private static let uiActionBoundedScanCap = 512
+
+  // PRB-091: reads a query strictly by index — never `.allElementsBoundByIndex`
+  // — and stops as soon as it has gathered enough passing matches to answer
+  // the question actually being asked: with no ordinal, 2 matches are
+  // enough to prove "ambiguous" (the exact total beyond that is never
+  // needed); with ordinal N, N matches are enough to return the Nth. This is
+  // the "materializes only enough matches to distinguish zero, one, or many"
+  // requirement — the planner never enumerates the full match set by
+  // default.
+  @MainActor
+  private func boundedMatchingElements(
+    query: XCUIElementQuery,
+    ordinal: Int?,
+    postFilter: (XCUIElement) -> Bool,
+  ) -> [XCUIElement] {
+    let neededCount = max(ordinal ?? 2, 2)
+    var matches: [XCUIElement] = []
+
+    for index in 0..<Self.uiActionBoundedScanCap {
+      let candidate = query.element(boundBy: index)
+      guard candidate.exists else {
+        break
+      }
+
+      if postFilter(candidate) {
+        matches.append(candidate)
+
+        if matches.count >= neededCount {
+          break
+        }
+      }
+    }
+
+    return matches
+  }
+
+  // PRB-091: identifier-first section resolution. A section token names a
+  // container by accessibility identifier first — `matching(identifier:)`
+  // is Apple's own typed identifier predicate, the narrowest public query
+  // for a strong locator — and only falls back to a `label ==` predicate
+  // when no identifier match exists. Both paths are bounded (never
+  // `app.descendants(matching: .any).allElementsBoundByIndex`) and stop at
+  // 2 matches, enough to know "unique" from "ambiguous" without enumerating
+  // every element in the app. See knowledge/xcuitest-runner/integration-notes.md.
+  @MainActor
+  private func boundedSectionMatches(sectionToken: String, app: XCUIApplication) -> [XCUIElement] {
+    let identifierMatches = boundedMatchingElements(
+      query: app.descendants(matching: .any).matching(identifier: sectionToken),
+      ordinal: nil,
+      postFilter: { $0.exists }
+    )
+
+    if !identifierMatches.isEmpty {
+      return identifierMatches
+    }
+
+    let labelPredicate = NSPredicate(format: "label == %@", sectionToken)
+    return boundedMatchingElements(
+      query: app.descendants(matching: .any).matching(labelPredicate),
+      ordinal: nil,
+      postFilter: { $0.exists }
+    )
+  }
+
+  // PRB-091: the narrowest public XCUIElementQuery the locator supports.
+  // Identifier goes through `matching(identifier:)` first (typed, and the
+  // only form the knowledge pack certifies for a strong locator); label and
+  // placeholder — plain String AX attributes — narrow further as a single
+  // compound NSPredicate. `value` deliberately stays out of the predicate:
+  // AX `value` is `Any?` (String, NSNumber, ...) and normalizedValue's
+  // NSNumber → stringValue coercion has no faithful NSPredicate equivalent,
+  // so it is checked only by the `elementMatchesLocator` post-filter over
+  // the few candidates the bounded scan actually fetches — never by
+  // widening the query itself.
+  private func narrowedUIActionQuery(
+    root: XCUIElement,
+    type: XCUIElement.ElementType,
+    locator: RunnerUIActionLocator,
+  ) -> XCUIElementQuery {
+    var query = root.descendants(matching: type)
+
+    if let identifier = Self.normalizedText(locator.identifier) {
+      query = query.matching(identifier: identifier)
+    }
+
+    var predicateFormats: [String] = []
+    var predicateArgs: [Any] = []
+
+    if let label = Self.normalizedText(locator.label) {
+      predicateFormats.append("label == %@")
+      predicateArgs.append(label)
+    }
+
+    if let placeholder = Self.normalizedText(locator.placeholder) {
+      predicateFormats.append("placeholderValue == %@")
+      predicateArgs.append(placeholder)
+    }
+
+    if !predicateFormats.isEmpty {
+      query = query.matching(NSPredicate(format: predicateFormats.joined(separator: " AND "), argumentArray: predicateArgs))
+    }
+
+    return query
   }
 
   @MainActor
@@ -2414,32 +2633,26 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     let type = elementType(for: locator.type)
     let sectionToken = Self.normalizedText(locator.section)
-    let sectionMatches: [XCUIElement]
+    let sectionMatchCount: Int?
+    let queryRoot: XCUIElement
 
     if let sectionToken {
-      sectionMatches = app.descendants(matching: .any).allElementsBoundByIndex.filter { element in
-        element.exists && elementMatchesSectionToken(element, token: sectionToken)
-      }
+      let sectionMatches = boundedSectionMatches(sectionToken: sectionToken, app: app)
+      sectionMatchCount = sectionMatches.count
+      queryRoot = sectionMatches.count == 1 ? sectionMatches[0] : app
     } else {
-      sectionMatches = []
+      sectionMatchCount = nil
+      queryRoot = app
     }
 
-    let queryRoot = sectionMatches.count == 1 ? sectionMatches[0] : app
-    let query = queryRoot.descendants(matching: type)
-    let candidates: [XCUIElement]
-
-    if let identifier = Self.normalizedText(locator.identifier) {
-      candidates = query.matching(identifier: identifier).allElementsBoundByIndex
-    } else {
-      candidates = query.allElementsBoundByIndex
-    }
-
-    return ResolvedUIActionCandidates(
-      matches: candidates.filter { element in
-        element.exists && elementMatchesLocator(element, locator: locator)
-      },
-      sectionMatchCount: sectionToken == nil ? nil : sectionMatches.count
+    let query = narrowedUIActionQuery(root: queryRoot, type: type, locator: locator)
+    let matches = boundedMatchingElements(
+      query: query,
+      ordinal: locator.ordinal,
+      postFilter: { element in element.exists && elementMatchesLocator(element, locator: locator) }
     )
+
+    return ResolvedUIActionCandidates(matches: matches, sectionMatchCount: sectionMatchCount)
   }
 
   @MainActor
@@ -2452,6 +2665,11 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
 
     let resolved = matchingUIActionElements(locator: locator, app: app)
+    // PRB-091: bounded to at most `max(ordinal, 2)` elements by
+    // `boundedMatchingElements` — never the full match set. `matches.count`
+    // below is exact whenever it is below that bound (the true zero/one/N
+    // case), and pinned at the bound otherwise, which is exactly the
+    // "ambiguous"/"at-least-ordinal" signal the branches below need.
     let matches = resolved.matches
 
     let sectionDetail: String = {
@@ -2459,7 +2677,7 @@ final class AttachControlSpikeUITests: XCTestCase {
         return ""
       }
 
-      return " The section token matched \(sectionMatchCount) containers, so the runner could not narrow the duplicate weak target further."
+      return " The section token matched more than one container, so the runner could not narrow the duplicate weak target further."
     }()
 
     if let ordinal = locator.ordinal {
@@ -2472,7 +2690,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       }
 
       throw actionError(
-        "Semantic locator \(describeUIActionLocator(locator)) expected ordinal \(ordinal) but runner found only \(matches.count) matches.\(sectionDetail) Add stronger accessibility identifiers or unique labels to remove ambiguity."
+        "Semantic locator \(describeUIActionLocator(locator)) expected ordinal \(ordinal) but the runner's bounded scan found only \(matches.count) matching element(s).\(sectionDetail) Add stronger accessibility identifiers or unique labels to remove ambiguity."
       )
     }
 
@@ -2489,7 +2707,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
 
     throw actionError(
-      "Semantic locator \(describeUIActionLocator(locator)) matched \(matches.count) elements on the runner. Replay can recover ref drift only while the runner-side semantic locator stays unique.\(sectionDetail) Duplicate weak targets still need stronger accessibility identifiers or unique labels."
+      "Semantic locator \(describeUIActionLocator(locator)) matched more than one element on the runner. Replay can recover ref drift only while the runner-side semantic locator stays unique.\(sectionDetail) Duplicate weak targets still need stronger accessibility identifiers or unique labels."
     )
   }
 
@@ -2543,76 +2761,129 @@ final class AttachControlSpikeUITests: XCTestCase {
     coordinate.press(forDuration: 0.01, thenDragTo: coordinate.withOffset(offset))
   }
 
+  // PRB-091: `uiAction`'s timing breakdown. `resolutionMs` is how long the
+  // query planner took to turn a locator into a coordinate/element (zero AX
+  // enumeration for a point locator, a bounded query for a semantic one);
+  // `waitMs` is existence/hittability gating (always zero for a point
+  // locator — there is nothing to wait on); `interactionMs` is the gesture
+  // itself. Kept as three explicit timers rather than one `handledMs` blob
+  // so a caller can tell "the query planner got slow" apart from "the tap
+  // itself got slow" instead of guessing from one number.
+  private struct RunnerUIActionOutcome {
+    let summary: String
+    let resolutionMs: Int
+    let waitMs: Int
+    let interactionMs: Int
+  }
+
   @MainActor
   private func performRunnerUIAction(
     _ action: RunnerUIActionPayload,
     app: XCUIApplication,
-  ) throws -> String {
+  ) throws -> RunnerUIActionOutcome {
     if action.locator.kind == "point" {
+      let resolutionStartedAt = Date()
       let target = try resolveUIActionCoordinate(locator: action.locator, app: app)
+      let resolutionMs = milliseconds(since: resolutionStartedAt)
       let targetDescription = describeUIActionLocator(action.locator)
+
+      func pointOutcome(_ summary: String, interactionStartedAt: Date) -> RunnerUIActionOutcome {
+        RunnerUIActionOutcome(
+          summary: summary,
+          resolutionMs: resolutionMs,
+          // A point locator resolves directly to a coordinate with no
+          // existence/hittability gating to wait on — see the doc comment
+          // above.
+          waitMs: 0,
+          interactionMs: milliseconds(since: interactionStartedAt)
+        )
+      }
 
       switch action.kind {
       case "tap":
+        let interactionStartedAt = Date()
         target.tap()
-        return "tapped \(targetDescription)"
+        return pointOutcome("tapped \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "press":
         let durationMs = action.durationMs ?? 750
         try requireActionCondition(durationMs > 0, "Press duration must be positive.")
+        let interactionStartedAt = Date()
         target.press(forDuration: Double(durationMs) / 1000.0)
-        return "pressed \(targetDescription)"
+        return pointOutcome("pressed \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "swipe":
+        let interactionStartedAt = Date()
         try performDirectionalGesture(on: target, direction: action.direction ?? "")
-        return "swiped \(action.direction ?? "unknown") on \(targetDescription)"
+        return pointOutcome("swiped \(action.direction ?? "unknown") on \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "type":
+        let interactionStartedAt = Date()
         target.tap()
         if let text = action.text, !text.isEmpty {
           app.typeText(text)
         }
-        return "typed into \(targetDescription)"
+        return pointOutcome("typed into \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "scroll":
         let steps = action.steps ?? 1
         try requireActionCondition(steps > 0, "Scroll steps must be positive.")
+        let interactionStartedAt = Date()
         for _ in 0..<steps {
           try performDirectionalGesture(on: target, direction: action.direction ?? "")
         }
-        return "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps"
+        return pointOutcome(
+          "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps",
+          interactionStartedAt: interactionStartedAt
+        )
 
       default:
         throw actionError("Unsupported UI action \(action.kind).")
       }
     }
 
+    let resolutionStartedAt = Date()
     let target = try resolveUIActionElement(locator: action.locator, app: app)
+    let resolutionMs = milliseconds(since: resolutionStartedAt)
     let targetDescription = describeUIActionLocator(action.locator)
+
+    func requireExistsAndHittable(_ waitDescription: String) throws -> Int {
+      let waitStartedAt = Date()
+      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before \(waitDescription).")
+      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before \(waitDescription).")
+      return milliseconds(since: waitStartedAt)
+    }
+
+    func requireExists(_ waitDescription: String) throws -> Int {
+      let waitStartedAt = Date()
+      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before \(waitDescription).")
+      return milliseconds(since: waitStartedAt)
+    }
 
     switch action.kind {
     case "tap":
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before tap.")
-      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before tap.")
+      let waitMs = try requireExistsAndHittable("tap")
+      let interactionStartedAt = Date()
       target.tap()
-      return "tapped \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "tapped \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "press":
       let durationMs = action.durationMs ?? 750
       try requireActionCondition(durationMs > 0, "Press duration must be positive.")
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before press.")
-      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before press.")
+      let waitMs = try requireExistsAndHittable("press")
+      let interactionStartedAt = Date()
       target.press(forDuration: Double(durationMs) / 1000.0)
-      return "pressed \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "pressed \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "swipe":
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before swipe.")
+      let waitMs = try requireExists("swipe")
+      let interactionStartedAt = Date()
       try performDirectionalGesture(on: target, direction: action.direction ?? "")
-      return "swiped \(action.direction ?? "unknown") on \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "swiped \(action.direction ?? "unknown") on \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "type":
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before typing.")
-      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before typing.")
+      let waitMs = try requireExistsAndHittable("typing")
+      let interactionStartedAt = Date()
       target.tap()
       if action.replace ?? true {
         clearTextIfNeeded(on: target, locator: action.locator)
@@ -2620,40 +2891,44 @@ final class AttachControlSpikeUITests: XCTestCase {
       if let text = action.text, !text.isEmpty {
         target.typeText(text)
       }
-      return "typed into \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "typed into \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "scroll":
       let steps = action.steps ?? 1
       try requireActionCondition(steps > 0, "Scroll steps must be positive.")
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before scrolling.")
+      let waitMs = try requireExists("scrolling")
+      let interactionStartedAt = Date()
       for _ in 0..<steps {
         try performDirectionalGesture(on: target, direction: action.direction ?? "")
       }
-      return "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps"
+      return RunnerUIActionOutcome(
+        summary: "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps",
+        resolutionMs: resolutionMs,
+        waitMs: waitMs,
+        interactionMs: milliseconds(since: interactionStartedAt)
+      )
 
     default:
       throw actionError("Unsupported UI action \(action.kind).")
     }
   }
 
+  // PRB-091: generic (non-fixture) status text for response finalization.
+  // The runner used to probe three ProbeFixture-only static-text
+  // identifiers (`fixture.status.label`, `fixture.detail.label`,
+  // `fixture.detail.summaryLabel`) on *every* response, for *every* target
+  // app — three extra AX existence queries per command that only ever
+  // resolved to anything on ProbeFixture itself, and did nothing but add
+  // latency for every other app. `app.label` is already-resolved attribute
+  // data on the `app` handle the caller already holds, not a fresh query,
+  // so this reads as zero additional AX enumeration. Fixture-specific
+  // status assertions (the `fixture.status.label` waits in `applyInput` and
+  // the attach helpers, and the direct `staticTexts["fixture.status.label"]`
+  // lookups in the test methods below) are unaffected — they are already
+  // test-only and stay that way.
   @MainActor
-  private func currentStatusLabelText(app: XCUIApplication) -> String {
-    let primaryStatus = app.staticTexts["fixture.status.label"]
-    if primaryStatus.exists {
-      return primaryStatus.label
-    }
-
-    let detailLabel = app.staticTexts["fixture.detail.label"]
-    if detailLabel.exists {
-      return detailLabel.label
-    }
-
-    let detailSummary = app.staticTexts["fixture.detail.summaryLabel"]
-    if detailSummary.exists {
-      return detailSummary.label
-    }
-
-    return app.label.isEmpty ? "<status-unavailable>" : app.label
+  private static func genericResponseStatusLabel(app: XCUIApplication) -> String {
+    app.label.isEmpty ? "<status-unavailable>" : app.label
   }
 
   @MainActor
@@ -2718,7 +2993,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       let interactiveNodeCount = Self.interactiveNodeCount(in: compactRoot)
       let payload = RunnerSnapshotPayload(
         capturedAt: Self.iso8601Formatter.string(from: Date()),
-        statusLabel: currentStatusLabelText(app: app),
+        statusLabel: Self.genericResponseStatusLabel(app: app),
         metrics: RunnerSnapshotMetrics(
           rawNodeCount: rawNodeCount,
           prunedNodeCount: compactNodeCount,
@@ -2799,13 +3074,16 @@ final class AttachControlSpikeUITests: XCTestCase {
     case "uiAction":
       let payloadData = Data((command.payload ?? "{}").utf8)
       let actionPayload = try JSONDecoder().decode(RunnerUIActionPayload.self, from: payloadData)
-      let summary = try performRunnerUIAction(actionPayload, app: app)
+      let outcome = try performRunnerUIAction(actionPayload, app: app)
       return LifecycleCommandResult(
         inlinePayload: nil,
         inlinePayloadEncoding: nil,
-        payload: summary,
+        payload: outcome.summary,
         snapshotPayloadPath: nil,
-        snapshotNodeCount: nil
+        snapshotNodeCount: nil,
+        resolutionMs: outcome.resolutionMs,
+        waitMs: outcome.waitMs,
+        interactionMs: outcome.interactionMs
       )
 
     case "shutdown":

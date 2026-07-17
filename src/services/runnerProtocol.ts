@@ -128,6 +128,18 @@ export const RunnerResponseFrameSchema = Schema.Struct({
   inlinePayloadEncoding: OptionalNullableString,
   handledMs: Schema.Number,
   statusLabel: Schema.String,
+  // PRB-091: `handledMs` broken into the phases a `uiAction` command went
+  // through — resolving the locator, waiting for existence/hittability, and
+  // performing the gesture — plus the (always-populated) generic response
+  // finalization cost. Nullable/optional because only `uiAction` responses
+  // go through `performRunnerUIAction` on the runner side; every other
+  // action (ping, snapshot, screenshot, recordVideo, shutdown) has no
+  // resolution/wait/interaction phase to report. See
+  // ios/ProbeRunner/AttachControlSpikeUITests.swift's `LifecycleResponseFrame`.
+  resolutionMs: Schema.optional(OptionalNullableNumber),
+  waitMs: Schema.optional(OptionalNullableNumber),
+  interactionMs: Schema.optional(OptionalNullableNumber),
+  finalizationMs: Schema.optional(OptionalNullableNumber),
   snapshotNodeCount: OptionalNullableNumber,
   failedActionIndex: OptionalNullableNumber,
   failedActionKind: OptionalNullableString,

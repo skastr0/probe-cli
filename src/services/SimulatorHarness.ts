@@ -70,6 +70,16 @@ export interface RunnerCommandResult {
   readonly inlinePayload?: string | null
   readonly inlinePayloadEncoding?: string | null
   readonly handledMs: number
+  // PRB-091: `handledMs` broken into the phases a `uiAction` command went
+  // through on the runner (resolving the locator, waiting for
+  // existence/hittability, performing the gesture), plus the generic
+  // response-finalization cost. `null` for actions other than `uiAction`,
+  // which have no resolution/wait/interaction phase to report — see
+  // `RunnerResponseFrameSchema` in runnerProtocol.ts.
+  readonly resolutionMs?: number | null
+  readonly waitMs?: number | null
+  readonly interactionMs?: number | null
+  readonly finalizationMs?: number | null
   readonly totalHandledMs?: number | null
   readonly childHandledMs?: ReadonlyArray<number | null> | null
   readonly failedActionIndex?: number | null
@@ -529,6 +539,10 @@ export const createHttpRunnerCommandSender = (commandUrl: string, epoch: string)
       inlinePayload: response.inlinePayload ?? null,
       inlinePayloadEncoding: response.inlinePayloadEncoding ?? null,
       handledMs: response.handledMs,
+      resolutionMs: response.resolutionMs ?? null,
+      waitMs: response.waitMs ?? null,
+      interactionMs: response.interactionMs ?? null,
+      finalizationMs: response.finalizationMs ?? null,
       totalHandledMs: response.totalHandledMs ?? null,
       childHandledMs: response.childHandledMs ?? null,
       failedActionIndex: response.failedActionIndex ?? null,
