@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto"
 import { statSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
-import { Context, Effect, Either, Layer, Ref } from "effect"
+import { Context, Effect, Either, FiberRef, Layer, Ref } from "effect"
 import {
   buildRecordedSessionAction,
   buildDirectRunnerUiActionPayload,
@@ -95,11 +95,24 @@ import {
   type OpenedRealDeviceSession,
   RealDeviceHarness,
 } from "./RealDeviceHarness"
+import { RunnerTransportError } from "./RunnerTransportClient"
+import {
+  makeSessionController,
+  type SessionCloseReason,
+  type SessionController,
+  type SessionControllerContext,
+} from "./SessionController"
 import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
 import type { RunnerAction } from "./runnerProtocol"
 
 const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
 const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
+// PRB-083: bounded operation queue per SessionController. Comfortably above
+// any realistic in-flight command burst (batched UI actions, retries) so
+// legitimate traffic never trips queue saturation; a caller issuing more
+// than this many concurrent commands against one session gets a typed
+// session-busy error instead of unbounded memory growth.
+const sessionControllerQueueCapacity = Number(process.env.PROBE_SESSION_QUEUE_CAPACITY ?? 512)
 const maxSessionLogCaptureSeconds = 30
 const defaultDebugCommandTimeoutMs = Number(process.env.PROBE_LLDB_COMMAND_TIMEOUT_MS ?? 60_000)
 const maxDebugFrameLimit = 200
@@ -701,11 +714,17 @@ interface BaseActiveSessionRecord {
   recording: {
     steps: Array<RecordedSessionAction>
   }
+  // PRB-083: the controller is the sole writer of `health` (reassigned as a
+  // whole object, never mutated in place) and the sole allocator of runner
+  // command sequence numbers. Every other field above stays a plain mutable
+  // property because nothing outside the controller's serialized execution
+  // ever writes it concurrently; see SessionController.ts for the invariant
+  // this buys.
+  readonly controller: SessionController
 }
 
 interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "simulator"
-  nextSequence: number
   readonly sendRunnerCommand: (
     sequence: number,
     action: RunnerAction,
@@ -719,7 +738,6 @@ interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
 interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
   kind: "device"
   integrationPoints: ReadonlyArray<string>
-  nextSequence: number
   readonly sendRunnerCommand: ((
     sequence: number,
     action: RunnerAction,
@@ -1435,8 +1453,51 @@ export const SessionRegistryLive = Layer.scoped(
     const simulatorHarness = yield* SimulatorHarness
     const lldbBridgeFactory = yield* LldbBridgeFactory
     const sessionsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
+    // PRB-083 gate 10: `closeSessionInternal` removes a session from
+    // `sessionsRef` once it is fully closed (so it stops counting as
+    // active and stops showing up in listings), but a *repeat* close call
+    // for that same session id must still return the already-closed result
+    // rather than SessionNotFoundError. This small side-table is what makes
+    // that possible: it keeps just the closed record's controller (already
+    // memoized/terminal) reachable by session id after removal from the
+    // main table.
+    const closedRecordsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
     const openingRef = yield* Ref.make<OpeningSessionReservation | null>(null)
     const openMutex = yield* Effect.makeSemaphore(1)
+
+    // PRB-083: the ambient handle for "we are currently executing inside
+    // this session's controller fiber". Every top-level entry point that
+    // mutates health or allocates a runner command sequence number wraps
+    // its body with `withControllerContext`; everything nested underneath
+    // (sendRunnerCommand, snapshot capture, etc.) recovers the same context
+    // via `requireControllerContext` instead of threading it through every
+    // call signature. It is a FiberRef, not a plain module variable,
+    // because each session's controller fiber runs its own submitted
+    // operation with its own context value, and operations for different
+    // sessions (or concurrent operations serialized one after another on
+    // the same session) must never see each other's allocator.
+    const controllerContextRef = yield* FiberRef.make<SessionControllerContext | null>(null)
+
+    const requireControllerContext = (sessionId: string) =>
+      Effect.gen(function* () {
+        const ctx = yield* FiberRef.get(controllerContextRef)
+
+        if (ctx === null) {
+          return yield* new EnvironmentError({
+            code: "session-controller-context-missing",
+            reason:
+              `Internal error: a runner dispatch for session ${sessionId} ran outside its SessionController's `
+              + "exclusive execution.",
+            nextStep: "This indicates a Probe defect. File a bug with the session id and command attempted.",
+            details: [],
+          })
+        }
+
+        return ctx
+      })
+
+    const withControllerContext = <A, E>(ctx: SessionControllerContext, effect: Effect.Effect<A, E>) =>
+      effect.pipe(Effect.locally(controllerContextRef, ctx))
 
     const persistHealth = (sessionId: string, health: SessionHealth) =>
       Effect.gen(function* () {
@@ -1506,6 +1567,29 @@ export const SessionRegistryLive = Layer.scoped(
         return record
       })
 
+    // PRB-083 gate 5/6: a transport failure against a wrapper that is still
+    // running is ambiguous, not proof the runner died — `RunnerTransportError`
+    // already carries that fact (`ambiguous`, populated for timeouts and
+    // decode failures; false for a dispatch that never reached the runner,
+    // e.g. connection refused). `waitForFreshJson`'s stdout-transport
+    // fallback signals the same ambiguity as `ChildProcessError` with code
+    // "runner-timeout". Treat either as recoverable ("degraded") exactly
+    // when the wrapper process itself is still alive; everything else is a
+    // hard failure.
+    const isAmbiguousTransportFailure = (error: unknown): boolean => {
+      if (error instanceof RunnerTransportError) {
+        return error.ambiguous
+      }
+
+      return error instanceof ChildProcessError && error.code === "runner-timeout"
+    }
+
+    const classifyRunnerDispatchFailure = (args: {
+      readonly error: unknown
+      readonly wrapperRunning: boolean
+    }): "degraded" | "failed" =>
+      args.wrapperRunning && isAmbiguousTransportFailure(args.error) ? "degraded" : "failed"
+
     const markSessionRunnerFailed = (args: {
       readonly sessionId: string
       readonly record: ActiveSessionRecord
@@ -1513,26 +1597,31 @@ export const SessionRegistryLive = Layer.scoped(
       readonly reason: string
       readonly wrapperRunning: boolean
       readonly pingRttMs?: number | null
+      /** "degraded": ambiguous/transient, wrapper still live — recoverable by a later successful same-controller ping.
+       *  "failed" (default): hard failure — Probe's fail-closed policy applies (`nonRecoverableSessionWarning`). */
+      readonly severity?: "degraded" | "failed"
     }) =>
       Effect.gen(function* () {
         if (args.record.health.state === "closing" || args.record.health.state === "closed") {
           return
         }
 
+        const severity = args.severity ?? "failed"
+        const liveRunner = severity === "degraded"
+
         const capabilities = isRealDeviceRecord(args.record)
           ? [...buildRealDeviceCapabilities({
               connection: args.record.health.connection,
               integrationPoints: args.record.integrationPoints,
-              liveRunner: false,
+              liveRunner,
             })]
           : args.record.health.capabilities
 
-        args.record.health = {
+        const nextHealthBase: SessionHealth = {
           ...args.record.health,
-          state: "failed",
           updatedAt: nowIso(),
           expiresAt: expiresAtIso(),
-          resources: setRunnerResourceState(args.record.health.resources, "failed"),
+          resources: setRunnerResourceState(args.record.health.resources, severity),
           capabilities,
           healthCheck: {
             ...args.record.health.healthCheck,
@@ -1540,13 +1629,23 @@ export const SessionRegistryLive = Layer.scoped(
             wrapperRunning: args.wrapperRunning,
             pingRttMs: args.pingRttMs ?? null,
             lastCommand: args.lastCommand,
-            lastOk: false,
+            // "degraded" is deliberately indeterminate (`null`), not `false`:
+            // the transport attempt was ambiguous, so Probe does not know
+            // whether the runner executed the command.
+            lastOk: severity === "degraded" ? null : false,
           },
           warnings: dedupeStrings([
             ...args.record.health.warnings,
-            `${args.reason} ${nonRecoverableSessionWarning}`,
+            severity === "degraded"
+              ? `${args.reason} The runner wrapper is still running; Probe marked the session degraded rather than failed and will recover automatically on the next successful ping.`
+              : `${args.reason} ${nonRecoverableSessionWarning}`,
           ]),
           artifacts: [...(yield* refreshArtifacts(args.sessionId))],
+        }
+
+        args.record.health = {
+          ...nextHealthBase,
+          state: severity === "degraded" ? deriveSessionPhase(nextHealthBase) : "failed",
         }
 
         yield* persistHealth(args.sessionId, args.record.health)
@@ -1559,26 +1658,39 @@ export const SessionRegistryLive = Layer.scoped(
       action: RunnerAction,
       payload?: string,
     ) =>
-      Effect.tryPromise({
-        try: () => record.sendRunnerCommand(record.nextSequence, action, payload),
-        catch: (error) =>
-          new EnvironmentError({
-            code: `session-runner-${action}`,
-            reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
-            details: [],
+      Effect.gen(function* () {
+        const ctx = yield* requireControllerContext(sessionId)
+        const attempt = yield* Effect.either(
+          Effect.tryPromise({
+            try: () => record.sendRunnerCommand(ctx.allocateSequence(), action, payload),
+            catch: (error) => error,
           }),
-      }).pipe(
-        Effect.tapError((error) =>
-          markSessionRunnerFailed({
-            sessionId,
-            record,
-            lastCommand: action,
-            reason: error.reason,
-            wrapperRunning: record.isRunnerRunning(),
-          }),
-        ),
-      )
+        )
+
+        if (Either.isRight(attempt)) {
+          return attempt.right
+        }
+
+        const rawError = attempt.left
+        const reason = rawError instanceof Error ? rawError.message : String(rawError)
+        const wrapperRunning = record.isRunnerRunning()
+
+        yield* markSessionRunnerFailed({
+          sessionId,
+          record,
+          lastCommand: action,
+          reason,
+          wrapperRunning,
+          severity: classifyRunnerDispatchFailure({ error: rawError, wrapperRunning }),
+        })
+
+        return yield* new EnvironmentError({
+          code: `session-runner-${action}`,
+          reason,
+          nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
+          details: [],
+        })
+      })
 
     const refreshSessionArtifacts = (sessionId: string, record: ActiveSessionRecord) =>
       Effect.gen(function* () {
@@ -2000,7 +2112,6 @@ export const SessionRegistryLive = Layer.scoped(
                 "uiAction",
                 JSON.stringify(buildRunnerUiActionPayload(action, resolvedTarget, preSnapshot?.artifact ?? null)),
               )
-              record.nextSequence += 1
 
               if (!response.ok) {
                 const failureReason = response.error
@@ -2274,7 +2385,6 @@ export const SessionRegistryLive = Layer.scoped(
     }) =>
       Effect.gen(function* () {
         const response = yield* sendRunnerCommand(args.sessionId, args.record, "screenshot")
-        args.record.nextSequence += 1
 
         if (!response.ok) {
           return yield* new EnvironmentError({
@@ -2517,7 +2627,6 @@ export const SessionRegistryLive = Layer.scoped(
     }) =>
       Effect.gen(function* () {
         const response = yield* sendRunnerCommand(args.sessionId, args.record, "recordVideo", String(args.durationMs))
-        args.record.nextSequence += 1
 
         if (!response.ok) {
           return yield* new EnvironmentError({
@@ -3362,7 +3471,6 @@ export const SessionRegistryLive = Layer.scoped(
         }
 
         const response = yield* sendRunnerCommand(sessionId, record, "snapshot")
-        record.nextSequence += 1
 
         if (!response.ok) {
           updateHealthCheck(record, response.action, false)
@@ -3601,90 +3709,142 @@ export const SessionRegistryLive = Layer.scoped(
         return true
       })
 
+    // PRB-083 gate 3/4/10: explicit close, TTL expiry, runner exit, and
+    // daemon shutdown all call this. Every one of those triggers routes
+    // through the *same* `record.controller.close(...)` call, so whichever
+    // one reaches the controller first is the only one that ever runs the
+    // teardown body below — the others (concurrent or later, including a
+    // caller that arrives after the session is already fully closed) all
+    // receive that exact same terminal health back. `closeResources()` is
+    // best-effort inside teardown (a warning, not a failure the caller must
+    // handle) because teardown itself cannot fail: a close that failed
+    // outright would leave the session stuck in "closing" forever with no
+    // way to retry cleanly, which is worse than a closed session carrying a
+    // cleanup warning.
     const closeSessionInternal = (
       sessionId: string,
-      reason: "explicit-close" | "ttl-expired" | "daemon-shutdown" | "runner-exit",
-    ) =>
+      reason: SessionCloseReason,
+    ): Effect.Effect<SessionHealth | null> =>
       Effect.gen(function* () {
         const sessions = yield* Ref.get(sessionsRef)
         const record = sessions.get(sessionId)
 
         if (!record) {
-          return false
-        }
+          const closedSessions = yield* Ref.get(closedRecordsRef)
+          const closedRecord = closedSessions.get(sessionId)
 
-        if (record.health.state !== "closed") {
-          record.health = {
-            ...record.health,
-            state: "closing",
-            updatedAt: nowIso(),
-            expiresAt: expiresAtIso(),
-            resources: setSessionResourceStates(record.health.resources, {
-              runner: "stopping",
-              debugger: record.health.resources.debugger === "not-requested"
-                ? "not-requested"
-                : "stopping",
-            }),
+          if (!closedRecord) {
+            return null
           }
-          yield* persistHealth(sessionId, record.health)
+
+          // Already fully closed and removed from `sessionsRef`; the
+          // controller is terminal, so this just replays the cached
+          // terminal result instead of re-running teardown or claiming
+          // the session was never found.
+          return yield* closedRecord.controller.close(reason, () => Effect.succeed(closedRecord.health))
         }
 
-        yield* closeDebuggerBridgeInternal(sessionId, record)
+        yield* record.controller.close(reason, (closeReason, ctx) =>
+          Effect.gen(function* () {
+            if (record.health.state !== "closed") {
+              record.health = {
+                ...record.health,
+                state: "closing",
+                updatedAt: nowIso(),
+                expiresAt: expiresAtIso(),
+                resources: setSessionResourceStates(record.health.resources, {
+                  runner: "stopping",
+                  debugger: record.health.resources.debugger === "not-requested"
+                    ? "not-requested"
+                    : "stopping",
+                }),
+              }
+              yield* persistHealth(sessionId, record.health)
+            }
 
-        if (reason !== "runner-exit" && isRunnerBackedRecord(record) && record.isRunnerRunning()) {
-          yield* Effect.tryPromise({
-            try: async () => {
-              await record.sendRunnerCommand(record.nextSequence, "shutdown")
-            },
-            catch: () => new EnvironmentError({
-              code: "session-close-shutdown",
-              reason: `Failed to send shutdown to session ${sessionId}; falling back to wrapper termination.`,
-              nextStep: "Inspect the session log artifact if the runner did not exit cleanly.",
-              details: [],
-            }),
-          }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
-        }
+            yield* closeDebuggerBridgeInternal(sessionId, record).pipe(Effect.catchAll(() => Effect.succeed(false)))
 
-        yield* Effect.tryPromise({
-          try: () => record.closeResources(),
-          catch: (error) =>
-            new EnvironmentError({
-              code: "session-close-resources",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: "Inspect the session artifacts and retry closing the session.",
-              details: [],
-            }),
-        })
+            if (closeReason !== "runner-exit" && isRunnerBackedRecord(record) && record.isRunnerRunning()) {
+              yield* Effect.tryPromise({
+                try: async () => {
+                  await record.sendRunnerCommand(ctx.allocateSequence(), "shutdown")
+                },
+                catch: () => new EnvironmentError({
+                  code: "session-close-shutdown",
+                  reason: `Failed to send shutdown to session ${sessionId}; falling back to wrapper termination.`,
+                  nextStep: "Inspect the session log artifact if the runner did not exit cleanly.",
+                  details: [],
+                }),
+              }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
+            }
 
-        record.health = {
-          ...record.health,
-          state: "closed",
-          updatedAt: nowIso(),
-          expiresAt: expiresAtIso(),
-          resources: setSessionResourceStates(record.health.resources, {
-            runner: "stopped",
-            debugger: record.health.resources.debugger === "not-requested"
-              ? "not-requested"
-              : "stopped",
-          }),
-          healthCheck: {
-            ...record.health.healthCheck,
-            checkedAt: nowIso(),
-            wrapperRunning: false,
-            lastCommand: reason === "runner-exit" ? "runner-exit" : "shutdown",
-            lastOk: reason === "runner-exit" ? false : true,
-          },
-        }
-        yield* persistHealth(sessionId, record.health)
+            const closeResourcesFailure = yield* Effect.tryPromise({
+              try: () => record.closeResources(),
+              catch: (error) => (error instanceof Error ? error.message : String(error)),
+            }).pipe(Effect.either)
+
+            record.health = {
+              ...record.health,
+              state: "closed",
+              updatedAt: nowIso(),
+              expiresAt: expiresAtIso(),
+              resources: setSessionResourceStates(record.health.resources, {
+                runner: "stopped",
+                debugger: record.health.resources.debugger === "not-requested"
+                  ? "not-requested"
+                  : "stopped",
+              }),
+              healthCheck: {
+                ...record.health.healthCheck,
+                checkedAt: nowIso(),
+                wrapperRunning: false,
+                lastCommand: closeReason === "runner-exit" ? "runner-exit" : "shutdown",
+                lastOk: closeReason === "runner-exit" ? false : true,
+              },
+              warnings: Either.isLeft(closeResourcesFailure)
+                ? dedupeStrings([
+                    ...record.health.warnings,
+                    `Session resource cleanup reported an error and may be incomplete: ${closeResourcesFailure.left}`,
+                  ])
+                : record.health.warnings,
+            }
+            yield* persistHealth(sessionId, record.health)
+
+            return record.health
+          }).pipe(
+            // teardown's contract is Effect<SessionHealth, never>: it must
+            // always settle to a terminal health so every observer waiting
+            // on the coalesced close gets a value, never a hung deferred.
+            // An artifact-manifest write failure mid-teardown (the only
+            // remaining fallible step here) becomes a warning on the
+            // closed health snapshot rather than a close that never
+            // finishes.
+            Effect.catchAll((error) =>
+              Effect.sync(() => {
+                record.health = {
+                  ...record.health,
+                  state: "closed",
+                  updatedAt: nowIso(),
+                  warnings: dedupeStrings([
+                    ...record.health.warnings,
+                    `Session close teardown reported an error and health persistence may be incomplete: ${error.reason}`,
+                  ]),
+                }
+                return record.health
+              }),
+            ),
+          ),
+        )
 
         yield* Ref.update(sessionsRef, (current) => {
           const next = new Map(current)
           next.delete(sessionId)
           return next
         })
+        yield* Ref.update(closedRecordsRef, (current) => new Map(current).set(sessionId, record))
         yield* syncDaemonMetadata
 
-        return true
+        return record.health
       })
 
     const sweeper = Effect.forever(
@@ -3990,12 +4150,18 @@ export const SessionRegistryLive = Layer.scoped(
                     artifacts: [...(yield* refreshArtifacts(opening.sessionId))],
                   }
 
+                  const controller = yield* makeSessionController({
+                    sessionId: opening.sessionId,
+                    initialSequence: opened.nextSequence,
+                    opQueueCapacity: sessionControllerQueueCapacity,
+                  })
+
                   const record: RealDeviceActiveSessionRecord = {
                     kind: "device",
                     health,
                     baseWarnings: warnings,
                     integrationPoints: opened.integrationPoints,
-                    nextSequence: opened.nextSequence,
+                    controller,
                     debuggerBridge: null,
                     snapshotState: {
                       latest: null,
@@ -4015,19 +4181,15 @@ export const SessionRegistryLive = Layer.scoped(
                   yield* persistHealth(opening.sessionId, health)
                   yield* Ref.update(sessionsRef, (current) => new Map(current).set(opening.sessionId, record))
 
+                  // PRB-083 gate 3: runner exit is one of the four triggers
+                  // that must go through the same coalesced close as
+                  // explicit close / TTL expiry / daemon shutdown, instead
+                  // of only marking the session "failed" and leaving it
+                  // registered (the prior sticky-failure behavior this
+                  // glyph fixes).
                   record.waitForExit?.then(() => {
-                    if (record.health.state === "closing" || record.health.state === "closed") {
-                      return
-                    }
-
                     void Effect.runPromise(
-                      markSessionRunnerFailed({
-                        sessionId: opening.sessionId,
-                        record,
-                        lastCommand: "runner-exit",
-                        reason: "The real-device runner wrapper exited unexpectedly.",
-                        wrapperRunning: false,
-                      }).pipe(
+                      closeSessionInternal(opening.sessionId, "runner-exit").pipe(
                         Effect.catchAll(() => Effect.void),
                       ),
                     )
@@ -4214,11 +4376,17 @@ export const SessionRegistryLive = Layer.scoped(
                     artifacts: [...(yield* refreshArtifacts(opening.sessionId))],
                   }
 
+                  const controller = yield* makeSessionController({
+                    sessionId: opening.sessionId,
+                    initialSequence: opened.nextSequence,
+                    opQueueCapacity: sessionControllerQueueCapacity,
+                  })
+
                   const record: SimulatorActiveSessionRecord = {
                     kind: "simulator",
                     health,
                     baseWarnings: warnings,
-                    nextSequence: opened.nextSequence,
+                    controller,
                     debuggerBridge: null,
                     snapshotState: {
                       latest: null,
@@ -4237,19 +4405,11 @@ export const SessionRegistryLive = Layer.scoped(
                   yield* persistHealth(opening.sessionId, health)
                   yield* Ref.update(sessionsRef, (current) => new Map(current).set(opening.sessionId, record))
 
+                  // PRB-083 gate 3: see the matching comment in the device
+                  // open flow above.
                   record.waitForExit.then(() => {
-                    if (record.health.state === "closing" || record.health.state === "closed") {
-                      return
-                    }
-
                     void Effect.runPromise(
-                      markSessionRunnerFailed({
-                        sessionId: opening.sessionId,
-                        record,
-                        lastCommand: "runner-exit",
-                        reason: "The runner wrapper exited unexpectedly.",
-                        wrapperRunning: false,
-                      }).pipe(
+                      closeSessionInternal(opening.sessionId, "runner-exit").pipe(
                         Effect.catchAll(() => Effect.void),
                       ),
                     )
@@ -4276,6 +4436,12 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          // PRB-083: the whole health-check body (both the ping dispatch
+          // and every health mutation it makes) runs as one operation on
+          // this session's controller fiber, serialized against every
+          // other command, TTL sweep, runner exit, and close on the same
+          // session.
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           if (isRealDeviceRecord(record)) {
             const connection = yield* Effect.tryPromise({
               try: () => record.refreshConnection(),
@@ -4391,7 +4557,7 @@ export const SessionRegistryLive = Layer.scoped(
 
             const pingAttempt = yield* Effect.either(
               Effect.tryPromise({
-                try: () => record.sendRunnerCommand(record.nextSequence, "ping", "health-check"),
+                try: () => record.sendRunnerCommand(ctx.allocateSequence(), "ping", "health-check"),
                 catch: (error) =>
                   new EnvironmentError({
                     code: "device-session-health-ping",
@@ -4474,7 +4640,6 @@ export const SessionRegistryLive = Layer.scoped(
             }
 
             const response = pingAttempt.right
-            record.nextSequence += 1
             const interruptionIsActive = interruption?.evidenceKind === "direct"
             const warningExtras = [
               ...(interruptionWarning ? [interruptionWarning] : []),
@@ -4540,16 +4705,59 @@ export const SessionRegistryLive = Layer.scoped(
             "Continue or detach the debugger before retrying session health, then retry.",
           )
 
-          const response = yield* sendRunnerCommand(sessionId, record, "ping", "health-check")
-          record.nextSequence += 1
-          record.health = {
+          // PRB-083 gate 5: dispatched directly (not through the shared
+          // `sendRunnerCommand` helper, which always fails the calling
+          // Effect on any transport error) so an ambiguous/degraded outcome
+          // can return successfully with a degraded health snapshot,
+          // mirroring the real-device ping branch above instead of
+          // surfacing a hard failure for what may just be a transient
+          // timeout against a still-live wrapper.
+          const pingAttempt = yield* Effect.either(
+            Effect.tryPromise({
+              try: () => record.sendRunnerCommand(ctx.allocateSequence(), "ping", "health-check"),
+              catch: (error) => error,
+            }),
+          )
+
+          if (Either.isLeft(pingAttempt)) {
+            const wrapperRunning = record.isRunnerRunning()
+            const severity = classifyRunnerDispatchFailure({ error: pingAttempt.left, wrapperRunning })
+            const reason = pingAttempt.left instanceof Error ? pingAttempt.left.message : String(pingAttempt.left)
+
+            yield* markSessionRunnerFailed({
+              sessionId,
+              record,
+              lastCommand: "ping",
+              reason,
+              wrapperRunning,
+              severity,
+            })
+
+            if (severity === "degraded") {
+              return record.health
+            }
+
+            return yield* new EnvironmentError({
+              code: "session-runner-ping",
+              reason,
+              nextStep: "Inspect the runner artifacts, then close and reopen the session instead of expecting transparent recovery.",
+              details: [],
+            })
+          }
+
+          const response = pingAttempt.right
+
+          // PRB-083 gate 6: a successful ping against the same live wrapper
+          // restores `resources.runner` to "ready" (rather than carrying
+          // forward whatever it was, which is how a prior "failed" used to
+          // stick forever) and re-derives `state` from that instead of
+          // hard-coding it — so a session genuinely recovers instead of
+          // staying stuck failed after the runner answers again.
+          const nextHealthBase: SessionHealth = {
             ...record.health,
-            state: response.ok ? record.health.state : "failed",
             updatedAt: nowIso(),
             expiresAt: expiresAtIso(),
-            resources: response.ok
-              ? record.health.resources
-              : setRunnerResourceState(record.health.resources, "failed"),
+            resources: setRunnerResourceState(record.health.resources, response.ok ? "ready" : "failed"),
             healthCheck: {
               checkedAt: nowIso(),
               wrapperRunning: record.isRunnerRunning(),
@@ -4566,9 +4774,15 @@ export const SessionRegistryLive = Layer.scoped(
             artifacts: [...(yield* refreshArtifacts(sessionId))],
           }
 
+          record.health = {
+            ...nextHealthBase,
+            state: deriveSessionPhase(nextHealthBase),
+          }
+
           yield* persistHealth(sessionId, record.health)
           yield* syncDaemonMetadata
           return record.health
+          })))
         }),
       sendRunnerKeepalive: (sessionId) =>
         Effect.gen(function* () {
@@ -4578,8 +4792,9 @@ export const SessionRegistryLive = Layer.scoped(
             return
           }
 
-          yield* sendRunnerCommand(sessionId, record, "ping", "perf-keepalive")
-          record.nextSequence += 1
+          yield* record.controller.submit((ctx) =>
+            withControllerContext(ctx, sendRunnerCommand(sessionId, record, "ping", "perf-keepalive")),
+          ).pipe(Effect.asVoid)
         }),
       getSessionLogs: ({
         sessionId,
@@ -4971,13 +5186,18 @@ export const SessionRegistryLive = Layer.scoped(
       captureSnapshot: ({ sessionId, outputMode }) =>
         Effect.gen(function* () {
           const record = yield* requireSessionRecord(sessionId)
-          const captured = yield* (runWithRetry({
-            policy: defaultReadOnlyRetryPolicy,
-            run: () => captureSnapshotArtifactInternal(sessionId, record),
-          }) as Effect.Effect<
-            { readonly value: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord }; readonly retry: RetryAttemptMetadata },
-            UnsupportedCapabilityError | EnvironmentError | ChildProcessError
-          >)
+          const captured = yield* record.controller.submit((ctx) =>
+            withControllerContext(
+              ctx,
+              runWithRetry({
+                policy: defaultReadOnlyRetryPolicy,
+                run: () => captureSnapshotArtifactInternal(sessionId, record),
+              }) as Effect.Effect<
+                { readonly value: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord }; readonly retry: RetryAttemptMetadata },
+                UnsupportedCapabilityError | EnvironmentError | ChildProcessError
+              >,
+            ),
+          )
           return buildSessionSnapshotResult({
             artifact: captured.value.artifact,
             artifactRecord: captured.value.artifactRecord,
@@ -4987,11 +5207,17 @@ export const SessionRegistryLive = Layer.scoped(
         }),
       performAction: ({ sessionId, action }) =>
         Effect.gen(function* () {
-          const outcome = yield* executeSessionAction({
-            sessionId,
-            action,
-            recordAction: true,
-          })
+          const record = yield* requireSessionRecord(sessionId)
+          const outcome = yield* record.controller.submit((ctx) =>
+            withControllerContext(
+              ctx,
+              executeSessionAction({
+                sessionId,
+                action,
+                recordAction: true,
+              }),
+            ),
+          )
 
           if (!outcome.ok) {
             return yield* outcome.error
@@ -5013,6 +5239,14 @@ export const SessionRegistryLive = Layer.scoped(
           }
 
           const record = yield* requireSessionRecord(sessionId)
+
+          // PRB-083: the whole flow run — every step it dispatches — is one
+          // operation on this session's controller fiber, exactly like a
+          // single action. This is a mechanical integration (routing the
+          // flow's existing runner dispatches through the shared
+          // controller context), not a change to flow planning/execution
+          // itself, which stays out of PRB-083's scope per the glyph notes.
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           yield* refreshSessionArtifacts(sessionId, record)
           const plan = planFlowExecution(flow)
 
@@ -5319,7 +5553,6 @@ export const SessionRegistryLive = Layer.scoped(
                       "uiAction",
                       JSON.stringify(payload),
                     )
-                    record.nextSequence += 1
 
                     if (!response.ok) {
                       const failureReason = response.error
@@ -5636,7 +5869,6 @@ export const SessionRegistryLive = Layer.scoped(
                     "uiActionBatch",
                     JSON.stringify(payload),
                   )
-                  record.nextSequence += 1
                   updateHealthCheck(record, response.action, response.ok)
 
                   const checkpointCapture = checkpoint === "end"
@@ -5877,6 +6109,7 @@ export const SessionRegistryLive = Layer.scoped(
             finalSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
             warnings: overallWarnings,
           } satisfies FlowV2Result
+          })))
         }),
       exportRecording: ({ sessionId, label }) =>
         Effect.gen(function* () {
@@ -5954,6 +6187,9 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          // PRB-083: the whole replay run is one operation on this
+          // session's controller fiber, mirroring runFlow above.
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           const reports: Array<ReplayStepReport> = []
           let retriedStepCount = 0
           let semanticFallbackCount = 0
@@ -6126,7 +6362,6 @@ export const SessionRegistryLive = Layer.scoped(
                   ),
                 ),
               )
-              record.nextSequence += 1
 
               if (!response.ok) {
                 lastFailure = response.error ?? response.payload ?? `Runner ${step.kind} failed with status ${response.statusLabel}.`
@@ -6263,6 +6498,7 @@ export const SessionRegistryLive = Layer.scoped(
             semanticFallbackCount,
             finalSnapshotId,
           } satisfies SessionReplayResult
+          })))
         }),
       captureScreenshot: ({ sessionId, label, outputMode }) =>
         Effect.gen(function* () {
@@ -6270,6 +6506,7 @@ export const SessionRegistryLive = Layer.scoped(
 
           yield* assertRunnerActionsAvailable(record)
 
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           const labelStem = sanitizeFileComponent(label, "screenshot")
           const fileStem = `${timestampForFile()}-${labelStem}`
           const capture = yield* Effect.either(runWithRetry({
@@ -6308,6 +6545,7 @@ export const SessionRegistryLive = Layer.scoped(
             retryCount: capture.right.retry.retryCount,
             retryReasons: capture.right.retry.retryReasons,
           } satisfies SessionScreenshotResult
+          })))
         }),
       recordVideo: ({ sessionId, duration }) =>
         Effect.gen(function* () {
@@ -6326,6 +6564,7 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
           const durationMs = normalizeVideoDurationMs(parsedDurationMs)
           const fileStem = `${timestampForFile()}-${sanitizeFileComponent(duration, "video")}`
           const capture = yield* Effect.either(captureVideoArtifact({
@@ -6357,22 +6596,26 @@ export const SessionRegistryLive = Layer.scoped(
             summary: `Captured ${modeSummary} at ${capture.right.artifact.absolutePath}.${clampNote}`,
             artifact: capture.right.artifact,
           } satisfies SummaryArtifactResult
+          })))
         }),
       closeSession: (sessionId) =>
         Effect.gen(function* () {
-          const closed = yield* closeSessionInternal(sessionId, "explicit-close")
+          const closedHealth = yield* closeSessionInternal(sessionId, "explicit-close")
 
-          if (!closed) {
+          if (closedHealth === null) {
             return yield* new SessionNotFoundError({
               sessionId,
               nextStep: "Open a new session before attempting to close it.",
             })
           }
 
+          // PRB-083 gate 10: `closedAt` comes from the terminal health
+          // itself, so a repeat close call reports the moment the session
+          // actually closed rather than a fresh timestamp on every call.
           return {
             sessionId,
             state: "closed",
-            closedAt: nowIso(),
+            closedAt: closedHealth.updatedAt,
           }
         }),
       runDebugCommand: ({ sessionId, outputMode, command }) =>
