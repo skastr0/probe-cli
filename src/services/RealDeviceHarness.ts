@@ -24,6 +24,7 @@ import {
   type RunnerReadyFrame,
   type RunnerResponseFrame,
 } from "./runnerProtocol"
+import { resolveRunnerCommandTimeoutMs, runRunnerTransportSend } from "./RunnerTransportClient"
 import {
   probeRunnerDeviceDerivedRootPath,
   resolveProbeFixtureProjectPath,
@@ -33,10 +34,6 @@ import {
 const runnerScheme = "ProbeRunner"
 const commandPollIntervalMs = 50
 const runnerReadyTimeoutMs = 120_000
-const commandTimeoutMs = 20_000
-const recordVideoTimeoutBufferMs = 30_000
-const maxRecordVideoDurationMs = 120_000
-const defaultRecordVideoDurationMs = 10_000
 const runnerArtifactDownloadTimeoutMs = 15_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
@@ -284,19 +281,6 @@ export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePrefli
 }
 
 export type OpenedRealDeviceSession = OpenedRealDevicePreflightSession | OpenedRealDeviceLiveSession
-
-const resolveCommandTimeoutMs = (action: RunnerAction, payload?: string): number => {
-  if (action !== "recordVideo") {
-    return commandTimeoutMs
-  }
-
-  const parsedDurationMs = Number(payload ?? "")
-  const durationMs = Number.isFinite(parsedDurationMs) && parsedDurationMs > 0
-    ? Math.min(parsedDurationMs, maxRecordVideoDurationMs)
-    : defaultRecordVideoDurationMs
-
-  return Math.max(commandTimeoutMs, durationMs + recordVideoTimeoutBufferMs)
-}
 
 const nowIso = (): string => new Date().toISOString()
 
@@ -1746,59 +1730,6 @@ const waitForFreshJson = async <T>(args: {
   })
 }
 
-const sendRunnerHttpCommand = async (args: {
-  readonly commandUrls: ReadonlyArray<string>
-  readonly commandFrame: string
-  readonly action: RunnerAction
-  readonly payload?: string
-}): Promise<RunnerResponseFrame> => {
-  const totalTimeoutMs = resolveCommandTimeoutMs(args.action, args.payload)
-  const perEndpointTimeoutMs = Math.max(1_000, Math.ceil(totalTimeoutMs / Math.max(args.commandUrls.length, 1)))
-  const failures: Array<string> = []
-
-  for (const commandUrl of args.commandUrls) {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), perEndpointTimeoutMs)
-
-    try {
-      const response = await fetch(commandUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: args.commandFrame,
-        signal: controller.signal,
-      })
-      const responseText = await response.text()
-
-      if (!response.ok) {
-        failures.push(`${commandUrl} returned ${response.status}: ${responseText.trim() || "<empty-body>"}`)
-        continue
-      }
-
-      try {
-        return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
-      } catch (error) {
-        failures.push(
-          `${commandUrl} returned an invalid response frame: ${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        failures.push(`${commandUrl} timed out after ${perEndpointTimeoutMs} ms`)
-      } else {
-        failures.push(`${commandUrl} failed: ${error instanceof Error ? error.message : String(error)}`)
-      }
-    } finally {
-      clearTimeout(timeout)
-    }
-  }
-
-  throw new Error(
-    `Runner HTTP ${args.action} failed for ${args.commandUrls.join(", ")}: ${failures.join(" | ") || "unknown failure"}`,
-  )
-}
-
 const assertReadyTransportContract = (args: {
   readonly ready: RunnerReadyFrame
   readonly expectedBootstrapPath: string
@@ -2655,15 +2586,17 @@ export const RealDeviceHarnessLive = Layer.succeed(
               payload?: string,
             ): Promise<RunnerCommandResult> => {
               const commandStartedAt = Date.now()
-              const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
               const responseFrame = isDeviceSession
-                ? await sendRunnerHttpCommand({
-                    commandUrls: deviceCommandUrls,
-                    commandFrame,
+                ? (await runRunnerTransportSend({
+                    endpoints: deviceCommandUrls,
                     action,
-                    payload,
-                  })
+                    sequence,
+                    payload: payload ?? null,
+                    deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
+                    idempotent: action === "ping",
+                  })).frame
                 : await (async () => {
+                    const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
                     const stdoutResponsePath = join(
                       observerControlDirectory,
                       `stdout-response-${String(sequence).padStart(3, "0")}.json`,
@@ -2673,7 +2606,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
 
                     return await waitForFreshJson<RunnerResponseFrame>({
                       path: stdoutResponsePath,
-                      timeoutMs: resolveCommandTimeoutMs(action, payload),
+                      timeoutMs: resolveRunnerCommandTimeoutMs(action, payload),
                       minMtimeMs: commandStartedAt,
                       isRunning: isWrapperRunning,
                       decode: decodeRunnerResponseFrame,

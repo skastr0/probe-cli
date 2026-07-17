@@ -13,16 +13,14 @@ import type { SimulatorSessionMode } from "../domain/session"
 import {
   type RunnerCapability,
   decodeRunnerReadyFrame,
-  decodeRunnerResponseFrame,
-  encodeRunnerCommandFrame,
   RUNNER_EVENT_EGRESS,
   RUNNER_HTTP_COMMAND_INGRESS,
   RUNNER_TRANSPORT_CONTRACT,
   type RunnerAction,
   type RunnerReadyFrame,
-  type RunnerResponseFrame,
 } from "./runnerProtocol"
 import { injectEnvironmentVariablesIntoXctestrunPlist } from "./RealDeviceHarness"
+import { resolveRunnerCommandTimeoutMs, runRunnerTransportSend } from "./RunnerTransportClient"
 import {
   probeRunnerSimulatorDerivedRootPath,
   resolveProbeFixtureProjectPath,
@@ -31,11 +29,7 @@ import {
 
 const defaultTestBundleId = "dev.probe.fixture"
 const observerFramePollIntervalMs = 50
-const commandTimeoutMs = 20_000
 const runnerReadyTimeoutMs = 120_000
-const recordVideoTimeoutBufferMs = 30_000
-const maxRecordVideoDurationMs = 120_000
-const defaultRecordVideoDurationMs = 10_000
 const runnerBootstrapRootPath = "/tmp/probe-runner-bootstrap"
 const runnerPortEnvKey = "PROBE_RUNNER_PORT"
 const runnerTransportContract = RUNNER_TRANSPORT_CONTRACT
@@ -65,7 +59,6 @@ interface SimctlListPayload {
 }
 
 type ReadyFrame = RunnerReadyFrame
-type ResponseFrame = RunnerResponseFrame
 
 export interface RunnerCommandResult {
   readonly ok: boolean
@@ -132,19 +125,6 @@ interface RunnerBootstrapManifest {
   readonly sessionIdentifier: string
   readonly simulatorUdid: string
   readonly targetBundleId: string
-}
-
-const resolveCommandTimeoutMs = (action: RunnerAction, payload?: string): number => {
-  if (action !== "recordVideo") {
-    return commandTimeoutMs
-  }
-
-  const parsedDurationMs = Number(payload ?? "")
-  const durationMs = Number.isFinite(parsedDurationMs) && parsedDurationMs > 0
-    ? Math.min(parsedDurationMs, maxRecordVideoDurationMs)
-    : defaultRecordVideoDurationMs
-
-  return Math.max(commandTimeoutMs, durationMs + recordVideoTimeoutBufferMs)
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -526,58 +506,21 @@ const waitForFreshJson = async <T>(args: {
   })
 }
 
-const sendRunnerHttpCommand = async (args: {
-  readonly commandUrl: string
-  readonly commandFrame: string
-  readonly action: RunnerAction
-  readonly payload?: string
-}): Promise<ResponseFrame> => {
-  const controller = new AbortController()
-  const timeoutMs = resolveCommandTimeoutMs(args.action, args.payload)
-  const timeout = setTimeout(() => controller.abort(), timeoutMs)
-
-  try {
-    const response = await fetch(args.commandUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: args.commandFrame,
-      signal: controller.signal,
-    })
-    const responseText = await response.text()
-
-    if (!response.ok) {
-      throw new Error(
-        `Runner HTTP ${args.action} returned ${response.status}: ${responseText.trim() || "<empty-body>"}`,
-      )
-    }
-
-    return decodeRunnerResponseFrame(JSON.parse(responseText) as unknown)
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Runner HTTP ${args.action} timed out after ${timeoutMs} ms`)
-    }
-
-    throw error
-  } finally {
-    clearTimeout(timeout)
-  }
-}
-
 export const createHttpRunnerCommandSender = (commandUrl: string) =>
   async (
     sequence: number,
     action: RunnerAction,
     payload?: string,
   ): Promise<RunnerCommandResult> => {
-    const startedAt = Date.now()
-    const response = await sendRunnerHttpCommand({
-      commandUrl,
-      commandFrame: encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null }),
+    const outcome = await runRunnerTransportSend({
+      endpoints: [commandUrl],
       action,
-      payload,
+      sequence,
+      payload: payload ?? null,
+      deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
+      idempotent: action === "ping",
     })
+    const response = outcome.frame
 
     return {
       ok: response.ok,
@@ -594,7 +537,7 @@ export const createHttpRunnerCommandSender = (commandUrl: string) =>
       failedActionKind: response.failedActionKind ?? null,
       statusLabel: response.statusLabel,
       snapshotNodeCount: response.snapshotNodeCount ?? null,
-      hostRttMs: Date.now() - startedAt,
+      hostRttMs: outcome.elapsedMs,
     }
   }
 
