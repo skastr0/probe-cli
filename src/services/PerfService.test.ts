@@ -1951,6 +1951,35 @@ describe("PerfService analyzeTrace", () => {
     })
   })
 
+  test("logging analyzer returns signpost interval diagnostics", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "logging" })
+      const commandRunner = createCommandRunner({
+        exports: { "os-signpost-interval": signpostIntervalsXml },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "logging",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.artifacts.exports).toHaveLength(1)
+      expect(result.summary.metrics.find((metric) => metric.label === "Signpost intervals")?.value).toBe("3")
+      expect(result.summary.headline).toContain("loadData dominated")
+    })
+  })
+
   test("reuses exportSchema's cache across two analyze calls on the same trace", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
