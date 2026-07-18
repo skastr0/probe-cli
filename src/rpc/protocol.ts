@@ -24,7 +24,10 @@ import {
   SummaryArtifactResult,
 } from "../domain/output"
 import {
+  PerfAnalyzeResult,
+  PerfAnalyzerName,
   PerfAroundFlowResult,
+  PerfExportResult,
   PerfRecordResult,
   PerfSignpostSummaryResult,
   PerfSummaryGroupBy,
@@ -62,6 +65,8 @@ export const RpcMethod = Schema.Literal(
   "perf.record",
   "perf.around",
   "perf.summarize",
+  "perf.export",
+  "perf.analyze",
   "artifact.drill",
 )
 export type RpcMethod = typeof RpcMethod.Type
@@ -365,6 +370,33 @@ export const PerfSummarizeRequest = Schema.Struct({
 })
 export type PerfSummarizeRequest = typeof PerfSummarizeRequest.Type
 
+export const PerfExportRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.export"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    artifactKey: Schema.String,
+    schema: Schema.String,
+    xpath: Schema.optional(Schema.String),
+  }),
+})
+export type PerfExportRequest = typeof PerfExportRequest.Type
+
+export const PerfAnalyzeRequest = Schema.Struct({
+  kind: Schema.Literal("request"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.analyze"),
+  params: Schema.Struct({
+    sessionId: Schema.String,
+    artifactKey: Schema.String,
+    analyzer: PerfAnalyzerName,
+  }),
+})
+export type PerfAnalyzeRequest = typeof PerfAnalyzeRequest.Type
+
 export const ArtifactDrillRequest = Schema.Struct({
   kind: Schema.Literal("request"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -404,6 +436,8 @@ export const RpcRequest = Schema.Union(
   PerfRecordRequest,
   PerfAroundRequest,
   PerfSummarizeRequest,
+  PerfExportRequest,
+  PerfAnalyzeRequest,
   ArtifactDrillRequest,
 )
 export type RpcRequest = typeof RpcRequest.Type
@@ -637,6 +671,24 @@ export const PerfSummarizeResponse = Schema.Struct({
 })
 export type PerfSummarizeResponse = typeof PerfSummarizeResponse.Type
 
+export const PerfExportResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.export"),
+  result: PerfExportResult,
+})
+export type PerfExportResponse = typeof PerfExportResponse.Type
+
+export const PerfAnalyzeResponse = Schema.Struct({
+  kind: Schema.Literal("response"),
+  protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
+  requestId: Schema.String,
+  method: Schema.Literal("perf.analyze"),
+  result: PerfAnalyzeResult,
+})
+export type PerfAnalyzeResponse = typeof PerfAnalyzeResponse.Type
+
 export const ArtifactDrillResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
@@ -671,6 +723,8 @@ export const RpcResponse = Schema.Union(
   PerfRecordResponse,
   PerfAroundResponse,
   PerfSummarizeResponse,
+  PerfExportResponse,
+  PerfAnalyzeResponse,
   ArtifactDrillResponse,
 )
 export type RpcResponse = typeof RpcResponse.Type
@@ -752,6 +806,8 @@ const coerceRpcMethod = (value: unknown): RpcMethod => {
     case "perf.record":
     case "perf.around":
     case "perf.summarize":
+    case "perf.export":
+    case "perf.analyze":
     case "artifact.drill":
       return value
     default:

@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, open, readFile, rename, rm } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { tmpdir } from "node:os"
 import type { DefectFinding } from "../schema"
@@ -28,16 +28,59 @@ const safeJsonParse = <T>(content: string, fallback: T): T => {
   }
 }
 
-// Faithful mirror of the read-modify-write shape in src/services/ArtifactStore.ts.
-// readArtifactIndex: ArtifactStore.ts:258-277. writeArtifactIndex: ArtifactStore.ts:279-293.
-// registerArtifact:  ArtifactStore.ts:509-517 (sizeBytes lookup omitted here — it does
-// not participate in the read-modify-write window this scenario measures).
+// PRB-097: as of PRB-090 (atomic ArtifactStore, landed on main before this
+// wave), ArtifactStore.ts's real registerArtifact no longer does a bare,
+// unlocked read-modify-write -- it serializes every read+write of a given
+// catalog file behind an in-process, per-path lock (`withCatalogLock`,
+// ArtifactStore.ts:350; `catalogLockFor`/`catalogLocks`, ArtifactStore.ts:336-348)
+// and the write itself lands via an atomic temp-write-then-rename
+// (`atomicWriteFile`, ArtifactStore.ts:82-108), never a bare `writeFile`.
+// `registerArtifact` (ArtifactStore.ts:721) delegates the whole
+// read-modify-write critical section to `mutateArtifactIndex`
+// (ArtifactStore.ts:415-435), which is the `withCatalogLock`-wrapped
+// read+write this mirror now reproduces. This mirror was left un-updated
+// after PRB-090 landed -- flipping it to match the current, already-fixed
+// algorithm (and updating the findings below) is this glyph's (PRB-097)
+// scoped ownership, per the wave handoff note.
+//
 // ArtifactStoreLive itself roots every session under `join(homedir(), ".probe")`
-// (ArtifactStore.ts:238) with no injection point, and Bun's `os.homedir()` does not
+// (ArtifactStore.ts:323) with no injection point, and Bun's `os.homedir()` does not
 // honor a HOME override at call time (verified empirically against this repo's Bun
 // 1.3.14), so this scenario exercises the identical algorithm against a temp
 // directory rather than the real singleton service to avoid touching the operator's
 // real ~/.probe artifact root during an automated benchmark run.
+
+// Mirrors ArtifactStore.ts's `catalogLocks`/`catalogLockFor`/`withCatalogLock`
+// (ArtifactStore.ts:336-351): one serialized queue per exact file path, so two
+// concurrent registrations for the *same* session catalog never interleave
+// their read+write, while unrelated sessions (different catalog paths) never
+// contend with each other.
+const catalogLocks = new Map<string, Promise<unknown>>()
+
+const withCatalogLockMirror = <T>(path: string, critical: () => Promise<T>): Promise<T> => {
+  const previous = catalogLocks.get(path) ?? Promise.resolve()
+  const next = previous.then(critical, critical)
+  catalogLocks.set(path, next.catch(() => undefined))
+  return next
+}
+
+// Mirrors ArtifactStore.ts's `atomicWriteFile` (ArtifactStore.ts:82-108): write
+// to a sibling temp file, then atomically rename it over the target so a
+// concurrent reader only ever observes the fully-old or fully-new content.
+const atomicWriteFileMirror = async (targetPath: string, content: string): Promise<void> => {
+  await mkdir(dirname(targetPath), { recursive: true })
+  const tempPath = `${targetPath}.tmp`
+  const handle = await open(tempPath, "w")
+
+  try {
+    await handle.writeFile(content, "utf8")
+  } finally {
+    await handle.close()
+  }
+
+  await rename(tempPath, targetPath)
+}
+
 const readArtifactIndexMirror = async (
   sessionsRoot: string,
   sessionId: string,
@@ -52,25 +95,19 @@ const readArtifactIndexMirror = async (
   return safeJsonParse<Array<FixtureArtifactRecord>>(content, [])
 }
 
-const writeArtifactIndexMirror = async (
-  sessionsRoot: string,
-  sessionId: string,
-  records: ReadonlyArray<FixtureArtifactRecord>,
-): Promise<void> => {
-  const indexPath = join(sessionsRoot, sessionId, "meta", "artifact-index.json")
-  await mkdir(dirname(indexPath), { recursive: true })
-  await writeFile(indexPath, `${JSON.stringify(records, null, 2)}\n`, "utf8")
-}
-
 const registerArtifactMirror = async (
   sessionsRoot: string,
   sessionId: string,
   record: FixtureArtifactRecord,
 ): Promise<FixtureArtifactRecord> => {
-  const existing = await readArtifactIndexMirror(sessionsRoot, sessionId)
-  const next = [...existing.filter((entry) => entry.key !== record.key), record]
-  await writeArtifactIndexMirror(sessionsRoot, sessionId, next)
-  return record
+  const indexPath = join(sessionsRoot, sessionId, "meta", "artifact-index.json")
+
+  return withCatalogLockMirror(indexPath, async () => {
+    const existing = await readArtifactIndexMirror(sessionsRoot, sessionId)
+    const next = [...existing.filter((entry) => entry.key !== record.key), record]
+    await atomicWriteFileMirror(indexPath, `${JSON.stringify(next, null, 2)}\n`)
+    return record
+  })
 }
 
 interface TrialResult {
@@ -125,11 +162,11 @@ export const runArtifactRaceAndEagerExportScenario = async (): Promise<
       verdict: raceReproduced ? "red" : "green",
       summary: raceReproduced
         ? `Concurrent artifact registrations for the same session lost one registration in ${lostTrials.length}/${trialCount} trials: registerArtifact reads the whole index, appends in memory, then overwrites the file, so two concurrent registrations can both read the pre-write state and the later write clobbers the earlier one.`
-        : `Concurrent artifact registrations only lost data in ${lostTrials.length}/${trialCount} trials, below the ${Math.round(reproductionThreshold * 100)}% reproduction threshold.`,
+        : `PRB-097: re-verified against the current (PRB-090) locked ArtifactStore algorithm — ${lostTrials.length}/${trialCount} trials lost a registration, below the ${Math.round(reproductionThreshold * 100)}% reproduction threshold. The per-catalog-path lock (registerArtifact -> mutateArtifactIndex -> withCatalogLock) serializes the whole read-modify-write critical section, so two concurrent registrations for the same session catalog can no longer interleave.`,
       evidence: [
-        "src/services/ArtifactStore.ts:509-517 — registerArtifact does `const existing = yield* readArtifactIndex(sessionId)`, appends in memory, then `yield* writeArtifactIndex(sessionId, next)` with no lock, version check, or atomic append.",
-        "src/services/ArtifactStore.ts:258-293 — readArtifactIndex/writeArtifactIndex operate on the same JSON file with no compare-and-swap.",
-        `reproduction: ${lostTrials.length}/${trialCount} trials lost a registration (${(raceRate * 100).toFixed(0)}%).`,
+        "src/services/ArtifactStore.ts:721 (registerArtifact) delegates its whole read-modify-write to mutateArtifactIndex (ArtifactStore.ts:415-435), which wraps the read + atomic write in withCatalogLock (ArtifactStore.ts:350-351) keyed by the exact catalog file path (catalogLockFor/catalogLocks, ArtifactStore.ts:336-348) -- no longer a bare read-then-write with no lock.",
+        "src/services/ArtifactStore.ts:82-108 (atomicWriteFile) -- the write itself is a temp-file-then-rename, so a concurrent reader never observes a partial write, on top of (not instead of) the lock above.",
+        `reproduction: ${lostTrials.length}/${trialCount} trials lost a registration (${(raceRate * 100).toFixed(0)}%), re-measured against a mirror of the current locked algorithm.`,
       ],
       metrics: {
         trialCount,
@@ -144,11 +181,11 @@ export const runArtifactRaceAndEagerExportScenario = async (): Promise<
       verdict: eagerReproduced ? "red" : "green",
       summary: eagerReproduced
         ? `In ${eagerLossTrials.length}/${trialCount} trials, both concurrent registrations reported success with no thrown error even though only one was actually persisted — a caller that receives the "artifact registered" result has no guarantee the artifact is durably discoverable via a subsequent list/drill call.`
-        : `Every trial with data loss also surfaced a thrown error, so callers were not misled by an eager success in this run.`,
+        : `PRB-097: re-verified against the current (PRB-090) locked ArtifactStore algorithm — ${eagerLossTrials.length}/${trialCount} trials returned an eager success for a registration that did not survive, below the ${Math.round(reproductionThreshold * 100)}% reproduction threshold. Because the underlying artifact-race window is now closed (see artifact-race-01), a caller that receives "artifact registered" can trust the entry is durably discoverable via a subsequent list/drill call.`,
       evidence: [
-        "src/services/ArtifactStore.ts:509-517 — registerArtifact always resolves with `normalizedRecord` on the happy path; it never re-reads the index after writing to confirm its own entry survived a concurrent writer.",
-        "src/services/SessionRegistry.ts:5949-5999 (exportRecording) delegates to the shared writeJsonArtifact helper (SessionRegistry.ts:2215-2254), which resolves on a single registerArtifact call (line 2252); src/services/ArtifactStore.ts:534-558 (writeDerivedOutput) duplicates registerArtifact's own read-modify-write index update inline (readArtifactIndex then writeArtifactIndex at lines 556-557). Both return their artifact record to the RPC caller as export success without a post-write verification read.",
-        `reproduction: ${eagerLossTrials.length}/${trialCount} trials returned success for a registration that did not survive (${(eagerRate * 100).toFixed(0)}%).`,
+        "src/services/ArtifactStore.ts:721 (registerArtifact) returns `normalizedRecord` only after mutateArtifactIndex's lock-guarded read-modify-write (ArtifactStore.ts:415-435) has already committed via the atomic rename (ArtifactStore.ts:82-108, 94), so a concurrent registration under the same lock cannot silently clobber it before the caller sees success.",
+        "src/services/ArtifactStore.ts:777 (writeDerivedOutput) and every other artifact-registering path in this file (writeDerivedFile, ArtifactStore.ts:846) call mutateArtifactIndex directly (ArtifactStore.ts:415-435) -- the same withCatalogLock-guarded helper registerArtifact uses -- not an inlined, unlocked read-modify-write.",
+        `reproduction: ${eagerLossTrials.length}/${trialCount} trials returned success for a registration that did not survive (${(eagerRate * 100).toFixed(0)}%), re-measured against a mirror of the current locked algorithm.`,
       ],
       metrics: {
         trialCount,

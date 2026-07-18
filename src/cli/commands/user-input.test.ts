@@ -157,6 +157,8 @@ const buildCapturedOpenClient = (capture: (params: CapturedOpenParams) => void) 
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -194,6 +196,8 @@ const buildCapturedActionClient = (capture: (params: CapturedActionParams) => vo
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -231,6 +235,8 @@ const buildCapturedFlowClient = (capture: (params: CapturedFlowParams) => void) 
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -260,6 +266,8 @@ const buildReturningFlowClient = (result: SessionFlowResult) =>
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -297,6 +305,8 @@ const buildCapturedPerfAroundClient = (capture: (params: CapturedPerfAroundParam
       }))
     },
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -334,6 +344,8 @@ const buildCapturedPerfRecordClient = (capture: (params: CapturedPerfRecordParam
     },
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -371,6 +383,8 @@ const buildCapturedPerfSummaryClient = (capture: (params: CapturedPerfSummaryPar
         details: [],
       }))
     },
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -408,6 +422,8 @@ const buildCapturedLogMarkClient = (capture: (params: CapturedLogMarkParams) => 
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -445,6 +461,8 @@ const buildCapturedLogCaptureClient = (capture: (params: CapturedLogCaptureParam
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -482,6 +500,8 @@ const buildCapturedLogDoctorClient = (capture: (params: CapturedLogDoctorParams)
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -519,6 +539,8 @@ const buildCapturedLogsClient = (capture: (params: CapturedLogsParams) => void) 
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -548,6 +570,8 @@ const buildCapturedDiagnosticCaptureClient = (capture: (params: CapturedDiagnost
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: (params) => {
       capture(params as CapturedDiagnosticCaptureParams)
@@ -585,6 +609,8 @@ const buildCapturedDrillClient = (capture: (params: CapturedDrillParams) => void
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: (params) => {
       capture(params as CapturedDrillParams)
       return Effect.fail(new UserInputError({
@@ -640,6 +666,8 @@ const buildCapturedSessionResultClient = (args: {
     recordPerf: unexpectedClientCall,
     recordPerfAroundFlow: unexpectedClientCall,
     summarizePerfBySignpost: unexpectedClientCall,
+    exportPerfSchema: unexpectedClientCall,
+    analyzePerfTrace: unexpectedClientCall,
     drillArtifact: unexpectedClientCall,
     captureDiagnosticBundle: unexpectedClientCall,
   })
@@ -668,6 +696,8 @@ const neverUsedClient = DaemonClient.of({
   recordPerf: unexpectedClientCall,
   recordPerfAroundFlow: unexpectedClientCall,
   summarizePerfBySignpost: unexpectedClientCall,
+  exportPerfSchema: unexpectedClientCall,
+  analyzePerfTrace: unexpectedClientCall,
   drillArtifact: unexpectedClientCall,
   captureDiagnosticBundle: unexpectedClientCall,
 })

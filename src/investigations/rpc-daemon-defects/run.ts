@@ -56,8 +56,9 @@ const main = async () => {
     findings,
     overallVerdict: deriveOverallVerdict(findings),
     notes: [
-      "This baseline intentionally captures known-red defects (ambiguous mutation delivery, eager export, artifact races, detached RPC work) without fixing them; see PRB-087.",
-      "The artifact-race and eager-export scenarios exercise a faithful mirror of ArtifactStore.registerArtifact's read-modify-write algorithm against a temp directory rather than the real ArtifactStoreLive service, because that service roots artifacts under `join(homedir(), \".probe\")` with no injection point and Bun's os.homedir() does not honor a HOME override at call time.",
+      "This baseline originally captured known-red defects (ambiguous mutation delivery, eager export, artifact races, detached RPC work) without fixing them; see PRB-087.",
+      "PRB-097 update: the artifact-race and eager-export findings now reproduce green -- ArtifactStore.registerArtifact's read-modify-write moved behind a per-catalog-path lock plus an atomic temp-write-then-rename (PRB-090, landed on main before PRB-097's wave); the scenario's mirror was re-verified against that fixed algorithm rather than deleted. ambiguous-mutation-delivery and detached-rpc-work are unrelated to this fix and remain whatever this run measures them as.",
+      "The artifact-race and eager-export scenarios exercise a faithful mirror of ArtifactStore.registerArtifact's (now lock-guarded, atomically-written) read-modify-write algorithm against a temp directory rather than the real ArtifactStoreLive service, because that service roots artifacts under `join(homedir(), \".probe\")` with no injection point and Bun's os.homedir() does not honor a HOME override at call time.",
       "The simulator lane boots and shuts down a real iOS Simulator via simctl but does not install/launch the Probe XCUITest runner app; a full app-session lane requires the ios/ Xcode build pipeline and is out of scope for this harness.",
     ],
   }

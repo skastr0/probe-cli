@@ -178,15 +178,10 @@ const summarizePerfRecord = (result: PerfRecordResult) => ({
     wall: diagnosis.wall,
     details: diagnosis.details,
   })),
+  schemas: result.schemas,
   artifacts: {
     trace: result.artifacts.trace.absolutePath,
     toc: result.artifacts.toc.absolutePath,
-    exports: result.artifacts.exports.map((artifact) => ({
-      key: artifact.key,
-      label: artifact.label,
-      path: artifact.absolutePath,
-      summary: artifact.summary,
-    })),
   },
 })
 

@@ -179,6 +179,8 @@ const buildDaemonClientStub = () =>
     recordPerf: () => Effect.die("unused recordPerf"),
     recordPerfAroundFlow: () => Effect.die("unused recordPerfAroundFlow"),
     summarizePerfBySignpost: () => Effect.die("unused summarizePerfBySignpost"),
+    exportPerfSchema: () => Effect.die("unused exportPerfSchema"),
+    analyzePerfTrace: () => Effect.die("unused analyzePerfTrace"),
     drillArtifact: () => Effect.die("unused drillArtifact"),
     captureDiagnosticBundle: () => Effect.die("unused captureDiagnosticBundle"),
   })

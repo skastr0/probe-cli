@@ -34,7 +34,10 @@ import type {
 } from "../domain/output"
 import type { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
 import type {
+  PerfAnalyzeResult,
+  PerfAnalyzerName,
   PerfAroundFlowResult,
+  PerfExportResult,
   PerfRecordResult,
   PerfSignpostSummaryResult,
   PerfTemplate,
@@ -44,7 +47,9 @@ import { ArtifactStore } from "./ArtifactStore"
 import { resolveDevelopmentTeamFromHost } from "./DeviceSigningConfig"
 import {
   sendArtifactDrill,
+  sendPerfAnalyze,
   sendPerfAround,
+  sendPerfExport,
   sendDaemonPing,
   sendPerfRecord,
   sendPerfSummarize,
@@ -458,6 +463,41 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
       PerfSignpostSummaryResult,
+      | DaemonNotRunningError
+      | EnvironmentError
+      | ProtocolMismatchError
+      | UserInputError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+      | SessionConflictError
+      | SessionNotFoundError
+      | ArtifactNotFoundError
+    >
+    readonly exportPerfSchema: (params: {
+      readonly sessionId: string
+      readonly artifactKey: string
+      readonly schema: string
+      readonly xpath?: string
+      readonly onEvent?: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      PerfExportResult,
+      | DaemonNotRunningError
+      | EnvironmentError
+      | ProtocolMismatchError
+      | UserInputError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+      | SessionConflictError
+      | SessionNotFoundError
+      | ArtifactNotFoundError
+    >
+    readonly analyzePerfTrace: (params: {
+      readonly sessionId: string
+      readonly artifactKey: string
+      readonly analyzer: PerfAnalyzerName
+      readonly onEvent?: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      PerfAnalyzeResult,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError
@@ -895,6 +935,41 @@ export const DaemonClientLive = Layer.effect(
               sessionId,
               artifactKey,
               groupBy: "signpost",
+            },
+          })
+
+          return response.result
+        }),
+      exportPerfSchema: ({ sessionId, artifactKey, schema, xpath, onEvent }) =>
+        Effect.gen(function* () {
+          const options = yield* buildOptions(onEvent)
+          const response = yield* sendPerfExport(options, {
+            kind: "request",
+            protocolVersion: PROBE_PROTOCOL_VERSION,
+            requestId: randomUUID(),
+            method: "perf.export",
+            params: {
+              sessionId,
+              artifactKey,
+              schema,
+              xpath,
+            },
+          })
+
+          return response.result
+        }),
+      analyzePerfTrace: ({ sessionId, artifactKey, analyzer, onEvent }) =>
+        Effect.gen(function* () {
+          const options = yield* buildOptions(onEvent)
+          const response = yield* sendPerfAnalyze(options, {
+            kind: "request",
+            protocolVersion: PROBE_PROTOCOL_VERSION,
+            requestId: randomUUID(),
+            method: "perf.analyze",
+            params: {
+              sessionId,
+              artifactKey,
+              analyzer,
             },
           })
 
