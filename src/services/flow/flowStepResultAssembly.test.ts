@@ -134,7 +134,7 @@ describe("diffArtifacts", () => {
 })
 
 describe("buildFlowStepResult / toFailedStep", () => {
-  test("derives executionProfile/transportLane from the planned step, and defaults checkpoint/sequenceChildFailure to null", () => {
+  test("derives executionProfile/transportLane from the planned step, and defaults evidence/sequenceChildFailure", () => {
     const result = buildFlowStepResult({
       plannedStep: tapPlannedStep,
       kind: "tap",
@@ -150,7 +150,11 @@ describe("buildFlowStepResult / toFailedStep", () => {
 
     expect(result.executionProfile).toBe("verified")
     expect(result.transportLane).toBe("host-single")
-    expect(result.checkpoint).toBeNull()
+    expect(result.evidence).toEqual({
+      requested: { success: "end", failure: "snapshot" },
+      captures: [],
+      evidenceMs: 0,
+    })
     expect(result.sequenceChildFailure).toBeNull()
 
     const failed = toFailedStep({ ...result, verdict: "failed" })
@@ -162,7 +166,11 @@ describe("buildFlowStepResult / toFailedStep", () => {
       executionProfile: "verified",
       transportLane: "host-single",
       handledMs: 12,
-      checkpoint: null,
+      evidence: {
+        requested: { success: "end", failure: "snapshot" },
+        captures: [],
+        evidenceMs: 0,
+      },
       sequenceChildFailure: null,
     })
   })
@@ -223,6 +231,11 @@ describe("buildActionOutcomeStepResult", () => {
         verdict: null,
         waitedMs: null,
         polledCount: null,
+        evidence: {
+          requested: { success: "end", failure: "snapshot" },
+          captures: [{ reason: "policy-post", phase: "post", snapshotId: "snap-2", ms: 4 }],
+          evidenceMs: 4,
+        },
       },
     })
     const result = buildActionOutcomeStepResult({
@@ -237,6 +250,7 @@ describe("buildActionOutcomeStepResult", () => {
     expect(result.summary).toBe("tapped it")
     expect(result.matchedRef).toBe("ref-1")
     expect(result.latestSnapshotId).toBe("snap-2")
+    expect(result.evidence.captures).toHaveLength(1)
   })
 })
 

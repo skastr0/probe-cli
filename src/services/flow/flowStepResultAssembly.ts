@@ -10,6 +10,7 @@ import type {
 } from "../../domain/flow-v2"
 import type { PlannedStep } from "../../domain/flow-planner"
 import type { ArtifactRecord } from "../../domain/output"
+import { emptyEvidenceReport, resolveEvidencePolicy, type EvidenceReport } from "../../domain/evidence"
 import { EnvironmentError, SessionNotFoundError } from "../../domain/errors"
 import { dedupeStrings, selectorDriftContractWarning, type ActionExecutionOutcome, type SessionActionError } from "../SessionRegistry"
 
@@ -101,7 +102,11 @@ export const buildFlowStepResult = (args: {
   readonly retryReasons: ReadonlyArray<string>
   readonly warnings: Array<string>
   readonly handledMs: number | null
-  readonly checkpoint?: FlowV2StepResult["checkpoint"]
+  // PRB-093: every step reports its evidence -- requested policy, actual
+  // captures, and their cost. Defaults to an empty report under the
+  // canonical default policy for steps that never touch a snapshot
+  // (sleep, logMark) or that fail before any capture happens.
+  readonly evidence?: EvidenceReport
   readonly sequenceChildFailure?: FlowSequenceChildFailure | null
 }): FlowV2StepResult =>
   ({
@@ -118,7 +123,7 @@ export const buildFlowStepResult = (args: {
     transportLane: plannedTransportLane(args.plannedStep),
     handledMs: args.handledMs,
     warnings: args.warnings,
-    checkpoint: args.checkpoint ?? null,
+    evidence: args.evidence ?? emptyEvidenceReport(resolveEvidencePolicy()),
     sequenceChildFailure: args.sequenceChildFailure ?? null,
   }) satisfies FlowV2StepResult
 
@@ -186,6 +191,7 @@ export const buildActionOutcomeStepResult = (args: {
     retryCount: actionResult.retryCount,
     retryReasons: actionResult.retryReasons,
     handledMs: actionResult.handledMs ?? null,
+    evidence: actionResult.evidence,
     warnings: successWarnings({
       step,
       baseWarnings: [],
@@ -202,7 +208,7 @@ export const toFailedStep = (step: FlowV2StepResult): FlowV2FailedStep => ({
   executionProfile: step.executionProfile,
   transportLane: step.transportLane,
   handledMs: step.handledMs,
-  checkpoint: step.checkpoint,
+  evidence: step.evidence,
   sequenceChildFailure: step.sequenceChildFailure,
 })
 

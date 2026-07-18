@@ -29,6 +29,7 @@ import {
   validateFlowStep,
   validateSessionAction,
 } from "./action"
+import { EvidencePolicyInputSchema, EvidenceReportSchema } from "./evidence"
 import { ArtifactRecord, NullableString } from "./output"
 import { UnsupportedFlowContractError } from "./errors"
 
@@ -150,9 +151,6 @@ export type FlowExecutionProfile = typeof FlowExecutionProfileSchema.Type
 
 export const FlowTransportLaneSchema = Schema.Literal("host-single", "runner-single", "runner-batch")
 export type FlowTransportLane = typeof FlowTransportLaneSchema.Type
-
-export const FlowSequenceCheckpointPolicySchema = Schema.Literal("none", "end")
-export type FlowSequenceCheckpointPolicy = typeof FlowSequenceCheckpointPolicySchema.Type
 
 export const FlowSequenceActionKindSchema = Schema.Literal("tap", "multiTap", "press", "swipe", "type", "scroll", "wait")
 export type FlowSequenceActionKind = typeof FlowSequenceActionKindSchema.Type
@@ -324,7 +322,12 @@ export const FlowSequenceStepSchema = Schema.Struct({
   kind: Schema.Literal("sequence"),
   actions: Schema.Array(FlowSequenceActionSchema),
   execution: OptionalExecutionProfile,
-  checkpoint: Schema.optional(FlowSequenceCheckpointPolicySchema),
+  // PRB-093: replaces the sequence-only "none"/"end" checkpoint vocabulary
+  // with the same canonical evidence policy every other mutation-capable
+  // step carries (see evidence.ts). Omitted, it resolves to the same
+  // default (success=end, failure=snapshot) -- one post-batch snapshot,
+  // regardless of child count.
+  evidencePolicy: Schema.optional(EvidencePolicyInputSchema),
   continueOnError: Schema.optional(Schema.Boolean),
 })
 export type FlowSequenceStep = typeof FlowSequenceStepSchema.Type
@@ -375,7 +378,10 @@ export const FlowV2StepResultSchema = Schema.Struct({
   executionProfile: FlowExecutionProfileSchema,
   transportLane: FlowTransportLaneSchema,
   handledMs: NullableNumber,
-  checkpoint: Schema.Union(FlowSequenceCheckpointPolicySchema, Schema.Null),
+  // PRB-093: replaces the "none"/"end" checkpoint field -- every step now
+  // reports the same canonical evidence report (requested policy, actual
+  // captures with reasons/snapshot IDs, and total evidence milliseconds).
+  evidence: EvidenceReportSchema,
   sequenceChildFailure: Schema.Union(FlowSequenceChildFailureSchema, Schema.Null),
 })
 export type FlowV2StepResult = typeof FlowV2StepResultSchema.Type
@@ -386,7 +392,7 @@ export const FlowV2FailedStepSchema = Schema.Struct({
   executionProfile: FlowExecutionProfileSchema,
   transportLane: FlowTransportLaneSchema,
   handledMs: NullableNumber,
-  checkpoint: Schema.Union(FlowSequenceCheckpointPolicySchema, Schema.Null),
+  evidence: EvidenceReportSchema,
   sequenceChildFailure: Schema.Union(FlowSequenceChildFailureSchema, Schema.Null),
 })
 export type FlowV2FailedStep = typeof FlowV2FailedStepSchema.Type

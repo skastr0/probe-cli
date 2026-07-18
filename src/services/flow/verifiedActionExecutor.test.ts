@@ -45,6 +45,11 @@ describe("executeVerifiedActionStep", () => {
             verdict: null,
             waitedMs: null,
             polledCount: null,
+            evidence: {
+              requested: { success: "end", failure: "snapshot" },
+              captures: [],
+              evidenceMs: 0,
+            },
           },
         })
       },

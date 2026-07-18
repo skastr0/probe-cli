@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { EvidencePolicyInputSchema, EvidenceReportSchema } from "./evidence"
 import { ArtifactRecord, NullableString, OutputMode } from "./output"
 import type { SnapshotFrame, SnapshotNodeState, StoredSnapshotArtifact, StoredSnapshotNode } from "./snapshot"
 
@@ -30,6 +31,13 @@ export type RetryPolicy = typeof RetryPolicySchema.Type
 
 const OptionalRetryPolicy = Schema.optional(RetryPolicySchema)
 const OptionalContinueOnError = Schema.optional(Schema.Boolean)
+
+// PRB-093: every mutation-capable action carries this same optional field.
+// Omitted, it resolves to `defaultMutationEvidencePolicy` (evidence.ts) --
+// success=end, failure=snapshot -- everywhere the action executes: direct
+// session actions, flow steps (verified and fast), and batched sequence
+// children.
+const OptionalEvidencePolicy = Schema.optional(EvidencePolicyInputSchema)
 
 export const WaitCondition = Schema.Literal("match", "text", "absence", "duration")
 export type WaitCondition = typeof WaitCondition.Type
@@ -181,6 +189,7 @@ export const TapActionSchema = Schema.Struct({
   kind: Schema.Literal("tap"),
   target: ActionSelectorSchema,
   retryPolicy: OptionalRetryPolicy,
+  evidencePolicy: OptionalEvidencePolicy,
 })
 export type TapAction = typeof TapActionSchema.Type
 
@@ -210,6 +219,7 @@ export const MultiTapActionSchema = Schema.Struct({
   tapCount: MultiTapCountSchema,
   interTapDelayMs: MultiTapInterTapDelayMsSchema,
   retryPolicy: OptionalRetryPolicy,
+  evidencePolicy: OptionalEvidencePolicy,
 })
 export type MultiTapAction = typeof MultiTapActionSchema.Type
 
@@ -218,6 +228,7 @@ export const PressActionSchema = Schema.Struct({
   target: ActionSelectorSchema,
   durationMs: Schema.Number,
   retryPolicy: OptionalRetryPolicy,
+  evidencePolicy: OptionalEvidencePolicy,
 })
 export type PressAction = typeof PressActionSchema.Type
 
@@ -226,6 +237,7 @@ export const SwipeActionSchema = Schema.Struct({
   target: ActionSelectorSchema,
   direction: ActionDirection,
   retryPolicy: OptionalRetryPolicy,
+  evidencePolicy: OptionalEvidencePolicy,
 })
 export type SwipeAction = typeof SwipeActionSchema.Type
 
@@ -235,6 +247,7 @@ export const TypeActionSchema = Schema.Struct({
   text: Schema.String,
   replace: Schema.Boolean,
   retryPolicy: OptionalRetryPolicy,
+  evidencePolicy: OptionalEvidencePolicy,
 })
 export type TypeAction = typeof TypeActionSchema.Type
 
@@ -244,6 +257,7 @@ export const ScrollActionSchema = Schema.Struct({
   direction: ActionDirection,
   steps: Schema.Number,
   retryPolicy: OptionalRetryPolicy,
+  evidencePolicy: OptionalEvidencePolicy,
 })
 export type ScrollAction = typeof ScrollActionSchema.Type
 
@@ -564,6 +578,12 @@ export const SessionActionResultSchema = Schema.Struct({
   verdict: Schema.Union(ActionVerdict, Schema.Null),
   waitedMs: NullableNumber,
   polledCount: NullableNumber,
+  // PRB-093: the canonical evidence report -- requested policy, actual
+  // captures (each tagged with why it happened), and their total cost.
+  // Populated for every action result, including read-only/explicit-capture
+  // actions (screenshot/video/assert/wait), which always report a fixed
+  // "explicit"/"resolution"-only shape unaffected by evidence policy.
+  evidence: EvidenceReportSchema,
 })
 export type SessionActionResult = typeof SessionActionResultSchema.Type
 

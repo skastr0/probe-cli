@@ -336,7 +336,7 @@ const formatFlowV2StepResult = (step: FlowV2CliStepResult): string => {
     `- [${step.index}] ${step.kind} [${step.verdict}] ${step.summary}`,
     `  execution profile: ${step.executionProfile}`,
     `  transport lane: ${step.transportLane}`,
-    `  checkpoint: ${step.checkpoint ?? "n/a"}`,
+    `  evidence: policy success=${step.evidence.requested.success} failure=${step.evidence.requested.failure}, ${step.evidence.captures.length} capture(s), ${step.evidence.evidenceMs}ms`,
     `  latest snapshot: ${step.latestSnapshotId ?? "n/a"}`,
     `  retries: ${step.retryCount}`,
     `  handled ms: ${step.handledMs ?? "n/a"}`,

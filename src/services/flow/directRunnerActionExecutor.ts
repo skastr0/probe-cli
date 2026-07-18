@@ -5,6 +5,14 @@ import {
   isRunnerUiSessionAction,
 } from "../../domain/action"
 import { EnvironmentError, type UnsupportedCapabilityError } from "../../domain/errors"
+import {
+  buildEvidenceReport,
+  emptyEvidenceReport,
+  planSuccessEvidence,
+  resolveEvidencePolicy,
+  shouldCaptureFailureEvidence,
+  type EvidenceCapture,
+} from "../../domain/evidence"
 import { flowV2StepToSessionAction, type FlowV2FastSingleStep } from "../../domain/flow-v2"
 import {
   advertisedRunnerCapabilities,
@@ -28,12 +36,19 @@ import type { FlowExecutorDeps } from "./flowExecutorDeps"
  * PRB-073: extracted from `runFlow`'s `executeFastSingleStep` closure. The
  * "direct runner action" lane — a fast single tap/press/swipe/type/scroll or
  * a duration wait, dispatched straight to the runner without a host
- * snapshot. Takes the flow step, the session id, and the session record as
- * explicit immutable-shaped inputs (no JS closure over `runFlow`'s locals)
- * plus a `FlowExecutorDeps` port bag for the SessionRegistry-layer calls it
- * still needs (sendRunnerCommand, health persistence, failure-snapshot
- * capture). Every branch below is byte-for-byte the original logic; only the
- * inputs became explicit.
+ * resolution snapshot (targets are point or on-device-resolvable; see
+ * isRunnerResolvableActionSelector). Takes the flow step, the session id,
+ * and the session record as explicit immutable-shaped inputs (no JS closure
+ * over `runFlow`'s locals) plus a `FlowExecutorDeps` port bag for the
+ * SessionRegistry-layer calls it still needs.
+ *
+ * PRB-093: this lane used to always capture zero snapshots on success and
+ * one (unconditionally) on failure — one of the three inconsistent
+ * behaviors this glyph replaces with the canonical evidence policy
+ * (evidence.ts). It now asks the same success/failure policy every other
+ * mutation-capable lane asks; a pre capture only ever happens for "around"
+ * (pure evidence, never resolution, since this lane needs no host
+ * resolution snapshot at all).
  */
 export const executeDirectRunnerActionStep = (args: {
   readonly sessionId: string
@@ -77,6 +92,8 @@ export const executeDirectRunnerActionStep = (args: {
           artifact: null,
           recordingLength: record.recording.steps.length,
           handledMs: null,
+          // Duration waits never touch a snapshot.
+          evidence: emptyEvidenceReport(resolveEvidencePolicy()),
           ...buildActionResultMetadata(emptyRetryAttemptMetadata(), "passed", step.timeoutMs, 1),
         } satisfies ExtendedSessionActionResult,
       } satisfies ActionExecutionOutcome
@@ -91,6 +108,26 @@ export const executeDirectRunnerActionStep = (args: {
         nextStep: "Use verified execution for unsupported steps, or adjust the flow contract before retrying.",
         details: [],
       })
+    }
+
+    const policy = resolveEvidencePolicy(action.evidencePolicy)
+    const successPlan = planSuccessEvidence(policy.success)
+    const evidenceCaptures: Array<EvidenceCapture> = []
+
+    // "around" is the only policy this lane ever pays a pre-dispatch
+    // capture for -- captured once, before the retry loop, so retries never
+    // multiply it.
+    if (successPlan.forcedFreshPre) {
+      const preCapture = yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+
+      if (preCapture._tag === "Right") {
+        evidenceCaptures.push({
+          reason: "policy-pre",
+          phase: "pre",
+          snapshotId: preCapture.right.artifact.snapshotId,
+          ms: preCapture.right.handledMs,
+        })
+      }
     }
 
     const resolvedBy: ExtendedSessionActionResult["resolvedBy"] = step.target.kind === "point" ? "point" : "semantic"
@@ -137,7 +174,10 @@ export const executeDirectRunnerActionStep = (args: {
     })
 
     if (!actionResult.ok) {
-      yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+      if (shouldCaptureFailureEvidence(policy.failure)) {
+        yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+      }
+
       yield* deps.persistActionFailure(sessionId, record, step.kind)
 
       return {
@@ -151,9 +191,29 @@ export const executeDirectRunnerActionStep = (args: {
     yield* deps.persistHealth(sessionId, record.health)
     yield* deps.syncDaemonMetadata
 
+    if (successPlan.needsPost) {
+      const postCapture = yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+
+      if (postCapture._tag === "Right") {
+        evidenceCaptures.push({
+          reason: "policy-post",
+          phase: "post",
+          snapshotId: postCapture.right.artifact.snapshotId,
+          ms: postCapture.right.handledMs,
+        })
+      }
+    }
+
+    const latestSnapshotId = evidenceCaptures.length > 0
+      ? evidenceCaptures[evidenceCaptures.length - 1]!.snapshotId
+      : record.snapshotState.latest?.snapshotId ?? null
+    const captureNote = evidenceCaptures.length > 0
+      ? `; captured ${latestSnapshotId}`
+      : " without host snapshots"
+
     const summary = step.target.kind === "point"
-      ? `Executed fast ${step.kind} at point(${step.target.x}, ${step.target.y}) without host snapshots.`
-      : `Executed fast ${step.kind} on ${describeActionSelector(step.target)} without host snapshots.`
+      ? `Executed fast ${step.kind} at point(${step.target.x}, ${step.target.y})${captureNote}.`
+      : `Executed fast ${step.kind} on ${describeActionSelector(step.target)}${captureNote}.`
 
     return {
       ok: true,
@@ -163,7 +223,7 @@ export const executeDirectRunnerActionStep = (args: {
         matchedRef: null,
         resolvedBy,
         statusLabel: actionResult.value.response.statusLabel,
-        latestSnapshotId: record.snapshotState.latest?.snapshotId ?? null,
+        latestSnapshotId,
         artifact: null,
         recordingLength: record.recording.steps.length,
         handledMs: actionResult.value.response.handledMs,
@@ -171,6 +231,7 @@ export const executeDirectRunnerActionStep = (args: {
         waitMs: actionResult.value.response.waitMs ?? null,
         interactionMs: actionResult.value.response.interactionMs ?? null,
         finalizationMs: actionResult.value.response.finalizationMs ?? null,
+        evidence: buildEvidenceReport(policy, evidenceCaptures),
         ...buildActionResultMetadata(actionResult.retry),
       } satisfies ExtendedSessionActionResult,
     } satisfies ActionExecutionOutcome
