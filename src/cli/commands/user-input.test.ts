@@ -48,7 +48,7 @@ type CapturedFlowParams = {
     readonly steps: Array<{
       readonly kind: string
       readonly execution?: string
-      readonly checkpoint?: string
+      readonly evidencePolicy?: { readonly success?: string; readonly failure?: string }
       readonly continueOnError?: boolean
       readonly actions?: Array<{
         readonly kind: string
@@ -1230,7 +1230,7 @@ describe("cli user input handling", () => {
           steps: [
             {
               kind: "sequence",
-              checkpoint: "end",
+              evidencePolicy: { success: "end" },
               actions: [
                 {
                   kind: "tap",
@@ -1272,7 +1272,7 @@ describe("cli user input handling", () => {
       expect(captured.current.flow.contract).toBe("probe.session-flow/v2")
       expect(captured.current.flow.execution).toBe("fast")
       expect(captured.current.flow.steps[0]?.kind).toBe("sequence")
-      expect(captured.current.flow.steps[0]?.checkpoint).toBe("end")
+      expect(captured.current.flow.steps[0]?.evidencePolicy).toEqual({ success: "end" })
       expect(captured.current.flow.steps[0]?.actions?.[0]?.kind).toBe("tap")
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -1392,7 +1392,7 @@ describe("cli user input handling", () => {
               {
                 kind: "sequence",
                 execution: "fast",
-                checkpoint: "end",
+                evidencePolicy: { success: "end" },
                 actions: [
                   {
                     kind: "tap",
@@ -1434,7 +1434,11 @@ describe("cli user input handling", () => {
               transportLane: "runner-batch",
               handledMs: 2,
               warnings: [],
-              checkpoint: "end",
+              evidence: {
+                requested: { success: "end", failure: "snapshot" },
+                captures: [],
+                evidenceMs: 0,
+              },
               sequenceChildFailure: {
                 index: 2,
                 kind: "tap",
@@ -1450,7 +1454,11 @@ describe("cli user input handling", () => {
             executionProfile: "fast",
             transportLane: "runner-batch",
             handledMs: 2,
-            checkpoint: "end",
+            evidence: {
+              requested: { success: "end", failure: "snapshot" },
+              captures: [],
+              evidenceMs: 0,
+            },
             sequenceChildFailure: {
               index: 2,
               kind: "tap",
@@ -1467,7 +1475,7 @@ describe("cli user input handling", () => {
 
     expect(output).toContain("execution profile: fast")
     expect(output).toContain("transport lane: runner-batch")
-    expect(output).toContain("checkpoint: end")
+    expect(output).toContain("evidence: policy success=end failure=snapshot, 0 capture(s), 0ms")
     expect(output).toContain("failure child: #2 tap — fixture.form.applyButton forced batched failure")
   })
 
@@ -1518,7 +1526,11 @@ describe("cli user input handling", () => {
               transportLane: "runner-single",
               handledMs: 1,
               warnings: [],
-              checkpoint: null,
+              evidence: {
+                requested: { success: "none", failure: "snapshot" },
+                captures: [],
+                evidenceMs: 0,
+              },
               sequenceChildFailure: null,
             },
           ],
@@ -1533,7 +1545,7 @@ describe("cli user input handling", () => {
 
     expect(output).toContain('"executionProfile": "fast"')
     expect(output).toContain('"transportLane": "runner-single"')
-    expect(output).toContain('"checkpoint": null')
+    expect(output).toContain('"success": "none"')
     expect(output).toContain('"sequenceChildFailure": null')
   })
 

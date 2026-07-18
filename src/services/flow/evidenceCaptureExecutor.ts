@@ -8,6 +8,7 @@ import type {
 } from "../../domain/flow-v2"
 import type { PlannedStep } from "../../domain/flow-planner"
 import type { EnvironmentError } from "../../domain/errors"
+import { buildEvidenceReport, resolveEvidencePolicy } from "../../domain/evidence"
 import { buildSessionSnapshotResult } from "../../domain/snapshot"
 import { normalizeVideoDurationMs } from "../VideoCapturePolicy"
 import {
@@ -73,6 +74,16 @@ export const captureSnapshotEvidenceStep = (args: {
           step,
           baseWarnings: snapshotResult.warnings,
         }),
+        // Explicit snapshot steps are unaffected by evidence policy
+        // (acceptance criterion #11) but the capture is real -- report it
+        // with reason "explicit" so it is never confused with a
+        // discretionary policy-driven capture.
+        evidence: buildEvidenceReport(resolveEvidencePolicy(), [{
+          reason: "explicit",
+          phase: "post",
+          snapshotId: captured.value.artifact.snapshotId,
+          ms: captured.value.handledMs,
+        }]),
       })
     }
 

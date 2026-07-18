@@ -134,7 +134,7 @@ describe("diffArtifacts", () => {
 })
 
 describe("buildFlowStepResult / toFailedStep", () => {
-  test("derives executionProfile/transportLane from the planned step, and defaults checkpoint/sequenceChildFailure to null", () => {
+  test("derives executionProfile/transportLane from the planned step, and defaults evidence/sequenceChildFailure", () => {
     const result = buildFlowStepResult({
       plannedStep: tapPlannedStep,
       kind: "tap",
@@ -150,7 +150,11 @@ describe("buildFlowStepResult / toFailedStep", () => {
 
     expect(result.executionProfile).toBe("verified")
     expect(result.transportLane).toBe("host-single")
-    expect(result.checkpoint).toBeNull()
+    expect(result.evidence).toEqual({
+      requested: { success: "end", failure: "snapshot" },
+      captures: [],
+      evidenceMs: 0,
+    })
     expect(result.sequenceChildFailure).toBeNull()
 
     const failed = toFailedStep({ ...result, verdict: "failed" })
@@ -162,7 +166,11 @@ describe("buildFlowStepResult / toFailedStep", () => {
       executionProfile: "verified",
       transportLane: "host-single",
       handledMs: 12,
-      checkpoint: null,
+      evidence: {
+        requested: { success: "end", failure: "snapshot" },
+        captures: [],
+        evidenceMs: 0,
+      },
       sequenceChildFailure: null,
     })
   })
@@ -186,11 +194,19 @@ describe("buildActionOutcomeStepResult", () => {
     expect(result.latestSnapshotId).toBe("prior-snap")
   })
 
-  test("Right with ok:false folds into a failed step carrying the executor's retry metadata", () => {
+  test("Right with ok:false folds into a failed step carrying the executor's retry metadata and evidence", () => {
+    // PRB-093 review finding: a failed step's best-effort failure snapshot
+    // must survive into the flow step result instead of being defaulted
+    // away to an empty evidence report.
     const outcome: Either.Either<ActionExecutionOutcome, never> = Either.right({
       ok: false,
       error: new EnvironmentError({ code: "session-action-failed", reason: "no element", nextStep: "n", details: [] }),
       retry: { retryCount: 2, retryReasons: ["not-found: x"] },
+      evidence: {
+        requested: { success: "end", failure: "snapshot" },
+        captures: [{ reason: "policy-failure", phase: "post", snapshotId: "@failure-1", ms: 9 }],
+        evidenceMs: 9,
+      },
     })
     const result = buildActionOutcomeStepResult({
       plannedStep: tapPlannedStep,
@@ -203,6 +219,8 @@ describe("buildActionOutcomeStepResult", () => {
     expect(result.verdict).toBe("failed")
     expect(result.retryCount).toBe(2)
     expect(result.retryReasons).toEqual(["not-found: x"])
+    expect(result.evidence.captures).toEqual([{ reason: "policy-failure", phase: "post", snapshotId: "@failure-1", ms: 9 }])
+    expect(result.evidence.evidenceMs).toBe(9)
   })
 
   test("Right with ok:true folds into a passed step using the executor's result", () => {
@@ -223,6 +241,11 @@ describe("buildActionOutcomeStepResult", () => {
         verdict: null,
         waitedMs: null,
         polledCount: null,
+        evidence: {
+          requested: { success: "end", failure: "snapshot" },
+          captures: [{ reason: "policy-post", phase: "post", snapshotId: "snap-2", ms: 4 }],
+          evidenceMs: 4,
+        },
       },
     })
     const result = buildActionOutcomeStepResult({
@@ -237,6 +260,7 @@ describe("buildActionOutcomeStepResult", () => {
     expect(result.summary).toBe("tapped it")
     expect(result.matchedRef).toBe("ref-1")
     expect(result.latestSnapshotId).toBe("snap-2")
+    expect(result.evidence.captures).toHaveLength(1)
   })
 })
 

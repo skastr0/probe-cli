@@ -2161,6 +2161,248 @@ describe("SessionRegistry", () => {
     })
   })
 
+  // PRB-093: command-count tests proving semantic/point/ref behavior for
+  // every evidence policy on the legacy verified single-action lane (the
+  // "direct actions" surface named by evidence.ts's module doc). See the
+  // sibling command-count tests in directRunnerActionExecutor.test.ts (fast
+  // lane) and batchActionExecutor.test.ts (batch lane) for the other two
+  // lanes' proofs of the same defaults.
+  describe("PRB-093 evidence policy (direct verified actions)", () => {
+    const semanticTapAction = {
+      kind: "tap" as const,
+      target: {
+        kind: "semantic" as const,
+        identifier: "fixture.form.applyButton",
+        label: null,
+        value: null,
+        placeholder: null,
+        type: "button",
+        section: null,
+        interactive: true,
+      },
+    }
+    const pointTapAction = {
+      kind: "tap" as const,
+      target: { kind: "point" as const, x: 5, y: 5 },
+    }
+
+    test("a bootstrap semantic tap (no cached snapshot yet) captures a resolution snapshot plus the default post snapshot", async () => {
+      await withTempRoot(async (root) => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const result = await runtime.runPromise(registry.performAction({
+            sessionId: session.sessionId,
+            action: semanticTapAction,
+          }))
+
+          expect(result.action).toBe("tap")
+          expect(result.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+          expect(result.evidence.captures.map((capture) => capture.reason)).toEqual(["resolution", "policy-post"])
+          expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiAction", "snapshot"])
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("a warm semantic tap (cached snapshot already exists) falls from two captures to one under the default policy", async () => {
+      await withTempRoot(async (root) => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          // Seed a cached snapshot the same way an explicit `snapshot`
+          // command or a previous action's own post capture would.
+          await runtime.runPromise(registry.captureSnapshot({ sessionId: session.sessionId, outputMode: "auto" }))
+          runnerCommands.length = 0
+
+          const result = await runtime.runPromise(registry.performAction({
+            sessionId: session.sessionId,
+            action: semanticTapAction,
+          }))
+
+          expect(result.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+          expect(result.evidence.captures.map((capture) => capture.reason)).toEqual(["policy-post"])
+          expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot"])
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("evidencePolicy success=none captures zero snapshots once a cached snapshot exists", async () => {
+      await withTempRoot(async (root) => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          await runtime.runPromise(registry.captureSnapshot({ sessionId: session.sessionId, outputMode: "auto" }))
+          runnerCommands.length = 0
+
+          const result = await runtime.runPromise(registry.performAction({
+            sessionId: session.sessionId,
+            action: { ...semanticTapAction, evidencePolicy: { success: "none" as const } },
+          }))
+
+          expect(result.evidence.requested).toEqual({ success: "none", failure: "snapshot" })
+          expect(result.evidence.captures).toEqual([])
+          expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction"])
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("evidencePolicy success=around always captures exactly one fresh pre and one post snapshot, even with a cached snapshot", async () => {
+      await withTempRoot(async (root) => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          await runtime.runPromise(registry.captureSnapshot({ sessionId: session.sessionId, outputMode: "auto" }))
+          runnerCommands.length = 0
+
+          const result = await runtime.runPromise(registry.performAction({
+            sessionId: session.sessionId,
+            action: { ...semanticTapAction, evidencePolicy: { success: "around" as const } },
+          }))
+
+          expect(result.evidence.requested).toEqual({ success: "around", failure: "snapshot" })
+          expect(result.evidence.captures.map((capture) => [capture.phase, capture.reason])).toEqual([
+            ["pre", "policy-pre"],
+            ["post", "policy-post"],
+          ])
+          expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiAction", "snapshot"])
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("a point-target tap needs no resolution snapshot -- default policy captures exactly one post snapshot, none captures zero", async () => {
+      await withTempRoot(async (root) => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+
+          const defaultResult = await runtime.runPromise(registry.performAction({
+            sessionId: session.sessionId,
+            action: pointTapAction,
+          }))
+
+          expect(defaultResult.evidence.captures.map((capture) => capture.reason)).toEqual(["policy-post"])
+          expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot"])
+
+          runnerCommands.length = 0
+
+          const noneResult = await runtime.runPromise(registry.performAction({
+            sessionId: session.sessionId,
+            action: { ...pointTapAction, evidencePolicy: { success: "none" as const } },
+          }))
+
+          expect(noneResult.evidence.captures).toEqual([])
+          expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction"])
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("failure evidence is best-effort and never replaces the original mutation failure; failure=none skips it entirely", async () => {
+      await withTempRoot(async (root) => {
+        const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+        const runtime = makeRuntime(root, createFakeHarness({
+          captureRunnerCommand: (command) => {
+            runnerCommands.push(command)
+          },
+          interceptUiAction: () => ({ ok: false, error: "forced failure" }),
+        }))
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+
+          const defaultFailure = await runtime.runPromise(Effect.either(
+            registry.performAction({ sessionId: session.sessionId, action: pointTapAction }),
+          ))
+
+          expect(Either.isLeft(defaultFailure)).toBe(true)
+          // The original failure reason survives untouched regardless of
+          // whether the best-effort failure snapshot succeeded.
+          if (Either.isLeft(defaultFailure) && defaultFailure.left instanceof EnvironmentError) {
+            expect(defaultFailure.left.reason).toContain("forced failure")
+          }
+          expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot"])
+
+          runnerCommands.length = 0
+
+          const noneFailure = await runtime.runPromise(Effect.either(
+            registry.performAction({
+              sessionId: session.sessionId,
+              action: { ...pointTapAction, evidencePolicy: { failure: "none" as const } },
+            }),
+          ))
+
+          expect(Either.isLeft(noneFailure)).toBe(true)
+          expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction"])
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
   test("gives up after exhausting mutation redelivery and reports a typed indeterminate failure", async () => {
     await withTempRoot(async (root) => {
       const deliveredSequences: Array<number> = []
@@ -3305,10 +3547,21 @@ describe("SessionRegistry", () => {
 
         expect(replayed.stepCount).toBe(3)
         expect(replayed.semanticFallbackCount).toBeGreaterThanOrEqual(1)
+        // PRB-093 review finding: replay's capture decisions (reuse cached
+        // snapshot for resolution, one post capture per step) were never
+        // surfaced anywhere -- the top-level result now carries an
+        // aggregate evidence roll-up under the canonical default policy.
+        expect(replayed.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(replayed.evidence.captures.length).toBeGreaterThan(0)
 
         const replayReport = JSON.parse(await readFile(replayed.artifact.absolutePath, "utf8")) as ReplayReport
         expect(replayReport.steps[1]?.outcome).toBe("semantic-fallback")
         expect(replayReport.steps[1]?.summary).toContain("semantic fallback succeeded")
+        // Every replay step now reports its own evidence too, not just the
+        // run-wide aggregate above.
+        expect(replayReport.steps[0]?.evidence.captures.map((capture) => capture.reason)).toEqual(["resolution", "policy-post"])
+        expect(replayReport.steps[1]?.evidence.captures.map((capture) => capture.reason)).toEqual(["policy-post"])
+        expect(replayReport.steps[2]?.evidence.captures.map((capture) => capture.reason)).toEqual(["resolution"])
 
         const afterReplay = await runtime.runPromise(
           registry.captureSnapshot({
@@ -3730,7 +3983,7 @@ describe("SessionRegistry", () => {
     })
   })
 
-  test("executes fast v2 single steps without pre/post snapshots", async () => {
+  test("executes fast v2 single steps and captures the default post-mutation evidence snapshot", async () => {
     await withTempRoot(async (root) => {
       const runnerCommands: Array<FakeHarnessRunnerCommand> = []
       const runtime = makeRuntime(root, createFakeHarness({
@@ -3781,8 +4034,76 @@ describe("SessionRegistry", () => {
           executionProfile: "fast",
           transportLane: "runner-single",
           handledMs: 1,
+        })
+        // PRB-093: default mutation policy (success=end) -- this is the
+        // fast lane's own default falling from "captures none" to "captures
+        // one", one of the three inconsistencies the glyph unifies away.
+        expect(result.executedSteps[0]?.latestSnapshotId).not.toBeNull()
+        expect(result.executedSteps[0]?.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(result.executedSteps[0]?.evidence.captures).toHaveLength(1)
+        expect(result.executedSteps[0]?.evidence.captures[0]?.reason).toBe("policy-post")
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot"])
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("fast v2 single step with evidencePolicy success=none captures zero snapshots", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const flow: FlowV2Contract = {
+          contract: "probe.session-flow/v2",
+          steps: [
+            {
+              kind: "tap",
+              execution: "fast",
+              evidencePolicy: { success: "none" },
+              target: {
+                kind: "semantic",
+                identifier: "fixture.navigation.detailButton",
+                label: null,
+                value: null,
+                placeholder: null,
+                type: "button",
+                section: null,
+                interactive: true,
+              },
+            },
+          ],
+        }
+
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("passed")
+        expect(result.executedSteps[0]).toMatchObject({
+          kind: "tap",
+          executionProfile: "fast",
+          transportLane: "runner-single",
+          handledMs: 1,
           latestSnapshotId: null,
         })
+        expect(result.executedSteps[0]?.evidence.requested).toEqual({ success: "none", failure: "snapshot" })
+        expect(result.executedSteps[0]?.evidence.captures).toEqual([])
         expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction"])
       } finally {
         await runtime.dispose()
@@ -3855,6 +4176,91 @@ describe("SessionRegistry", () => {
         expect(result.executedSteps[0]?.latestSnapshotId).not.toBeNull()
         expect(result.executedSteps[0]?.artifacts.some((artifact) => artifact.kind === "json")).toBe(true)
         expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot"])
+        // PRB-093 review finding: the "snapshot" runner command above proves
+        // a failure capture was attempted, but that alone never proved the
+        // capture's reason/snapshotId/ms reached the reported evidence --
+        // FlowV2FailedStep.evidence used to default to empty on this path.
+        if (result.failedStep === null) {
+          throw new Error("Expected a failed step.")
+        }
+        expect(result.failedStep.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(result.failedStep.evidence.captures).toHaveLength(1)
+        expect(result.failedStep.evidence.captures[0]?.reason).toBe("policy-failure")
+        expect(result.executedSteps[0]?.evidence).toEqual(result.failedStep.evidence)
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("captures failure evidence snapshots for verified v2 steps", async () => {
+    await withTempRoot(async (root) => {
+      const runnerCommands: Array<FakeHarnessRunnerCommand> = []
+      const runtime = makeRuntime(root, createFakeHarness({
+        captureRunnerCommand: (command) => {
+          runnerCommands.push(command)
+        },
+        interceptUiAction: ({ kind, identifier }) => {
+          if (kind === "tap" && identifier === "fixture.problem.offscreenButton") {
+            return {
+              ok: false,
+              error: "Expected fixture.problem.offscreenButton to be hittable before tap.",
+            }
+          }
+
+          return null
+        },
+      }))
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.runFlow({
+          sessionId: session.sessionId,
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "tap",
+                execution: "verified",
+                target: {
+                  kind: "semantic",
+                  identifier: "fixture.problem.offscreenButton",
+                  label: null,
+                  value: null,
+                  placeholder: null,
+                  type: "button",
+                  section: null,
+                  interactive: true,
+                },
+                retryPolicy: {
+                  maxAttempts: 1,
+                  backoffMs: 0,
+                  refreshSnapshotBetweenAttempts: false,
+                  retryOn: ["not-hittable"],
+                },
+              },
+            ],
+          } satisfies FlowV2Contract,
+        }))
+
+        if (result.contract !== "probe.session-flow/report-v2") {
+          throw new Error(`Expected a v2 flow report, received ${result.contract}.`)
+        }
+
+        expect(result.verdict).toBe("failed")
+        expect(result.failedStep?.index).toBe(1)
+        expect(result.executedSteps[0]?.executionProfile).toBe("verified")
+        expect(result.executedSteps[0]?.transportLane).toBe("host-single")
+        // The verified lane's legacy failure path (SessionRegistry.ts
+        // executeSessionAction) used to carry only {error, retry} on
+        // ok:false -- the resolution snapshot plus the best-effort
+        // failure snapshot were both taken but never reported.
+        expect(result.failedStep?.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(result.failedStep?.evidence.captures.map((capture) => capture.reason)).toEqual(["resolution", "policy-failure"])
       } finally {
         await runtime.dispose()
       }
@@ -3894,7 +4300,7 @@ describe("SessionRegistry", () => {
               {
                 kind: "sequence",
                 execution: "fast",
-                checkpoint: "end",
+                evidencePolicy: { success: "end" },
                 actions: [
                   {
                     kind: "type",
@@ -3939,10 +4345,12 @@ describe("SessionRegistry", () => {
           kind: "sequence",
           executionProfile: "fast",
           transportLane: "runner-batch",
-          checkpoint: "end",
           sequenceChildFailure: null,
           handledMs: 2,
         })
+        expect(result.executedSteps[0]?.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(result.executedSteps[0]?.evidence.captures).toHaveLength(1)
+        expect(result.executedSteps[0]?.evidence.captures[0]?.reason).toBe("policy-post")
         expect(result.executedSteps[0]?.latestSnapshotId).not.toBeNull()
         expect(runnerCommands.map((command) => command.action)).toEqual(["uiActionBatch", "snapshot"])
 
@@ -4054,15 +4462,21 @@ describe("SessionRegistry", () => {
           executionProfile: "fast",
           transportLane: "runner-batch",
           handledMs: 2,
-          checkpoint: "none",
           sequenceChildFailure: {
             index: 2,
             kind: "tap",
           },
         })
+        // PRB-093: default failure policy is "snapshot" -- a failed batch now
+        // captures one best-effort failure snapshot, uniformly with every
+        // other mutation-capable lane (the old batch lane never captured
+        // anything on failure).
+        expect(result.executedSteps[0]?.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(result.executedSteps[0]?.evidence.captures).toHaveLength(1)
+        expect(result.executedSteps[0]?.evidence.captures[0]?.reason).toBe("policy-failure")
         expect(result.executedSteps[0]?.summary).toContain("child 2")
         expect(attemptedTargets).toEqual(["fixture.form.input", "fixture.form.applyButton"])
-        expect(runnerCommands.map((command) => command.action)).toEqual(["uiActionBatch"])
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiActionBatch", "snapshot"])
       } finally {
         await runtime.dispose()
       }
@@ -4192,7 +4606,10 @@ describe("SessionRegistry", () => {
         expect(result.executedSteps[0]?.handledMs).toBe(1)
         expect(result.executedSteps[1]?.handledMs).toBe(1)
         expect(result.executedSteps[2]?.handledMs).toBeNull()
-        expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiAction"])
+        // PRB-093: the fast tap's default policy (success=end) now captures
+        // one post-mutation snapshot -- see the dedicated fast-lane default
+        // test above for why this is one, not the old zero.
+        expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiAction", "snapshot"])
       } finally {
         await runtime.dispose()
       }
@@ -4298,11 +4715,16 @@ describe("SessionRegistry", () => {
           ["assert", "verified", "host-single"],
         ])
         expect(result.executedSteps[1]).toMatchObject({
-          checkpoint: "none",
           sequenceChildFailure: null,
           handledMs: 2,
         })
-        expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiActionBatch", "snapshot"])
+        // PRB-093: the batch step's evidencePolicy is omitted, so it takes
+        // the canonical default (success=end) -- one post-batch capture,
+        // where the old "none"-by-default checkpoint captured nothing.
+        expect(result.executedSteps[1]?.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+        expect(result.executedSteps[1]?.evidence.captures).toHaveLength(1)
+        expect(result.executedSteps[1]?.evidence.captures[0]?.reason).toBe("policy-post")
+        expect(runnerCommands.map((command) => command.action)).toEqual(["snapshot", "uiActionBatch", "snapshot", "snapshot"])
       } finally {
         await runtime.dispose()
       }
@@ -4400,7 +4822,10 @@ describe("SessionRegistry", () => {
           ["assert", "verified"],
         ])
         expect(result.executedSteps[2]?.latestSnapshotId).not.toBeNull()
-        expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "uiAction", "snapshot"])
+        // PRB-093: each fast mutation's default policy (success=end) now
+        // captures its own post-mutation snapshot; the final assert still
+        // captures its own resolution snapshot on top.
+        expect(runnerCommands.map((command) => command.action)).toEqual(["uiAction", "snapshot", "uiAction", "snapshot", "snapshot"])
       } finally {
         await runtime.dispose()
       }
@@ -4536,6 +4961,13 @@ describe("SessionRegistry", () => {
         expect(report.steps[1]?.outcome).toBe("retry-succeeded")
         expect(report.steps[1]?.summary).toContain("retry succeeded")
         expect(report.warnings.some((warning) => warning.includes("Offscreen targets must already be hittable"))).toBe(true)
+        // PRB-093 review finding: 3 attempts on the same step must still
+        // report exactly one post capture, not one per attempt -- retries
+        // reuse the already-cached resolution snapshot and only the
+        // winning attempt pays for a post capture.
+        expect(report.steps[1]?.evidence.captures).toEqual([
+          { reason: "policy-post", phase: "post", snapshotId: expect.any(String), ms: expect.any(Number) },
+        ])
 
         const afterReplay = await runtime.runPromise(
           registry.captureSnapshot({
@@ -4592,6 +5024,11 @@ describe("SessionRegistry", () => {
         expect(report.steps[1]?.outcome).toBe("no-retry")
         expect(report.steps[1]?.artifact?.kind).toBe("mp4")
         expect(report.steps[1]?.artifact?.absolutePath).toContain("/video/step-002-video.mp4")
+        // Screenshot/video replay steps are explicit captures, not
+        // policy-driven, mirroring the live screenshot/video actions.
+        expect(report.steps[0]?.evidence.captures).toEqual([])
+        expect(report.steps[1]?.evidence.captures).toEqual([])
+        expect(replayed.evidence.captures).toEqual([])
         } finally {
           await runtime.dispose()
         }
@@ -4682,6 +5119,14 @@ describe("SessionRegistry", () => {
         expect(report.failure?.reason).toContain("retry exhausted")
         expect(report.failure?.reason).toContain("hittable")
         expect(report.warnings.some((warning) => warning.includes("Offscreen targets must already be hittable"))).toBe(true)
+        // PRB-093 review finding: an exhausted-retries step still took a
+        // real (bootstrap) resolution capture on its first attempt -- that
+        // capture work must survive into the failed step's evidence rather
+        // than being silently discarded, and must not be double-counted
+        // across the 3 attempts.
+        expect(report.steps[0]?.evidence.captures).toEqual([
+          { reason: "resolution", phase: "pre", snapshotId: expect.any(String), ms: expect.any(Number) },
+        ])
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {

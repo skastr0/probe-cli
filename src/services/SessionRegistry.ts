@@ -46,6 +46,17 @@ import {
 import { planFlowExecution, type PlannedStep } from "../domain/flow-planner"
 import { CapabilityReport } from "../domain/capabilities"
 import {
+  buildEvidenceReport,
+  defaultMutationEvidencePolicy,
+  emptyEvidenceReport,
+  planSuccessEvidence,
+  resolveEvidencePolicy,
+  shouldCaptureFailureEvidence,
+  type EvidenceCapture,
+  type EvidenceCaptureReason,
+  type EvidenceReport,
+} from "../domain/evidence"
+import {
   type DebugBreakpointLocation,
   type DebugCommandInput,
   type DebugCommandResult,
@@ -447,6 +458,16 @@ export interface RetryAttemptMetadata {
   readonly retryReasons: Array<string>
 }
 
+// PRB-093: named separately (not `typeof lastSnapshot`) to sidestep a real
+// TS inference cycle when a `let`-declared snapshot cache is read into a
+// same-named `const` inside the loop that reassigns it -- see the wait-poll
+// loop in executeSessionAction.
+interface WaitPollSnapshot {
+  readonly artifact: StoredSnapshotArtifact
+  readonly artifactRecord: ArtifactRecord
+  readonly handledMs: number
+}
+
 export type ExtendedSessionActionResult = SessionActionResult & {
   readonly handledMs?: number | null
   // PRB-091: `handledMs` broken into the runner's uiAction phases —
@@ -481,6 +502,12 @@ export type ActionExecutionOutcome =
       readonly ok: false
       readonly error: SessionActionError
       readonly retry: RetryAttemptMetadata
+      // PRB-093: every outcome reports its evidence, failure included -- a
+      // best-effort failure snapshot is real capture work and must not be
+      // silently discarded just because the mutation itself failed. See
+      // evidence.ts's module doc: failure evidence never replaces or masks
+      // the original failure, it only rides alongside it.
+      readonly evidence: EvidenceReport
     }
 
 export const emptyRetryAttemptMetadata = (): RetryAttemptMetadata => ({
@@ -640,6 +667,7 @@ const buildReplayStepReport = (args: {
   readonly matchedRef: string | null
   readonly artifact: ArtifactRecord | null
   readonly summary: string
+  readonly evidence: EvidenceReport
   readonly exhausted?: boolean
 }): ReplayStepReport => {
   const outcome = classifyReplayStepOutcome({
@@ -656,6 +684,7 @@ const buildReplayStepReport = (args: {
     resolvedBy: args.resolvedBy,
     matchedRef: args.matchedRef,
     artifact: args.artifact,
+    evidence: args.evidence,
     summary: withReplayStepOutcomeLabel({
       outcome,
       summary: args.summary,
@@ -1935,6 +1964,10 @@ export const SessionRegistryLive = Layer.scoped(
               ok: false,
               error: captureResult.error,
               retry: captureResult.retry,
+              // A failed screenshot capture has no separate failure-evidence
+              // concept: the capture that failed IS the action, not a
+              // discretionary policy capture around a mutation.
+              evidence: emptyEvidenceReport(resolveEvidencePolicy()),
             } satisfies ActionExecutionOutcome
           }
 
@@ -1957,6 +1990,9 @@ export const SessionRegistryLive = Layer.scoped(
               artifact: captureResult.value.artifact,
               recordingLength: record.recording.steps.length,
               handledMs: captureResult.value.handledMs,
+              // Screenshot captures are explicit, not policy-driven — see
+              // evidence.ts's module doc (acceptance criterion #11).
+              evidence: emptyEvidenceReport(resolveEvidencePolicy()),
               ...buildActionResultMetadata(captureResult.retry),
             } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
@@ -1981,6 +2017,9 @@ export const SessionRegistryLive = Layer.scoped(
               ok: false,
               error: captureResult.left,
               retry: emptyRetryAttemptMetadata(),
+              // A failed video capture has no separate failure-evidence
+              // concept, same reasoning as the screenshot failure above.
+              evidence: emptyEvidenceReport(resolveEvidencePolicy()),
             } satisfies ActionExecutionOutcome
           }
 
@@ -2008,6 +2047,9 @@ export const SessionRegistryLive = Layer.scoped(
               artifact: captureResult.right.artifact,
               recordingLength: record.recording.steps.length,
               handledMs: captureResult.right.handledMs,
+              // Video captures are explicit, not policy-driven — see
+              // evidence.ts's module doc (acceptance criterion #11).
+              evidence: emptyEvidenceReport(resolveEvidencePolicy()),
               ...buildActionResultMetadata(emptyRetryAttemptMetadata()),
             } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
@@ -2016,14 +2058,30 @@ export const SessionRegistryLive = Layer.scoped(
         if (args.action.kind === "assert") {
           const action = args.action
           const retryPolicy = action.retryPolicy ?? defaultAssertRetryPolicy
-          let cachedSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } | null = null
+          let cachedSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord; readonly handledMs: number } | null = null
+          // PRB-093: assert always needs a current snapshot to resolve its
+          // target -- that capture is "resolution" evidence, not a
+          // discretionary evidence-policy capture (assert has no
+          // evidencePolicy field; see evidence.ts). Accumulated across every
+          // retry attempt, not just the winning one, for an honest count.
+          const evidenceCaptures: Array<EvidenceCapture> = []
           const result = yield* attemptWithRetry({
             policy: retryPolicy,
             run: () =>
               Effect.gen(function* () {
-                const snapshot = retryPolicy.refreshSnapshotBetweenAttempts || cachedSnapshot === null
+                const previousSnapshot = cachedSnapshot
+                const snapshot = retryPolicy.refreshSnapshotBetweenAttempts || previousSnapshot === null
                   ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
-                  : cachedSnapshot
+                  : previousSnapshot
+
+                if (snapshot !== previousSnapshot) {
+                  evidenceCaptures.push({
+                    reason: "resolution",
+                    phase: "pre",
+                    snapshotId: snapshot.artifact.snapshotId,
+                    ms: snapshot.handledMs,
+                  })
+                }
 
                 cachedSnapshot = snapshot
 
@@ -2049,6 +2107,11 @@ export const SessionRegistryLive = Layer.scoped(
               ok: false,
               error: result.error,
               retry: result.retry,
+              // assert has no evidencePolicy field (unaffected by evidence
+              // policy) -- but the resolution snapshots taken across its
+              // retry attempts are still real capture work, so report them
+              // here exactly like the passing branch below does.
+              evidence: buildEvidenceReport(resolveEvidencePolicy(), evidenceCaptures),
             } satisfies ActionExecutionOutcome
           }
 
@@ -2079,6 +2142,7 @@ export const SessionRegistryLive = Layer.scoped(
               artifact: null,
               recordingLength: record.recording.steps.length,
               handledMs: null,
+              evidence: buildEvidenceReport(resolveEvidencePolicy(), evidenceCaptures),
               ...buildActionResultMetadata(result.retry, "passed", null, result.retry.retryCount + 1),
             } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
@@ -2105,6 +2169,9 @@ export const SessionRegistryLive = Layer.scoped(
                 artifact: null,
                 recordingLength: record.recording.steps.length,
                 handledMs: null,
+                // Duration waits never resolve a target, so they never touch
+                // a snapshot -- zero captures, trivially.
+                evidence: emptyEvidenceReport(resolveEvidencePolicy()),
                 ...buildActionResultMetadata(emptyRetryAttemptMetadata(), "passed", action.timeoutMs, 1),
               } satisfies ExtendedSessionActionResult,
             } satisfies ActionExecutionOutcome
@@ -2134,15 +2201,27 @@ export const SessionRegistryLive = Layer.scoped(
           const startedAt = Date.now()
           const retryReasons: Array<string> = []
           let attempts = 0
-          let lastSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } | null = null
+          let lastSnapshot: WaitPollSnapshot | null = null
           let lastEvaluation: ReturnType<typeof evaluateAssertion> | null = null
+          // PRB-093: same "resolution, not policy" accounting as assert above.
+          const evidenceCaptures: Array<EvidenceCapture> = []
 
           while (attempts < retryPolicy.maxAttempts) {
             attempts += 1
 
-            const snapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } = retryPolicy.refreshSnapshotBetweenAttempts || lastSnapshot === null
+            const previousSnapshot: WaitPollSnapshot | null = lastSnapshot
+            const snapshot: WaitPollSnapshot = retryPolicy.refreshSnapshotBetweenAttempts || previousSnapshot === null
               ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
-              : lastSnapshot
+              : previousSnapshot
+
+            if (snapshot !== previousSnapshot) {
+              evidenceCaptures.push({
+                reason: "resolution",
+                phase: "pre",
+                snapshotId: snapshot.artifact.snapshotId,
+                ms: snapshot.handledMs,
+              })
+            }
 
             lastSnapshot = snapshot
 
@@ -2185,6 +2264,7 @@ export const SessionRegistryLive = Layer.scoped(
                   artifact: null,
                   recordingLength: record.recording.steps.length,
                   handledMs: null,
+                  evidence: buildEvidenceReport(resolveEvidencePolicy(), evidenceCaptures),
                   ...buildActionResultMetadata({ retryCount: attempts - 1, retryReasons }, "passed", waitedMs, attempts),
                 } satisfies ExtendedSessionActionResult,
               } satisfies ActionExecutionOutcome
@@ -2215,6 +2295,11 @@ export const SessionRegistryLive = Layer.scoped(
               retryCount: Math.max(0, attempts - 1),
               retryReasons,
             },
+            // wait has no evidencePolicy field, same "resolution, not
+            // policy" accounting as assert above -- report the polling
+            // snapshots taken across the timed-out attempts rather than
+            // discarding that capture work.
+            evidence: buildEvidenceReport(resolveEvidencePolicy(), evidenceCaptures),
           } satisfies ActionExecutionOutcome
         }
 
@@ -2229,19 +2314,60 @@ export const SessionRegistryLive = Layer.scoped(
 
         const action = args.action
         const retryPolicy = action.retryPolicy ?? defaultMutationRetryPolicy
-        let cachedPreSnapshot: { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord } | null = null
+        // PRB-093: the canonical evidence policy replaces the old implicit
+        // "always capture pre, always capture post" behavior. `wantsPre`
+        // covers two independent reasons a pre-mutation snapshot might be
+        // needed: resolving a ref/semantic target at all (mandatory,
+        // regardless of policy), or "around" explicitly requesting
+        // pre-mutation evidence even for a point target that needs no
+        // resolution. Only "around" ever forces a *fresh* pre, ignoring the
+        // session's cached latest snapshot -- "end" and "none" trust that
+        // cache for resolution (the previous action's own post capture, or
+        // an explicit snapshot command) rather than paying for a redundant
+        // fresh capture before every mutation. See evidence.ts's module doc.
+        const policy = resolveEvidencePolicy(action.evidencePolicy)
+        const successPlan = planSuccessEvidence(policy.success)
+        const requiresResolution = action.target.kind !== "point"
+        const wantsPre = requiresResolution || successPlan.forcedFreshPre
+        const evidenceCaptures: Array<EvidenceCapture> = []
+        let cachedPreSnapshot: StoredSnapshotArtifact | null = wantsPre && !successPlan.forcedFreshPre
+          ? record.snapshotState.latest
+          : null
+        // `refreshSnapshotBetweenAttempts` governs refreshing *between this
+        // action's own retry attempts* -- it must not force a fresh capture
+        // on the action's first attempt just because a cross-action cached
+        // snapshot was seeded above; that would silently undo the whole
+        // point of reusing the cache. Only a genuine retry (attempt > 1)
+        // asks `refreshSnapshotBetweenAttempts`.
+        let attemptCount = 0
+
         const actionResult = yield* attemptWithRetry({
           policy: retryPolicy,
           run: () =>
             Effect.gen(function* () {
-              const preSnapshot = action.target.kind === "point"
+              attemptCount += 1
+              const previousPreSnapshot = cachedPreSnapshot
+              const isRetryAttempt = attemptCount > 1
+              const needsFreshPre = wantsPre
+                && (previousPreSnapshot === null || (isRetryAttempt && retryPolicy.refreshSnapshotBetweenAttempts))
+              const preSnapshot = !wantsPre
                 ? null
-                : retryPolicy.refreshSnapshotBetweenAttempts || cachedPreSnapshot === null
+                : needsFreshPre
                   ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
-                  : cachedPreSnapshot
+                  : { artifact: previousPreSnapshot!, handledMs: 0 }
+
+              if (needsFreshPre && preSnapshot !== null) {
+                const reason: EvidenceCaptureReason = successPlan.forcedFreshPre ? "policy-pre" : "resolution"
+                evidenceCaptures.push({
+                  reason,
+                  phase: "pre",
+                  snapshotId: preSnapshot.artifact.snapshotId,
+                  ms: preSnapshot.handledMs,
+                })
+              }
 
               if (preSnapshot !== null) {
-                cachedPreSnapshot = preSnapshot
+                cachedPreSnapshot = preSnapshot.artifact
               }
 
               const resolution = resolveActionSelectorInSnapshot(preSnapshot?.artifact ?? null, action.target)
@@ -2289,7 +2415,18 @@ export const SessionRegistryLive = Layer.scoped(
                 })
               }
 
-              const postSnapshot = yield* captureSnapshotArtifactInternal(args.sessionId, record)
+              const postSnapshot = successPlan.needsPost
+                ? yield* captureSnapshotArtifactInternal(args.sessionId, record)
+                : null
+
+              if (postSnapshot !== null) {
+                evidenceCaptures.push({
+                  reason: "policy-post",
+                  phase: "post",
+                  snapshotId: postSnapshot.artifact.snapshotId,
+                  ms: postSnapshot.handledMs,
+                })
+              }
 
               return {
                 postSnapshot,
@@ -2300,11 +2437,30 @@ export const SessionRegistryLive = Layer.scoped(
         })
 
         if (!actionResult.ok) {
+          // Failure evidence: best-effort, additive only -- never replaces
+          // the original mutation failure above. Swallowed via Effect.either
+          // exactly like the fast direct-runner lane (directRunnerActionExecutor.ts),
+          // but a successful capture is still reported through `evidence`
+          // below rather than silently discarded (PRB-093 review finding).
+          if (shouldCaptureFailureEvidence(policy.failure)) {
+            const failureCapture = yield* Effect.either(captureSnapshotArtifactInternal(args.sessionId, record))
+
+            if (failureCapture._tag === "Right") {
+              evidenceCaptures.push({
+                reason: "policy-failure",
+                phase: "post",
+                snapshotId: failureCapture.right.artifact.snapshotId,
+                ms: failureCapture.right.handledMs,
+              })
+            }
+          }
+
           yield* persistActionFailure(args.sessionId, record, args.action.kind)
           return {
             ok: false,
             error: actionResult.error,
             retry: actionResult.retry,
+            evidence: buildEvidenceReport(policy, evidenceCaptures),
           } satisfies ActionExecutionOutcome
         }
 
@@ -2316,13 +2472,23 @@ export const SessionRegistryLive = Layer.scoped(
         yield* persistHealth(args.sessionId, record.health)
         yield* syncDaemonMetadata
 
+        const latestSnapshotId = actionResult.value.postSnapshot?.artifact.snapshotId
+          ?? record.snapshotState.latest?.snapshotId
+          ?? null
+        const statusLabel = actionResult.value.postSnapshot?.artifact.statusLabel
+          ?? record.snapshotState.latest?.statusLabel
+          ?? null
+        const captureNote = actionResult.value.postSnapshot !== null
+          ? `; captured ${actionResult.value.postSnapshot.artifact.snapshotId}`
+          : ""
+
         const summary = actionResult.value.resolvedTarget.kind === "snapshot"
           ? actionResult.value.resolvedTarget.resolvedBy === "semantic"
               && action.target.kind === "ref"
               && action.target.fallback !== null
-            ? `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)} after semantic selector-drift recovery; captured ${actionResult.value.postSnapshot.artifact.snapshotId}.`
-            : `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)}; captured ${actionResult.value.postSnapshot.artifact.snapshotId}.`
-          : `Executed ${action.kind} at point(${actionResult.value.resolvedTarget.x}, ${actionResult.value.resolvedTarget.y}) in interaction-root coordinates; captured ${actionResult.value.postSnapshot.artifact.snapshotId}.`
+            ? `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)} after semantic selector-drift recovery${captureNote}.`
+            : `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)}${captureNote}.`
+          : `Executed ${action.kind} at point(${actionResult.value.resolvedTarget.x}, ${actionResult.value.resolvedTarget.y}) in interaction-root coordinates${captureNote}.`
 
         return {
           ok: true,
@@ -2331,11 +2497,12 @@ export const SessionRegistryLive = Layer.scoped(
             action: args.action.kind,
             matchedRef: actionResult.value.resolvedTarget.kind === "snapshot" ? actionResult.value.resolvedTarget.ref : null,
             resolvedBy: actionResult.value.resolvedTarget.resolvedBy,
-            statusLabel: actionResult.value.postSnapshot.artifact.statusLabel,
-            latestSnapshotId: actionResult.value.postSnapshot.artifact.snapshotId,
+            statusLabel,
+            latestSnapshotId,
               artifact: null,
               recordingLength: record.recording.steps.length,
               handledMs: actionResult.value.handledMs,
+              evidence: buildEvidenceReport(policy, evidenceCaptures),
               ...buildActionResultMetadata(actionResult.retry),
             } satisfies ExtendedSessionActionResult,
           } satisfies ActionExecutionOutcome
@@ -5656,9 +5823,10 @@ export const SessionRegistryLive = Layer.scoped(
             } else if (plannedStep.kind === "batch-sequence") {
               const outcome = yield* executeBatchActionStep({ sessionId, record, step: plannedStep.step, deps })
               // Read after dispatch, not before: the batch executor may have
-              // captured a fresh snapshot (checkpoint, or none at all), and
+              // captured one or more evidence snapshots per its evidence
+              // policy (or none at all under "none"), and
               // `buildBatchStepResult` also falls back to
-              // `record.snapshotState.latest` when there is no checkpoint —
+              // `record.snapshotState.latest` when nothing was captured —
               // exactly like the original inline branch read it post-dispatch.
               stepResult = buildBatchStepResult({
                 plannedStep,
@@ -5800,6 +5968,17 @@ export const SessionRegistryLive = Layer.scoped(
             })
           }
 
+          // PRB-093: replay shares the canonical mutation evidence policy
+          // (evidence.ts) rather than the old "always fresh pre + always
+          // post" behavior every mutation step used to have. Recorded steps
+          // carry no per-step evidencePolicy field (matching the existing
+          // precedent that retryPolicy also isn't recorded/replayed
+          // per-step; see ActionRecordingScript), so replay runs under the
+          // one canonical default for its whole duration: success=end,
+          // failure=snapshot.
+          const replayEvidencePolicy = defaultMutationEvidencePolicy
+          const replaySuccessPlan = planSuccessEvidence(replayEvidencePolicy.success)
+
           // PRB-083: the whole replay run is one operation on this
           // session's controller fiber, mirroring runFlow above.
           return yield* record.controller.submit((ctx) => withControllerContext(ctx, Effect.gen(function* () {
@@ -5807,6 +5986,10 @@ export const SessionRegistryLive = Layer.scoped(
           let retriedStepCount = 0
           let semanticFallbackCount = 0
           let finalSnapshotId: string | null = record.snapshotState.latest?.snapshotId ?? null
+          // PRB-093 review finding: an aggregate roll-up of every step's
+          // evidence captures, in step order, surfaced on the top-level
+          // SessionReplayResult -- mirrors retriedStepCount/semanticFallbackCount.
+          const allEvidenceCaptures: Array<EvidenceCapture> = []
 
           for (const [index, step] of script.steps.entries()) {
             let attempt = 0
@@ -5814,6 +5997,10 @@ export const SessionRegistryLive = Layer.scoped(
             let lastFailure = "unknown replay failure"
             let lastResolvedBy: ReplayStepReport["resolvedBy"] = "none"
             let lastMatchedRef: string | null = null
+            // Reset per step -- captures accumulate across this step's own
+            // retry attempts only (mirrors the assert/wait accounting in
+            // executeSessionAction above).
+            const evidenceCaptures: Array<EvidenceCapture> = []
 
             while (attempt < defaultReplayAttemptLimit && !succeeded) {
               attempt += 1
@@ -5848,6 +6035,10 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: null,
                   artifact: capture.right.artifact,
                   summary: `Captured replay screenshot artifact ${capture.right.artifact.absolutePath}.`,
+                  // Screenshot captures are explicit, not policy-driven --
+                  // see evidence.ts's module doc (acceptance criterion #11),
+                  // mirroring the live screenshot action above.
+                  evidence: emptyEvidenceReport(replayEvidencePolicy),
                 }))
                 succeeded = true
                 continue
@@ -5887,6 +6078,10 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: null,
                   artifact: capture.right.artifact,
                   summary: `Captured replay ${modeSummary} artifact ${capture.right.artifact.absolutePath}.${clampNote}`,
+                  // Video captures are explicit, not policy-driven -- see
+                  // evidence.ts's module doc (acceptance criterion #11),
+                  // mirroring the live video action above.
+                  evidence: emptyEvidenceReport(replayEvidencePolicy),
                 }))
                 succeeded = true
                 continue
@@ -5898,13 +6093,37 @@ export const SessionRegistryLive = Layer.scoped(
               }
 
               const recordedTarget = step.target
+              const wantsResolution = !(recordedTarget.preferredRef === null && recordedTarget.fallback?.kind === "point")
 
-              const preSnapshot = step.kind === "assert" || !(recordedTarget.preferredRef === null && recordedTarget.fallback?.kind === "point")
+              // Asserts always verify against a fresh snapshot -- unaffected
+              // by evidence policy, exactly like the live assert action.
+              // Mutations reuse the session's cached latest snapshot for
+              // resolution when one exists (the previous step's own post
+              // capture) instead of forcing a redundant fresh one; only a
+              // true bootstrap (no snapshot yet) forces a fresh capture.
+              const cachedSnapshot = record.snapshotState.latest
+              const forcesFreshResolution = step.kind === "assert" || (wantsResolution && cachedSnapshot === null)
+              const preSnapshot = forcesFreshResolution
                 ? yield* captureSnapshotArtifactInternal(sessionId, record)
-                : null
+                : wantsResolution && cachedSnapshot !== null
+                  ? { artifact: cachedSnapshot, handledMs: 0 }
+                  : null
 
               if (preSnapshot !== null) {
                 finalSnapshotId = preSnapshot.artifact.snapshotId
+              }
+
+              // A capture is only reported when one actually happened --
+              // reusing the cached snapshot (ms: 0) is not discretionary
+              // capture work, exactly like the live mutation lane's cached
+              // pre-reuse above never adds an evidence entry either.
+              if (forcesFreshResolution && preSnapshot !== null) {
+                evidenceCaptures.push({
+                  reason: "resolution",
+                  phase: "pre",
+                  snapshotId: preSnapshot.artifact.snapshotId,
+                  ms: preSnapshot.handledMs,
+                })
               }
 
               const resolution = resolveRecordedActionTargetInSnapshot(preSnapshot?.artifact ?? null, recordedTarget)
@@ -5939,6 +6158,7 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: evaluation.matchedRef,
                   artifact: null,
                   summary,
+                  evidence: buildEvidenceReport(replayEvidencePolicy, evidenceCaptures),
                 }))
                 succeeded = true
                 continue
@@ -5981,8 +6201,19 @@ export const SessionRegistryLive = Layer.scoped(
                 continue
               }
 
-              const postSnapshot = yield* captureSnapshotArtifactInternal(sessionId, record)
-              finalSnapshotId = postSnapshot.artifact.snapshotId
+              const postSnapshot = replaySuccessPlan.needsPost
+                ? yield* captureSnapshotArtifactInternal(sessionId, record)
+                : null
+
+              if (postSnapshot !== null) {
+                finalSnapshotId = postSnapshot.artifact.snapshotId
+                evidenceCaptures.push({
+                  reason: "policy-post",
+                  phase: "post",
+                  snapshotId: postSnapshot.artifact.snapshotId,
+                  ms: postSnapshot.handledMs,
+                })
+              }
 
               if (attempt > 1) {
                 retriedStepCount += 1
@@ -5992,11 +6223,12 @@ export const SessionRegistryLive = Layer.scoped(
                 semanticFallbackCount += 1
               }
 
+              const captureNote = postSnapshot !== null ? `; captured ${postSnapshot.artifact.snapshotId}` : ""
               const summary = resolvedTarget.kind === "snapshot"
                 ? resolvedTarget.resolvedBy === "semantic" && recordedTarget.preferredRef !== null
-                  ? `Executed ${step.kind} on ${describeRecordedActionTarget(recordedTarget)} after semantic selector-drift recovery; captured ${postSnapshot.artifact.snapshotId}.`
-                  : `Executed ${step.kind} on ${describeRecordedActionTarget(recordedTarget)}; captured ${postSnapshot.artifact.snapshotId}.`
-                : `Executed ${step.kind} at point(${resolvedTarget.x}, ${resolvedTarget.y}) in interaction-root coordinates; captured ${postSnapshot.artifact.snapshotId}.`
+                  ? `Executed ${step.kind} on ${describeRecordedActionTarget(recordedTarget)} after semantic selector-drift recovery${captureNote}.`
+                  : `Executed ${step.kind} on ${describeRecordedActionTarget(recordedTarget)}${captureNote}.`
+                : `Executed ${step.kind} at point(${resolvedTarget.x}, ${resolvedTarget.y}) in interaction-root coordinates${captureNote}.`
 
                 reports.push(buildReplayStepReport({
                   index: index + 1,
@@ -6006,9 +6238,17 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: resolvedTarget.kind === "snapshot" ? resolvedTarget.ref : null,
                   artifact: null,
                   summary,
+                  evidence: buildEvidenceReport(replayEvidencePolicy, evidenceCaptures),
                 }))
                 succeeded = true
             }
+
+            // Folded into the run-wide aggregate regardless of whether this
+            // step succeeded or exhausted its retries -- harmless either
+            // way, since the exhausted branch below returns early via a
+            // typed error before the final result (the only place
+            // `allEvidenceCaptures` is read) is ever built.
+            allEvidenceCaptures.push(...evidenceCaptures)
 
             if (!succeeded) {
               const failedStepReport = buildReplayStepReport({
@@ -6019,6 +6259,7 @@ export const SessionRegistryLive = Layer.scoped(
                 matchedRef: lastMatchedRef,
                 artifact: null,
                 summary: lastFailure,
+                evidence: buildEvidenceReport(replayEvidencePolicy, evidenceCaptures),
                 exhausted: true,
               })
               const warnings = buildReplayWarnings(semanticFallbackCount)
@@ -6110,6 +6351,7 @@ export const SessionRegistryLive = Layer.scoped(
             retriedStepCount,
             semanticFallbackCount,
             finalSnapshotId,
+            evidence: buildEvidenceReport(replayEvidencePolicy, allEvidenceCaptures),
           } satisfies SessionReplayResult
           })))
         }),

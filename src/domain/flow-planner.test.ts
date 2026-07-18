@@ -71,7 +71,7 @@ describe("flow planner", () => {
         },
         {
           kind: "sequence",
-          checkpoint: "end",
+          evidencePolicy: { success: "end" },
           actions: [
             {
               kind: "tap",

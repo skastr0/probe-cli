@@ -51,14 +51,23 @@ describe("executeDirectRunnerActionStep", () => {
     }
   })
 
-  test("dispatches a tap through deps.sendRunnerCommand and reports passed on success", async () => {
+  test("dispatches a tap through deps.sendRunnerCommand, captures the default post-mutation evidence snapshot, and reports passed on success", async () => {
     const record = makeFakeSimulatorRecord()
     const dispatch: { action: string | null } = { action: null }
+    let snapshotCaptures = 0
     const deps: FlowExecutorDeps = {
       ...makeUnusedFlowExecutorDeps(),
       sendRunnerCommand: (_sessionId, _record, action) => {
         dispatch.action = action
         return Effect.succeed(baseRunnerCommandResult)
+      },
+      captureSnapshotArtifactInternal: () => {
+        snapshotCaptures += 1
+        return Effect.succeed({
+          artifact: { snapshotId: "@s1" },
+          artifactRecord: { key: "snapshot-@s1" },
+          handledMs: 7,
+        } as never)
       },
       updateHealthCheck: () => {},
       persistHealth: () => Effect.void,
@@ -75,6 +84,80 @@ describe("executeDirectRunnerActionStep", () => {
     if (outcome.ok) {
       expect(outcome.result.summary).toContain("point(1, 2)")
       expect(outcome.result.handledMs).toBe(42)
+      // PRB-093: the canonical default (success=end) now captures exactly
+      // one post-mutation snapshot even in the fast lane -- the old "fast
+      // success captures none" behavior the glyph names as one of the three
+      // inconsistencies it replaces.
+      expect(snapshotCaptures).toBe(1)
+      expect(outcome.result.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+      expect(outcome.result.evidence.captures).toEqual([{ reason: "policy-post", phase: "post", snapshotId: "@s1", ms: 7 }])
+    }
+  })
+
+  test("policy success=none skips the post-mutation snapshot entirely", async () => {
+    const record = makeFakeSimulatorRecord()
+    let snapshotCaptures = 0
+    const deps: FlowExecutorDeps = {
+      ...makeUnusedFlowExecutorDeps(),
+      sendRunnerCommand: () => Effect.succeed(baseRunnerCommandResult),
+      captureSnapshotArtifactInternal: () => {
+        snapshotCaptures += 1
+        return Effect.succeed({ artifact: { snapshotId: "@s1" }, artifactRecord: {}, handledMs: 7 } as never)
+      },
+      updateHealthCheck: () => {},
+      persistHealth: () => Effect.void,
+      syncDaemonMetadata: Effect.void,
+    }
+    const step: FlowV2FastSingleStep = {
+      kind: "tap",
+      target: { kind: "point", x: 1, y: 2 },
+      evidencePolicy: { success: "none" },
+    } as never
+
+    const outcome = await Effect.runPromise(
+      executeDirectRunnerActionStep({ sessionId: "s1", record, step, deps }),
+    )
+
+    expect(outcome.ok).toBe(true)
+    expect(snapshotCaptures).toBe(0)
+    if (outcome.ok) {
+      expect(outcome.result.evidence.captures).toEqual([])
+    }
+  })
+
+  test("policy success=around captures exactly one pre and one post snapshot", async () => {
+    const record = makeFakeSimulatorRecord()
+    let snapshotCaptures = 0
+    const deps: FlowExecutorDeps = {
+      ...makeUnusedFlowExecutorDeps(),
+      sendRunnerCommand: () => Effect.succeed(baseRunnerCommandResult),
+      captureSnapshotArtifactInternal: () => {
+        snapshotCaptures += 1
+        return Effect.succeed({
+          artifact: { snapshotId: `@s${snapshotCaptures}` },
+          artifactRecord: {},
+          handledMs: 7,
+        } as never)
+      },
+      updateHealthCheck: () => {},
+      persistHealth: () => Effect.void,
+      syncDaemonMetadata: Effect.void,
+    }
+    const step: FlowV2FastSingleStep = {
+      kind: "tap",
+      target: { kind: "point", x: 1, y: 2 },
+      evidencePolicy: { success: "around" },
+    } as never
+
+    const outcome = await Effect.runPromise(
+      executeDirectRunnerActionStep({ sessionId: "s1", record, step, deps }),
+    )
+
+    expect(outcome.ok).toBe(true)
+    expect(snapshotCaptures).toBe(2)
+    if (outcome.ok) {
+      expect(outcome.result.evidence.captures.map((capture) => capture.phase)).toEqual(["pre", "post"])
+      expect(outcome.result.evidence.captures.map((capture) => capture.reason)).toEqual(["policy-pre", "policy-post"])
     }
   })
 
@@ -115,6 +198,46 @@ describe("executeDirectRunnerActionStep", () => {
     if (!outcome.ok) {
       expect(outcome.error).toBeInstanceOf(EnvironmentError)
       expect(outcome.error instanceof EnvironmentError ? outcome.error.reason : null).toBe("no element matched")
+      // The failure capture itself failed, so no capture is reported --
+      // but `evidence` must still be present and reflect the requested
+      // policy rather than being omitted from the outcome entirely.
+      expect(outcome.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+      expect(outcome.evidence.captures).toEqual([])
+    }
+  })
+
+  test("a runner failure reports the best-effort failure snapshot's id and cost in evidence (PRB-093 review finding)", async () => {
+    const record = makeFakeSimulatorRecord()
+    const deps: FlowExecutorDeps = {
+      ...makeUnusedFlowExecutorDeps(),
+      sendRunnerCommand: () =>
+        Effect.succeed({
+          ...baseRunnerCommandResult,
+          ok: false,
+          error: "no element matched",
+        }),
+      captureSnapshotArtifactInternal: () =>
+        Effect.succeed({
+          artifact: { snapshotId: "@failure-1" },
+          artifactRecord: { key: "snapshot-@failure-1" },
+          handledMs: 11,
+        } as never),
+      persistActionFailure: () => Effect.void,
+    }
+    const step: FlowV2FastSingleStep = { kind: "tap", target: { kind: "point", x: 1, y: 2 } } as never
+
+    const outcome = await Effect.runPromise(
+      executeDirectRunnerActionStep({ sessionId: "s1", record, step, deps }),
+    )
+
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      // Before this fix, a failed `ActionExecutionOutcome` carried only
+      // {error, retry} -- the successful failure snapshot's reason,
+      // snapshotId, and cost were captured but never reported anywhere.
+      expect(outcome.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+      expect(outcome.evidence.captures).toEqual([{ reason: "policy-failure", phase: "post", snapshotId: "@failure-1", ms: 11 }])
+      expect(outcome.evidence.evidenceMs).toBe(11)
     }
   })
 
