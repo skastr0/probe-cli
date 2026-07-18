@@ -147,6 +147,7 @@ const protocolFailure = (
     exitCode: null,
     sessionId: null,
     artifactKey: null,
+    diagnosticArtifactKey: null,
     wall: false,
   })
 
@@ -165,6 +166,7 @@ const environmentFailure = (request: RpcRequest, reason: string) =>
     exitCode: null,
     sessionId: null,
     artifactKey: null,
+    diagnosticArtifactKey: null,
     wall: false,
   })
 

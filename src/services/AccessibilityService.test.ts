@@ -59,8 +59,8 @@ const buildSessionHealthStub = () => ({
     trace: "not-requested",
   },
   capabilities: [],
-  warnings: [],
-  artifacts: [],
+  warnings: { total: 0, shown: [], omitted: 0, drill: null },
+  artifacts: { total: 0, shown: [], omitted: 0, drill: null },
   transport: {
     kind: "simulator-runner",
     contract: "probe.runner.transport/hybrid-v1",
@@ -166,13 +166,14 @@ const buildArtifactStoreStub = (capture?: { readonly derivedOutputs?: Array<{ re
 const buildDaemonClientStub = (args: {
   readonly snapshotResult: ReturnType<typeof buildSessionSnapshotResult>
   readonly screenshotArtifactPath: string
+  readonly sessionHealth?: ReturnType<typeof buildSessionHealthStub>
 }) =>
   DaemonClient.of({
     ping: () => Effect.die("unused ping"),
     listSessions: () => Effect.die("unused listSessions"),
     openSession: () => Effect.die("unused openSession"),
     showSession: () => Effect.die("unused showSession"),
-    getSessionHealth: () => Effect.succeed(buildSessionHealthStub()),
+    getSessionHealth: () => Effect.succeed(args.sessionHealth ?? buildSessionHealthStub()),
     closeSession: () => Effect.die("unused closeSession"),
     getSessionLogs: () => Effect.die("unused getSessionLogs"),
     markSessionLog: () => Effect.die("unused markSessionLog"),
@@ -373,6 +374,79 @@ describe("AccessibilityService", () => {
         expect(report.checks.find((check) => check.key === "session.snapshot-capture")?.verdict).toBe("verified")
         expect(report.checks.find((check) => check.key === "session.screenshot-capture")?.verdict).toBe("verified")
         expect(report.checks.find((check) => check.key === "snapshot.identity-stability")?.verdict).toBe("configured")
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // PRB-094 review finding: doctor now consumes only `session.warnings.shown`
+  // (the RPC-bounded excerpt) -- a real narrowing versus the old unbounded
+  // array. This proves the omission is recorded, not silently dropped, when
+  // a session has more warnings than the shown limit.
+  test("doctor records omitted session warnings instead of silently dropping them", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-accessibility-doctor-"))
+
+    try {
+      const built = buildSnapshotArtifact({
+        previous: null,
+        nextSnapshotIndex: 1,
+        nextElementRefIndex: 1,
+        raw: rawSnapshot(node({ type: "application", frame: { x: 0, y: 0, width: 390, height: 844 } })),
+      })
+      const snapshotPath = join(root, "snapshot.json")
+      const screenshotPath = join(root, "screenshot.png")
+      await writeFile(snapshotPath, `${JSON.stringify(built.artifact, null, 2)}\n`, "utf8")
+      await writeFile(screenshotPath, "png", "utf8")
+
+      const snapshotArtifactRecord = {
+        key: "snapshot-s1",
+        label: "snapshot-@s1",
+        kind: "json" as const,
+        summary: "snapshot artifact",
+        absolutePath: snapshotPath,
+        relativePath: "snapshots/snapshot.json",
+        external: false,
+        createdAt: "2026-04-14T12:00:00.000Z",
+      }
+      const snapshotResult = buildSessionSnapshotResult({
+        artifact: built.artifact,
+        artifactRecord: snapshotArtifactRecord,
+        outputMode: "artifact",
+      })
+      const sessionHealth = {
+        ...buildSessionHealthStub(),
+        warnings: {
+          total: 8,
+          shown: ["warning 1", "warning 2", "warning 3", "warning 4", "warning 5"],
+          omitted: 3,
+          drill: {
+            contractVersion: 1,
+            sessionId: "session-1",
+            artifactKey: "derived-session-warnings-overflow",
+            query: { kind: "collection" as const, offset: 0, limit: 200 },
+          },
+        },
+      }
+
+      const baseLayer = Layer.mergeAll(
+        Layer.succeed(ArtifactStore, buildArtifactStoreStub()),
+        Layer.succeed(DaemonClient, buildDaemonClientStub({ snapshotResult, screenshotArtifactPath: screenshotPath, sessionHealth })),
+      )
+      const runtime = ManagedRuntime.make(Layer.mergeAll(baseLayer, AccessibilityServiceLive.pipe(Layer.provide(baseLayer))))
+
+      try {
+        const service = await runtime.runPromise(Effect.gen(function* () {
+          return yield* AccessibilityService
+        }))
+        const report = await runtime.runPromise(service.doctor({ sessionId: "session-1" }))
+
+        expect(report.warnings).toContain("warning 1")
+        expect(report.warnings).toContain("warning 5")
+        expect(report.warnings.some((warning) => warning.includes("3 additional session warning(s) omitted"))).toBe(true)
+        expect(report.warnings.some((warning) => warning.includes("derived-session-warnings-overflow"))).toBe(true)
       } finally {
         await runtime.dispose()
       }

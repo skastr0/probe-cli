@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer, ManagedRuntime } from "effect"
+import { boundedCollectionAllShown } from "../domain/bounded"
 import { decodeCommerceValidationPlan } from "../domain/commerce"
 import { ArtifactStore } from "./ArtifactStore"
 import { CommerceService, CommerceServiceLive } from "./CommerceService"
@@ -55,7 +56,9 @@ const buildArtifactStoreStub = (capture?: { readonly derivedOutputs?: Array<{ re
     pruneExpiredSessions: () => Effect.void,
   } as any)
 
-const buildDaemonClientStub = () =>
+const buildDaemonClientStub = (overrides?: {
+  readonly runSessionFlowResult?: Record<string, unknown>
+}) =>
   DaemonClient.of({
     ping: () => Effect.die("unused ping"),
     listSessions: () => Effect.die("unused listSessions"),
@@ -159,19 +162,19 @@ const buildDaemonClientStub = () =>
     recordVideo: () => Effect.die("unused recordVideo"),
     captureSnapshot: () => Effect.die("unused captureSnapshot"),
     performSessionAction: () => Effect.die("unused performSessionAction"),
-    runSessionFlow: () => Effect.succeed({
+    runSessionFlow: () => Effect.succeed((overrides?.runSessionFlowResult ?? {
       contract: "probe.session-flow/report-v2",
       executedAt: "2026-04-14T00:00:00.000Z",
       sessionId: "session-1",
       summary: "probe flow passed",
       verdict: "passed",
-      executedSteps: [],
+      executedSteps: boundedCollectionAllShown([]),
       failedStep: null,
       retries: 0,
-      artifacts: [],
+      artifacts: boundedCollectionAllShown([]),
       finalSnapshotId: null,
-      warnings: [],
-    }),
+      warnings: boundedCollectionAllShown([]),
+    }) as any),
     exportSessionRecording: () => Effect.die("unused exportSessionRecording"),
     replaySessionRecording: () => Effect.die("unused replaySessionRecording"),
     getSessionResultSummary: () => Effect.die("unused getSessionResultSummary"),
@@ -389,20 +392,154 @@ describe("CommerceService", () => {
       }))
 
       expect(report.verdict).toBe("configured")
-      expect(report.executedSteps).toHaveLength(4)
-      expect(report.executedSteps[0]?.verdict).toBe("verified")
-      expect(report.executedSteps[0]?.boundary).toBe("apple-storekit")
-      expect(report.executedSteps[1]?.stub).toBe(true)
-      expect(report.executedSteps[1]?.boundary).toBe("apple-storekit")
-      expect(report.executedSteps[2]?.kind).toBe("commerce.assertCancellationLeavesEntitlementInactive")
-      expect(report.executedSteps[2]?.stub).toBe(true)
-      expect(report.executedSteps[3]?.kind).toBe("commerce.assertSinglePurchaseInFlight")
-      expect(report.executedSteps[3]?.stub).toBe(true)
+      // PRB-094: `executedSteps` is now a bounded collection -- 4 steps
+      // stays under `commerceExecutedStepsShownLimit` (5), so everything is
+      // shown inline (`total === shown.length`, `omitted === 0`).
+      expect(report.executedSteps.total).toBe(4)
+      expect(report.executedSteps.omitted).toBe(0)
+      expect(report.executedSteps.drill).toBeNull()
+      expect(report.executedSteps.shown).toHaveLength(4)
+      expect(report.executedSteps.shown[0]?.verdict).toBe("verified")
+      expect(report.executedSteps.shown[0]?.boundary).toBe("apple-storekit")
+      expect(report.executedSteps.shown[1]?.stub).toBe(true)
+      expect(report.executedSteps.shown[1]?.boundary).toBe("apple-storekit")
+      expect(report.executedSteps.shown[2]?.kind).toBe("commerce.assertCancellationLeavesEntitlementInactive")
+      expect(report.executedSteps.shown[2]?.stub).toBe(true)
+      expect(report.executedSteps.shown[3]?.kind).toBe("commerce.assertSinglePurchaseInFlight")
+      expect(report.executedSteps.shown[3]?.stub).toBe(true)
       expect(report.reportArtifact?.label).toBe("commerce-report")
       expect(report.timingFacts.some((fact) => fact.includes("CustomerInfo"))).toBe(true)
       expect(report.warnings).toContain("Negative cases still need coverage: purchase cancellation must not unlock entitlement, and double-tap buy must keep only one purchase operation in flight.")
       expect(capture.derivedOutputs).toHaveLength(1)
       expect(capture.derivedOutputs[0]?.content).toContain("probe.commerce-validation/report-v1")
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  // PRB-094 review finding: `CommerceValidationReport.executedSteps` stayed
+  // an unbounded top-level array even after each step's embedded
+  // `flowResult` was bounded -- a many-step plan can still blow the generic
+  // budget through step count alone. This proves the top-level collection
+  // itself now gets the same bounded-collection treatment.
+  test("validate bounds executedSteps itself once a plan has more steps than the shown limit", async () => {
+    const capture = { derivedOutputs: [] as Array<{ readonly sessionId: string; readonly label: string; readonly content: string }> }
+    const baseLayer = Layer.mergeAll(
+      Layer.succeed(ArtifactStore, buildArtifactStoreStub(capture)),
+      Layer.succeed(DaemonClient, buildDaemonClientStub()),
+    )
+    const runtime = ManagedRuntime.make(Layer.mergeAll(baseLayer, CommerceServiceLive.pipe(Layer.provide(baseLayer))))
+
+    try {
+      const service = await runtime.runPromise(Effect.gen(function* () {
+        return yield* CommerceService
+      }))
+      // 4 executable plan steps + RevenueCat's 2 auto-appended negative-case
+      // stubs = 6 total, one past `commerceExecutedStepsShownLimit` (5).
+      const plan = decodeCommerceValidationPlan({
+        contract: "probe.commerce-plan/v1",
+        productId: "com.example.pro.monthly",
+        expectedEntitlement: "pro",
+        steps: Array.from({ length: 4 }, (_, index) => ({
+          kind: "commerce.loadProducts",
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [{ kind: "sleep", durationMs: 10 + index }],
+          },
+        })),
+      })
+
+      const report = await runtime.runPromise(service.validate({
+        sessionId: "session-1",
+        mode: "local-storekit",
+        provider: "revenuecat",
+        plan,
+      }))
+
+      expect(report.executedSteps.total).toBe(6)
+      expect(report.executedSteps.shown).toHaveLength(5)
+      expect(report.executedSteps.omitted).toBe(1)
+      expect(report.executedSteps.drill).not.toBeNull()
+      expect(report.executedSteps.drill?.sessionId).toBe("session-1")
+
+      // AC4: the full 6-step detail was persisted atomically -- a second
+      // derived-output artifact alongside the whole-report artifact.
+      expect(capture.derivedOutputs).toHaveLength(2)
+      const overflowArtifact = capture.derivedOutputs.find((output) => output.label === "commerce-executed-steps-overflow")
+      expect(overflowArtifact).not.toBeUndefined()
+      const persistedSteps = JSON.parse(overflowArtifact?.content ?? "[]") as Array<{ readonly kind: string }>
+      expect(persistedSteps).toHaveLength(6)
+      expect(persistedSteps[5]?.kind).toBe("commerce.assertSinglePurchaseInFlight")
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  // PRB-094 review finding: a step now consumes only
+  // `flowResult.warnings.shown` -- a real narrowing versus the old
+  // unbounded array. This proves the omission is recorded, not silently
+  // dropped, when a step's underlying flow raised more warnings than the
+  // shown limit.
+  test("validate records omitted flow warnings on a step instead of silently dropping them", async () => {
+    const baseLayer = Layer.mergeAll(
+      Layer.succeed(ArtifactStore, buildArtifactStoreStub()),
+      Layer.succeed(DaemonClient, buildDaemonClientStub({
+        runSessionFlowResult: {
+          contract: "probe.session-flow/report-v2",
+          executedAt: "2026-04-14T00:00:00.000Z",
+          sessionId: "session-1",
+          summary: "probe flow passed",
+          verdict: "passed",
+          executedSteps: boundedCollectionAllShown([]),
+          failedStep: null,
+          retries: 0,
+          artifacts: boundedCollectionAllShown([]),
+          finalSnapshotId: null,
+          warnings: {
+            total: 7,
+            shown: ["flow warning 1", "flow warning 2", "flow warning 3", "flow warning 4", "flow warning 5"],
+            omitted: 2,
+            drill: {
+              contractVersion: 1,
+              sessionId: "session-1",
+              artifactKey: "derived-flow-warnings-overflow",
+              query: { kind: "collection", offset: 0, limit: 200 },
+            },
+          },
+        },
+      })),
+    )
+    const runtime = ManagedRuntime.make(Layer.mergeAll(baseLayer, CommerceServiceLive.pipe(Layer.provide(baseLayer))))
+
+    try {
+      const service = await runtime.runPromise(Effect.gen(function* () {
+        return yield* CommerceService
+      }))
+      const plan = decodeCommerceValidationPlan({
+        contract: "probe.commerce-plan/v1",
+        productId: "com.example.pro.monthly",
+        expectedEntitlement: "pro",
+        steps: [
+          {
+            kind: "commerce.loadProducts",
+            flow: {
+              contract: "probe.session-flow/v2",
+              steps: [{ kind: "sleep", durationMs: 10 }],
+            },
+          },
+        ],
+      })
+
+      const report = await runtime.runPromise(service.validate({
+        sessionId: "session-1",
+        mode: "local-storekit",
+        plan,
+      }))
+
+      const step = report.executedSteps.shown[0]
+      expect(step?.warnings).toContain("flow warning 1")
+      expect(step?.warnings.some((warning) => warning.includes("2 additional flow warning(s) omitted"))).toBe(true)
+      expect(step?.warnings.some((warning) => warning.includes("derived-flow-warnings-overflow"))).toBe(true)
     } finally {
       await runtime.dispose()
     }

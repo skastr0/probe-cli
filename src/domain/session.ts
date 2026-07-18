@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { BoundedCollectionSchema } from "./bounded"
 import { CapabilityReport } from "./capabilities"
 import { SessionCoordination, SessionDebuggerDetails } from "./debug"
 import { ArtifactRecord, NullableString } from "./output"
@@ -237,6 +238,22 @@ export type ProbeSessionHealth = typeof ProbeSessionHealth.Type
 export const SessionHealth = ProbeSessionHealth
 export type SessionHealth = typeof ProbeSessionHealth.Type
 
+// PRB-094: the RPC/CLI-boundary contract for `session.health`/`session.open`/
+// `session.show`. `ProbeSessionHealth`/`SessionHealth` above stays the
+// *internal* record every active-session tracks and reads from constantly
+// (e.g. `record.health.artifacts` while diffing a flow step's created
+// artifacts) -- that internal bookkeeping needs the full, unbounded arrays.
+// Only the outermost RPC response (built in `ProbeKernel.ts`) swaps
+// `artifacts`/`warnings` for their bounded-collection form, so a
+// long-lived session with thousands of registered artifacts or warnings
+// stays inside the generic 4 KiB / 100 line inline budget on the wire.
+export const BoundedSessionHealthSchema = Schema.Struct({
+  ...ProbeSessionHealth.fields,
+  artifacts: BoundedCollectionSchema(ArtifactRecord),
+  warnings: BoundedCollectionSchema(Schema.String),
+})
+export type BoundedSessionHealth = typeof BoundedSessionHealthSchema.Type
+
 export const SessionListTarget = Schema.Struct({
   platform: SessionTarget.fields.platform,
   deviceId: SessionTarget.fields.deviceId,
@@ -253,6 +270,19 @@ export const SessionListEntry = Schema.Struct({
   openedAt: Schema.String,
 })
 export type SessionListEntry = typeof SessionListEntry.Type
+
+// PRB-094 AC3 review finding (minor): `session.list` reports every
+// in-memory active session the daemon is tracking -- unlike a single
+// session's `artifacts`/`warnings`, nothing in the daemon enforces a hard
+// cap on concurrent active sessions, so a long-lived daemon juggling many
+// sessions could inline every entry unbounded. Same summary/detail contract
+// every other potentially-unbounded collection gets at the RPC boundary
+// (see domain/bounded.ts); bound in `ProbeKernel.ts`'s `session.list` case
+// under `workspaceDiagnosticsSessionId` (session.list reports on the whole
+// daemon, not one session, the same reason getWorkspaceStatus's
+// diagnostics/known-walls bind against that fixed id).
+export const BoundedSessionListSchema = BoundedCollectionSchema(SessionListEntry)
+export type BoundedSessionList = typeof BoundedSessionListSchema.Type
 
 export const isLiveRunnerTransport = (
   transport: SessionTransportDetails,

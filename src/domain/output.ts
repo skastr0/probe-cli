@@ -95,7 +95,25 @@ export const XcresultDrillQuery = Schema.Struct({
 })
 export type XcresultDrillQuery = typeof XcresultDrillQuery.Type
 
-export const DrillQuery = Schema.Union(TextDrillQuery, JsonDrillQuery, XmlDrillQuery, XcresultDrillQuery)
+// PRB-094: an offset/limit page cursor over a persisted JSON array artifact
+// (a bounded-collection overflow -- see domain/bounded.ts). Deterministic
+// across repeated reads because the backing artifact is written once,
+// atomically, and never mutated: the same { offset, limit } always
+// resolves to the same page.
+export const CollectionDrillQuery = Schema.Struct({
+  kind: Schema.Literal("collection"),
+  offset: Schema.Number,
+  limit: Schema.Number,
+})
+export type CollectionDrillQuery = typeof CollectionDrillQuery.Type
+
+export const DrillQuery = Schema.Union(
+  TextDrillQuery,
+  JsonDrillQuery,
+  XmlDrillQuery,
+  XcresultDrillQuery,
+  CollectionDrillQuery,
+)
 export type DrillQuery = typeof DrillQuery.Type
 
 export const DrillInlineResult = Schema.Struct({

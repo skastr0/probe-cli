@@ -6,15 +6,16 @@ import {
 } from "../../domain/accessibility"
 import {
   decodeCommerceValidationPlan,
+  type BoundedCommerceValidationReport,
   type CommerceDoctorReport,
   type CommerceProvider,
   type CommerceValidationMode,
   type CommerceValidationPlan,
-  type CommerceValidationReport,
 } from "../../domain/commerce"
 import { UserInputError } from "../../domain/errors"
 import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
+import { boundCliEscapingError } from "../errorBounding"
 import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
@@ -111,16 +112,24 @@ const formatDoctorLikeReport = (report: Pick<CommerceDoctorReport, "summary" | "
   ...(report.warnings.length > 0 ? ["", "warnings:", ...report.warnings.map((warning) => `- ${warning}`)] : []),
 ]
 
-const formatValidationReport = (report: CommerceValidationReport): string => [
+const formatValidationReport = (report: BoundedCommerceValidationReport): string => [
   ...formatDoctorLikeReport(report),
   `mode: ${report.mode}`,
   `session id: ${report.sessionId}`,
   `environment: ${report.environment.authority} (${report.environment.authoritative ? "authoritative" : "non-authoritative"})`,
   `artifact: ${report.reportArtifact?.absolutePath ?? "n/a"}`,
   "",
-  "steps:",
-  ...(report.executedSteps.length > 0
-    ? report.executedSteps.flatMap((step) => [
+  // PRB-094: `executedSteps` is now a bounded collection (total/shown/
+  // omitted/drill, domain/bounded.ts) -- same "N of total, M omitted --
+  // drill <key>" idiom as `session run`'s step formatter (cli/commands/
+  // session.ts).
+  `steps (${report.executedSteps.shown.length} of ${report.executedSteps.total}${
+    report.executedSteps.omitted > 0
+      ? `, ${report.executedSteps.omitted} omitted -- drill ${report.executedSteps.drill?.artifactKey}`
+      : ""
+  }):`,
+  ...(report.executedSteps.shown.length > 0
+    ? report.executedSteps.shown.flatMap((step) => [
         `- ${step.index}. ${step.kind} [${step.verdict}${step.stub ? "/stub" : ""}] (${step.boundary}) ${step.summary}`,
         ...step.details.map((detail) => `  - ${detail}`),
       ])
@@ -181,7 +190,9 @@ export const runValidateCommand = (args: ReadonlyArray<string>) =>
         const report = yield* accessibility.validate({
           sessionId,
           scope: scope as AccessibilityScope,
-        })
+        }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(sessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatAccessibilityValidationReport(report))
@@ -218,7 +229,9 @@ export const runValidateCommand = (args: ReadonlyArray<string>) =>
           mode,
           provider,
           plan,
-        })
+        }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(sessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatValidationReport(report))
