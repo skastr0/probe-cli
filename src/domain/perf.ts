@@ -338,12 +338,15 @@ export const parsePerfTableExport = (xml: string): ParsedPerfTable => {
   }
 }
 
-const readRaw = (row: PerfRow, mnemonic: string): string | null => row[mnemonic]?.raw ?? null
+// PRB-098: exported so the cross-channel evidence-correlation module
+// (perf-evidence.ts) can read the same generic table cells these
+// single-channel analyzers already read, instead of re-parsing rows itself.
+export const readRaw = (row: PerfRow, mnemonic: string): string | null => row[mnemonic]?.raw ?? null
 
-const readDisplay = (row: PerfRow, mnemonic: string): string | null =>
+export const readDisplay = (row: PerfRow, mnemonic: string): string | null =>
   row[mnemonic]?.display ?? row[mnemonic]?.raw ?? null
 
-const readNumber = (row: PerfRow, mnemonic: string): number | null => {
+export const readNumber = (row: PerfRow, mnemonic: string): number | null => {
   const raw = readRaw(row, mnemonic)
 
   if (!raw) {
@@ -393,7 +396,7 @@ const summarizeCounts = (
 
 const uniqueCount = (values: ReadonlyArray<string>): number => new Set(values).size
 
-const assertSchemaContract = (args: {
+export const assertSchemaContract = (args: {
   readonly table: ParsedPerfTable
   readonly schema: string
   readonly requiredMnemonics: ReadonlyArray<string>
