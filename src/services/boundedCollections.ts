@@ -80,3 +80,82 @@ export const bindBoundedCollection = <A>(
       },
     }
   })
+
+/**
+ * PRB-094: the workspace-status analogue of `bindFlowResultForWire`
+ * (ProbeKernel.ts) -- `DiagnosticReport`/`KnownWall` (domain/diagnostics.ts)
+ * are keyed reports with one potentially-unbounded `details: Array<string>`
+ * field each (a long-running host's stale-session recovery notes, in
+ * particular, grows with however many stale sessions it finds). Unlike
+ * session health/flow results, `getWorkspaceStatus` has no single session to
+ * scope an overflow artifact to -- it reports on the whole workspace, not
+ * one session -- so this binds against the fixed `sessionId` the caller
+ * passes in (see `workspaceDiagnosticsSessionId`, ProbeKernel.ts), reusing
+ * the same atomic-persist-then-drill contract and the same session-directory
+ * prune lifecycle (`ArtifactStore.pruneExpiredSessions`) every other bound
+ * collection already relies on.
+ */
+export const bindDetailsForWire = <T extends { readonly key: string; readonly details: ReadonlyArray<string> }>(
+  artifactStore: BoundedCollectionArtifactWriter,
+  args: {
+    readonly sessionId: string
+    readonly shownLimit: number
+    readonly report: T
+  },
+): Effect.Effect<Omit<T, "details"> & { readonly details: BoundedCollection<string> }, EnvironmentError> =>
+  Effect.gen(function* () {
+    const details = yield* bindBoundedCollection(artifactStore, {
+      sessionId: args.sessionId,
+      collectionLabel: `diagnostic-${args.report.key}-details`,
+      items: args.report.details,
+      shownLimit: args.shownLimit,
+    })
+
+    return { ...args.report, details }
+  })
+
+/**
+ * PRB-094 AC8: "errors bound excerpts and link the complete diagnostic
+ * artifact" -- the error-shaped analogue of `bindBoundedCollection`. A typed
+ * error's `details: Array<string>` (`UserInputError`/`EnvironmentError`/
+ * `DeviceInterruptionError`/`UnsupportedCapabilityError`/
+ * `UnsupportedFlowContractError`, domain/errors.ts) is unbounded at the type
+ * level the same way `DiagnosticReport.details` was -- this is the one place
+ * that actually enforces a bound before an error escapes to the RPC/CLI
+ * boundary (see `ProbeKernel.ts`'s `handleRpcRequest`, which wraps its whole
+ * response in a `catchAll` that calls this for any escaping error whose
+ * `details` is too big to inline).
+ *
+ * Below the limit, `details`/`diagnosticArtifactKey` come back unchanged
+ * (`null`) -- nothing was truncated, nothing to link, exactly mirroring
+ * `bindBoundedCollection`'s "nothing omitted -> no artifact write, drill
+ * null" behavior. Over the limit, the *complete* detail list is persisted
+ * atomically (AC4) before the excerpt is ever returned (AC7: never a silent
+ * clip -- a caller that only sees the truncated `details` can still resolve
+ * `diagnosticArtifactKey` for everything that didn't fit).
+ */
+export const bindErrorDetailsForWire = (
+  artifactStore: BoundedCollectionArtifactWriter,
+  args: {
+    readonly sessionId: string
+    readonly errorCode: string
+    readonly details: ReadonlyArray<string>
+    readonly shownLimit: number
+  },
+): Effect.Effect<
+  { readonly details: ReadonlyArray<string>; readonly diagnosticArtifactKey: string | null },
+  EnvironmentError
+> =>
+  Effect.gen(function* () {
+    const bound = yield* bindBoundedCollection(artifactStore, {
+      sessionId: args.sessionId,
+      collectionLabel: `error-${args.errorCode}-details`,
+      items: args.details,
+      shownLimit: args.shownLimit,
+    })
+
+    return {
+      details: bound.shown,
+      diagnosticArtifactKey: bound.drill?.artifactKey ?? null,
+    }
+  })

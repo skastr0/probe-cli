@@ -156,6 +156,7 @@ describe("rpc socket behavior", () => {
               exitCode: null,
               sessionId: null,
               artifactKey: null,
+              diagnosticArtifactKey: null,
               wall: false,
             },
           })}\n`)

@@ -3,10 +3,10 @@ import { Effect, Schema } from "effect"
 import { UserInputError } from "../../domain/errors"
 import { decodeSessionFlowContract } from "../../domain/flow-v2"
 import {
+  type BoundedPerfAroundFlowResult,
   defaultPerfTimeLimitForTemplate,
   formatNanoseconds,
   type PerfAnalyzeResult,
-  type PerfAroundFlowResult,
   type PerfExportResult,
   perfTemplateChoiceText,
   perfTemplateChoices,
@@ -242,7 +242,7 @@ const formatPerfAnalyzeResult = (result: PerfAnalyzeResult): string => {
   ].join("\n")
 }
 
-const formatPerfAroundResult = (result: PerfAroundFlowResult): string => {
+const formatPerfAroundResult = (result: BoundedPerfAroundFlowResult): string => {
   const diagnosisLines = result.diagnoses.map((diagnosis) => {
     const prefix = diagnosis.wall ? "wall" : diagnosis.severity
     const details = diagnosis.details.map((detail) => `    ${detail}`).join("\n")

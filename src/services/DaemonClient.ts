@@ -34,9 +34,9 @@ import type {
 } from "../domain/output"
 import type { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
 import type {
+  BoundedPerfAroundFlowResult,
   PerfAnalyzeResult,
   PerfAnalyzerName,
-  PerfAroundFlowResult,
   PerfExportResult,
   PerfRecordResult,
   PerfSignpostSummaryResult,
@@ -446,7 +446,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly flow: SessionFlowContract
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      PerfAroundFlowResult,
+      BoundedPerfAroundFlowResult,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError

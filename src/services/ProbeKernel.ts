@@ -23,7 +23,7 @@ import { appendSessionLogMarkers, isTextArtifactKind, summarizeContent } from ".
 import type { WorkspaceStatus } from "../domain/workspace"
 import { disposeAppleProcessSupervisorRuntime, runAppleProcess } from "./AppleProcessSupervisor"
 import { ArtifactStore } from "./ArtifactStore"
-import { bindBoundedCollection } from "./boundedCollections"
+import { bindBoundedCollection, bindDetailsForWire, bindErrorDetailsForWire } from "./boundedCollections"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
 import { resolveProbeRuntimeRoot } from "./ProjectRoot"
@@ -84,6 +84,26 @@ const sessionHealthWarningsShownLimit = 5
 const flowExecutedStepsShownLimit = 5
 const flowArtifactsShownLimit = 3
 const flowWarningsShownLimit = 5
+const diagnosticDetailsShownLimit = 10
+
+// PRB-094 AC8: how many `details` lines a typed error crossing the RPC
+// boundary inlines before the rest is persisted as a complete diagnostic
+// artifact and linked via `diagnosticArtifactKey` (see
+// `bindErrorDetailsForWire`, services/boundedCollections.ts, and
+// `boundEscapingErrorDetails` below).
+const errorDetailsShownLimit = 20
+
+// PRB-094: `getWorkspaceStatus`'s diagnostics/known-walls report on the
+// whole workspace, not one session, so there is no real `sessionId` to
+// scope their `details` overflow artifact to the way session-health/flow
+// results are scoped to the session that produced them. This fixed id
+// gives every workspace-status overflow artifact one stable, well-known
+// home under the same session-directory tree `ArtifactStore` already owns
+// (and already prunes via `pruneExpiredSessions`, which sweeps every
+// directory under the sessions root by mtime, not just ones with a live
+// session manifest) instead of inventing a parallel non-session artifact
+// store.
+const workspaceDiagnosticsSessionId = "workspace-diagnostics"
 
 interface HostCommandResult {
   readonly stdout: string
@@ -436,7 +456,8 @@ export const ProbeKernelLive = Layer.effect(
         return { ...health, artifacts, warnings }
       })
 
-    // PRB-094: the RPC-boundary bind step for `session.run` -- mirrors
+    // PRB-094: the RPC-boundary bind step for `session.run` and `perf.around`
+    // (both carry a `FlowV2Result` inline in their response) -- mirrors
     // `bindSessionHealthForWire` above for `FlowV2Result`'s three
     // potentially-unbounded fields.
     const bindFlowResultForWire = (result: SessionFlowResult): Effect.Effect<BoundedFlowV2Result, EnvironmentError> =>
@@ -1140,6 +1161,130 @@ export const ProbeKernelLive = Layer.effect(
       }
     })
 
+    // PRB-094 AC8: which session an escaping error's diagnostic-overflow
+    // artifact should persist under. Most `RpcRequest.params` shapes carry a
+    // real `sessionId` (session.*/perf.*/artifact.drill); session-less
+    // methods (daemon.ping, session.list) fall back to the same
+    // `workspaceDiagnosticsSessionId` sentinel `getWorkspaceStatus` uses.
+    const sessionIdHintForRequest = (request: RpcRequest): string => {
+      const params: unknown = (request as { readonly params?: unknown }).params
+      return isRecord(params) && typeof params.sessionId === "string"
+        ? params.sessionId
+        : workspaceDiagnosticsSessionId
+    }
+
+    type DetailBearingProbeError =
+      | UserInputError
+      | EnvironmentError
+      | DeviceInterruptionError
+      | UnsupportedCapabilityError
+
+    // PRB-094 AC8: the one place every RPC-boundary failure passes through
+    // before it reaches `rpc/server.ts`'s `toFailurePayload` -- bounds
+    // `details` to `errorDetailsShownLimit` and links the complete
+    // diagnostic artifact via `bindErrorDetailsForWire` when it does not
+    // already fit. An error whose `details` already fits comes back
+    // byte-for-byte unchanged (no persistence, mirroring
+    // `bindBoundedCollection`'s "nothing omitted -> no artifact write").
+    const boundDetailBearingError = (
+      request: RpcRequest,
+      error: DetailBearingProbeError,
+    ): Effect.Effect<never, DetailBearingProbeError> =>
+      Effect.gen(function* () {
+        if (error.details.length <= errorDetailsShownLimit) {
+          return yield* Effect.fail(error)
+        }
+
+        // Best-effort: if persisting the complete diagnostic artifact
+        // itself fails, degrade to a plain excerpt instead of compounding
+        // one failure with an unrelated "could not persist diagnostics"
+        // one -- the original error is already informative on its own.
+        const bound = yield* bindErrorDetailsForWire(artifactStore, {
+          sessionId: sessionIdHintForRequest(request),
+          errorCode: error.code,
+          details: error.details,
+          shownLimit: errorDetailsShownLimit,
+        }).pipe(
+          Effect.catchAll(() =>
+            Effect.succeed({
+              details: error.details.slice(0, errorDetailsShownLimit),
+              diagnosticArtifactKey: null as string | null,
+            }),
+          ),
+        )
+
+        switch (error._tag) {
+          case "UserInputError":
+            return yield* Effect.fail(new UserInputError({
+              code: error.code,
+              reason: error.reason,
+              nextStep: error.nextStep,
+              details: bound.details,
+              diagnosticArtifactKey: bound.diagnosticArtifactKey,
+            }))
+          case "EnvironmentError":
+            return yield* Effect.fail(new EnvironmentError({
+              code: error.code,
+              reason: error.reason,
+              nextStep: error.nextStep,
+              details: bound.details,
+              diagnosticArtifactKey: bound.diagnosticArtifactKey,
+            }))
+          case "DeviceInterruptionError":
+            return yield* Effect.fail(new DeviceInterruptionError({
+              code: error.code,
+              signal: error.signal,
+              reason: error.reason,
+              nextStep: error.nextStep,
+              details: bound.details,
+              diagnosticArtifactKey: bound.diagnosticArtifactKey,
+            }))
+          case "UnsupportedCapabilityError":
+            return yield* Effect.fail(new UnsupportedCapabilityError({
+              code: error.code,
+              capability: error.capability,
+              reason: error.reason,
+              nextStep: error.nextStep,
+              details: bound.details,
+              diagnosticArtifactKey: bound.diagnosticArtifactKey,
+              wall: error.wall,
+            }))
+        }
+      })
+
+    const boundEscapingErrorDetails = (
+      request: RpcRequest,
+      error:
+        | DeviceInterruptionError
+        | EnvironmentError
+        | UserInputError
+        | UnsupportedCapabilityError
+        | ArtifactNotFoundError
+        | SessionConflictError
+        | SessionNotFoundError
+        | ChildProcessError,
+    ): Effect.Effect<
+      never,
+      | DeviceInterruptionError
+      | EnvironmentError
+      | UserInputError
+      | UnsupportedCapabilityError
+      | ArtifactNotFoundError
+      | SessionConflictError
+      | SessionNotFoundError
+      | ChildProcessError
+    > => {
+      switch (error._tag) {
+        case "UserInputError":
+        case "EnvironmentError":
+        case "DeviceInterruptionError":
+        case "UnsupportedCapabilityError":
+          return boundDetailBearingError(request, error)
+        default:
+          return Effect.fail(error)
+      }
+    }
+
     const handleRpcRequest = (request: RpcRequest, emit: (event: RpcProgressEvent) => void) =>
       Effect.gen(function* () {
         let eventSequence = 0
@@ -1536,12 +1681,19 @@ export const ProbeKernelLive = Layer.effect(
               "perf.around",
               `Recording ${request.params.template} around ${request.params.flow.steps.length} flow step(s) for session ${request.params.sessionId}.`,
             )
-            const result = yield* perfService.recordAroundFlow({
+            const recordResult = yield* perfService.recordAroundFlow({
               sessionId: request.params.sessionId,
               template: request.params.template,
               flow: request.params.flow,
               emitProgress: progress,
             })
+            // PRB-094: bound the embedded flow result the same way
+            // `session.run` bounds it (`bindFlowResultForWire`) -- this is
+            // an equivalent flow-carrying inline RPC result, and an
+            // unbounded `flow` here would blow past the generic budget
+            // exactly like an unbounded `session.run` response would.
+            const boundedFlow = yield* bindFlowResultForWire(recordResult.flow)
+            const result = { ...recordResult, flow: boundedFlow }
             return {
               kind: "response",
               protocolVersion: PROBE_PROTOCOL_VERSION,
@@ -1802,7 +1954,7 @@ export const ProbeKernelLive = Layer.effect(
               details: [],
             })
         }
-      })
+      }).pipe(Effect.catchAll((error) => boundEscapingErrorDetails(request, error)))
 
     return ProbeKernel.of({
       getWorkspaceStatus: () =>
@@ -1812,6 +1964,30 @@ export const ProbeKernelLive = Layer.effect(
           const metadataPath = yield* artifactStore.getDaemonMetadataPath()
           const daemonRunning = yield* artifactStore.isDaemonRunning()
           const workspaceDiagnostics = yield* collectWorkspaceDiagnostics
+
+          // PRB-094: bound each diagnostic's/known-wall's `details` the same
+          // way session health/flow results are bound at the RPC boundary --
+          // see `bindDetailsForWire` (services/boundedCollections.ts) and
+          // `workspaceDiagnosticsSessionId` above for why this uses a fixed
+          // id instead of a per-session one.
+          const boundedDiagnostics = yield* Effect.forEach(
+            workspaceDiagnostics.diagnostics,
+            (report) =>
+              bindDetailsForWire(artifactStore, {
+                sessionId: workspaceDiagnosticsSessionId,
+                shownLimit: diagnosticDetailsShownLimit,
+                report,
+              }),
+          )
+          const boundedKnownWalls = yield* Effect.forEach(
+            workspaceKnownWalls,
+            (wall) =>
+              bindDetailsForWire(artifactStore, {
+                sessionId: workspaceDiagnosticsSessionId,
+                shownLimit: diagnosticDetailsShownLimit,
+                report: wall,
+              }),
+          )
 
           return {
             workspaceRoot: process.cwd(),
@@ -1853,8 +2029,8 @@ export const ProbeKernelLive = Layer.effect(
               artifactRetentionMs: artifactStore.getArtifactRetentionMs(),
             },
             capabilities: [...workspaceCapabilities],
-            diagnostics: workspaceDiagnostics.diagnostics,
-            knownWalls: [...workspaceKnownWalls],
+            diagnostics: boundedDiagnostics,
+            knownWalls: boundedKnownWalls,
             notes: [
               "The current control plane is daemon-backed and real for simulator sessions via either Probe's fixture build/install flow or attach-to-running against an installed app.",
               "Runner command ingress now uses the validated HTTP POST listener seam because xcodebuild stdin is still not proven at this boundary.",

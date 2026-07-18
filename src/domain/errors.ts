@@ -20,11 +20,22 @@ export class CapabilityNotReadyError extends Schema.TaggedError<CapabilityNotRea
   },
 ) {}
 
+// PRB-094 AC8: `diagnosticArtifactKey` is `Schema.optional` (not required)
+// so every pre-existing construction site across the codebase keeps
+// compiling unchanged -- only `ProbeKernel.ts`'s RPC/CLI-boundary catch step
+// (`bindErrorDetailsForWire`, services/boundedCollections.ts) ever actually
+// sets it, when `details` is large enough that it persisted the complete
+// detail list as an artifact before truncating the inline excerpt. Absent
+// (or `null`) means exactly what it always meant: `details` already is the
+// complete list, nothing was truncated.
+const DiagnosticArtifactKey = Schema.optional(Schema.Union(Schema.String, Schema.Null))
+
 export class UserInputError extends Schema.TaggedError<UserInputError>()("UserInputError", {
   code: Schema.String,
   reason: Schema.String,
   nextStep: Schema.String,
   details: Schema.Array(Schema.String),
+  diagnosticArtifactKey: DiagnosticArtifactKey,
 }) {}
 
 export class EnvironmentError extends Schema.TaggedError<EnvironmentError>()(
@@ -34,6 +45,7 @@ export class EnvironmentError extends Schema.TaggedError<EnvironmentError>()(
     reason: Schema.String,
     nextStep: Schema.String,
     details: Schema.Array(Schema.String),
+    diagnosticArtifactKey: DiagnosticArtifactKey,
   },
 ) {}
 
@@ -45,6 +57,7 @@ export class DeviceInterruptionError extends Schema.TaggedError<DeviceInterrupti
     reason: Schema.String,
     nextStep: Schema.String,
     details: Schema.Array(Schema.String),
+    diagnosticArtifactKey: DiagnosticArtifactKey,
   },
 ) {}
 
@@ -57,6 +70,7 @@ export class UnsupportedCapabilityError extends Schema.TaggedError<UnsupportedCa
     nextStep: Schema.String,
     details: Schema.Array(Schema.String),
     wall: Schema.Boolean,
+    diagnosticArtifactKey: DiagnosticArtifactKey,
   },
 ) {}
 
@@ -68,6 +82,7 @@ export class UnsupportedFlowContractError extends Schema.TaggedError<Unsupported
     reason: Schema.String,
     nextStep: Schema.String,
     details: Schema.Array(Schema.String),
+    diagnosticArtifactKey: DiagnosticArtifactKey,
   },
 ) {}
 
@@ -164,6 +179,12 @@ export interface ProbeFailurePayload {
   readonly exitCode: number | null
   readonly sessionId: string | null
   readonly artifactKey: string | null
+  // PRB-094 AC8: distinct from `artifactKey` above (which names an artifact
+  // that a lookup could not find) -- this points at the complete diagnostic
+  // artifact `bindErrorDetailsForWire` persisted when `details` was too
+  // large to inline, so a caller that only sees a truncated excerpt can
+  // still drill the full detail list instead of losing it silently.
+  readonly diagnosticArtifactKey: string | null
   readonly wall: boolean
 }
 
@@ -217,6 +238,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: null,
         wall: true,
       })
 
@@ -235,6 +257,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: error.diagnosticArtifactKey ?? null,
         wall: false,
       })
 
@@ -254,6 +277,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: error.diagnosticArtifactKey ?? null,
         wall: false,
       })
 
@@ -273,6 +297,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: error.diagnosticArtifactKey ?? null,
         wall: false,
       })
 
@@ -291,6 +316,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: error.diagnosticArtifactKey ?? null,
         wall: error.wall,
       })
 
@@ -309,6 +335,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: error.diagnosticArtifactKey ?? null,
         wall: true,
       })
 
@@ -328,6 +355,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: error.exitCode,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: null,
         wall: false,
       })
 
@@ -347,6 +375,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: null,
         wall: false,
       })
 
@@ -366,6 +395,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: null,
         wall: false,
       })
 
@@ -385,6 +415,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: null,
         artifactKey: null,
+        diagnosticArtifactKey: null,
         wall: false,
       })
 
@@ -403,6 +434,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: error.sessionId,
         artifactKey: null,
+        diagnosticArtifactKey: null,
         wall: false,
       })
 
@@ -421,6 +453,7 @@ export const toFailurePayload = (error: ProbeError): ProbeFailurePayload => {
         exitCode: null,
         sessionId: error.sessionId,
         artifactKey: error.artifactKey,
+        diagnosticArtifactKey: null,
         wall: false,
       })
   }

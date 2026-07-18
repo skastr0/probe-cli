@@ -24,9 +24,9 @@ import {
   SummaryArtifactResult,
 } from "../domain/output"
 import {
+  BoundedPerfAroundFlowResult,
   PerfAnalyzeResult,
   PerfAnalyzerName,
-  PerfAroundFlowResult,
   PerfExportResult,
   PerfRecordResult,
   PerfSignpostSummaryResult,
@@ -658,7 +658,7 @@ export const PerfAroundResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("perf.around"),
-  result: PerfAroundFlowResult,
+  result: BoundedPerfAroundFlowResult,
 })
 export type PerfAroundResponse = typeof PerfAroundResponse.Type
 
@@ -766,6 +766,11 @@ export const RpcFailure = Schema.Struct({
     exitCode: Schema.Union(Schema.Number, Schema.Null),
     sessionId: NullableString,
     artifactKey: NullableString,
+    // PRB-094 AC8: links the complete diagnostic artifact
+    // `bindErrorDetailsForWire` (services/boundedCollections.ts) persisted
+    // when `details` was too large to inline in full -- distinct from
+    // `artifactKey` above (an artifact lookup that failed).
+    diagnosticArtifactKey: NullableString,
     wall: Schema.Boolean,
   }),
 })

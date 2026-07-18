@@ -437,6 +437,7 @@ describe("rpc protocol", () => {
             exitCode: null,
             sessionId: null,
             artifactKey: null,
+            diagnosticArtifactKey: null,
             wall: false,
           },
         }),

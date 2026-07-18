@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer, ManagedRuntime } from "effect"
+import { EnvironmentError } from "../domain/errors"
 import { countLines, shouldInlineOutput } from "../domain/output"
 import { PROBE_PROTOCOL_VERSION } from "../rpc/protocol"
 import { ArtifactStore } from "./ArtifactStore"
@@ -159,7 +160,11 @@ const buildRealArtifactStore = (root: string) => {
   } as any)
 }
 
-const buildKernel = (root: string, sessionRegistryOverrides: Record<string, unknown>) => {
+const buildKernel = (
+  root: string,
+  sessionRegistryOverrides: Record<string, unknown>,
+  perfServiceOverrides: Record<string, unknown> = {},
+) => {
   const baseLayer = Layer.mergeAll(
     Layer.succeed(ArtifactStore, buildRealArtifactStore(root)),
     Layer.succeed(
@@ -170,7 +175,14 @@ const buildKernel = (root: string, sessionRegistryOverrides: Record<string, unkn
         shouldInlineBinary: () => false,
       }),
     ),
-    Layer.succeed(PerfService, PerfService.of({ record: () => Effect.die("unused perf.record") } as any)),
+    Layer.succeed(
+      PerfService,
+      PerfService.of({
+        record: () => Effect.die("unused perf.record"),
+        recordAroundFlow: () => Effect.die("unused perf.recordAroundFlow"),
+        ...perfServiceOverrides,
+      } as any),
+    ),
     Layer.succeed(SessionRegistry, SessionRegistry.of(sessionRegistryOverrides as any)),
     Layer.succeed(SimulatorHarness, SimulatorHarness.of({} as any)),
   )
@@ -371,6 +383,292 @@ describe("ProbeKernel bounded-collection RPC boundary (PRB-094)", () => {
           const page = JSON.parse(drilled.result.content) as Array<{ readonly index: number }>
           expect(page).toHaveLength(1)
           expect(page[0]?.index).toBe(10_000)
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // PRB-094 review finding: `perf.around` embeds a `FlowV2Result` inline in
+  // its response (`PerfAroundFlowResult.flow`) exactly like `session.run`
+  // does -- an equivalent flow-carrying inline RPC result, not covered by
+  // the glyph's Exclusions. This mirrors the `session.run` 10k-step test
+  // above to prove `perf.around` gets the same `bindFlowResultForWire`
+  // treatment instead of inlining every step unbounded.
+  test("perf.around stays within the generic 4 KiB / 100 line budget with a 10k-step flow", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
+
+    try {
+      const sessionId = "session-1"
+      const executedSteps = Array.from({ length: 10_000 }, (_, index) => ({
+        index: index + 1,
+        kind: "tap" as const,
+        summary: `Executed fast tap step ${index}.`,
+        verdict: "passed" as const,
+        matchedRef: null,
+        latestSnapshotId: null,
+        retryCount: 0,
+        retryReasons: [],
+        artifacts: [],
+        executionProfile: "fast" as const,
+        transportLane: "runner-single" as const,
+        handledMs: 1,
+        warnings: [],
+        evidence: { requested: { success: "none" as const, failure: "snapshot" as const }, captures: [], evidenceMs: 0 },
+        sequenceChildFailure: null,
+      }))
+      const flowResult = {
+        contract: "probe.session-flow/report-v2" as const,
+        executedAt: "2026-04-14T12:00:00.000Z",
+        sessionId,
+        summary: "Executed 10000 flow steps successfully.",
+        verdict: "passed" as const,
+        executedSteps,
+        failedStep: null,
+        retries: 0,
+        artifacts: [],
+        finalSnapshotId: null,
+        warnings: [],
+      }
+      const aroundResult = {
+        sessionId,
+        template: "logging" as const,
+        templateName: "Logging",
+        recordedAt: "2026-04-14T12:00:00.000Z",
+        xctraceVersion: "16.0",
+        session: {
+          state: "ready" as const,
+          healthCheck: { checkedAt: "2026-04-14T12:00:00.000Z", wrapperRunning: true, pingRttMs: 10, lastCommand: null, lastOk: true },
+        },
+        flow: flowResult,
+        diagnoses: [],
+        artifacts: {
+          trace: {
+            key: "logging-trace",
+            label: "logging-trace",
+            kind: "directory" as const,
+            summary: "trace",
+            absolutePath: "/tmp/probe/session-1/logging.trace",
+            relativePath: null,
+            external: false as const,
+            createdAt: "2026-04-14T12:00:00.000Z",
+          },
+          toc: {
+            key: "logging-toc",
+            label: "logging-toc",
+            kind: "json" as const,
+            summary: "toc",
+            absolutePath: "/tmp/probe/session-1/logging-toc.json",
+            relativePath: null,
+            external: false as const,
+            createdAt: "2026-04-14T12:00:00.000Z",
+          },
+        },
+      }
+
+      const runtime = buildKernel(
+        root,
+        {},
+        { recordAroundFlow: () => Effect.succeed(aroundResult) },
+      )
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+        const response: any = await runtime.runPromise(kernel.handleRpcRequest({
+          kind: "request",
+          protocolVersion: PROBE_PROTOCOL_VERSION,
+          requestId: "req-1",
+          method: "perf.around",
+          params: {
+            sessionId,
+            template: "logging",
+            flow: { contract: "probe.session-flow/v2", steps: [] },
+          },
+        }, () => {}))
+
+        const serialized = JSON.stringify(response)
+        const bytes = Buffer.byteLength(serialized, "utf8")
+        const lines = countLines(serialized)
+
+        // AC1/AC6: an equivalent inline-RPC flow-carrying result stays
+        // within budget with a 10k-step flow behind it.
+        expect(bytes).toBeLessThanOrEqual(maxInlineBytes)
+        expect(lines).toBeLessThanOrEqual(maxInlineLines)
+
+        expect(response.result.flow.executedSteps.total).toBe(10_000)
+        expect(response.result.flow.executedSteps.omitted).toBe(
+          10_000 - response.result.flow.executedSteps.shown.length,
+        )
+        expect(response.result.flow.executedSteps.drill).not.toBeNull()
+
+        const handle = response.result.flow.executedSteps.drill
+        const drilled: any = await runtime.runPromise(kernel.handleRpcRequest({
+          kind: "request",
+          protocolVersion: PROBE_PROTOCOL_VERSION,
+          requestId: "req-2",
+          method: "artifact.drill",
+          params: {
+            sessionId,
+            artifactKey: handle.artifactKey,
+            outputMode: "inline",
+            query: { kind: "collection", offset: 9_999, limit: 10 },
+          },
+        }, () => {}))
+
+        expect(drilled.result.kind).toBe("inline")
+
+        if (drilled.result.kind === "inline") {
+          const page = JSON.parse(drilled.result.content) as Array<{ readonly index: number }>
+          expect(page).toHaveLength(1)
+          expect(page[0]?.index).toBe(10_000)
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+// PRB-094 AC8 review finding: no code bounded a command/error's excerpt or
+// linked a complete diagnostic artifact for an over-large error. This
+// exercises the fix end to end through the real RPC boundary: a
+// `session.health` failure with a huge `details` array escapes
+// `handleRpcRequest`, and `boundEscapingErrorDetails` (ProbeKernel.ts)
+// bounds it and links the persisted complete diagnostic before it reaches
+// the caller -- then the linked artifact is drilled back through the same
+// `artifact.drill` RPC method every other bounded collection uses.
+describe("ProbeKernel error-details bound at the RPC boundary (PRB-094 AC8)", () => {
+  test("a session.health failure with 500 detail lines is bounded and links a drillable diagnostic artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
+
+    try {
+      const sessionId = "session-1"
+      const details = Array.from(
+        { length: 500 },
+        (_, index) => `runner ping attempt ${index} failed: connection refused`,
+      )
+
+      const runtime = buildKernel(root, {
+        getSessionHealth: () =>
+          Effect.fail(
+            new EnvironmentError({
+              code: "session-runner-ping",
+              reason: "The session runner stopped responding to health checks.",
+              nextStep: "Reopen the session.",
+              details,
+            }),
+          ),
+      })
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+        const outcome = await runtime.runPromise(
+          Effect.either(kernel.handleRpcRequest({
+            kind: "request",
+            protocolVersion: PROBE_PROTOCOL_VERSION,
+            requestId: "req-1",
+            method: "session.health",
+            params: { sessionId },
+          }, () => {})),
+        )
+
+        expect(outcome._tag).toBe("Left")
+
+        if (outcome._tag !== "Left") {
+          throw new Error("expected session.health to fail")
+        }
+
+        const error = outcome.left as EnvironmentError
+
+        // AC8: bounded excerpt, not the full 500 lines, and not a silent
+        // clip -- a real link to the complete diagnostic artifact.
+        expect(error.code).toBe("session-runner-ping")
+        expect(error.details.length).toBeLessThan(500)
+        expect(error.details).toEqual(details.slice(0, error.details.length))
+        expect(error.diagnosticArtifactKey).not.toBeNull()
+
+        // The failure itself, serialized as it would cross the wire, stays
+        // small -- the same budget concern as any bounded normal result.
+        const serialized = JSON.stringify(error)
+        expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(maxInlineBytes)
+
+        // The linked artifact resolves through the same artifact.drill RPC
+        // method every other bounded collection's overflow uses -- the
+        // complete 500-line detail list was really persisted, not dropped.
+        const drilled: any = await runtime.runPromise(kernel.handleRpcRequest({
+          kind: "request",
+          protocolVersion: PROBE_PROTOCOL_VERSION,
+          requestId: "req-2",
+          method: "artifact.drill",
+          params: {
+            sessionId,
+            artifactKey: error.diagnosticArtifactKey as string,
+            outputMode: "inline",
+            query: { kind: "collection", offset: 0, limit: 500 },
+          },
+        }, () => {}))
+
+        expect(drilled.result.kind).toBe("inline")
+
+        if (drilled.result.kind === "inline") {
+          const persisted = JSON.parse(drilled.result.content) as Array<string>
+          expect(persisted).toHaveLength(500)
+          expect(persisted).toEqual(details)
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a session.health failure with a small details array escapes unchanged", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
+
+    try {
+      const sessionId = "session-1"
+      const runtime = buildKernel(root, {
+        getSessionHealth: () =>
+          Effect.fail(
+            new EnvironmentError({
+              code: "session-runner-ping",
+              reason: "The session runner stopped responding to health checks.",
+              nextStep: "Reopen the session.",
+              details: ["connection refused"],
+            }),
+          ),
+      })
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+        const outcome = await runtime.runPromise(
+          Effect.either(kernel.handleRpcRequest({
+            kind: "request",
+            protocolVersion: PROBE_PROTOCOL_VERSION,
+            requestId: "req-1",
+            method: "session.health",
+            params: { sessionId },
+          }, () => {})),
+        )
+
+        expect(outcome._tag).toBe("Left")
+
+        if (outcome._tag === "Left") {
+          const error = outcome.left as EnvironmentError
+          expect(error.details).toEqual(["connection refused"])
+          expect(error.diagnosticArtifactKey ?? null).toBeNull()
         }
       } finally {
         await runtime.dispose()

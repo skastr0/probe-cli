@@ -2,10 +2,10 @@ import { Effect, Schema } from "effect"
 import type { AccessibilityDoctorReport } from "../../domain/accessibility"
 import type { CommerceDoctorReport, CommerceProvider, CommerceValidationMode } from "../../domain/commerce"
 import type {
+  BoundedDiagnosticReport,
   DiagnosticCaptureKind,
   DiagnosticCaptureTarget,
-  DiagnosticReport,
-  KnownWall,
+  BoundedKnownWall,
 } from "../../domain/diagnostics"
 import type { SummaryArtifactResult } from "../../domain/output"
 import type { WorkspaceStatus } from "../../domain/workspace"
@@ -39,14 +39,25 @@ const decodeDoctorAccessibilityPayload = Schema.decodeUnknownSync(DoctorAccessib
 const decodeDoctorCommercePayload = Schema.decodeUnknownSync(DoctorCommercePayload)
 const decodeDoctorCapturePayload = Schema.decodeUnknownSync(DoctorCapturePayload)
 
-const formatDiagnostic = (diagnostic: DiagnosticReport): Array<string> => [
-  `- ${diagnostic.key} [${diagnostic.status}] ${diagnostic.summary}`,
-  ...diagnostic.details.map((detail) => `  - ${detail}`),
+// PRB-094: `details` is now a bounded collection (total/shown/omitted/drill,
+// domain/bounded.ts) -- mirrors the `session health`/`session run` text
+// formatters' "N of total, M omitted -- drill <key>" idiom (cli/commands/
+// session.ts) instead of assuming every detail line is present inline.
+const formatBoundedDetails = (details: BoundedDiagnosticReport["details"]): Array<string> => [
+  ...details.shown.map((detail) => `  - ${detail}`),
+  ...(details.omitted > 0
+    ? [`  - ${details.omitted} more omitted -- drill ${details.drill?.artifactKey}`]
+    : []),
 ]
 
-const formatKnownWall = (wall: KnownWall): Array<string> => [
+const formatDiagnostic = (diagnostic: BoundedDiagnosticReport): Array<string> => [
+  `- ${diagnostic.key} [${diagnostic.status}] ${diagnostic.summary}`,
+  ...formatBoundedDetails(diagnostic.details),
+]
+
+const formatKnownWall = (wall: BoundedKnownWall): Array<string> => [
   `- ${wall.key}: ${wall.summary}`,
-  ...wall.details.map((detail) => `  - ${detail}`),
+  ...formatBoundedDetails(wall.details),
 ]
 
 const formatWorkspaceStatus = (status: WorkspaceStatus): string => {

@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { ArtifactRecord } from "./output"
-import { SessionFlowResultSchema } from "./flow-v2"
+import { BoundedFlowV2ResultSchema, SessionFlowResultSchema } from "./flow-v2"
 import { SessionHealthCheck, SessionPhase } from "./session"
 
 const perfTemplateValues = [
@@ -119,6 +119,24 @@ export const PerfAroundFlowResult = Schema.Struct({
   artifacts: PerfAroundFlowArtifacts,
 })
 export type PerfAroundFlowResult = typeof PerfAroundFlowResult.Type
+
+// PRB-094: `PerfAroundFlowResult` above is `PerfService.recordAroundFlow`'s
+// *internal* return shape -- it embeds the same unbounded `flow` (a full
+// `SessionFlowResult`, `executedSteps`/`artifacts`/`warnings` inline) that
+// `SessionRegistry.runFlow` returns, since `PerfService` needs the whole
+// flow result to build `diagnoses` from it. Only the outermost RPC response
+// (built in `ProbeKernel.ts`'s `perf.around` handler, the one place this
+// result actually gets serialized to a caller) swaps embedded `flow` for its
+// bounded-collection form via the same `bindFlowResultForWire` step
+// `session.run` already uses -- otherwise a 10k-step flow run under
+// `perf.around` would inline every step and blow past the generic
+// 4 KiB / 100 line inline budget the same way an unbounded `session.run`
+// response would.
+export const BoundedPerfAroundFlowResult = Schema.Struct({
+  ...PerfAroundFlowResult.fields,
+  flow: BoundedFlowV2ResultSchema,
+})
+export type BoundedPerfAroundFlowResult = typeof BoundedPerfAroundFlowResult.Type
 
 export const PerfSummaryGroupBy = Schema.Literal("signpost")
 export type PerfSummaryGroupBy = typeof PerfSummaryGroupBy.Type
