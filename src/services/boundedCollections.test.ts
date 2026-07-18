@@ -1,13 +1,16 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { defaultCollectionDrillPageSize } from "../domain/bounded"
-import { EnvironmentError } from "../domain/errors"
+import { ArtifactNotFoundError, EnvironmentError, UserInputError } from "../domain/errors"
 import type { ArtifactRecord } from "../domain/output"
 import { countLines } from "../domain/output"
 import {
   bindBoundedCollection,
+  bindDetailBearingErrorForWire,
   bindDetailsForWire,
+  bindEscapingErrorForWire,
   bindErrorDetailsForWire,
+  isDetailBearingProbeError,
   type BoundedCollectionArtifactWriter,
 } from "./boundedCollections"
 
@@ -294,5 +297,187 @@ describe("bindErrorDetailsForWire", () => {
       expect(failure).toBeInstanceOf(EnvironmentError)
       expect((failure as EnvironmentError).code).toBe("artifact-write-failed")
     }
+  })
+})
+
+// PRB-094 AC8 review finding (major): `bindErrorDetailsForWire` above was
+// only ever reached through `ProbeKernel.ts`'s `handleRpcRequest` catch
+// step, so any escaping error that never transits the RPC socket --
+// `getWorkspaceStatus`'s own failure path, and `doctor
+// accessibility|commerce`/`validate accessibility|commerce`'s in-process
+// `AccessibilityService`/`CommerceService` calls -- inlined the full,
+// unbounded excerpt with no `diagnosticArtifactKey`. `isDetailBearingProbeError`/
+// `bindDetailBearingErrorForWire`/`bindEscapingErrorForWire` are the
+// sessionId-parameterized, boundary-agnostic fix: the exact reconstruction
+// `ProbeKernel.ts` used to keep private to its own closure, now reusable
+// from any boundary.
+describe("isDetailBearingProbeError", () => {
+  test("recognizes every detail-bearing tag and rejects everything else", () => {
+    expect(isDetailBearingProbeError({ _tag: "UserInputError" })).toBe(true)
+    expect(isDetailBearingProbeError({ _tag: "EnvironmentError" })).toBe(true)
+    expect(isDetailBearingProbeError({ _tag: "DeviceInterruptionError" })).toBe(true)
+    expect(isDetailBearingProbeError({ _tag: "UnsupportedCapabilityError" })).toBe(true)
+    expect(isDetailBearingProbeError({ _tag: "ArtifactNotFoundError" })).toBe(false)
+    expect(isDetailBearingProbeError({ _tag: "SessionNotFoundError" })).toBe(false)
+  })
+})
+
+describe("bindDetailBearingErrorForWire", () => {
+  test("passes a small details array through unchanged, with no artifact write", async () => {
+    let writeCalls = 0
+    const writer: BoundedCollectionArtifactWriter = {
+      writeDerivedOutput: () => {
+        writeCalls += 1
+        return Effect.die("writeDerivedOutput should not be called when details already fit the limit")
+      },
+    }
+
+    const error = new EnvironmentError({
+      code: "session-runner-ping",
+      reason: "The session runner stopped responding to health checks.",
+      nextStep: "Reopen the session.",
+      details: ["connection refused"],
+    })
+
+    const exit = await Effect.runPromiseExit(
+      bindDetailBearingErrorForWire(writer, { sessionId: "session-1", shownLimit: 20, error }),
+    )
+
+    expect(exit._tag).toBe("Failure")
+    const failure = exit._tag === "Failure" && exit.cause._tag === "Fail" ? exit.cause.error : null
+    expect(failure).toBe(error)
+    expect(writeCalls).toBe(0)
+  })
+
+  test("bounds the excerpt and links the complete diagnostic artifact once details overflow", async () => {
+    let persistedContent: string | null = null
+    const writer: BoundedCollectionArtifactWriter = {
+      writeDerivedOutput: (args) => {
+        persistedContent = args.content
+        return Effect.succeed(makeArtifact("error-session-runner-ping-details-overflow"))
+      },
+    }
+
+    const details = Array.from({ length: 500 }, (_, index) => `runner ping attempt ${index} failed: connection refused`)
+    const error = new EnvironmentError({
+      code: "session-runner-ping",
+      reason: "The session runner stopped responding to health checks.",
+      nextStep: "Reopen the session.",
+      details,
+    })
+
+    const exit = await Effect.runPromiseExit(
+      bindDetailBearingErrorForWire(writer, { sessionId: "session-1", shownLimit: 20, error }),
+    )
+
+    expect(exit._tag).toBe("Failure")
+    const failure = exit._tag === "Failure" && exit.cause._tag === "Fail" ? (exit.cause.error as EnvironmentError) : null
+    expect(failure).not.toBeNull()
+    expect(failure?.details).toEqual(details.slice(0, 20))
+    expect(failure?.diagnosticArtifactKey).toBe("error-session-runner-ping-details-overflow")
+    expect(failure?.code).toBe("session-runner-ping")
+
+    const persisted = JSON.parse(persistedContent as unknown as string) as Array<string>
+    expect(persisted).toHaveLength(500)
+    expect(persisted).toEqual(details)
+  })
+
+  // PRB-094 AC7 review finding (minor): when persisting the overflow itself
+  // fails, the old fallback silently sliced to `shownLimit` with
+  // `diagnosticArtifactKey: null` -- a caller saw a truncated error with no
+  // link and no signal that anything was dropped. The fix keeps the
+  // original error (never masks it with an unrelated persist failure) but
+  // makes the drop observable: the last inlined line names how many lines
+  // were dropped and why.
+  test("AC7: a persist failure degrades to an excerpt that names the drop instead of silently clipping", async () => {
+    const writer: BoundedCollectionArtifactWriter = {
+      writeDerivedOutput: () =>
+        Effect.fail(
+          new EnvironmentError({
+            code: "artifact-write-failed",
+            reason: "disk full",
+            nextStep: "Free disk space and retry.",
+            details: [],
+          }),
+        ),
+    }
+
+    const details = Array.from({ length: 500 }, (_, index) => `runner ping attempt ${index} failed: connection refused`)
+    const error = new EnvironmentError({
+      code: "session-runner-ping",
+      reason: "The session runner stopped responding to health checks.",
+      nextStep: "Reopen the session.",
+      details,
+    })
+
+    const exit = await Effect.runPromiseExit(
+      bindDetailBearingErrorForWire(writer, { sessionId: "session-1", shownLimit: 20, error }),
+    )
+
+    expect(exit._tag).toBe("Failure")
+    const failure = exit._tag === "Failure" && exit.cause._tag === "Fail" ? (exit.cause.error as EnvironmentError) : null
+    expect(failure).not.toBeNull()
+    // Never masked by the unrelated persist failure -- the original error's
+    // code/reason survive.
+    expect(failure?.code).toBe("session-runner-ping")
+    expect(failure?.diagnosticArtifactKey ?? null).toBeNull()
+    // The excerpt itself stays at the shown limit...
+    expect(failure?.details).toHaveLength(20)
+    // ...but the last line is not a silently-dropped 20th original detail
+    // line -- it explicitly names how many lines were omitted and why.
+    expect(failure?.details.slice(0, 19)).toEqual(details.slice(0, 19))
+    expect(failure?.details[19]).toContain("481 more detail line(s) omitted")
+    expect(failure?.details[19]).toContain("disk full")
+  })
+})
+
+describe("bindEscapingErrorForWire", () => {
+  test("passes a non-detail-bearing error through unchanged, with no artifact write", async () => {
+    let writeCalls = 0
+    const writer: BoundedCollectionArtifactWriter = {
+      writeDerivedOutput: () => {
+        writeCalls += 1
+        return Effect.die("writeDerivedOutput should not be called for a non-detail-bearing error")
+      },
+    }
+
+    const error = new ArtifactNotFoundError({
+      sessionId: "session-1",
+      artifactKey: "missing-artifact",
+      nextStep: "Check the artifact key and retry.",
+    })
+
+    const exit = await Effect.runPromiseExit(
+      bindEscapingErrorForWire(writer, { sessionId: "session-1", shownLimit: 20 }, error),
+    )
+
+    expect(exit._tag).toBe("Failure")
+    const failure = exit._tag === "Failure" && exit.cause._tag === "Fail" ? exit.cause.error : null
+    expect(failure).toBe(error)
+    expect(writeCalls).toBe(0)
+  })
+
+  test("bounds a detail-bearing error's overflow the same way bindDetailBearingErrorForWire does", async () => {
+    const writer: BoundedCollectionArtifactWriter = {
+      writeDerivedOutput: (args) => Effect.succeed(makeArtifact(args.label)),
+    }
+
+    const details = Array.from({ length: 100 }, (_, index) => `bad input ${index}`)
+    const error = new UserInputError({
+      code: "invalid-plan",
+      reason: "The commerce plan failed validation.",
+      nextStep: "Fix the reported plan entries and retry.",
+      details,
+    })
+
+    const exit = await Effect.runPromiseExit(
+      bindEscapingErrorForWire(writer, { sessionId: "session-1", shownLimit: 20 }, error),
+    )
+
+    expect(exit._tag).toBe("Failure")
+    const failure = exit._tag === "Failure" && exit.cause._tag === "Fail" ? (exit.cause.error as UserInputError) : null
+    expect(failure).not.toBeNull()
+    expect(failure?.details).toEqual(details.slice(0, 20))
+    expect(failure?.diagnosticArtifactKey).not.toBeNull()
   })
 })

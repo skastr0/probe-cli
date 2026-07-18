@@ -97,7 +97,7 @@ const baseHealthFields = (sessionId: string, artifacts: ReadonlyArray<unknown>, 
  * `getArtifact`/`artifact.drill` can resolve it right back -- unlike
  * ProbeKernel.test.ts's simpler stubs, this one needs to survive an actual
  * atomic-persist-then-drill round trip. */
-const buildRealArtifactStore = (root: string) => {
+const buildRealArtifactStore = (root: string, artifactStoreOverrides: Record<string, unknown> = {}) => {
   const catalog = new Map<string, { readonly key: string; readonly label: string; readonly kind: "json"; readonly summary: string; readonly absolutePath: string; readonly relativePath: null; readonly external: false; readonly createdAt: string }>()
 
   return ArtifactStore.of({
@@ -157,6 +157,7 @@ const buildRealArtifactStore = (root: string) => {
     writeDaemonMetadata: () => Effect.void,
     syncDaemonSessionMetadata: () => Effect.void,
     pruneExpiredSessions: () => Effect.void,
+    ...artifactStoreOverrides,
   } as any)
 }
 
@@ -164,9 +165,10 @@ const buildKernel = (
   root: string,
   sessionRegistryOverrides: Record<string, unknown>,
   perfServiceOverrides: Record<string, unknown> = {},
+  artifactStoreOverrides: Record<string, unknown> = {},
 ) => {
   const baseLayer = Layer.mergeAll(
-    Layer.succeed(ArtifactStore, buildRealArtifactStore(root)),
+    Layer.succeed(ArtifactStore, buildRealArtifactStore(root, artifactStoreOverrides)),
     Layer.succeed(
       OutputPolicy,
       OutputPolicy.of({
@@ -669,6 +671,128 @@ describe("ProbeKernel error-details bound at the RPC boundary (PRB-094 AC8)", ()
           const error = outcome.left as EnvironmentError
           expect(error.details).toEqual(["connection refused"])
           expect(error.diagnosticArtifactKey ?? null).toBeNull()
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+// PRB-094 AC8 review finding (major): the AC8 bounding above was wired only
+// into `handleRpcRequest`'s catchAll, so it covered errors that transit the
+// daemon RPC socket. `getWorkspaceStatus` never transits that socket --
+// `probe doctor`/`probe capabilities` call it in-process -- so an escaping
+// `EnvironmentError` from it (e.g. `collectWorkspaceDiagnostics` failing to
+// read persisted session state) inlined its full, unbounded `details` with
+// no `diagnosticArtifactKey`. This exercises `getWorkspaceStatus` directly
+// (not through `handleRpcRequest`) to prove it now gets the same
+// bound-or-link treatment.
+describe("ProbeKernel.getWorkspaceStatus error-details bound in-process (PRB-094 AC8 review fix)", () => {
+  test("an EnvironmentError from collectWorkspaceDiagnostics with 500 detail lines is bounded and links a drillable diagnostic artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
+
+    try {
+      const details = Array.from(
+        { length: 500 },
+        (_, index) => `session manifest ${index} could not be read: corrupt JSON`,
+      )
+
+      const runtime = buildKernel(root, {}, {}, {
+        listPersistedSessions: () =>
+          Effect.fail(
+            new EnvironmentError({
+              code: "session-listing-failed",
+              reason: "Could not list persisted sessions.",
+              nextStep: "Inspect the artifact root's session directories for corruption.",
+              details,
+            }),
+          ),
+      })
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+        const outcome = await runtime.runPromise(Effect.either(kernel.getWorkspaceStatus()))
+
+        expect(outcome._tag).toBe("Left")
+
+        if (outcome._tag !== "Left") {
+          throw new Error("expected getWorkspaceStatus to fail")
+        }
+
+        const error = outcome.left
+
+        // AC8: bounded excerpt, not the full 500 lines, and a real link to
+        // the complete diagnostic artifact -- exactly like the RPC-boundary
+        // case above, even though this call never touched the RPC socket.
+        expect(error.code).toBe("session-listing-failed")
+        expect(error.details.length).toBeLessThan(500)
+        expect(error.details).toEqual(details.slice(0, error.details.length))
+        expect(error.diagnosticArtifactKey).not.toBeNull()
+
+        // The linked artifact resolves through the same artifact.drill RPC
+        // method every other bounded collection's overflow uses, scoped
+        // under `workspaceDiagnosticsSessionId` since there is no single
+        // session behind a workspace-wide diagnostic.
+        const drilled: any = await runtime.runPromise(kernel.handleRpcRequest({
+          kind: "request",
+          protocolVersion: PROBE_PROTOCOL_VERSION,
+          requestId: "req-1",
+          method: "artifact.drill",
+          params: {
+            sessionId: "workspace-diagnostics",
+            artifactKey: error.diagnosticArtifactKey as string,
+            outputMode: "inline",
+            query: { kind: "collection", offset: 0, limit: 500 },
+          },
+        }, () => {}))
+
+        expect(drilled.result.kind).toBe("inline")
+
+        if (drilled.result.kind === "inline") {
+          const persisted = JSON.parse(drilled.result.content) as Array<string>
+          expect(persisted).toHaveLength(500)
+          expect(persisted).toEqual(details)
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("an EnvironmentError with a small details array escapes unchanged", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
+
+    try {
+      const runtime = buildKernel(root, {}, {}, {
+        listPersistedSessions: () =>
+          Effect.fail(
+            new EnvironmentError({
+              code: "session-listing-failed",
+              reason: "Could not list persisted sessions.",
+              nextStep: "Inspect the artifact root's session directories for corruption.",
+              details: ["corrupt JSON"],
+            }),
+          ),
+      })
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+        const outcome = await runtime.runPromise(Effect.either(kernel.getWorkspaceStatus()))
+
+        expect(outcome._tag).toBe("Left")
+
+        if (outcome._tag === "Left") {
+          expect(outcome.left.details).toEqual(["corrupt JSON"])
+          expect(outcome.left.diagnosticArtifactKey ?? null).toBeNull()
         }
       } finally {
         await runtime.dispose()

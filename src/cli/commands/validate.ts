@@ -15,6 +15,7 @@ import {
 import { UserInputError } from "../../domain/errors"
 import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
+import { boundCliEscapingError } from "../errorBounding"
 import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
@@ -189,7 +190,9 @@ export const runValidateCommand = (args: ReadonlyArray<string>) =>
         const report = yield* accessibility.validate({
           sessionId,
           scope: scope as AccessibilityScope,
-        })
+        }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(sessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatAccessibilityValidationReport(report))
@@ -226,7 +229,9 @@ export const runValidateCommand = (args: ReadonlyArray<string>) =>
           mode,
           provider,
           plan,
-        })
+        }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(sessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatValidationReport(report))

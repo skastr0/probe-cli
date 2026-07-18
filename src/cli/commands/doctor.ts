@@ -12,7 +12,8 @@ import type { WorkspaceStatus } from "../../domain/workspace"
 import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
 import { DaemonClient } from "../../services/DaemonClient"
-import { ProbeKernel } from "../../services/ProbeKernel"
+import { ProbeKernel, workspaceDiagnosticsSessionId } from "../../services/ProbeKernel"
+import { boundCliEscapingError } from "../errorBounding"
 import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
@@ -234,7 +235,9 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
         const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
         const asJson = hasMachineJsonOutput(rest)
         const accessibility = yield* AccessibilityService
-        const report = yield* accessibility.doctor({ sessionId })
+        const report = yield* accessibility.doctor({ sessionId }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(sessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatAccessibilityDoctorReport(report))
@@ -257,7 +260,9 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
           mode,
           provider,
           storekitConfigPath,
-        })
+        }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(workspaceDiagnosticsSessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatCommerceDoctorReport(report))

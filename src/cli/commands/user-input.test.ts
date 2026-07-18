@@ -8,6 +8,7 @@ import { boundedCollectionAllShown } from "../../domain/bounded"
 import type { BoundedFlowV2Result } from "../../domain/flow-v2"
 import type { DrillQuery, OutputMode } from "../../domain/output"
 import { AccessibilityService } from "../../services/AccessibilityService"
+import { ArtifactStore } from "../../services/ArtifactStore"
 import { CommerceService } from "../../services/CommerceService"
 import { DaemonClient } from "../../services/DaemonClient"
 import { ProbeKernel } from "../../services/ProbeKernel"
@@ -23,6 +24,7 @@ const unexpectedClientCall = () => {
 const neverUsedProbeKernel = ProbeKernel.of({} as any)
 const neverUsedAccessibilityService = AccessibilityService.of({} as any)
 const neverUsedCommerceService = CommerceService.of({} as any)
+const neverUsedArtifactStore = ArtifactStore.of({} as any)
 
 type CapturedOpenParams = {
   readonly target: "simulator" | "device"
@@ -1048,6 +1050,7 @@ describe("cli user input handling", () => {
           Effect.provideService(ProbeKernel, neverUsedProbeKernel),
           Effect.provideService(AccessibilityService, neverUsedAccessibilityService),
           Effect.provideService(CommerceService, neverUsedCommerceService),
+          Effect.provideService(ArtifactStore, neverUsedArtifactStore),
         ),
       ),
     )
@@ -1071,6 +1074,7 @@ describe("cli user input handling", () => {
           Effect.provideService(ProbeKernel, neverUsedProbeKernel),
           Effect.provideService(AccessibilityService, neverUsedAccessibilityService),
           Effect.provideService(CommerceService, neverUsedCommerceService),
+          Effect.provideService(ArtifactStore, neverUsedArtifactStore),
         ),
       ),
     )
