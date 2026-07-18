@@ -1,6 +1,6 @@
 # XCUITest Runner Integration Notes
 
-Updated: 2026-04-09
+Updated: 2026-07-18 (PRB-092)
 
 ## Observed facts that affect integration
 
@@ -322,3 +322,154 @@ container, empirically also matches on accessibility *label* — see
 `api-notes.md`'s `XCUIElementQuery` section for the full caveat and why
 `boundedSectionMatches`'s 2-match ambiguity stop is what actually protects
 correctness here, not identifier-only precision.
+
+## PRB-092: `uiActionBatch` and `multiTap`
+
+Closes the defect PRB-078's implementation note claimed but never actually
+shipped: production Swift had `case "uiAction"` and no `case "uiActionBatch"`,
+and no first-class multi-tap gesture. Both now exist in
+`AttachControlSpikeUITests.swift`:
+
+- `handleLifecycleCommand`'s new `case "uiActionBatch"` decodes a
+  `RunnerUIActionBatchPayload` (`{actions: [...]}`, each child either a
+  duration-only `{kind:"wait", timeoutMs}` or a full `RunnerUIActionPayload`),
+  runs `performRunnerUIActionBatch`, which executes children **in order** and
+  **stops at the first failure** — never attempts a later child once an
+  earlier one has thrown.
+- `LifecycleCommandResult`/`LifecycleResponseFrame` gained `ok`,
+  `errorMessage`/`error`, `failedActionIndex`, `failedActionKind`,
+  `totalHandledMs`, and `childHandledMs`. Critically, a batch that fails
+  partway through returns a normal (non-thrown) result with `ok: false` and
+  full partial-completion telemetry — the prior single-command shape (throw
+  on failure, caught by `executeLifecycleCommandFrame`'s catch branch) would
+  have discarded all of that telemetry, which is exactly the "never reports
+  the whole batch unexecuted after child mutation" acceptance criterion.
+- `multiTap` is a new `RunnerUIActionPayload.kind`, decoded through the exact
+  same `RunnerUIActionPayload` shape as `tap`/`press`/`swipe`/`type`/`scroll`
+  (two new optional fields, `tapCount`/`interTapDelayMs`, populated only for
+  this kind) — the "one domain schema for direct action and batch child"
+  acceptance criterion is structural, not a separate code path: a `multiTap`
+  batch child is built by the exact same
+  `buildDirectRunnerUiActionPayload`/`buildRunnerUiActionPayloadWithLocator`
+  the direct-action lane uses (see `src/domain/action.ts` and
+  `src/services/flow/batchActionExecutor.ts`).
+- `performRunnerUIAction`'s new `"multiTap"` case resolves the locator
+  **exactly once** (the existing `resolveUIActionElement`/
+  `resolveUIActionCoordinate` calls above the per-kind switch, unchanged),
+  then loops `tapCount` discrete `target.tap()` calls with a
+  `RunLoop.current.run(until:)` sleep of `interTapDelayMs` between
+  consecutive taps (not after the last one). This is deliberately **not**
+  `XCUIElement.tapWithNumberOfTaps(_:numberOfTouches:)` — that native gesture
+  exposes no inter-tap timing control at all, so it cannot satisfy "bounded
+  inter-tap delay" as a caller-controlled parameter.
+- Bounds: `tapCount` 2...20, `interTapDelayMs` 0...500ms, enforced in both
+  layers — `MultiTapCountSchema`/`MultiTapInterTapDelayMsSchema` in
+  `src/domain/action.ts` (a typed `ParseError` before a command ever reaches
+  the runner) and `multiTapCountRange`/`multiTapInterTapDelayMsRange` in the
+  runner itself (defense-in-depth against a hand-built payload that bypassed
+  the host's schema).
+- `RUNNER_CAPABILITY_REGISTRY`'s `uiActionBatch` entry flipped to
+  `implementedInSwift: true` (`src/services/runnerCapabilities.ts`) only
+  after the boundary tests below passed; the ready frame's
+  `advertisedRunnerCapabilities` now includes `uiActionBatch` alongside
+  `uiAction`. `KNOWN_PENDING_CAPABILITY_EXAMPLES` (`flowExampleInventory.ts`)
+  is now empty — `sequence-batch-v2.json` runs as a real pass, not a
+  documented skip.
+
+### ProbeFixture: the five-tap recognizer
+
+`multiTapButton`/`multiTapStatusLabel` (`fixture.gesture.multiTapTarget` /
+`fixture.gesture.multiTapStatus`) implement a declared "N taps inside a
+window" recognizer (`FixtureViewController.handleMultiTapTarget`) —
+deliberately not a `UITapGestureRecognizer(numberOfTapsRequired:)`, since a
+native multi-tap gesture recognizer's own timing constants are private and
+not something Probe's fixture controls or can cite. The window itself is a
+declared constant (`multiTapWindowSeconds`), tracked against tap timestamps
+relative to the first tap in the current run.
+
+**Window sizing required a real correction.** An initial 3.0s estimate
+(reasoned from "5 taps × up to a 500ms programmed `interTapDelayMs`, plus
+slack") was wrong: a measured 100-iteration run at `interTapDelayMs: 40`
+consistently spanned ~2.9-3.0s from first tap to fifth — right at the 3.0s
+boundary — and produced a real, reproducible flake at iteration 93/100
+(`XCTAssertTrue failed … Expected multi-tap iteration 93/100 to recognize
+exactly five taps inside the declared window`). The root cause: XCUITest's
+own per-`tap()` cross-process synchronization/quiescence wait (the same
+fixed cost the PRB-091 section above measured for element resolution)
+dominates real elapsed time far more than the programmed
+`interTapDelayMs` does — each discrete `tap()` call costs on the order of a
+few hundred ms of XCUITest overhead alone, regardless of the requested
+delay. `multiTapWindowSeconds` was corrected to 6.0s (~2x the measured
+typical span) and a full 100-iteration rerun passed 100/100 with no flake.
+
+### Measured receipts (2026-07-18, Simulator, iPhone 17 Pro, iOS 26.5)
+
+- `testUIActionBatchExecutesChildrenInOrderAndStopsAtFirstFailure`: a
+  3-child batch (tap toggle / tap a nonexistent identifier / tap toggle
+  again) reports `completedCount: 1`, `failedActionIndex: 1`,
+  `failedActionKind: "tap"`, `childHandledMs.count: 2` (never a third
+  entry), and the toggle's value confirms the third child never ran.
+- `testUIActionBatchMultiTapChildRecognizesFiveTapsThroughOneDomainSchema`:
+  a single-child batch containing a `multiTap` (tapCount 5) recognizes all
+  five taps, proving the batch-child and direct-action shapes share one
+  schema end to end.
+- `testUIActionMultiTapAppliesBoundedDiscreteTapsAndRejectsOutOfBoundsInput`:
+  a valid five-tap multiTap recognizes; both bound edges
+  (`interTapDelayMs: 0` and `interTapDelayMs: 500`) still recognize all five
+  taps (the empirical grounding for the declared bound, not just that the
+  bound is enforced); `tapCount` 1/21 and `interTapDelayMs` -1/501 are all
+  rejected with a typed error naming the offending field, and none of the
+  rejected attempts touch the fixture.
+- `testUIActionBatchAtTheHTTPBoundaryIsOneRPCWithReplaySafeRedelivery`: one
+  `postLifecycleCommand` POST (one RPC) produces the whole five-tap
+  `multiTap` gesture over the real HTTP command server; the ready frame
+  advertises `uiActionBatch`; redelivering the identical
+  `(sequence, epoch)` replays the cached response (`replayStatus:
+  "cached-replay"`, byte-identical `recordedAt`/`childHandledMs`) rather
+  than re-executing — the same `RunnerReplayCoordinator` dispatch
+  `testCommandLoopReplaySafety` already proves generically for every action
+  kind, confirmed here specifically for `uiActionBatch`.
+- `testFixtureFiveTapRecognizerPassesRepeatedWarmMultiTapActions`: **100/100**
+  Simulator runs recognized all five taps (acceptance criterion met in
+  full) over a 100-iteration in-process loop (mirrors PRB-091's benchmark
+  shape — one long-lived XCUITest process, not 100 separate `xcodebuild`
+  invocations) plus a 20-burst baseline of five separate single-tap
+  `uiAction` calls at the same target. Two full runs, both 100/100:
+  - Run 1 (before the window fix, see above): `multi_tap_p95_ms≈5876`,
+    `baseline_five_separate_taps_p95_ms≈8080` (~1.37x faster).
+  - Run 2 (final committed state, `multiTapWindowSeconds: 6.0`):
+    `multi_tap_p95_ms≈6505`, `baseline_five_separate_taps_p95_ms≈8065`
+    (~1.24x faster).
+  - Both runs: multiTap is genuinely, consistently faster, **but neither
+    clears the glyph's "at least 3x faster" target**.
+  - Root cause (see the window-sizing paragraph above for the same
+    underlying fact): the dominant cost per tap is XCUITest's own
+    synchronization wait, paid once per discrete `tap()` dispatch whether
+    that tap happens inside `multiTap`'s loop or as a separate command.
+    `multiTap`'s real, structural savings is avoiding four extra
+    `resolveUIActionElement` + hittability-recheck cycles — genuine, but
+    small relative to the per-tap dispatch cost that both paths pay
+    identically five times over.
+  - This is an architectural ceiling of this host/XCUITest version, not a
+    Probe defect, and not something a different `interTapDelayMs` choice
+    would fix (the delay is a small fraction of the per-tap cost). The
+    acceptance criterion's underlying assumption — that resolution/wait
+    dominates and batching would yield a large multiple — does not hold for
+    this fixture on this host; the honest, measured finding overturns it.
+    The committed test asserts what is actually true (≥1.2x faster,
+    comfortably under both measured runs' ~1.24-1.37x) rather than a false
+    3x.
+
+### Real-device attempt (PRB-092)
+
+One bounded attempt was made against the connected iPhone 13 Pro per this
+glyph's PHYSICAL-DEVICE gate instruction; it failed at destination
+resolution (`The developer disk image could not be mounted on this
+device.`) before any signing step, and this host also has no
+`DEVELOPMENT_TEAM` set. See
+`knowledge/devicectl-device-signing/integration-notes.md`'s "PRB-092"
+section for the full command/output. The Ripple 20/20 physical-device gate
+and the physical-device half of "real Simulator and physical-device
+boundary tests replace fake-only proof" stay **partial**: implemented and
+Simulator-boundary-tested, not exercised against real hardware on this
+host.

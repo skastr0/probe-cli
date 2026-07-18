@@ -6,6 +6,7 @@ import {
   FlowAssertStepSchema,
   FlowFailedStepSchema,
   FlowLogMarkStepSchema,
+  FlowMultiTapStepSchema,
   FlowScreenshotStepSchema,
   FlowSleepStepSchema,
   FlowSnapshotStepSchema,
@@ -19,6 +20,8 @@ import {
   FlowWaitStepSchema,
   flowStepToSessionAction,
   isFlowSessionActionStep,
+  MultiTapCountSchema,
+  MultiTapInterTapDelayMsSchema,
   type ActionSelector,
   type FlowSessionActionStep,
   type FlowStep,
@@ -65,6 +68,7 @@ const normalizeActionLikeInput = (value: unknown): unknown => {
 
   if (
     value.kind === "tap"
+    || value.kind === "multiTap"
     || value.kind === "press"
     || value.kind === "swipe"
     || value.kind === "type"
@@ -150,12 +154,13 @@ export type FlowTransportLane = typeof FlowTransportLaneSchema.Type
 export const FlowSequenceCheckpointPolicySchema = Schema.Literal("none", "end")
 export type FlowSequenceCheckpointPolicy = typeof FlowSequenceCheckpointPolicySchema.Type
 
-export const FlowSequenceActionKindSchema = Schema.Literal("tap", "press", "swipe", "type", "scroll", "wait")
+export const FlowSequenceActionKindSchema = Schema.Literal("tap", "multiTap", "press", "swipe", "type", "scroll", "wait")
 export type FlowSequenceActionKind = typeof FlowSequenceActionKindSchema.Type
 
 export const FlowV2StepKindSchema = Schema.Literal(
   "snapshot",
   "tap",
+  "multiTap",
   "press",
   "swipe",
   "type",
@@ -175,6 +180,17 @@ export const FlowSequenceTapActionSchema = Schema.Struct({
   target: ActionSelectorSchema,
 })
 export type FlowSequenceTapAction = typeof FlowSequenceTapActionSchema.Type
+
+// PRB-092: same tapCount/interTapDelayMs bounds as MultiTapActionSchema
+// (action.ts) — the batch-child and direct-action shapes of multiTap share
+// one declared bound so they can never drift apart.
+export const FlowSequenceMultiTapActionSchema = Schema.Struct({
+  kind: Schema.Literal("multiTap"),
+  target: ActionSelectorSchema,
+  tapCount: MultiTapCountSchema,
+  interTapDelayMs: MultiTapInterTapDelayMsSchema,
+})
+export type FlowSequenceMultiTapAction = typeof FlowSequenceMultiTapActionSchema.Type
 
 export const FlowSequencePressActionSchema = Schema.Struct({
   kind: Schema.Literal("press"),
@@ -217,6 +233,7 @@ export type FlowSequenceWaitAction = typeof FlowSequenceWaitActionSchema.Type
 
 export const FlowSequenceActionSchema = Schema.Union(
   FlowSequenceTapActionSchema,
+  FlowSequenceMultiTapActionSchema,
   FlowSequencePressActionSchema,
   FlowSequenceSwipeActionSchema,
   FlowSequenceTypeActionSchema,
@@ -236,6 +253,12 @@ export const FlowV2TapStepSchema = Schema.Struct({
   execution: OptionalExecutionProfile,
 })
 export type FlowV2TapStep = typeof FlowV2TapStepSchema.Type
+
+export const FlowV2MultiTapStepSchema = Schema.Struct({
+  ...FlowMultiTapStepSchema.fields,
+  execution: OptionalExecutionProfile,
+})
+export type FlowV2MultiTapStep = typeof FlowV2MultiTapStepSchema.Type
 
 export const FlowV2PressStepSchema = Schema.Struct({
   ...FlowPressStepSchema.fields,
@@ -308,6 +331,7 @@ export type FlowSequenceStep = typeof FlowSequenceStepSchema.Type
 
 export const FlowV2SessionActionStepSchema = Schema.Union(
   FlowV2TapStepSchema,
+  FlowV2MultiTapStepSchema,
   FlowV2PressStepSchema,
   FlowV2SwipeStepSchema,
   FlowV2TypeStepSchema,
@@ -329,7 +353,7 @@ export const FlowV2StepSchema = Schema.Union(
 export type FlowV2Step = typeof FlowV2StepSchema.Type
 
 export type FlowV2NonSequenceStep = Exclude<FlowV2Step, FlowSequenceStep>
-export type FlowV2FastSingleStep = FlowV2TapStep | FlowV2PressStep | FlowV2SwipeStep | FlowV2TypeStep | FlowV2ScrollStep | FlowV2WaitStep
+export type FlowV2FastSingleStep = FlowV2TapStep | FlowV2MultiTapStep | FlowV2PressStep | FlowV2SwipeStep | FlowV2TypeStep | FlowV2ScrollStep | FlowV2WaitStep
 
 export const FlowV2ContractSchema = Schema.Struct({
   contract: Schema.Literal("probe.session-flow/v2"),
@@ -401,6 +425,7 @@ export const isFlowSequenceStep = (step: FlowV2Step): step is FlowSequenceStep =
 
 export const isFlowV2SessionActionStep = (step: FlowV2Step): step is FlowV2SessionActionStep =>
   step.kind === "tap"
+  || step.kind === "multiTap"
   || step.kind === "press"
   || step.kind === "swipe"
   || step.kind === "type"
@@ -426,6 +451,7 @@ export const isDurationOnlySequenceWaitAction = (action: FlowSequenceAction): ac
 export const isFastSingleFlowV2Step = (step: FlowV2Step): step is FlowV2FastSingleStep => {
   switch (step.kind) {
     case "tap":
+    case "multiTap":
     case "press":
     case "swipe":
     case "type":

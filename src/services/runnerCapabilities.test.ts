@@ -42,10 +42,12 @@ describe("RUNNER_CAPABILITY_REGISTRY", () => {
     const capabilities = RUNNER_CAPABILITY_REGISTRY.map((entry) => entry.capability)
     expect(new Set(capabilities).size).toBe(capabilities.length)
 
-    // PRB-072: uiAction is implemented (handleLifecycleCommand case "uiAction"); uiActionBatch is
-    // not (no matching case — falls to the default unsupported-action throw). PRB-092 flips this.
+    // PRB-072/PRB-092: both uiAction and uiActionBatch are implemented
+    // (handleLifecycleCommand has case "uiAction" and case "uiActionBatch")
+    // and boundary-tested against a live Simulator session — see
+    // RUNNER_CAPABILITY_REGISTRY's evidence strings.
     expect(runnerCapabilityRegistryEntry("uiAction").implementedInSwift).toBe(true)
-    expect(runnerCapabilityRegistryEntry("uiActionBatch").implementedInSwift).toBe(false)
+    expect(runnerCapabilityRegistryEntry("uiActionBatch").implementedInSwift).toBe(true)
   })
 
   test("throws for a capability with no registry entry, instead of silently allowing it", () => {

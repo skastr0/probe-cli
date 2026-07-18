@@ -31,9 +31,13 @@ export const FLOW_EXAMPLE_ROOTS: ReadonlyArray<string> = [
 // test and product validation — rather than silently treated as fully
 // verified. Delete the entry the moment the registry flips
 // implementedInSwift to true for that capability.
-export const KNOWN_PENDING_CAPABILITY_EXAMPLES: Readonly<Record<string, RunnerCapability>> = {
-  "sequence-batch-v2.json": "uiActionBatch",
-}
+//
+// PRB-092: empty — "sequence-batch-v2.json" (uiActionBatch) was the one
+// entry here; RUNNER_CAPABILITY_REGISTRY now marks uiActionBatch
+// implementedInSwift: true (boundary-tested — see that registry entry's
+// evidence string), so the example is no longer pending and runs as a real
+// pass in both the schema test and scripts/validate-product-flow.ts.
+export const KNOWN_PENDING_CAPABILITY_EXAMPLES: Readonly<Record<string, RunnerCapability>> = {}
 
 export interface DiscoveredFlowExample {
   readonly fileName: string
