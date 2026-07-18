@@ -197,6 +197,21 @@ describe("PRB-098 evidence report -- golden multi-channel", () => {
     expect(hangInference?.summary).toContain("not a causal claim")
     expect(hangInference?.windowLabel).toBe("workload")
 
+    // AC6: every finding carries a window -- not only the hang/phase
+    // inference. Whole-recording rollups (one per channel) get the real
+    // span their own source rows cover, never an omitted field.
+    for (const finding of report.findings) {
+      expect(typeof finding.windowLabel).toBe("string")
+      expect(finding.windowLabel.length).toBeGreaterThan(0)
+    }
+
+    const findingById = (id: string) => report.findings.find((finding) => finding.id === id)
+    expect(findingById("cpu-samples-summary")?.windowLabel).toBe("full-recording (100.00 ms - 200.00 ms)")
+    expect(findingById("main-thread-state-summary")?.windowLabel).toBe("full-recording (0 ns - 3.00 ms)")
+    expect(findingById("gpu-intervals-summary")?.windowLabel).toBe("full-recording (10.00 ms - 35.00 ms)")
+    expect(findingById("signposts-summary")?.windowLabel).toBe("full-recording (0 ns - 300.00 ms)")
+    expect(findingById("thermal-state-observed")?.windowLabel).toBe("full-recording (0 ns - 300.00 ms)")
+
     // Thermal finding surfaces the observed state, source-pointed at the
     // thermal schema, and is not fabricated as "Nominal".
     const thermalFinding = report.findings.find((finding) => finding.id === "thermal-state-observed")
@@ -306,6 +321,37 @@ describe("PRB-098 evidence report -- thermal channel is-induced passthrough (cap
     expect(thermalFinding?.summary).toContain("Serious")
     expect(thermalFinding?.summary).toContain("induced")
     expect(thermalFinding?.confidence).toBe("low")
+  })
+})
+
+describe("PRB-098 evidence report -- window fallback when rows carry no readable timestamp", () => {
+  test("a rollup finding whose rows lack start/duration still discloses an unavailable window, never omitting it", () => {
+    // thread-state's required-mnemonic contract (thread/state/process/
+    // cputime/waittime) does not include start/duration, so a table can
+    // legitimately export without them -- a valid-but-unusual state, not a
+    // malformed one. AC6 must still hold: the finding gets a real (if
+    // disclosed-unavailable) window, never a missing field.
+    const threadStateNoTimestampXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node xpath='//trace-toc[1]/run[1]/data[1]/table[2]'>
+    <schema name="thread-state">
+      <col><mnemonic>thread</mnemonic></col>
+      <col><mnemonic>state</mnemonic></col>
+      <col><mnemonic>process</mnemonic></col>
+      <col><mnemonic>cputime</mnemonic></col>
+      <col><mnemonic>waittime</mnemonic></col>
+    </schema>
+    <row><thread id="2" fmt="Main Thread 0x1 (ProbeFixture, pid: 111)"><tid id="3">1</tid></thread><thread-state id="4" fmt="Blocked">Blocked</thread-state><process id="6" fmt="ProbeFixture (111)"><pid id="7">111</pid></process><duration id="8" fmt="1.00 ms">1000000</duration><duration id="9" fmt="2.00 ms">2000000</duration></row>
+  </node>
+</trace-query-result>`
+
+    const report = buildEvidenceReport({
+      provenance: baseProvenance,
+      tables: { mainThreadState: parsePerfTableExport(threadStateNoTimestampXml) },
+    })
+
+    const finding = report.findings.find((entry) => entry.id === "main-thread-state-summary")
+    expect(finding?.windowLabel).toBe("full-recording (window unavailable: rows carried no readable timestamp)")
   })
 })
 

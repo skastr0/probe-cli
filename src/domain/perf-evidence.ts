@@ -289,11 +289,18 @@ export type PerfEvidenceSourcePointer = typeof PerfEvidenceSourcePointer.Type
 // this schema an author could use to assert causality. `basis` records what
 // evidence was correlated to produce the finding; it is never a "because"
 // clause about mechanism.
+// AC: "Every finding ... carries window, source artifact/row selector, and
+// confidence." Enforced structurally like the no-causation rule above:
+// `windowLabel` is required, not optional, so a finding cannot be
+// constructed without one. A hang/phase inference's window is the phase it
+// overlaps; a whole-recording rollup's window is the real span its own
+// source rows cover (see `wholeRecordingWindowLabel` below) -- never an
+// omitted or fabricated value.
 export const PerfEvidenceFinding = Schema.Struct({
   id: Schema.String,
   kind: PerfEvidenceFindingKind,
   summary: Schema.String,
-  windowLabel: Schema.optional(Schema.String),
+  windowLabel: Schema.String,
   source: PerfEvidenceSourcePointer,
   confidence: PerfEvidenceConfidence,
   basis: Schema.Array(Schema.String),
@@ -312,18 +319,75 @@ const observationFinding = (args: {
   readonly rowSelector: string
   readonly confidence: PerfEvidenceConfidence
   readonly basis: ReadonlyArray<string>
-  readonly windowLabel?: string
+  readonly windowLabel: string
 }): PerfEvidenceFinding => ({
   id: args.id,
   kind: "observation",
   summary: args.headline,
-  ...(args.windowLabel ? { windowLabel: args.windowLabel } : {}),
+  windowLabel: args.windowLabel,
   source: { schema: args.schema, rowSelector: args.rowSelector },
   confidence: args.confidence,
   basis: [...args.basis],
 })
 
 const allRowsSelector = (rowCount: number): string => `row[0..${Math.max(rowCount - 1, 0)}]`
+
+// ---------------------------------------------------------------------------
+// Whole-recording windows for rollup findings
+// ---------------------------------------------------------------------------
+
+// A channel rollup finding (one per channel, summarizing every row rather
+// than one phase) is not anchored to a single phase window, but it does have
+// a real window: the span its own source rows actually cover. This section
+// computes that span from the same cells the rollup's headline was built
+// from, so the "window" on these findings is read evidence, never an
+// omitted field or a fabricated placeholder.
+interface PerfEvidenceTimeSpan {
+  readonly startNs: number
+  readonly endNs: number
+}
+
+// Interval-shaped rows (thread-state, metal-gpu-intervals, os-signpost-
+// interval, device-thermal-state-intervals): each row covers [start,
+// start+duration].
+const intervalSpans = (
+  table: ParsedPerfTable,
+  startMnemonic: string,
+  durationMnemonic: string,
+): ReadonlyArray<PerfEvidenceTimeSpan> =>
+  table.rows
+    .map((row): PerfEvidenceTimeSpan | null => {
+      const startNs = readNumber(row, startMnemonic)
+      const durationNs = readNumber(row, durationMnemonic)
+      return startNs === null || durationNs === null ? null : { startNs, endNs: startNs + durationNs }
+    })
+    .filter((span): span is PerfEvidenceTimeSpan => span !== null)
+
+// Instant-shaped rows (time-sample): each row is a single point in time, not
+// an interval, so start and end collapse to the same instant.
+const instantSpans = (table: ParsedPerfTable, instantMnemonic: string): ReadonlyArray<PerfEvidenceTimeSpan> =>
+  table.rows
+    .map((row): PerfEvidenceTimeSpan | null => {
+      const atNs = readNumber(row, instantMnemonic)
+      return atNs === null ? null : { startNs: atNs, endNs: atNs }
+    })
+    .filter((span): span is PerfEvidenceTimeSpan => span !== null)
+
+// This is a valid-but-unusual state, not an impossible one: a channel's
+// required-mnemonic contract (asserted elsewhere) does not always cover its
+// start/duration columns, so a row can legitimately fail to yield a
+// timestamp. The fallback discloses that rather than fabricating a span --
+// matching the file's "unavailable, never nominal" thermal precedent.
+const wholeRecordingWindowLabel = (spans: ReadonlyArray<PerfEvidenceTimeSpan>): string => {
+  if (spans.length === 0) {
+    return "full-recording (window unavailable: rows carried no readable timestamp)"
+  }
+
+  const startNs = Math.min(...spans.map((span) => span.startNs))
+  const endNs = Math.max(...spans.map((span) => span.endNs))
+
+  return `full-recording (${formatNanoseconds(startNs)} - ${formatNanoseconds(endNs)})`
+}
 
 const intervalsOverlap = (aStart: number, aEnd: number, bStart: number, bEnd: number): boolean => aStart < bEnd && bStart < aEnd
 
@@ -396,6 +460,9 @@ const buildThermalFinding = (
     rowSelector: allRowsSelector(thermal.intervals.length),
     confidence: anyInduced ? "low" : "high",
     basis: ["device-thermal-state-intervals interval rows"],
+    windowLabel: wholeRecordingWindowLabel(
+      thermal.intervals.map((interval) => ({ startNs: interval.startNs, endNs: interval.endNs })),
+    ),
   })
 }
 
@@ -424,6 +491,7 @@ const buildMainThreadStateFinding = (table: ParsedPerfTable | undefined): PerfEv
     rowSelector: allRowsSelector(table.rows.length),
     confidence: "high",
     basis: ["thread-state rows"],
+    windowLabel: wholeRecordingWindowLabel(intervalSpans(table, "start", "duration")),
   })
 }
 
@@ -452,6 +520,7 @@ const buildFindings = (args: {
       rowSelector: allRowsSelector(args.tables.cpuSamples.rows.length),
       confidence: "high",
       basis: ["time-sample rows"],
+      windowLabel: wholeRecordingWindowLabel(instantSpans(args.tables.cpuSamples, "time")),
     }))
   }
 
@@ -469,6 +538,7 @@ const buildFindings = (args: {
       rowSelector: allRowsSelector(args.tables.gpuIntervals.rows.length),
       confidence: "high",
       basis: ["metal-gpu-intervals rows"],
+      windowLabel: wholeRecordingWindowLabel(intervalSpans(args.tables.gpuIntervals, "start", "duration")),
     }))
   }
 
@@ -481,6 +551,7 @@ const buildFindings = (args: {
       rowSelector: allRowsSelector(args.tables.signposts.rows.length),
       confidence: "high",
       basis: ["os-signpost-interval rows"],
+      windowLabel: wholeRecordingWindowLabel(intervalSpans(args.tables.signposts, "start", "duration")),
     }))
   }
 
