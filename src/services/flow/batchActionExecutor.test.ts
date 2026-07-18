@@ -102,14 +102,19 @@ describe("executeBatchActionStep", () => {
     expect(outcome.ok).toBe(false)
   })
 
-  test("dispatches through deps.sendRunnerCommand and reports ok:true on a successful batch", async () => {
+  test("dispatches through deps.sendRunnerCommand, captures the default post-batch evidence snapshot, and reports ok:true", async () => {
     const record = makeFakeSimulatorRecord()
     const dispatch: { action: string | null } = { action: null }
+    let snapshotCaptures = 0
     const deps: FlowExecutorDeps = {
       ...makeUnusedFlowExecutorDeps(),
       sendRunnerCommand: (_sessionId, _record, action) => {
         dispatch.action = action
         return Effect.succeed(baseRunnerCommandResult)
+      },
+      captureSnapshotArtifactInternal: () => {
+        snapshotCaptures += 1
+        return Effect.succeed({ artifact: { snapshotId: "@s1" }, artifactRecord: {}, handledMs: 7 } as never)
       },
       updateHealthCheck: () => {},
       persistRecordHealth: () => Effect.void,
@@ -121,6 +126,84 @@ describe("executeBatchActionStep", () => {
 
     expect(dispatch.action).toBe("uiActionBatch")
     expect(outcome.ok).toBe(true)
+    // PRB-093: default policy (success=end) captures exactly one post-batch
+    // snapshot regardless of child count -- the old "none"-by-default
+    // checkpoint captured nothing.
+    expect(snapshotCaptures).toBe(1)
+    if (outcome.ok) {
+      expect(outcome.value.evidenceCaptures).toEqual([{ reason: "policy-post", phase: "post", snapshotId: "@s1", ms: 7 }])
+    }
+  })
+
+  test("policy success=none skips the post-batch snapshot for an N-child batch", async () => {
+    const record = makeFakeSimulatorRecord()
+    let snapshotCaptures = 0
+    const deps: FlowExecutorDeps = {
+      ...makeUnusedFlowExecutorDeps(),
+      sendRunnerCommand: () => Effect.succeed(baseRunnerCommandResult),
+      captureSnapshotArtifactInternal: () => {
+        snapshotCaptures += 1
+        return Effect.succeed({ artifact: { snapshotId: "@s1" }, artifactRecord: {}, handledMs: 7 } as never)
+      },
+      updateHealthCheck: () => {},
+      persistRecordHealth: () => Effect.void,
+    }
+    const noneStep: FlowSequenceStep = {
+      ...sequenceStep,
+      actions: [
+        { kind: "tap", target: { kind: "point", x: 1, y: 2 } },
+        { kind: "tap", target: { kind: "point", x: 3, y: 4 } },
+        { kind: "tap", target: { kind: "point", x: 5, y: 6 } },
+      ],
+      evidencePolicy: { success: "none" },
+    } as never
+
+    const outcome = await Effect.runPromise(
+      executeBatchActionStep({ sessionId: "s1", record, step: noneStep, deps }),
+    )
+
+    expect(outcome.ok).toBe(true)
+    expect(snapshotCaptures).toBe(0)
+    if (outcome.ok) {
+      expect(outcome.value.evidenceCaptures).toEqual([])
+    }
+  })
+
+  test("policy success=around captures exactly one pre and one post snapshot regardless of child count", async () => {
+    const record = makeFakeSimulatorRecord()
+    let snapshotCaptures = 0
+    const deps: FlowExecutorDeps = {
+      ...makeUnusedFlowExecutorDeps(),
+      sendRunnerCommand: () => Effect.succeed(baseRunnerCommandResult),
+      captureSnapshotArtifactInternal: () => {
+        snapshotCaptures += 1
+        return Effect.succeed({
+          artifact: { snapshotId: `@s${snapshotCaptures}` },
+          artifactRecord: {},
+          handledMs: 7,
+        } as never)
+      },
+      updateHealthCheck: () => {},
+      persistRecordHealth: () => Effect.void,
+    }
+    const aroundStep: FlowSequenceStep = {
+      ...sequenceStep,
+      actions: [
+        { kind: "tap", target: { kind: "point", x: 1, y: 2 } },
+        { kind: "tap", target: { kind: "point", x: 3, y: 4 } },
+      ],
+      evidencePolicy: { success: "around" },
+    } as never
+
+    const outcome = await Effect.runPromise(
+      executeBatchActionStep({ sessionId: "s1", record, step: aroundStep, deps }),
+    )
+
+    expect(outcome.ok).toBe(true)
+    expect(snapshotCaptures).toBe(2)
+    if (outcome.ok) {
+      expect(outcome.value.evidenceCaptures.map((capture) => capture.phase)).toEqual(["pre", "post"])
+    }
   })
 })
 
@@ -136,17 +219,21 @@ describe("buildBatchStepResult", () => {
 
     expect(result.verdict).toBe("failed")
     expect(result.summary).toBe("dispatch failed")
-    expect(result.checkpoint).toBe("none")
+    expect(result.evidence).toEqual({
+      requested: { success: "end", failure: "snapshot" },
+      captures: [],
+      evidenceMs: 0,
+    })
   })
 
-  test("a successful batch with no checkpoint reports passed and falls back to the prior snapshot id", () => {
+  test("a successful batch with no captures reports passed and falls back to the prior snapshot id", () => {
     const result = buildBatchStepResult({
       plannedStep,
       step: sequenceStep,
       continueOnError: false,
       outcome: {
         ok: true,
-        value: { response: baseRunnerCommandResult, checkpointCapture: null, checkpointError: null },
+        value: { response: baseRunnerCommandResult, evidenceCaptures: [], postCaptureError: null },
       },
       latestSnapshotIdBefore: "prior-snap",
     })
@@ -165,8 +252,8 @@ describe("buildBatchStepResult", () => {
         ok: true,
         value: {
           response: { ...baseRunnerCommandResult, ok: false, error: "child failed", failedActionIndex: 0 },
-          checkpointCapture: null,
-          checkpointError: null,
+          evidenceCaptures: [],
+          postCaptureError: null,
         },
       },
       latestSnapshotIdBefore: null,

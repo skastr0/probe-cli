@@ -527,20 +527,31 @@ before proposing this, not assumed:
 - **The host RPC/snapshot layer was checked as a second candidate source of
   the claimed 3x** (the committed benchmark only measures the
   runner-internal XCUITest layer, in-process, so it was fair to ask whether
-  batching's real advantage shows up further up the stack instead). It does
-  not: `executeDirectRunnerActionStep`
-  (`src/services/flow/directRunnerActionExecutor.ts`) is the actual
+  batching's real advantage shows up further up the stack instead). At the
+  time this was measured (PRB-092), it did not: `executeDirectRunnerActionStep`
+  (`src/services/flow/directRunnerActionExecutor.ts`) was the actual
   "five separate fast actions" comparator AC10 means, and fast actions
-  already skip the post-action host snapshot capture entirely ("Executed
+  skipped the post-action host snapshot capture entirely ("Executed
   fast ... without host snapshots.") — the expensive per-command snapshot
   walk that `uiActionBatch` avoids (one optional end-of-batch checkpoint
-  snapshot vs. N, `batchActionExecutor.ts`) is not paid by the fast-action
-  baseline in the first place. The only host-level saving batching adds on
-  top of the runner-internal number is avoided HTTP/dispatch round trips,
+  snapshot vs. N, `batchActionExecutor.ts`) was not paid by the fast-action
+  baseline in the first place. The only host-level saving batching added on
+  top of the runner-internal number was avoided HTTP/dispatch round trips,
   which are small next to the few-hundred-ms per-tap XCUITest
   synchronization cost that dominates on both sides of the comparison. This
   was verified by tracing the code path, not assumed from the runner-only
   number.
+  **PRB-093 update:** the fast lane's zero-snapshot default and the
+  batch lane's `checkpoint: "none"`/`"end"` vocabulary described above no
+  longer exist. Both lanes now ask the one canonical evidence policy
+  (`src/domain/evidence.ts`); the default (`success: "end"`) captures
+  exactly one post-mutation snapshot per fast action and one post-batch
+  snapshot per sequence, regardless of child count — the batch lane's
+  relative advantage (one capture for N children vs. N fast actions each
+  now also capturing one) is unchanged, but the absolute "fast actions pay
+  zero host snapshot cost" comparator above is stale. A caller that wants
+  the old zero-capture behavior back sets `evidencePolicy: { success:
+  "none" }` explicitly on the step.
 
 Given both avenues are closed, the **proposal** is: revise the glyph's "at
 least three times faster" target to "measurably and consistently faster,

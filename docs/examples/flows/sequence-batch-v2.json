@@ -4,7 +4,7 @@
     {
       "kind": "sequence",
       "execution": "fast",
-      "checkpoint": "end",
+      "evidencePolicy": { "success": "end" },
       "actions": [
         {
           "kind": "type",

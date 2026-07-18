@@ -9,6 +9,14 @@ import type {
 import type { PlannedStep } from "../../domain/flow-planner"
 import { buildDirectRunnerUiActionPayload } from "../../domain/action"
 import {
+  buildEvidenceReport,
+  emptyEvidenceReport,
+  planSuccessEvidence,
+  resolveEvidencePolicy,
+  shouldCaptureFailureEvidence,
+  type EvidenceCapture,
+} from "../../domain/evidence"
+import {
   advertisedRunnerCapabilities,
   requireRunnerCapability,
 } from "../runnerCapabilities"
@@ -19,8 +27,6 @@ import {
   type ActiveSessionRecord,
   type SessionActionError,
 } from "../SessionRegistry"
-import type { StoredSnapshotArtifact } from "../../domain/snapshot"
-import type { ArtifactRecord } from "../../domain/output"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 import {
   buildFlowStepResult,
@@ -35,7 +41,14 @@ import {
  * PRB-073: extracted from `runFlow`'s inline `plannedStep.kind ===
  * "batch-sequence"` branch. The "batch action" lane — a `sequence` step's
  * child tap/press/swipe/type/scroll/wait actions dispatched as one runner
- * batch command, with an optional end-of-batch checkpoint snapshot.
+ * batch command.
+ *
+ * PRB-093: the sequence-only "none"/"end" checkpoint vocabulary is gone --
+ * this lane now asks the same canonical evidence policy (evidence.ts) every
+ * other mutation-capable step asks. "around" is new for this lane (a batch
+ * previously had no pre-dispatch capture at all); "end" and "none" keep
+ * their old capture counts (1 post-batch snapshot / zero), just reported
+ * through the shared `EvidenceReport` shape instead of a bare literal.
  */
 
 type RunnerBatchWaitActionPayload = {
@@ -106,10 +119,13 @@ export const buildBatchSequenceChildFailure = (args: {
 
 interface BatchDispatchResult {
   readonly response: RunnerCommandResult
-  readonly checkpointCapture:
-    | { readonly artifact: StoredSnapshotArtifact; readonly artifactRecord: ArtifactRecord; readonly handledMs: number }
-    | null
-  readonly checkpointError: SessionActionError | null
+  readonly evidenceCaptures: ReadonlyArray<EvidenceCapture>
+  // Only the success-path post capture gets its own error slot: a batch
+  // that ran but whose requested evidence failed to land is worth
+  // surfacing distinctly (mirrors the old "end checkpoint failed" case).
+  // Pre captures ("around") and failure captures are best-effort and
+  // swallowed on error, exactly like the fast direct-runner lane.
+  readonly postCaptureError: SessionActionError | null
 }
 
 export type BatchActionOutcome =
@@ -125,7 +141,8 @@ export const executeBatchActionStep = (args: {
 }): Effect.Effect<BatchActionOutcome> =>
   Effect.gen(function* () {
     const { sessionId, record, step, deps } = args
-    const checkpoint = step.checkpoint ?? "none"
+    const policy = resolveEvidencePolicy(step.evidencePolicy)
+    const successPlan = planSuccessEvidence(policy.success)
 
     const dispatch = yield* Effect.either(
       Effect.gen(function* () {
@@ -155,6 +172,26 @@ export const executeBatchActionStep = (args: {
             }),
         })
 
+        const evidenceCaptures: Array<EvidenceCapture> = []
+
+        // "around" is the only policy that ever pays for a pre-dispatch
+        // capture in this lane — every batch child target is already
+        // runner-resolvable (semantic/point/ref+fallback; see
+        // isRunnerResolvableActionSelector), so a pre capture here is pure
+        // evidence, never resolution.
+        if (successPlan.forcedFreshPre) {
+          const preCapture = yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+
+          if (preCapture._tag === "Right") {
+            evidenceCaptures.push({
+              reason: "policy-pre",
+              phase: "pre",
+              snapshotId: preCapture.right.artifact.snapshotId,
+              ms: preCapture.right.handledMs,
+            })
+          }
+        }
+
         const response = yield* deps.sendRunnerCommand(
           sessionId,
           runnerRecord,
@@ -163,22 +200,45 @@ export const executeBatchActionStep = (args: {
         )
         deps.updateHealthCheck(record, response.action, response.ok)
 
-        const checkpointCapture = checkpoint === "end"
+        if (!response.ok) {
+          if (shouldCaptureFailureEvidence(policy.failure)) {
+            const failureCapture = yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+
+            if (failureCapture._tag === "Right") {
+              evidenceCaptures.push({
+                reason: "policy-failure",
+                phase: "post",
+                snapshotId: failureCapture.right.artifact.snapshotId,
+                ms: failureCapture.right.handledMs,
+              })
+            }
+          }
+
+          yield* deps.persistRecordHealth(sessionId, record)
+          return { response, evidenceCaptures, postCaptureError: null }
+        }
+
+        const postCapture = successPlan.needsPost
           ? yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
           : null
 
-        if (checkpoint === "none") {
+        if (postCapture === null) {
           yield* deps.persistRecordHealth(sessionId, record)
+        }
+
+        if (postCapture !== null && postCapture._tag === "Right") {
+          evidenceCaptures.push({
+            reason: "policy-post",
+            phase: "post",
+            snapshotId: postCapture.right.artifact.snapshotId,
+            ms: postCapture.right.handledMs,
+          })
         }
 
         return {
           response,
-          checkpointCapture: checkpointCapture !== null && checkpointCapture._tag === "Right"
-            ? checkpointCapture.right
-            : null,
-          checkpointError: checkpointCapture !== null && checkpointCapture._tag === "Left"
-            ? checkpointCapture.left
-            : null,
+          evidenceCaptures,
+          postCaptureError: postCapture !== null && postCapture._tag === "Left" ? postCapture.left : null,
         }
       }),
     )
@@ -189,11 +249,7 @@ export const executeBatchActionStep = (args: {
 
     return {
       ok: true,
-      value: {
-        response: dispatch.right.response,
-        checkpointCapture: dispatch.right.checkpointCapture,
-        checkpointError: dispatch.right.checkpointError,
-      } satisfies BatchDispatchResult,
+      value: dispatch.right satisfies BatchDispatchResult,
     }
   })
 
@@ -206,7 +262,7 @@ export const buildBatchStepResult = (args: {
   readonly latestSnapshotIdBefore: string | null
 }): FlowV2StepResult => {
   const { plannedStep, step, continueOnError, outcome, latestSnapshotIdBefore } = args
-  const checkpoint = step.checkpoint ?? "none"
+  const policy = resolveEvidencePolicy(step.evidencePolicy)
 
   if (!outcome.ok) {
     return buildFlowStepResult({
@@ -223,14 +279,16 @@ export const buildBatchStepResult = (args: {
         error: outcome.error,
         continued: continueOnError,
       }),
-      checkpoint,
+      evidence: emptyEvidenceReport(policy),
       sequenceChildFailure: null,
     })
   }
 
-  const { response, checkpointCapture, checkpointError } = outcome.value
+  const { response, evidenceCaptures, postCaptureError } = outcome.value
   const batchHandledMs = response.totalHandledMs ?? response.handledMs
-  const latestSnapshotId = checkpointCapture?.artifact.snapshotId ?? latestSnapshotIdBefore
+  const lastCapture = evidenceCaptures[evidenceCaptures.length - 1] ?? null
+  const latestSnapshotId = lastCapture?.snapshotId ?? latestSnapshotIdBefore
+  const evidence = buildEvidenceReport(policy, evidenceCaptures)
 
   if (!response.ok) {
     const failureReason = response.error
@@ -255,13 +313,6 @@ export const buildBatchStepResult = (args: {
       continued: continueOnError,
     })
 
-    if (checkpointError) {
-      warnings.push(
-        `Requested end checkpoint failed after the batch error: ${errorSummary(checkpointError)}`,
-        ...("details" in checkpointError && Array.isArray(checkpointError.details) ? checkpointError.details : []),
-      )
-    }
-
     return buildFlowStepResult({
       plannedStep,
       kind: plannedStep.step.kind,
@@ -275,27 +326,27 @@ export const buildBatchStepResult = (args: {
       retryReasons: [],
       handledMs: batchHandledMs,
       warnings,
-      checkpoint,
+      evidence,
       sequenceChildFailure,
     })
   }
 
-  if (checkpointError) {
+  if (postCaptureError) {
     return buildFlowStepResult({
       plannedStep,
       kind: plannedStep.step.kind,
-      summary: `Batch sequence executed, but the requested end checkpoint failed: ${errorSummary(checkpointError)}`,
-      verdict: failureVerdict(checkpointError),
+      summary: `Batch sequence executed, but the requested evidence capture failed: ${errorSummary(postCaptureError)}`,
+      verdict: failureVerdict(postCaptureError),
       matchedRef: null,
       latestSnapshotId,
       retryCount: 0,
       retryReasons: [],
       handledMs: batchHandledMs,
       warnings: failureWarnings({
-        error: checkpointError,
+        error: postCaptureError,
         continued: continueOnError,
       }),
-      checkpoint,
+      evidence,
       sequenceChildFailure: null,
     })
   }
@@ -303,9 +354,9 @@ export const buildBatchStepResult = (args: {
   return buildFlowStepResult({
     plannedStep,
     kind: plannedStep.step.kind,
-    summary: checkpoint === "end"
+    summary: evidenceCaptures.length > 0
       ? `Executed fast sequence step with ${step.actions.length} child action(s) through the runner batch lane; captured ${latestSnapshotId}.`
-      : `Executed fast sequence step with ${step.actions.length} child action(s) through the runner batch lane without host checkpoints.`,
+      : `Executed fast sequence step with ${step.actions.length} child action(s) through the runner batch lane without host evidence captures.`,
     verdict: "passed",
     matchedRef: null,
     latestSnapshotId,
@@ -316,7 +367,7 @@ export const buildBatchStepResult = (args: {
       step,
       baseWarnings: [],
     }),
-    checkpoint,
+    evidence,
     sequenceChildFailure: null,
   })
 }

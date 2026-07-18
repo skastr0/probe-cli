@@ -312,6 +312,10 @@ const formatReplayResult = (result: SessionReplayResult): string => {
     `retried steps: ${result.retriedStepCount}`,
     `semantic fallback recoveries: ${result.semanticFallbackCount}`,
     `final snapshot: ${result.finalSnapshotId ?? "n/a"}`,
+    // PRB-093 review finding: mirrors formatFlowV2StepResult's evidence
+    // line below -- an aggregate across every replayed step rather than
+    // requiring the caller to open the replay report artifact.
+    `evidence: policy success=${result.evidence.requested.success} failure=${result.evidence.requested.failure}, ${result.evidence.captures.length} capture(s), ${result.evidence.evidenceMs}ms`,
     `artifact: ${result.artifact.absolutePath}`,
   ].join("\n")
 }
@@ -336,7 +340,7 @@ const formatFlowV2StepResult = (step: FlowV2CliStepResult): string => {
     `- [${step.index}] ${step.kind} [${step.verdict}] ${step.summary}`,
     `  execution profile: ${step.executionProfile}`,
     `  transport lane: ${step.transportLane}`,
-    `  checkpoint: ${step.checkpoint ?? "n/a"}`,
+    `  evidence: policy success=${step.evidence.requested.success} failure=${step.evidence.requested.failure}, ${step.evidence.captures.length} capture(s), ${step.evidence.evidenceMs}ms`,
     `  latest snapshot: ${step.latestSnapshotId ?? "n/a"}`,
     `  retries: ${step.retryCount}`,
     `  handled ms: ${step.handledMs ?? "n/a"}`,
