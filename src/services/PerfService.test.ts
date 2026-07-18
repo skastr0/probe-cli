@@ -390,6 +390,38 @@ const createSessionHealth = (
   artifacts: [],
 }) as any
 
+// PRB-096: a raw record()'s target-process lease -- matches the pid/device
+// createSessionHealth's "runner" fixture advertises, so the identity check
+// stubbed in createCommandRunner's `ps` branch lines up with it.
+const createTraceLeaseHandle = (root: string) => ({
+  target: {
+    sessionId: "session-1",
+    platform: "simulator" as const,
+    deviceId: "sim-1",
+    deviceName: "iPhone 15",
+    bundleId: "dev.probe.fixture",
+    targetProcessId: 123,
+    artifactRoot: root,
+  },
+  signal: new AbortController().signal,
+})
+
+/**
+ * PRB-096: default SessionRegistry mock for record()/recordAroundFlow()
+ * tests -- `beginTraceLease`/`endTraceLease`/`peekSessionHealth` succeed by
+ * default (mirroring `getSessionHealth`/`sendRunnerKeepalive`'s existing
+ * "ready" defaults) so most tests only need to override what they actually
+ * exercise.
+ */
+const createSessionRegistryMock = (root: string, overrides?: Record<string, unknown>) => ({
+  getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+  sendRunnerKeepalive: () => Effect.void,
+  peekSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
+  beginTraceLease: () => Effect.succeed(createTraceLeaseHandle(root)),
+  endTraceLease: () => Effect.void,
+  ...overrides,
+})
+
 const createCommandRunner = (options: {
   readonly exports: Record<string, string>
   readonly tocXml?: string
@@ -413,6 +445,12 @@ const createCommandRunner = (options: {
     readonly exitCode: number | null
     readonly wasRunning: boolean
   }
+  /** PRB-096: override the `ps -p <pid> -o pid=,comm=` identity-check response (e.g. to simulate a dead/reused pid). */
+  readonly identityCheckResult?: {
+    readonly stdout: string
+    readonly stderr: string
+    readonly exitCode: number | null
+  }
 }) => {
   const stats = {
     captureCalls: 0,
@@ -431,6 +469,25 @@ const createCommandRunner = (options: {
         readonly allowFailure?: boolean
       }) => {
         stats.captureCalls += 1
+
+        // PRB-096: the fresh pre-spawn target-process identity check `ps -p
+        // <pid> -o pid=,comm=` -- succeeds by default so every existing
+        // record() test reaches recording without per-test wiring; the
+        // stdout deliberately includes the fixture's simulator deviceId
+        // ("sim-1", see createSessionHealth) since that is what the
+        // simulator identity check matches against.
+        if (args.command === "ps") {
+          if (options.identityCheckResult) {
+            return options.identityCheckResult
+          }
+
+          const pid = args.commandArgs[1] ?? "123"
+          return {
+            stdout: `${pid}  /Users/x/Library/Developer/CoreSimulator/Devices/sim-1/data/Containers/Bundle/Application/X/ProbeFixture.app/ProbeFixture`,
+            stderr: "",
+            exitCode: 0,
+          }
+        }
 
         if (args.command !== "xcrun") {
           throw new Error(`Unexpected command ${args.command}`)
@@ -581,22 +638,24 @@ const neverReachedDaemonClient = DaemonClient.of({
 })
 
 describe("PerfService", () => {
-  test("records a trace and reports a failed post-record session honestly", async () => {
+  // PRB-096: raw record's `session` outcome now comes from a passive
+  // `peekSessionHealth` read, never a fresh `getSessionHealth` ping -- these
+  // two tests replace the pre-PRB-096 "records a trace and reports a
+  // failed/degraded post-record session" tests, which asserted the old
+  // ping-and-refresh behavior the superseding gate removes from the raw
+  // path ("post-record runner health refresh").
+  test("raw record reports peekSessionHealth's snapshot and never calls getSessionHealth", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      let healthChecks = 0
-      const sessionRegistry = {
-        getSessionHealth: () =>
-          Effect.succeed(
-            (healthChecks += 1) === 1
-              ? createSessionHealth(root, "ready")
-              : createSessionHealth(root, "failed", {
-                  wrapperRunning: false,
-                  lastOk: false,
-                }),
-          ),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      let getSessionHealthCalls = 0
+      const sessionRegistry = createSessionRegistryMock(root, {
+        getSessionHealth: () => {
+          getSessionHealthCalls += 1
+          return Effect.succeed(createSessionHealth(root, "ready"))
+        },
+        peekSessionHealth: () =>
+          Effect.succeed(createSessionHealth(root, "failed", { wrapperRunning: false, lastOk: false })),
+      })
       const commandRunner = createCommandRunner({
         exports: {
           "time-sample": timeProfilerXml,
@@ -617,9 +676,9 @@ describe("PerfService", () => {
         }),
       )
 
-      expect(healthChecks).toBe(2)
+      expect(getSessionHealthCalls).toBe(0)
       expect(result.session.state).toBe("failed")
-      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "perf-session-failed-after-record")).toBe(true)
+      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "perf-target-identity-verified")).toBe(true)
       expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
         "time-profiler-trace",
         "time-profiler-toc",
@@ -628,28 +687,62 @@ describe("PerfService", () => {
     })
   })
 
-  test("records a trace and reports degraded post-record session with warning", async () => {
+  test("raw record acquires and releases exactly one trace lease, reporting a stopped outcome on success", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      let healthChecks = 0
-      const sessionRegistry = {
-        getSessionHealth: () =>
-          Effect.succeed(
-            (healthChecks += 1) === 1
-              ? createSessionHealth(root, "ready")
-              : createSessionHealth(root, "degraded", {
-                  wrapperRunning: true,
-                  lastOk: true,
-                  runnerActionsBlocked: true,
-                  reason: "Runner health check degraded after recording",
-                }),
-          ),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const leaseCalls: Array<string> = []
+      const sessionRegistry = createSessionRegistryMock(root, {
+        beginTraceLease: () => {
+          leaseCalls.push("begin")
+          return Effect.succeed(createTraceLeaseHandle(root))
+        },
+        endTraceLease: (_sessionId: string, outcome: { readonly kind: string }) => {
+          leaseCalls.push(`end:${outcome.kind}`)
+          return Effect.void
+        },
+      })
       const commandRunner = createCommandRunner({
         exports: {
           "time-sample": timeProfilerXml,
         },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      await Effect.runPromise(
+        perfService.record({
+          sessionId: "session-1",
+          template: "time-profiler",
+          timeLimit: "3s",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(leaseCalls).toEqual(["begin", "end:stopped"])
+    })
+  })
+
+  // PRB-096: replaces the pre-PRB-096 "sends runner keepalives during slow
+  // recordings" test with its exact inverse -- the raw path must send none,
+  // before, during, or after the xctrace record command.
+  test("raw record sends no runner keepalives, even during a slow recording", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      let keepaliveCalls = 0
+      const sessionRegistry = createSessionRegistryMock(root, {
+        sendRunnerKeepalive: () =>
+          Effect.sync(() => {
+            keepaliveCalls += 1
+          }),
+      })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "time-sample": timeProfilerXml,
+        },
+        recordDelayMs: 50,
       })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
@@ -666,29 +759,30 @@ describe("PerfService", () => {
         }),
       )
 
-      expect(healthChecks).toBe(2)
-      expect(result.session.state).toBe("degraded")
-      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "perf-session-degraded-after-record")).toBe(true)
-      expect(result.diagnoses.some((diagnosis) => diagnosis.summary.includes("degraded"))).toBe(true)
+      expect(result.template).toBe("time-profiler")
+      expect(keepaliveCalls).toBe(0)
     })
   })
 
-  test("sends runner keepalives during slow recordings", async () => {
+  test("a dead/reused target pid returns a typed pre-spawn error and starts no xctrace record", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      let keepaliveCalls = 0
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () =>
-          Effect.sync(() => {
-            keepaliveCalls += 1
-          }),
-      }
-      const commandRunner = createCommandRunner({
-        exports: {
-          "time-sample": timeProfilerXml,
+      const leaseCalls: Array<string> = []
+      const sessionRegistry = createSessionRegistryMock(root, {
+        beginTraceLease: () => {
+          leaseCalls.push("begin")
+          return Effect.succeed(createTraceLeaseHandle(root))
         },
-        recordDelayMs: 11_000,
+        endTraceLease: (_sessionId: string, outcome: { readonly kind: string }) => {
+          leaseCalls.push(`end:${outcome.kind}`)
+          return Effect.void
+        },
+      })
+      const commandRunner = createCommandRunner({
+        exports: { "time-sample": timeProfilerXml },
+        // The target pid is no longer alive by the time raw record verifies
+        // identity immediately before spawning xctrace.
+        identityCheckResult: { stdout: "", stderr: "", exitCode: 1 },
       })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
@@ -697,26 +791,37 @@ describe("PerfService", () => {
       })
 
       const result = await Effect.runPromise(
-        perfService.record({
-          sessionId: "session-1",
-          template: "time-profiler",
-          timeLimit: "12s",
-          emitProgress: () => undefined,
-        }),
+        Effect.either(
+          perfService.record({
+            sessionId: "session-1",
+            template: "time-profiler",
+            timeLimit: "3s",
+            emitProgress: () => undefined,
+          }),
+        ),
       )
 
-      expect(result.template).toBe("time-profiler")
-      expect(keepaliveCalls).toBeGreaterThanOrEqual(1)
+      expect(Either.isLeft(result)).toBe(true)
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-target-process-not-found")
+        }
+      }
+
+      // No `xctrace record` (or any other xctrace capture) ever ran, and the
+      // lease is still released -- as "failed" -- even though the failure
+      // happened before recording started.
+      expect(commandRunner.stats.captureCalls).toBe(1)
+      expect(artifactStore.artifacts).toHaveLength(0)
+      expect(leaseCalls).toEqual(["begin", "end:failed"])
     })
-  }, 20_000)
+  })
 
   test("rejects nonexistent custom template paths before recording starts", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({ exports: {} })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
@@ -752,10 +857,7 @@ describe("PerfService", () => {
   test("rejects custom template paths with the wrong extension", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({ exports: {} })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
@@ -794,10 +896,7 @@ describe("PerfService", () => {
   test("records custom templates with TOC-discovered exports and minimal analysis", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const templatePath = join(root, "GPU Counters.tracetemplate")
 
       await writeFile(templatePath, "custom-template", "utf8")
@@ -873,10 +972,7 @@ describe("PerfService", () => {
   test("maps export file size overrun into a typed environment failure", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "time-sample": timeProfilerXml,
@@ -920,10 +1016,7 @@ describe("PerfService", () => {
   test("rejects over-long system trace windows before xctrace runs", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({ exports: {} })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
@@ -959,10 +1052,7 @@ describe("PerfService", () => {
   test("skips optional system trace exports that exceed the budget", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "thread-state": systemThreadOnlyXml,
@@ -1010,10 +1100,7 @@ describe("PerfService", () => {
   test("fails when a required system trace export exceeds the budget", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "thread-state": systemThreadOnlyXml,
@@ -1067,10 +1154,7 @@ describe("PerfService", () => {
   test("system trace uses targeted budgets and time limits", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "thread-state": loadPerfFixture("system-trace.thread-state.no-target.xml"),
@@ -1105,10 +1189,7 @@ describe("PerfService", () => {
   test("metal system trace exports gpu, driver, and encoder tables with the extended budgets", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "metal-gpu-intervals": loadPerfFixture("metal-system-trace.metal-gpu-intervals.xml"),
@@ -1147,10 +1228,7 @@ describe("PerfService", () => {
   test("records hangs traces and returns structured hang diagnostics", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "potential-hangs": potentialHangsXml,
@@ -1184,10 +1262,7 @@ describe("PerfService", () => {
   test("records swift concurrency traces and returns task and actor diagnostics", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "swift-task-state": swiftTaskStateXml,
@@ -1223,10 +1298,7 @@ describe("PerfService", () => {
   test("rejects metal trace windows above the 120 second cap before xctrace runs", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({ exports: {} })
       const perfService = createPerfService({
         artifactStore: artifactStore.service,
@@ -1263,10 +1335,7 @@ describe("PerfService", () => {
   test("surfaces export schema drift as a typed contract failure", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         exports: {
           "time-sample": timeProfilerXml.replace('<col><mnemonic>sample-type</mnemonic></col>', ""),
@@ -1306,9 +1375,7 @@ describe("PerfService", () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const events: Array<string> = []
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
+      const sessionRegistry = createSessionRegistryMock(root, {
         runFlow: () =>
           Effect.sync(() => {
             events.push("run-flow")
@@ -1326,7 +1393,7 @@ describe("PerfService", () => {
               warnings: [],
             } as const
           }),
-      }
+      })
       const commandRunner = createCommandRunner({
         exports: {},
         onStartRecording: async () => {
@@ -1363,6 +1430,76 @@ describe("PerfService", () => {
     })
   })
 
+  // PRB-096 gate 8: "UI failure after flow completion cannot discard a
+  // completed trace" -- the post-flow session-health refresh is UI/runner
+  // work that happens strictly after the trace itself is done and its
+  // artifacts are already registered; a failure there must degrade the
+  // reported `session` outcome, not the whole result.
+  test("a post-flow session health failure degrades the result instead of discarding the completed trace", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      let healthChecks = 0
+      const sessionRegistry = createSessionRegistryMock(root, {
+        getSessionHealth: () => {
+          healthChecks += 1
+          return healthChecks === 1
+            ? Effect.succeed(createSessionHealth(root, "ready"))
+            : Effect.fail(
+                new EnvironmentError({
+                  code: "session-runner-ping",
+                  reason: "Runner wrapper stopped responding after the bounded flow completed.",
+                  nextStep: "Reopen the session.",
+                  details: [],
+                }),
+              )
+        },
+        runFlow: () =>
+          Effect.succeed({
+            contract: "probe.session-flow/report-v2",
+            executedAt: "2026-04-14T00:00:00.000Z",
+            sessionId: "session-1",
+            summary: "bounded flow passed",
+            verdict: "passed",
+            executedSteps: [],
+            failedStep: null,
+            retries: 0,
+            artifacts: [],
+            finalSnapshotId: null,
+            warnings: [],
+          } as const),
+      })
+      const commandRunner = createCommandRunner({ exports: {} })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.recordAroundFlow({
+          sessionId: "session-1",
+          template: "logging",
+          flow: {
+            contract: "probe.session-flow/v2",
+            steps: [{ kind: "sleep", durationMs: 10 }],
+          },
+          emitProgress: () => undefined,
+        }),
+      )
+
+      // The result still comes back -- carrying the completed trace -- not
+      // an EnvironmentError from the failed health refresh.
+      expect(result.flow.verdict).toBe("passed")
+      expect(result.session.state).toBe("degraded")
+      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "perf-session-degraded-after-record")).toBe(true)
+      expect(result.artifacts.trace.kind).toBe("directory")
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
+        "logging-trace",
+        "logging-toc",
+      ])
+    })
+  })
+
   test("summarizes signpost intervals by interval name", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
@@ -1382,10 +1519,7 @@ describe("PerfService", () => {
         }),
       )
 
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         tocXml: loggingTocWithSignpostSchemaXml,
         exports: {
@@ -1444,10 +1578,7 @@ describe("PerfService", () => {
         }),
       )
 
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const baseRunner = createCommandRunner({
         tocXml: loggingTocWithSignpostSchemaXml,
         exports: {},
@@ -1520,10 +1651,7 @@ describe("PerfService", () => {
         }),
       )
 
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         tocXml: loggingTocWithSignpostSchemaXml,
         exports: {
@@ -1569,10 +1697,7 @@ describe("PerfService", () => {
         }),
       )
 
-      const sessionRegistry = {
-        getSessionHealth: () => Effect.succeed(createSessionHealth(root, "ready")),
-        sendRunnerKeepalive: () => Effect.void,
-      }
+      const sessionRegistry = createSessionRegistryMock(root)
       const commandRunner = createCommandRunner({
         tocXml: loggingTocWithoutSignpostSchemaXml,
         exports: {},

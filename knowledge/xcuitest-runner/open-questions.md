@@ -29,6 +29,10 @@ Updated: 2026-04-09
       - a clean real-device equivalent for the shared file-ingress seam
       - whether a future cleaner egress path can replace mixed-log stdout without losing the current public-tooling honesty
 
+7. **PRB-091: device-scale selector-resolution benchmark**
+   - **Simulator:** the bounded query planner's identifier/ambiguity/ordinal/no-match paths are contract-tested against `ios/ProbeFixture/` (see `integration-notes.md`'s PRB-091 section). The hundred-warm-action large-fixture identifier-resolution release-budget gate is **closed**: it is Simulator-only (no physical device involved), and a real run against the Large profile (48 cards) measured `p95=1029 ms` / `max=1088 ms` over 100 warm actions with zero duplicate-target mismatches, against a committed 1500 ms budget — see `integration-notes.md`'s "PRB-091 review follow-up: large-fixture identifier-resolution benchmark" section for the full methodology and numbers. This gate had been incorrectly bundled with the device-gated one below on the premise of an unlanded "PRB-087 benchmark" dependency; that premise didn't hold (PRB-087, as actually landed, is the unrelated `rpc-daemon-defects` investigation), and the gate required no device, so it was built and closed directly instead.
+   - **Still open:** the Ripple-incident-scale selector path at 20/20 on a physical iPhone 13 Pro with a ≥5× p95 reduction (or p95 <2s) — genuinely device-gated. This host has two connected devices visible to `devicectl` but no `DEVELOPMENT_TEAM` signing configured, so a physical-device XCUITest run cannot be signed/launched from here. Closing this needs either signing configured on a host with device access, or a follow-up pass once that blocker is cleared.
+
 ## Immediate risks for later Probe items
 
 - Probe could overfit to `launch()` and accidentally destroy target-app continuity when a foreground/resume operation was intended.

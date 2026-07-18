@@ -2,7 +2,7 @@ import { constants, createWriteStream, statSync } from "node:fs"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
 import { pipeline } from "node:stream/promises"
-import { Context, Effect, Fiber, Layer } from "effect"
+import { Cause, Context, Effect, Either, Exit, Fiber, Layer, Option } from "effect"
 import { runAppleProcess, spawnAppleProcessHandle, type AppleProcessHandle } from "./AppleProcessSupervisor"
 import { type ExportBudget, ExportBudgetExceededError, ExportBudgetTransform, formatBytes } from "./ArtifactExportPolicy"
 import {
@@ -35,7 +35,8 @@ import {
   UserInputError,
 } from "../domain/errors"
 import { ArtifactStore } from "./ArtifactStore"
-import { SessionRegistry } from "./SessionRegistry"
+import { SessionRegistry, type TraceLeaseHandle, type TraceLeaseOutcome } from "./SessionRegistry"
+import { verifyTargetProcessIdentity } from "./TargetProcessIdentity"
 
 const nowIso = (): string => new Date().toISOString()
 
@@ -408,6 +409,37 @@ const rethrowSupervisorError = (args: {
     throw remapSpawnFailure({ ...args, error: args.error })
   }
   throw args.error
+}
+
+/**
+ * PRB-096: readable one-line reason a raw capture's `Effect.onExit`
+ * finalizer reports to `endTraceLease` -- the typed error's own `reason`
+ * when there is one, falling back to a plain message/pretty-cause for a
+ * defect or fiber interruption (e.g. a concurrent session close aborting
+ * `lease.signal`).
+ */
+const describeExitFailure = (exit: Exit.Exit<unknown, unknown>): string => {
+  if (Exit.isSuccess(exit)) {
+    return "none"
+  }
+
+  const failure = Cause.failureOption(exit.cause)
+
+  if (Option.isSome(failure)) {
+    const value = failure.value
+
+    if (value && typeof value === "object" && "reason" in value && typeof (value as { reason: unknown }).reason === "string") {
+      return (value as { reason: string }).reason
+    }
+
+    return value instanceof Error ? value.message : String(value)
+  }
+
+  if (Cause.isInterrupted(exit.cause)) {
+    return "interrupted (the owning session likely started closing)"
+  }
+
+  return Cause.pretty(exit.cause)
 }
 
 // Exported (in addition to being wired into `liveCommandRunner` below) so their
@@ -843,6 +875,16 @@ interface PerfSessionRegistryAccess {
     SessionFlowResult,
     SessionNotFoundError | UserInputError | UnsupportedCapabilityError | EnvironmentError | ChildProcessError
   >
+  // PRB-096: raw record's target-process lease seam -- see SessionRegistry.ts.
+  // Required (not optional like `runFlow`/`getArtifact`): the raw path's
+  // whole point is decoupling from `getSessionHealth`/runner health, so it
+  // has no honest fallback to degrade to when these are absent.
+  readonly peekSessionHealth: (sessionId: string) => Effect.Effect<SessionHealth, SessionNotFoundError>
+  readonly beginTraceLease: (sessionId: string) => Effect.Effect<
+    TraceLeaseHandle,
+    SessionNotFoundError | EnvironmentError | UnsupportedCapabilityError
+  >
+  readonly endTraceLease: (sessionId: string, outcome: TraceLeaseOutcome) => Effect.Effect<void>
 }
 
 const liveCommandRunner: PerfCommandRunner = {
@@ -1147,32 +1189,69 @@ export const createPerfService = (dependencies: {
         })
       }
 
-      const sessionBeforeRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
+      // PRB-096: raw record gates on a live, connected target-process lease
+      // -- device, live target pid, bundle, artifact root -- never on
+      // XCUITest runner health. `beginTraceLease` performs no runner ping
+      // and sets `resources.trace` ("starting") independently of
+      // `resources.runner`, so a degraded/failed runner wrapper with a
+      // still-live target pid can record successfully.
+      const lease = yield* dependencies.sessionRegistry.beginTraceLease(sessionId)
 
-      if (!isLiveRunnerDetails(sessionBeforeRecord.runner)) {
-        return yield* new UnsupportedCapabilityError({
-          code: "perf-session-real-device-runner",
-          capability: `perf.record.template.${templateKind}`,
-          reason: "The current session does not expose a live runner-backed target pid for perf recording.",
-          nextStep: "Retry on a simulator-backed runner session, or wait for the real-device runner/perf seam to be validated.",
-          details: [],
-          wall: false,
-        })
-      }
+      const captureResult = yield* recordWithTraceLease({
+        sessionId,
+        lease,
+        resolvedTemplate,
+        spec,
+        templateKind,
+        timeLimit,
+        timeLimitMs,
+        emitProgress,
+      })
 
-      const runnerDetails = sessionBeforeRecord.runner
+      // Passive, side-effect-free read (no runner ping) -- AC 9's "raw
+      // acquisition performs no pre/post runner ping side effect" -- for a
+      // best-effort `session` outcome in the result.
+      const sessionSnapshot = yield* dependencies.sessionRegistry.peekSessionHealth(sessionId)
 
-      if (
-        !sessionBeforeRecord.healthCheck.wrapperRunning
-        || (sessionBeforeRecord.state !== "ready" && sessionBeforeRecord.state !== "degraded")
-      ) {
-        return yield* new EnvironmentError({
-          code: "perf-session-not-ready",
-          reason: `Session ${sessionId} is ${sessionBeforeRecord.state} and cannot safely anchor a profiling request.`,
-          nextStep: "Reopen a healthy session, then retry the profiling command.",
-          details: [],
-        })
-      }
+      return {
+        ...captureResult,
+        session: {
+          state: sessionSnapshot.state,
+          healthCheck: sessionSnapshot.healthCheck,
+        },
+      } satisfies typeof PerfRecordResult.Type
+    })
+
+  // PRB-096: everything a raw capture does once it holds the lease --
+  // fresh pre-spawn process-identity verification, the xctrace record
+  // itself, TOC/schema exports, and analysis -- lives in its own Effect so
+  // `Effect.onExit` can guarantee `endTraceLease` runs exactly once no
+  // matter how it settles (success, a typed failure, or interruption from a
+  // concurrent session close aborting `lease.signal`). That is the "join":
+  // the trace lane always reaches a terminal state, and a session close
+  // blocked on it can never hang forever.
+  const recordWithTraceLease = (args: {
+    readonly sessionId: string
+    readonly lease: TraceLeaseHandle
+    readonly resolvedTemplate: { readonly customTemplate?: CustomTemplateRef }
+    readonly spec: TemplateSpec
+    readonly templateKind: TemplateSlug
+    readonly timeLimit: string
+    readonly timeLimitMs: number
+    readonly emitProgress: (stage: string, message: string) => void
+  }) => {
+    const { sessionId, lease, resolvedTemplate, spec, templateKind, timeLimit, timeLimitMs, emitProgress } = args
+    const target = lease.target
+    const withLeaseSignal = (signal: AbortSignal): AbortSignal => AbortSignal.any([signal, lease.signal])
+
+    return Effect.gen(function* () {
+      const identity = yield* verifyTargetProcessIdentity({
+        platform: target.platform,
+        deviceId: target.deviceId,
+        targetProcessId: target.targetProcessId,
+        capture: commandRunner.capture,
+        signal: lease.signal,
+      })
 
       if (templateKind !== "custom") {
         emitProgress("perf.record", `Checking xctrace template availability for ${spec.displayName}.`)
@@ -1183,7 +1262,7 @@ export const createPerfService = (dependencies: {
               command: "xcrun",
               commandArgs: ["xctrace", "list", "templates"],
               timeoutMs: defaultCommandOverheadMs,
-              signal,
+              signal: withLeaseSignal(signal),
             }),
           catch: (error) =>
             error instanceof ChildProcessError
@@ -1216,7 +1295,7 @@ export const createPerfService = (dependencies: {
             command: "xcrun",
             commandArgs: ["xctrace", "version"],
             timeoutMs: defaultCommandOverheadMs,
-            signal,
+            signal: withLeaseSignal(signal),
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1229,7 +1308,7 @@ export const createPerfService = (dependencies: {
               }),
       })
 
-      const tracesDirectory = join(sessionBeforeRecord.artifactRoot, "traces")
+      const tracesDirectory = join(target.artifactRoot, "traces")
       const baseName = `${timestampForFile()}-${spec.slug}`
       const tracePath = join(tracesDirectory, `${baseName}.trace`)
       const tocPath = join(tracesDirectory, `${baseName}.toc.xml`)
@@ -1247,22 +1326,15 @@ export const createPerfService = (dependencies: {
 
       emitProgress(
         "perf.record",
-        `Recording ${spec.displayName} for pid ${runnerDetails.targetProcessId} on device ${sessionBeforeRecord.target.deviceId}.`,
+        `Recording ${spec.displayName} for pid ${target.targetProcessId} on device ${target.deviceId} `
+          + `(process identity verified via ${identity.method}).`,
       )
 
-      const keepaliveFiber = yield* Effect.gen(function* () {
-        yield* Effect.sleep(runnerKeepaliveIntervalMs)
-        yield* dependencies.sessionRegistry.sendRunnerKeepalive(sessionId)
-      }).pipe(
-        Effect.catchAll((error) =>
-          Effect.sync(() => {
-            emitProgress("perf.record", `Runner keepalive failed: ${error instanceof Error ? error.message : String(error)}`)
-          })
-        ),
-        Effect.forever,
-        Effect.fork,
-      )
-
+      // PRB-096: no runner keepalive fiber here -- the raw capture never
+      // pings or pokes the XCUITest runner, before, during, or after
+      // recording. Session liveness while this runs is the trace lease
+      // itself (see the TTL sweeper's `activeTraceLeaseStates` exemption in
+      // SessionRegistry), not a runner-coupled ping.
       yield* Effect.tryPromise({
         try: (signal) =>
           commandRunner.capture({
@@ -1273,9 +1345,9 @@ export const createPerfService = (dependencies: {
               "--template",
               spec.xctraceTemplateName,
               "--device",
-              sessionBeforeRecord.target.deviceId,
+              target.deviceId,
               "--attach",
-              String(runnerDetails.targetProcessId),
+              String(target.targetProcessId),
               "--time-limit",
               timeLimit,
               "--output",
@@ -1286,7 +1358,7 @@ export const createPerfService = (dependencies: {
             ],
             timeoutMs: timeLimitMs + recordingOverheadMs,
             gracePeriodMs: recordingGracePeriodMs,
-            signal,
+            signal: withLeaseSignal(signal),
           }),
         catch: (error) =>
           error instanceof ChildProcessError
@@ -1297,9 +1369,7 @@ export const createPerfService = (dependencies: {
                 nextStep: "Inspect xctrace stderr and retry the profiling command.",
                 details: [],
               }),
-      }).pipe(
-        Effect.ensuring(Fiber.interrupt(keepaliveFiber)),
-      )
+      })
 
       const traceExists = yield* Effect.tryPromise({
         try: () => fileExists(tracePath),
@@ -1324,7 +1394,7 @@ export const createPerfService = (dependencies: {
       const traceArtifact = yield* dependencies.artifactStore.registerArtifact(
         sessionId,
         createArtifactRecord({
-          artifactRoot: sessionBeforeRecord.artifactRoot,
+          artifactRoot: target.artifactRoot,
           key: `${baseName}-trace`,
           label: `${spec.slug}-trace`,
           kind: "directory",
@@ -1333,12 +1403,13 @@ export const createPerfService = (dependencies: {
         }),
       )
 
-      emitProgress("perf.record", `Refreshing session health after recording ${spec.displayName}.`)
-      const sessionAfterRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
-
+      // PRB-096: no post-record runner health refresh here either -- the
+      // raw path's `session` outcome (built by `record()` after this
+      // Effect resolves) comes from `peekSessionHealth`'s passive read, not
+      // a fresh ping issued from inside the capture.
       const { tocXml, tocArtifact } = yield* exportTocArtifact({
         sessionId,
-        artifactRoot: sessionBeforeRecord.artifactRoot,
+        artifactRoot: target.artifactRoot,
         tracePath,
         tocPath,
         artifactKey: `${baseName}-toc`,
@@ -1403,7 +1474,7 @@ export const createPerfService = (dependencies: {
                 timeoutMs: defaultCommandOverheadMs,
                 outputPath: exportPath,
                 budget,
-                signal,
+                signal: withLeaseSignal(signal),
               })
 
               return {
@@ -1451,7 +1522,7 @@ export const createPerfService = (dependencies: {
         const artifact = yield* dependencies.artifactStore.registerArtifact(
           sessionId,
           createArtifactRecord({
-            artifactRoot: sessionBeforeRecord.artifactRoot,
+            artifactRoot: target.artifactRoot,
             key: `${baseName}-${schema}`,
             label: `${spec.slug}-${schema}`,
             kind: "xml",
@@ -1505,7 +1576,7 @@ export const createPerfService = (dependencies: {
       }
 
       const analysis = yield* Effect.try({
-        try: () => spec.analyze(parsedTables, runnerDetails.targetProcessId),
+        try: () => spec.analyze(parsedTables, target.targetProcessId),
         catch: (error) =>
           new EnvironmentError({
             code: "perf-analyze-export-contract",
@@ -1523,25 +1594,31 @@ export const createPerfService = (dependencies: {
         timeLimit,
         recordedAt: nowIso(),
         xctraceVersion: xctraceVersionResult.stdout.trim(),
-        session: {
-          state: sessionAfterRecord.state,
-          healthCheck: sessionAfterRecord.healthCheck,
-        },
         summary: analysis.summary,
         diagnoses: [
           ...analysis.diagnoses,
-          ...buildPostRecordSessionDiagnoses({
-            before: sessionBeforeRecord,
-            after: sessionAfterRecord,
-          }),
+          {
+            code: "perf-target-identity-verified",
+            severity: "info" as const,
+            summary: `Target process ${target.targetProcessId} identity verified via ${identity.method} immediately before recording (no XCUITest runner ping performed).`,
+            details: [identity.detail],
+            wall: false,
+          },
         ],
         artifacts: {
           trace: traceArtifact,
           toc: tocArtifact,
           exports: exportArtifacts,
         },
-      } satisfies typeof PerfRecordResult.Type
-    })
+      } satisfies Omit<typeof PerfRecordResult.Type, "session">
+    }).pipe(
+      Effect.onExit((exit) =>
+        dependencies.sessionRegistry.endTraceLease(
+          sessionId,
+          Exit.isSuccess(exit) ? { kind: "stopped" } : { kind: "failed", detail: describeExitFailure(exit) },
+        )),
+    )
+  }
 
   const recordAroundFlow = ({ sessionId, template, flow, emitProgress }: {
     readonly sessionId: string
@@ -1706,7 +1783,26 @@ export const createPerfService = (dependencies: {
       )
 
       emitProgress("perf.around", `Refreshing session health after recording ${spec.displayName}.`)
-      const sessionAfterRecord = yield* dependencies.sessionRegistry.getSessionHealth(sessionId)
+      const sessionHealthRefresh = yield* Effect.either(dependencies.sessionRegistry.getSessionHealth(sessionId))
+
+      // PRB-096 gate 8: a UI/runner failure in this post-flow health
+      // refresh must never discard an already-completed trace -- the
+      // recording and its artifacts are already done and registered by this
+      // point. Fall back to the pre-flow snapshot (marked degraded, with an
+      // explicit warning) instead of failing the whole `recordAroundFlow`
+      // result and losing the trace summary the caller would otherwise get.
+      const sessionAfterRecord: SessionHealth = Either.isRight(sessionHealthRefresh)
+        ? sessionHealthRefresh.right
+        : {
+            ...sessionBeforeRecord,
+            state: "degraded",
+            warnings: [
+              ...sessionBeforeRecord.warnings,
+              `Post-flow session health refresh failed after the trace recording completed: ${
+                sessionHealthRefresh.left instanceof Error ? sessionHealthRefresh.left.message : String(sessionHealthRefresh.left)
+              }. The recorded trace and its artifacts are preserved.`,
+            ],
+          }
       const { tocArtifact } = yield* exportTocArtifact({
         sessionId,
         artifactRoot: sessionBeforeRecord.artifactRoot,

@@ -95,6 +95,14 @@ export interface RunnerTransportSendArgs {
   readonly action: RunnerAction
   readonly sequence: number
   readonly payload?: string | null
+  /**
+   * PRB-089: the runner epoch this command targets, echoed straight into
+   * the wire frame. Purely pass-through at this layer — the transport
+   * client has no epoch policy of its own; it is the caller's job (the
+   * harness that knows which runner process it attached to) to supply the
+   * value from that runner's ready frame.
+   */
+  readonly epoch: string
   /** One absolute budget for the whole call. Never divided across candidate endpoints. */
   readonly deadlineMs: number
   /**
@@ -228,6 +236,7 @@ const sendWithClient = (args: RunnerTransportSendArgs): Effect.Effect<RunnerDeli
       sequence: args.sequence,
       action: args.action,
       payload: args.payload ?? null,
+      epoch: args.epoch,
     })
     const idempotent = args.idempotent ?? false
     const attemptedEndpoints: Array<string> = []

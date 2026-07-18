@@ -64,3 +64,73 @@ Updated: 2026-04-09
 - Screenshot attachments can be created directly from `XCUIScreenshot`.
 - Attachment metadata includes `name`, `uniformTypeIdentifier`, and `userInfo`.
 - Attachment retention is governed by `XCTAttachment.Lifetime`.
+
+### `XCUIElementQuery` (PRB-091: the public-XCUI query planner surface)
+
+Every method below is public API used by Probe's `uiAction` selector resolver
+(`ios/ProbeRunner/AttachControlSpikeUITests.swift`: `narrowedUIActionQuery`,
+`boundedMatchingElements`, `boundedSectionMatches`). No private/undocumented
+API is used anywhere in that path.
+
+- `XCUIElement.descendants(matching:)` returns an `XCUIElementQuery` scoped
+  to a specific `XCUIElement.ElementType` (or `.any`). This is the query
+  root — it does not itself materialize or enumerate anything.
+- `XCUIElementQuery.matching(identifier:)` narrows a query to elements whose
+  `identifier` equals the given string. This is Apple's own typed identifier
+  predicate and is the narrowest public query available for a strong
+  locator — Probe applies it first, before any weaker field, for every
+  identifier-bearing locator.
+- `XCUIElementQuery.matching(_:NSPredicate)` narrows a query with an
+  arbitrary predicate. Probe uses this to push `label ==` / `placeholderValue
+  ==` narrowing into the query itself (a compound `AND` predicate when both
+  are present) rather than materializing every element of the given type and
+  filtering client-side.
+- `XCUIElementQuery.element(boundBy:)` returns a single `XCUIElement` proxy
+  for the match at a specific index, evaluated lazily. Probe's bounded
+  scanner (`boundedMatchingElements`) reads a query exclusively through this
+  method — `index = 0, 1, 2, ...` — checking `.exists` at each step and
+  stopping the moment it has proven what it needs (zero vs one vs "more than
+  one", or the requested ordinal). This is the mechanism that satisfies
+  "materializes only enough matches to distinguish zero, one, or many": there
+  is no public API to ask a query for a bounded/lazy match count directly, so
+  index-bounded `element(boundBy:)` probing is the correct public substitute
+  for `.allElementsBoundByIndex` (which forces full, eager materialization of
+  every match as an `XCUIElement`).
+- `XCUIElementQuery.count` was considered and rejected for ambiguity
+  detection: it still requires evaluating the query to completion to produce
+  an exact number, so it is no cheaper than `.allElementsBoundByIndex.count`
+  for the "is this ambiguous" question the planner actually needs answered.
+  `element(boundBy:)` existence probing is strictly narrower for that
+  question.
+- `XCUIApplication` itself is a valid `XCUIElement` for locator resolution
+  (the `type: "application"` locator matches `app` directly with zero query
+  work — the cheapest possible resolution path).
+
+Value-field caveat: `XCUIElementAttributes.value` is `Any?` (String,
+NSNumber, ...). Probe's host-side value normalization (`normalizedValue`:
+NSNumber → `stringValue`, arbitrary `Any` → `String(describing:)`) has no
+faithful `NSPredicate` equivalent, so `value` locator matching stays a
+Swift-side post-filter over the bounded candidate set rather than a query
+predicate — never a reason to widen the query back to `.any` unfiltered.
+
+`matching(identifier:)` container caveat (found while building the PRB-091
+review-follow-up regression test — see
+`testUIActionSectionTokenIdentifierCollisionResolvesSafely` in
+`AttachControlSpikeUITests.swift`): for a non-accessibility-element
+container (`isAccessibilityElement == false`, the default for a plain
+`UIView`/`UIStackView`, which is what every section-token container in this
+codebase actually is), `XCUIElementQuery.matching(identifier:)` is **not**
+strict `identifier == %@` equality in practice — a container whose own
+`identifier` attribute is a distinct string but whose accessibility *label*
+equals the queried string still matched, empirically, against a real
+Simulator run (iPhone 17 Pro, iOS 26.4, 2026-07-17). This does not appear to
+hold for accessible leaf controls (buttons, switches, labels) — the
+gate-7 benchmark below resolves 100 button/switch identifiers by exact
+identifier with zero mismatches, and `boundedSectionMatches`'s ambiguity
+check (stop at 2 matches) is what actually protects `matchingUIActionElements`
+from acting on this: a section token that collides between a container's
+label and an unrelated element's identifier yields 2 identifier-query
+matches, not 1, so the token is correctly treated as ambiguous and the
+search broadens to `app` rather than narrowing to the wrong element. Do not
+assume `matching(identifier:)` is identifier-only for container-shaped
+(`.other`) elements without re-verifying against a real run.

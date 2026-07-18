@@ -32,6 +32,7 @@ const makeSimulatorReadyFrame = (): Record<string, unknown> => ({
   runnerTransportContract: RUNNER_TRANSPORT_CONTRACT,
   sessionIdentifier: "session-1",
   simulatorUdid: "SIM-1",
+  runnerEpoch: "epoch-sim-1",
 })
 
 describe("runner protocol", () => {
@@ -61,6 +62,14 @@ describe("runner protocol", () => {
     expect(ready.egressTransport).toBe("stdout-jsonl-mixed-log")
     expect(ready.runnerPort).toBe(41041)
     expect(ready.capabilities).toEqual(["uiAction", "uiActionBatch"])
+    expect(ready.runnerEpoch).toBe("epoch-sim-1")
+  })
+
+  test("fails with a focused error when a ready frame loses its runner epoch", () => {
+    const broken = structuredClone(makeSimulatorReadyFrame())
+    delete broken.runnerEpoch
+
+    expect(() => decodeRunnerReadyFrame(broken)).toThrow(/Invalid runner ready frame:.*runnerEpoch/)
   })
 
   test("decodes the snapshot response shape Probe consumes from local runner output", () => {
@@ -86,6 +95,7 @@ describe("runner protocol", () => {
       sequence: 7,
       action: "uiAction",
       payload: '{"kind":"tap"}',
+      epoch: "epoch-sim-1",
     })
 
     const decoded = decodeRunnerCommandFrame(JSON.parse(encoded))
@@ -93,6 +103,7 @@ describe("runner protocol", () => {
       sequence: 7,
       action: "uiAction",
       payload: '{"kind":"tap"}',
+      epoch: "epoch-sim-1",
     })
   })
 
@@ -115,6 +126,8 @@ describe("runner protocol", () => {
       totalHandledMs: 12,
       childHandledMs: [4, 8, null],
       recordedAt: "2026-04-14T00:00:00.000Z",
+      epoch: "epoch-sim-1",
+      replayStatus: "executed",
     })
 
     expect(response.action).toBe("uiActionBatch")
@@ -122,6 +135,47 @@ describe("runner protocol", () => {
     expect(response.failedActionKind).toBe("tap")
     expect(response.totalHandledMs).toBe(12)
     expect(response.childHandledMs).toEqual([4, 8, null])
+  })
+
+  // PRB-091: `resolutionMs`/`waitMs`/`interactionMs`/`finalizationMs` are the
+  // runner's phase breakdown of `handledMs` for a `uiAction` response — see
+  // ios/ProbeRunner/AttachControlSpikeUITests.swift's `LifecycleResponseFrame`.
+  test("decodes the uiAction phase telemetry breakdown", () => {
+    const response = decodeRunnerResponseFrame({
+      kind: "response",
+      sequence: 3,
+      ok: true,
+      action: "uiAction",
+      error: null,
+      payload: "tapped identifier=fixture.form.applyButton",
+      snapshotPayloadPath: null,
+      inlinePayload: null,
+      inlinePayloadEncoding: null,
+      handledMs: 42,
+      statusLabel: "ok",
+      resolutionMs: 5,
+      waitMs: 12,
+      interactionMs: 20,
+      finalizationMs: 1,
+      snapshotNodeCount: null,
+      recordedAt: "2026-04-14T00:00:00.000Z",
+      epoch: "epoch-sim-1",
+      replayStatus: "executed",
+    })
+
+    expect(response.resolutionMs).toBe(5)
+    expect(response.waitMs).toBe(12)
+    expect(response.interactionMs).toBe(20)
+    expect(response.finalizationMs).toBe(1)
+  })
+
+  test("decodes response frames that predate the uiAction phase telemetry breakdown", () => {
+    const response = decodeRunnerResponseFrame(loadFixture("runner", "response-snapshot.json"))
+
+    expect(response.resolutionMs).toBeUndefined()
+    expect(response.waitMs).toBeUndefined()
+    expect(response.interactionMs).toBeUndefined()
+    expect(response.finalizationMs).toBeUndefined()
   })
 
   test("fails with a focused error when a ready frame loses session identity", () => {
@@ -149,6 +203,7 @@ describe("runner protocol", () => {
       runnerTransportContract: RUNNER_TRANSPORT_CONTRACT,
       sessionIdentifier: "session-1",
       simulatorUdid: "device-1",
+      runnerEpoch: "epoch-device-1",
     })
 
     expect(ready.bootstrapSource).toBe("device-bootstrap-manifest")

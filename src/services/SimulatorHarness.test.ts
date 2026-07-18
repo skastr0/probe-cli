@@ -384,6 +384,8 @@ describe("SimulatorHarness helpers", () => {
             statusLabel: "ok",
             snapshotNodeCount: commandFrame.action === "snapshot" ? 94 : null,
             recordedAt: new Date().toISOString(),
+            epoch: commandFrame.epoch,
+            replayStatus: "executed",
           }),
         )
       })
@@ -420,7 +422,7 @@ describe("SimulatorHarness helpers", () => {
     })
 
     try {
-      const sendCommand = createHttpRunnerCommandSender(commandUrl)
+      const sendCommand = createHttpRunnerCommandSender(commandUrl, "test-runner-epoch")
       const results: Array<RunnerCommandResult> = []
 
       for (let sequence = 1; sequence <= 12; sequence += 1) {

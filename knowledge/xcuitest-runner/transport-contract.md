@@ -99,6 +99,167 @@ mutation again on the second candidate.
   exercised once for a single-endpoint (simulator-shaped) call and once for a
   two-endpoint (device-shaped) call in `RunnerTransportClient.test.ts`.
 
+## Replay-safety contract (PRB-089)
+
+PRB-081 made a mutation's ambiguous transport failure stop instead of
+falling through to another candidate; it did not make redelivering that
+same mutation safe. PRB-089 closes that gap: **at-most-once mutation
+execution within one live runner epoch**, with duplicate deliveries
+replaying the original terminal result instead of re-running the action.
+
+### Guarantee boundary
+
+- Scoped to **one live runner epoch** — the runner process's own lifetime.
+  A crash or restart mints a fresh epoch; nothing is claimed across that
+  boundary. "Runner loss after dispatch without a durable result" is
+  reported as **explicit indeterminate**, never as success and never as a
+  claim that the mutation definitely did not run.
+- Explicitly excluded (see the glyph's Exclusions): persistence across a
+  runner restart, automatic replay under a new epoch, distributed
+  exactly-once claims, and general HTTP caching.
+
+### Wire contract
+
+- `RunnerReadyFrameSchema` / the Swift `LifecycleReadyFrame` now carry
+  `runnerEpoch: string` — a fresh UUID minted once per
+  `attachForLifecycleLoop` call (i.e. once per live runner process/attach).
+- `RunnerCommandFrameSchema` / `LifecycleCommandFrame` now carry
+  `epoch: string`; the host always echoes back the epoch from the ready
+  frame it attached to.
+- `RunnerResponseFrameSchema` / `LifecycleResponseFrame` now carry
+  `epoch: string` (the runner's *current* epoch — reported even on a
+  rejected command) and `replayStatus`, one of:
+  - `"executed"` — ran for the first time this epoch.
+  - `"cached-replay"` — a duplicate of an already-cached sequence; the
+    stored terminal result was returned verbatim (`recordedAt`,
+    `handledMs`, `payload`, `statusLabel`, `ok`, `error` all byte-identical
+    to the original execution) with only `replayStatus` relabeled. That
+    field-level identity is the receipt that no second execution happened.
+  - `"result-expired"` — the sequence is at or below the executed
+    high-water mark but its cache entry was evicted; the runner refuses to
+    re-execute a mutation whose original result it can no longer prove.
+  - `"epoch-mismatch"` — the command's epoch does not match the runner's
+    current one; rejected before execution.
+  - `"sequence-gap"` — the command's sequence skips more than one past the
+    executed high-water mark; rejected before execution rather than risk
+    out-of-order mutation.
+
+### Runner-side mechanism (`RunnerReplayCoordinator`, AttachControlSpikeUITests.swift)
+
+One instance per live runner process, holding exactly two pieces of state:
+a bounded (64-entry, FIFO-evicted) terminal-result cache keyed by sequence
+number, and the executed high-water mark. `disposition(for:)` runs
+*before* `handleLifecycleCommand`, on the same `@MainActor`-serialized HTTP
+path as execution itself — every action handler in `handleLifecycleCommand`
+runs to completion without an `await`, so a second delivery for a sequence
+still executing cannot itself begin running until the first has already
+recorded its terminal result. That serialization is what makes "duplicate
+in-flight command coalesces onto the first execution" true without any
+separate in-flight bookkeeping: it degenerates to a cache hit by
+construction, not a race the coordinator has to referee.
+
+A failed execution attempt (a thrown `handleLifecycleCommand` error) is
+cached exactly like a successful one — a doomed mutation's first *attempt*
+already ran (with whatever side effects that implies), so a redelivery must
+never try it again.
+
+### Host-side mechanism (`SessionController` + `SessionRegistry.sendRunnerCommand`)
+
+`SessionController.allocateSequence()` (PRB-083) allocates a command's
+identity exactly once; PRB-089 makes `sendRunnerCommand` *reuse* that one
+sequence number across every permitted redelivery attempt, instead of
+allocating a fresh one per retry. Only an **ambiguous**
+`RunnerTransportError` (`sent-no-response` / `invalid-response` — the
+runner may already have executed the command) is retryable, bounded to 100
+attempts with a small backoff; an unambiguous `not-sent` failure (nothing
+reached the runner) keeps its prior single-attempt behavior, and `ping`
+is excluded entirely (it already retries safely *inside*
+`RunnerTransportClient`'s one absolute deadline). Exhausting the
+redelivery budget while every failure stayed ambiguous reports a typed
+`session-runner-<action>-indeterminate` `EnvironmentError` carrying the
+command's sequence, epoch, and last delivery phase — the glyph's "runner
+crash after dispatch cannot produce success" case.
+
+### Verification
+
+- `RunnerTransportClient.test.ts`, `runnerProtocol.test.ts`,
+  `SimulatorHarness.test.ts`: wire-contract coverage for the new
+  `epoch`/`replayStatus` fields.
+- `SessionRegistry.test.ts`: "redelivers an ambiguous mutation failure and
+  reuses the same command sequence", "does not redeliver an unambiguous
+  (not-sent) mutation failure", "gives up after exhausting mutation
+  redelivery and reports a typed indeterminate failure" — the host-side
+  redelivery policy against a fake harness, deterministic and fast.
+- `AttachControlSpikeUITests.testCommandLoopReplaySafety` — the real
+  Simulator/XCUITest boundary proof, run against the actual HTTP command
+  server: a fresh execute; 100 identical redeliveries returning the
+  byte-identical cached result; a fault-injection-shaped
+  execute-then-redeliver of a real `applyInput` mutation (one status-label
+  change, not two); an epoch-mismatch rejection; a sequence-gap rejection —
+  both leaving app state untouched; and (added in the PRB-089 review-fix
+  pass) a cache-eviction case that drives 63 additional executed sequences
+  through the real server to push the 64-entry FIFO cache past capacity,
+  evicting the very first sequence, then redelivers that identity and
+  asserts the runner returns typed `result-expired` (`ok: false`) rather
+  than silently re-executing it, with app state unchanged. Passed against
+  `iPhone 16 Pro` / iOS 18.0 on 2026-07-17 (`test-without-building
+  -only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testCommandLoopReplaySafety`)
+  — this was the pre-existing coverage before the eviction step was added;
+  see "Not yet covered" for the status of re-running the full test
+  (including the new eviction step) in this review pass.
+- `src/investigations/rpc-daemon-defects/scenarios/ambiguousMutationDelivery.ts`
+  is owned by this glyph (wave-1 handoff note) and is now green: it proved
+  the daemon RPC client silently accepted a sequence gap in progress
+  events; `src/rpc/client.ts`'s `sendRequest` now tracks the last-seen
+  event sequence per request and fails the request
+  (`EnvironmentError` code `rpc-progress-sequence-gap`) the moment a later
+  event skips ahead, instead of forwarding it to `onEvent` and letting the
+  request resolve as if nothing were missing. This is a distinct transport
+  (the Unix-socket daemon RPC protocol, not the runner HTTP command
+  protocol) but the same shape of defect — an unvalidated `sequence` field
+  — so the fix lives at its own layer, not folded into
+  `RunnerReplayCoordinator`.
+
+### Not yet covered
+
+- A **physical device** run of `testCommandLoopReplaySafety` — this host
+  has two connected devices visible to `devicectl` but no
+  `DEVELOPMENT_TEAM` configured, so device-signed XCUITest execution
+  cannot be exercised here. The device HTTP command path (`RealDeviceHarness.ts`)
+  threads `epoch` identically to the simulator path (same
+  `runRunnerTransportSend` call, same `ready.runnerEpoch` source), so the
+  wire contract is shared; only the on-device *execution* of
+  `RunnerReplayCoordinator` remains unverified against real hardware.
+- Before this review-fix pass, `testCommandLoopReplaySafety` never drove
+  enough distinct executed sequences to cross the terminal-result cache's
+  64-entry FIFO bound, so the `result-expired` rejection
+  (`RunnerReplayCoordinator.disposition(for:)`, the `sequence <=
+  executedHighWaterMark` branch) and the eviction itself
+  (`evictIfNeeded`) were verified by code review only, never exercised
+  live. A step forcing eviction and asserting the typed rejection was
+  added to `driveReplaySafetyScenario` in this pass. It could not be
+  re-run live in this review environment: two genuine attempts to execute
+  `testCommandLoopReplaySafety` against `iPhone 16 Pro` / iOS 18.0 both
+  failed before reaching the eviction step (or any step), at
+  `attachForLifecycleLoop`'s bootstrap-manifest read —
+  `resolveLifecycleControlDirectory` reports the manifest at
+  `/tmp/probe-runner-bootstrap/<udid>.json` as missing even though
+  `FileManager.fileExists` sees it and the host shell confirms it exists
+  and is readable (Xcode 26.6, `xcodebuild` 26.6/17F113 on this host). The
+  identical failure reproduces on the pre-existing, unmodified
+  `testCommandLoopLifecycle` via `validate-lifecycle.sh`, so this is not a
+  regression from this pass's diff — it is this host's current
+  Simulator/XCUITest toolchain no longer honoring cross-process
+  filesystem reads under `/tmp` for the UI test runner process the way the
+  2026-07-17 "Passed" receipt above assumes. A second attempt tried the
+  code's built-in bypass (`PROBE_BOOTSTRAP_JSON` env var, normally the
+  device-bootstrap path) via `xcodebuild`'s `TEST_RUNNER_`-prefixed
+  build-setting override; the override did not appear in the generated
+  `.xctestrun`'s `EnvironmentVariables`, so the test still fell through to
+  the same file-read path and failed the same way. The new eviction step
+  therefore stayed unexercised live in this pass — real-boundary coverage
+  for `#6`/`#11` is code-reviewed and typechecked only, not yet Simulator-run.
+
 ## Historical evidence (superseded)
 
 The measurements below are retained for provenance. They record why HTTP
@@ -141,6 +302,10 @@ Simulator and device.
   2. allocate a fresh control directory
   3. rewrite the bootstrap manifest
   4. relaunch the runner and wait for a new `ready` frame
+- A relaunched runner mints a fresh `runnerEpoch` (PRB-089); the old epoch's
+  terminal-result cache is gone with the process. There is no attempt to
+  carry replay safety across this boundary — see "Replay-safety contract"
+  above.
 - Commands remain correlated by sequence number in the `RunnerCommandFrame` /
   `RunnerResponseFrame` pair, regardless of which egress path carried a given
   frame.
