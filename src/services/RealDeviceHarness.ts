@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Context, Effect, Layer } from "effect"
@@ -27,10 +28,20 @@ import {
 import { resolveAdvertisedCapabilities } from "./runnerCapabilities"
 import { resolveRunnerCommandTimeoutMs, runRunnerTransportSend } from "./RunnerTransportClient"
 import {
-  probeRunnerDeviceDerivedRootPath,
+  probeRunnerDeviceSignedCacheRootPath,
   resolveProbeFixtureProjectPath,
   resolveProbeRunnerWrapperScriptPath,
 } from "./ProjectRoot"
+import { probeRuntimeAssetHash } from "./RuntimeAssets"
+import {
+  ensureRealDeviceRunnerBuildCached,
+  resolveRunnerSourceHash,
+  RunnerBuildCacheError,
+  type RunnerBuildCacheDeps,
+  type RunnerBuildCacheKeyInput,
+  type RunnerCacheStatus,
+  type SignedProductValidation,
+} from "./RunnerBuildCache"
 
 const runnerScheme = "ProbeRunner"
 const commandPollIntervalMs = 50
@@ -61,8 +72,6 @@ const assertPackagedProbePathExists = async (path: string, description: string):
     details: [],
   })
 }
-
-const resolveRealDeviceRunnerDerivedDataPath = (): string => probeRunnerDeviceDerivedRootPath
 
 interface DeviceInterruptionPattern {
   readonly signal: DeviceInterruptionSignal
@@ -178,6 +187,25 @@ interface PreflightIssue {
   readonly details: ReadonlyArray<string>
 }
 
+/** Cache-hit/miss/coalesce status plus discovered signing facts, surfaced through preflight/live session results into session health and compact progress. */
+export interface RealDeviceRunnerCacheSummary {
+  readonly status: RunnerCacheStatus | null
+  readonly key: string | null
+  readonly invalidationReason: string | null
+  readonly signingIdentity: string | null
+  readonly profileIdentity: string | null
+  readonly profileExpiresAt: string | null
+}
+
+const formatRunnerCacheSummary = (summary: RealDeviceRunnerCacheSummary): string => {
+  if (!summary.status || !summary.key) {
+    return "runner build cache: not evaluated (no signing team resolved)."
+  }
+
+  const base = `runner build cache ${summary.status} (key ${summary.key})`
+  return summary.invalidationReason ? `${base}, invalidated: ${summary.invalidationReason}` : `${base}.`
+}
+
 interface PreflightContext {
   readonly mode: "preflight"
   readonly device: {
@@ -207,6 +235,7 @@ interface PreflightContext {
   readonly developmentTeam: string
   readonly selectedDevice: RealDeviceCandidate
   readonly metaDirectory: string
+  readonly runnerBuildCache: RealDeviceRunnerCacheSummary
 }
 
 interface XmlElementRange {
@@ -246,6 +275,7 @@ export interface OpenedRealDevicePreflightSession {
   readonly connection: SessionConnectionDetails
   readonly refreshConnection: () => Promise<SessionConnectionDetails>
   readonly close: () => Promise<void>
+  readonly runnerBuildCache: RealDeviceRunnerCacheSummary
 }
 
 export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePreflightSession, "mode"> {
@@ -270,6 +300,8 @@ export interface OpenedRealDeviceLiveSession extends Omit<OpenedRealDevicePrefli
   readonly installedAppsJsonPath: string
   readonly launchJsonPath: string
   readonly nextSequence: number
+  /** PRB-089: the fresh random epoch this runner process's ready frame advertised. */
+  readonly runnerEpoch: string
   readonly initialPingRttMs: number
   readonly capabilities: ReadonlyArray<RunnerCapability>
   readonly sendCommand: (
@@ -620,6 +652,272 @@ const inferBuildForTestingNextStep = (result: CommandResult): string => {
 
   return "Fix the reported signing/provisioning issue, ensure the device is registered for development signing if needed, then retry the session open."
 }
+
+// -- PRB-095: signed runner build cache integration ------------------------
+//
+// Everything below resolves the composite cache key (runtime asset hash,
+// runner/project source hash, Xcode/SDK, platform/arch, team, and the
+// templated build-settings shape) and supplies `RunnerBuildCache` with real
+// `xcodebuild`/`codesign`/`security` implementations. `RunnerBuildCache`
+// itself stays dependency-free of this file (see its own header comment) so
+// it can be unit-tested with fakes; this section is the "real deps" half of
+// that split.
+
+interface HostToolchainInfo {
+  readonly xcodeVersion: string
+  readonly sdkVersion: string
+}
+
+// Memoized for the life of the process: the selected Xcode/SDK does not
+// change while a daemon is running, and re-deriving it on every session open
+// would eat into the "cache-hit preflight adds at most one second" budget.
+let cachedHostToolchainInfo: Promise<HostToolchainInfo> | null = null
+
+// Exported for direct process-level test coverage against the real
+// `xcodebuild`/`xcrun` toolchain-version seam, the same convention already
+// used for `runRealDeviceHostCommand`.
+export const resolveHostToolchainInfo = (): Promise<HostToolchainInfo> => {
+  if (cachedHostToolchainInfo) {
+    return cachedHostToolchainInfo
+  }
+
+  const computed = (async (): Promise<HostToolchainInfo> => {
+    const [versionResult, sdkResult] = await Promise.all([
+      runRealDeviceHostCommand({ command: "/usr/bin/xcodebuild", commandArgs: ["-version"] }),
+      runRealDeviceHostCommand({ command: "/usr/bin/xcrun", commandArgs: ["--sdk", "iphoneos", "--show-sdk-version"] }),
+    ])
+
+    return {
+      xcodeVersion: versionResult.stdout.split(/\r?\n/)[0]?.trim() || "unknown",
+      sdkVersion: sdkResult.stdout.trim() || "unknown",
+    }
+  })().catch((error: unknown) => {
+    cachedHostToolchainInfo = null
+    throw error
+  })
+
+  cachedHostToolchainInfo = computed
+  return computed
+}
+
+/** Test-only escape hatch: clears the per-process Xcode/SDK memoization. */
+export const resetHostToolchainInfoCacheForTests = (): void => {
+  cachedHostToolchainInfo = null
+}
+
+// Templated (team/paths replaced by fixed placeholders) so the hash tracks
+// only the *shape* of the build invocation -- scheme, destination, and
+// provisioning flags -- not values that already have their own key fields.
+const computeBuildSettingsHash = (): string =>
+  createHash("sha256")
+    .update(JSON.stringify(buildRealDeviceBuildForTestingCommandArgs({
+      projectPath: "<project>",
+      derivedDataPath: "<derived-data>",
+      developmentTeam: "<team>",
+    })))
+    .digest("hex")
+    .slice(0, 16)
+
+const resolveRunnerBuildCacheKeyInput = async (args: {
+  readonly projectRoot: string
+  readonly developmentTeam: string
+}): Promise<RunnerBuildCacheKeyInput> => {
+  const [runnerSourceHash, toolchain] = await Promise.all([
+    resolveRunnerSourceHash(args.projectRoot),
+    resolveHostToolchainInfo(),
+  ])
+
+  return {
+    runtimeAssetHash: probeRuntimeAssetHash,
+    runnerSourceHash,
+    xcodeVersion: toolchain.xcodeVersion,
+    sdkVersion: toolchain.sdkVersion,
+    platform: "ios-device",
+    arch: "arm64",
+    developmentTeam: args.developmentTeam,
+    // Xcode's `-allowProvisioningUpdates` automatic-signing path chooses the
+    // concrete identity/profile; Probe's session-open contract only carries
+    // a team id today (see the glyph notes), so these stay pinned to a
+    // sentinel in the *key* while the concrete discovered values still drive
+    // revalidation (see `RunnerBuildCache`'s header comment).
+    signingIdentity: "automatic",
+    profileIdentity: "automatic",
+    buildSettingsHash: computeBuildSettingsHash(),
+  }
+}
+
+const extractCodesignAuthority = (output: string): string | null => {
+  const match = output.match(/^Authority=(.+)$/mu)
+  return match ? match[1]!.trim() : null
+}
+
+const extractPlistRootDictXml = (plistXml: string): string => {
+  const plistStart = plistXml.indexOf("<plist")
+  const searchStart = plistStart === -1 ? 0 : plistXml.indexOf(">", plistStart) + 1
+  const rootDictStart = plistXml.indexOf("<dict", searchStart)
+
+  if (rootDictStart === -1) {
+    throw new Error("Expected a plist root dict.")
+  }
+
+  const rootDictRange = readXmlElement(plistXml, rootDictStart)
+
+  if (!rootDictRange || rootDictRange.tagName !== "dict") {
+    throw new Error("Expected a plist root dict.")
+  }
+
+  return rootDictRange.raw
+}
+
+const extractPlistStringValue = (plistXml: string, key: string): string | null => {
+  try {
+    const entry = readImmediateDictEntries(extractPlistRootDictXml(plistXml)).find((candidate) => candidate.key === key)
+
+    if (!entry || entry.valueRange.tagName !== "string") {
+      return null
+    }
+
+    return decodeXmlText(entry.valueRange.raw.replace(/^<string\b[^>]*>/u, "").replace(/<\/string>$/u, ""))
+  } catch {
+    return null
+  }
+}
+
+const extractPlistDateValue = (plistXml: string, key: string): string | null => {
+  try {
+    const entry = readImmediateDictEntries(extractPlistRootDictXml(plistXml)).find((candidate) => candidate.key === key)
+
+    if (!entry || entry.valueRange.tagName !== "date") {
+      return null
+    }
+
+    const rawDate = entry.valueRange.raw.replace(/^<date\b[^>]*>/u, "").replace(/<\/date>$/u, "").trim()
+    const parsed = new Date(rawDate)
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Verifies a built (or previously cached) `.app` bundle: code signature
+ * (`codesign --verify --deep --strict`), then the embedded provisioning
+ * profile's identity and expiry. Used both right after a fresh build (before
+ * publishing a cache entry) and on every cache hit (before trusting one) --
+ * see `RunnerBuildCacheDeps.verifyProduct`.
+ *
+ * Exported for direct process-level test coverage against a real, locally
+ * ad-hoc-signed fixture bundle, the same convention already used for
+ * `runRealDeviceHostCommand`.
+ */
+export const verifySignedRealDeviceProduct = async (appPath: string): Promise<SignedProductValidation> => {
+  const verifyResult = await runRealDeviceHostCommand({
+    command: "/usr/bin/codesign",
+    commandArgs: ["--verify", "--deep", "--strict", appPath],
+  })
+
+  if (verifyResult.exitCode !== 0) {
+    return {
+      signed: false,
+      signingIdentity: null,
+      profileIdentity: null,
+      profileExpiresAt: null,
+      reason: `codesign --verify failed for ${appPath}: ${formatCommandFailure("codesign --verify --deep --strict", verifyResult)}`,
+    }
+  }
+
+  const displayResult = await runRealDeviceHostCommand({
+    command: "/usr/bin/codesign",
+    commandArgs: ["--display", "--verbose=2", appPath],
+  })
+  const signingIdentity = extractCodesignAuthority(`${displayResult.stdout}\n${displayResult.stderr}`)
+  const embeddedProfilePath = join(appPath, "embedded.mobileprovision")
+
+  if (!(await fileExists(embeddedProfilePath))) {
+    return {
+      signed: false,
+      signingIdentity,
+      profileIdentity: null,
+      profileExpiresAt: null,
+      reason: `${appPath} has no embedded.mobileprovision.`,
+    }
+  }
+
+  const decodedProfile = await runRealDeviceHostCommand({
+    command: "/usr/bin/security",
+    commandArgs: ["cms", "-D", "-i", embeddedProfilePath],
+  })
+
+  if (decodedProfile.exitCode !== 0) {
+    return {
+      signed: false,
+      signingIdentity,
+      profileIdentity: null,
+      profileExpiresAt: null,
+      reason: `Could not decode the embedded provisioning profile at ${embeddedProfilePath}.`,
+    }
+  }
+
+  const profileIdentity = extractPlistStringValue(decodedProfile.stdout, "UUID")
+  const profileExpiresAt = extractPlistDateValue(decodedProfile.stdout, "ExpirationDate")
+
+  if (!profileIdentity || !profileExpiresAt) {
+    return {
+      signed: false,
+      signingIdentity,
+      profileIdentity,
+      profileExpiresAt,
+      reason: `Could not parse UUID/ExpirationDate from the embedded provisioning profile at ${embeddedProfilePath}.`,
+    }
+  }
+
+  return { signed: true, signingIdentity, profileIdentity, profileExpiresAt, reason: null }
+}
+
+const buildRunnerBuildCacheDeps = (args: {
+  readonly projectPath: string
+  readonly developmentTeam: string
+}): RunnerBuildCacheDeps => ({
+  runBuild: async ({ derivedDataPath, buildLogPath }) => {
+    const result = await runRealDeviceHostCommand({
+      command: "/usr/bin/xcodebuild",
+      commandArgs: buildRealDeviceBuildForTestingCommandArgs({
+        projectPath: args.projectPath,
+        derivedDataPath,
+        developmentTeam: args.developmentTeam,
+      }),
+    })
+    await writeCommandLog(buildLogPath, result)
+
+    return {
+      exitCode: result.exitCode,
+      failureSummary: result.exitCode !== 0
+        ? formatCommandFailure("xcodebuild build-for-testing -destination generic/platform=iOS", result)
+        : null,
+      failureNextStep: result.exitCode !== 0 ? inferBuildForTestingNextStep(result) : null,
+    }
+  },
+  locateProducts: async (derivedDataPath) => {
+    const buildProductsPath = join(derivedDataPath, "Build", "Products")
+    const xctestrunPath = await findFirstMatchingPath(buildProductsPath, (name) => name.endsWith(".xctestrun"))
+    const targetAppPath = join(buildProductsPath, "Debug-iphoneos", "ProbeFixture.app")
+    const runnerAppPath = join(buildProductsPath, "Debug-iphoneos", "ProbeRunnerUITests-Runner.app")
+    const runnerXctestPath = join(runnerAppPath, "PlugIns", "ProbeRunnerUITests.xctest")
+
+    if (
+      !xctestrunPath
+      || !(await fileExists(targetAppPath))
+      || !(await fileExists(runnerAppPath))
+      || !(await fileExists(runnerXctestPath))
+    ) {
+      return null
+    }
+
+    return { xctestrunPath, targetAppPath, runnerAppPath, runnerXctestPath }
+  },
+  verifyProduct: verifySignedRealDeviceProduct,
+  now: () => new Date(),
+})
 
 const captureDeviceDiagnosticBundle = async (args: {
   readonly deviceId: string
@@ -1751,6 +2049,14 @@ const performPreflight = async (args: {
   readonly logsDirectory: string
   readonly bundleId: string
   readonly requestedDeviceId: string | null
+  /**
+   * The already-resolved (explicit payload > persisted config > environment)
+   * signing team, carried through session-open RPC -- see
+   * `DeviceSigningConfig`. `null` means none of those three tiers supplied a
+   * value; this function never reads `process.env` for it directly, so a
+   * command-scoped override always takes effect without a daemon restart.
+   */
+  readonly signingTeamId: string | null
 }): Promise<PreflightContext> => {
   const projectPath = resolveProbeFixtureProjectPath(args.projectRoot)
   const metaDirectory = join(args.artifactRoot, "meta")
@@ -1763,7 +2069,7 @@ const performPreflight = async (args: {
   const devicesLogPath = join(deviceLogsDirectory, "devicectl-list-devices.log")
   const ddiServicesLogPath = join(deviceLogsDirectory, "devicectl-device-info-ddi-services.log")
   const buildLogPath = join(deviceLogsDirectory, "xcodebuild-build-for-testing-device.log")
-  const derivedDataPath = resolveRealDeviceRunnerDerivedDataPath()
+  let derivedDataPath = ""
 
   await Promise.all([
     assertPackagedProbePathExists(projectPath, "ProbeFixture Xcode project"),
@@ -1850,59 +2156,70 @@ const performPreflight = async (args: {
     }
   }
 
-  const developmentTeam = process.env.PROBE_DEVELOPMENT_TEAM?.trim() ?? ""
+  const developmentTeam = args.signingTeamId?.trim() ?? ""
   let xctestrunPath: string | null = null
   let targetAppPath: string | null = null
   let runnerAppPath: string | null = null
   let runnerXctestPath: string | null = null
   let buildCompleted = false
+  let cacheStatus: RunnerCacheStatus | null = null
+  let cacheKey: string | null = null
+  let cacheInvalidationReason: string | null = null
+  let signingIdentity: string | null = null
+  let profileIdentity: string | null = null
+  let profileExpiresAt: string | null = null
 
   if (developmentTeam.length === 0) {
     issues.push({
-      summary: "PROBE_DEVELOPMENT_TEAM is required for real-device runner signing but is not set.",
-      nextStep: "Export PROBE_DEVELOPMENT_TEAM=<your-team-id> (or add it to your local .env), then retry the real-device session open.",
+      summary: "No signing team is configured for the real-device runner build.",
+      nextStep:
+        "Pass an explicit team id to session open, persist a default with `probe config set-team-id <team-id>`, or export PROBE_DEVELOPMENT_TEAM, then retry.",
       details: [
-        "Probe passes DEVELOPMENT_TEAM from the host environment instead of committing a team identifier to source control.",
+        "Probe resolves explicit session-open payload > persisted ~/.probe/config.json > PROBE_DEVELOPMENT_TEAM, and none of the three supplied a value.",
       ],
     })
   } else {
-    const buildResult = await runRealDeviceHostCommand({
-      command: "/usr/bin/xcodebuild",
-      commandArgs: buildRealDeviceBuildForTestingCommandArgs({
-        projectPath,
-        derivedDataPath,
-        developmentTeam,
-      }),
-    })
-    await writeCommandLog(buildLogPath, buildResult)
-
-    if (buildResult.exitCode !== 0) {
-      issues.push({
-        summary: "The Probe runner could not complete a signed iPhoneOS build-for-testing preflight.",
-        nextStep: inferBuildForTestingNextStep(buildResult),
-        details: [
-          formatCommandFailure("xcodebuild build-for-testing -destination generic/platform=iOS", buildResult),
-          `build log: ${buildLogPath}`,
-        ],
+    try {
+      const keyInput = await resolveRunnerBuildCacheKeyInput({ projectRoot: args.projectRoot, developmentTeam })
+      const outcome = await ensureRealDeviceRunnerBuildCached({
+        cacheRoot: probeRunnerDeviceSignedCacheRootPath,
+        keyInput,
+        sessionBuildLogPath: buildLogPath,
+        deps: buildRunnerBuildCacheDeps({ projectPath, developmentTeam }),
       })
-    } else {
-      buildCompleted = true
-      const buildProductsPath = join(derivedDataPath, "Build", "Products")
-      xctestrunPath = await findFirstMatchingPath(buildProductsPath, (name) => name.endsWith(".xctestrun"))
-      targetAppPath = join(buildProductsPath, "Debug-iphoneos", "ProbeFixture.app")
-      runnerAppPath = join(buildProductsPath, "Debug-iphoneos", "ProbeRunnerUITests-Runner.app")
-      runnerXctestPath = join(runnerAppPath, "PlugIns", "ProbeRunnerUITests.xctest")
 
-      if (!xctestrunPath || !(await fileExists(targetAppPath)) || !(await fileExists(runnerAppPath)) || !(await fileExists(runnerXctestPath))) {
+      buildCompleted = true
+      derivedDataPath = outcome.derivedDataPath
+      xctestrunPath = outcome.products.xctestrunPath
+      targetAppPath = outcome.products.targetAppPath
+      runnerAppPath = outcome.products.runnerAppPath
+      runnerXctestPath = outcome.products.runnerXctestPath
+      cacheStatus = outcome.status
+      cacheKey = outcome.key
+      cacheInvalidationReason = outcome.invalidationReason
+      signingIdentity = outcome.signingIdentity
+      profileIdentity = outcome.profileIdentity
+      profileExpiresAt = outcome.profileExpiresAt
+
+      if (outcome.status === "hit") {
+        await writeFile(
+          buildLogPath,
+          `Reused cached signed real-device runner build (cache key ${outcome.key}, built ${outcome.builtAt}).\n`,
+          "utf8",
+        )
+      }
+    } catch (error) {
+      if (error instanceof RunnerBuildCacheError) {
         issues.push({
-          summary: "The signed build-for-testing preflight did not emit the expected Probe runner artifacts.",
-          nextStep: "Inspect the build products under the session artifact root and align the runner artifact contract before retrying.",
-          details: [
-            `xctestrun: ${xctestrunPath ?? "missing"}`,
-            `target app: ${await fileExists(targetAppPath) ? targetAppPath : "missing"}`,
-            `runner app: ${await fileExists(runnerAppPath) ? runnerAppPath : "missing"}`,
-            `runner xctest: ${await fileExists(runnerXctestPath) ? runnerXctestPath : "missing"}`,
-          ],
+          summary: error.message,
+          nextStep: error.nextStep,
+          details: [...error.details],
+        })
+      } else {
+        issues.push({
+          summary: "The Probe runner could not complete a signed iPhoneOS build-for-testing preflight.",
+          nextStep: "Fix the reported signing/provisioning issue, ensure the device is registered for development signing if needed, then retry the session open.",
+          details: [error instanceof Error ? error.message : String(error), `build log: ${buildLogPath}`],
         })
       }
     }
@@ -1975,6 +2292,14 @@ const performPreflight = async (args: {
       targetAppPath,
       runnerAppPath,
       runnerXctestPath,
+      signingIdentity,
+      profileIdentity,
+      profileExpiresAt,
+    },
+    runnerBuildCache: {
+      status: cacheStatus,
+      key: cacheKey,
+      invalidationReason: cacheInvalidationReason,
     },
     ddiServices: {
       checked: selectedDevice !== null && preferredDdiPayload !== null && ddiUsable && ddiCompatible,
@@ -2035,6 +2360,15 @@ const performPreflight = async (args: {
     })
   }
 
+  const runnerBuildCache: RealDeviceRunnerCacheSummary = {
+    status: cacheStatus,
+    key: cacheKey,
+    invalidationReason: cacheInvalidationReason,
+    signingIdentity,
+    profileIdentity,
+    profileExpiresAt,
+  }
+
   return {
     mode: "preflight",
     device: {
@@ -2055,7 +2389,7 @@ const performPreflight = async (args: {
     runnerAppPath,
     runnerXctestPath,
     integrationPoints: [...integrationPoints],
-    warnings: buildPreflightWarnings(),
+    warnings: [...buildPreflightWarnings(), formatRunnerCacheSummary(runnerBuildCache)],
     connection: createConnectionDetails({
       status: "connected",
       device: selectedDevice,
@@ -2068,6 +2402,7 @@ const performPreflight = async (args: {
     developmentTeam,
     selectedDevice,
     metaDirectory,
+    runnerBuildCache,
   }
 }
 
@@ -2082,6 +2417,7 @@ export class RealDeviceHarness extends Context.Tag("@probe/RealDeviceHarness")<
       readonly logsDirectory: string
       readonly bundleId: string
       readonly requestedDeviceId: string | null
+      readonly signingTeamId: string | null
     }) => Effect.Effect<OpenedRealDevicePreflightSession, EnvironmentError | UserInputError>
     readonly openLiveSession: (args: {
       readonly projectRoot: string
@@ -2091,6 +2427,7 @@ export class RealDeviceHarness extends Context.Tag("@probe/RealDeviceHarness")<
       readonly logsDirectory: string
       readonly bundleId: string
       readonly requestedDeviceId: string | null
+      readonly signingTeamId: string | null
     }) => Effect.Effect<OpenedRealDeviceLiveSession, DeviceInterruptionError | EnvironmentError | UserInputError | ChildProcessError>
     readonly captureDeviceDiagnosticBundle: (args: {
       readonly deviceId: string
@@ -2129,6 +2466,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
             connection: preflight.connection,
             refreshConnection: preflight.refreshConnection,
             close: preflight.close,
+            runnerBuildCache: preflight.runnerBuildCache,
           } satisfies OpenedRealDevicePreflightSession
         },
         catch: (error) =>
@@ -2429,12 +2767,18 @@ export const RealDeviceHarnessLive = Layer.succeed(
                     endpoints: deviceCommandUrls,
                     action,
                     sequence,
+                    epoch: ready.runnerEpoch,
                     payload: payload ?? null,
                     deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
                     idempotent: action === "ping",
                   })).frame
                 : await (async () => {
-                    const commandFrame = encodeRunnerCommandFrame({ sequence, action, payload: payload ?? null })
+                    const commandFrame = encodeRunnerCommandFrame({
+                      sequence,
+                      action,
+                      payload: payload ?? null,
+                      epoch: ready.runnerEpoch,
+                    })
                     const stdoutResponsePath = join(
                       observerControlDirectory,
                       `stdout-response-${String(sequence).padStart(3, "0")}.json`,
@@ -2476,6 +2820,10 @@ export const RealDeviceHarnessLive = Layer.succeed(
                 inlinePayload: responseFrame.inlinePayload ?? null,
                 inlinePayloadEncoding: responseFrame.inlinePayloadEncoding ?? null,
                 handledMs: responseFrame.handledMs,
+                resolutionMs: responseFrame.resolutionMs ?? null,
+                waitMs: responseFrame.waitMs ?? null,
+                interactionMs: responseFrame.interactionMs ?? null,
+                finalizationMs: responseFrame.finalizationMs ?? null,
                 totalHandledMs: responseFrame.totalHandledMs ?? null,
                 childHandledMs: responseFrame.childHandledMs ?? null,
                 failedActionIndex: responseFrame.failedActionIndex ?? null,
@@ -2541,11 +2889,13 @@ export const RealDeviceHarnessLive = Layer.succeed(
                integrationPoints: preflight.integrationPoints,
                warnings: dedupeStrings([
                  ...buildLiveWarnings(),
+                 formatRunnerCacheSummary(preflight.runnerBuildCache),
                  ...(openInterruption ? [buildRealDeviceInterruptionWarning(openInterruption)] : []),
                ]),
                connection: preflight.connection,
                refreshConnection: preflight.refreshConnection,
                close,
+               runnerBuildCache: preflight.runnerBuildCache,
               bootstrapPath: ready.bootstrapPath,
               bootstrapSource: "device-bootstrap-manifest",
               runnerTransportContract: ready.runnerTransportContract,
@@ -2566,6 +2916,7 @@ export const RealDeviceHarnessLive = Layer.succeed(
               installedAppsJsonPath,
               launchJsonPath,
               nextSequence: 2,
+              runnerEpoch: ready.runnerEpoch,
               initialPingRttMs: initialPing.hostRttMs,
               // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
               // that does not advertise a capability is treated as not having it.

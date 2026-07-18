@@ -70,6 +70,16 @@ export interface RunnerCommandResult {
   readonly inlinePayload?: string | null
   readonly inlinePayloadEncoding?: string | null
   readonly handledMs: number
+  // PRB-091: `handledMs` broken into the phases a `uiAction` command went
+  // through on the runner (resolving the locator, waiting for
+  // existence/hittability, performing the gesture), plus the generic
+  // response-finalization cost. `null` for actions other than `uiAction`,
+  // which have no resolution/wait/interaction phase to report — see
+  // `RunnerResponseFrameSchema` in runnerProtocol.ts.
+  readonly resolutionMs?: number | null
+  readonly waitMs?: number | null
+  readonly interactionMs?: number | null
+  readonly finalizationMs?: number | null
   readonly totalHandledMs?: number | null
   readonly childHandledMs?: ReadonlyArray<number | null> | null
   readonly failedActionIndex?: number | null
@@ -106,6 +116,8 @@ export interface OpenedSimulatorSession {
   readonly stdinProbeStatus: string
   readonly initialPingRttMs: number
   readonly nextSequence: number
+  /** PRB-089: the fresh random epoch this runner process's ready frame advertised. */
+  readonly runnerEpoch: string
   readonly capabilities: ReadonlyArray<RunnerCapability>
   readonly sendCommand: (
     sequence: number,
@@ -501,7 +513,7 @@ const waitForFreshJson = async <T>(args: {
   })
 }
 
-export const createHttpRunnerCommandSender = (commandUrl: string) =>
+export const createHttpRunnerCommandSender = (commandUrl: string, epoch: string) =>
   async (
     sequence: number,
     action: RunnerAction,
@@ -511,6 +523,7 @@ export const createHttpRunnerCommandSender = (commandUrl: string) =>
       endpoints: [commandUrl],
       action,
       sequence,
+      epoch,
       payload: payload ?? null,
       deadlineMs: resolveRunnerCommandTimeoutMs(action, payload),
       idempotent: action === "ping",
@@ -526,6 +539,10 @@ export const createHttpRunnerCommandSender = (commandUrl: string) =>
       inlinePayload: response.inlinePayload ?? null,
       inlinePayloadEncoding: response.inlinePayloadEncoding ?? null,
       handledMs: response.handledMs,
+      resolutionMs: response.resolutionMs ?? null,
+      waitMs: response.waitMs ?? null,
+      interactionMs: response.interactionMs ?? null,
+      finalizationMs: response.finalizationMs ?? null,
       totalHandledMs: response.totalHandledMs ?? null,
       childHandledMs: response.childHandledMs ?? null,
       failedActionIndex: response.failedActionIndex ?? null,
@@ -1439,7 +1456,7 @@ export const SimulatorHarnessLive = Layer.succeed(
             })
 
             const commandUrl = `http://127.0.0.1:${ready.runnerPort}/command`
-            const sendCommand = createHttpRunnerCommandSender(commandUrl)
+            const sendCommand = createHttpRunnerCommandSender(commandUrl, ready.runnerEpoch)
 
             const initialPing = await sendCommand(1, "ping", "session-open")
 
@@ -1493,6 +1510,7 @@ export const SimulatorHarnessLive = Layer.succeed(
               stdinProbeStatus: "not-required-http",
               initialPingRttMs: initialPing.hostRttMs,
               nextSequence: 2,
+              runnerEpoch: ready.runnerEpoch,
               // PRB-072: never upgrade an absent/unlisted flag by assumption — a runner
               // that does not advertise a capability is treated as not having it.
               capabilities: resolveAdvertisedCapabilities(ready),

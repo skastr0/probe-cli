@@ -126,6 +126,24 @@ export const LiveRunnerSessionDetails = Schema.Struct({
 })
 export type LiveRunnerSessionDetails = typeof LiveRunnerSessionDetails.Type
 
+// PRB-095: cache hit/miss/coalesce status plus the discovered signing
+// identity/profile for the signed real-device runner build, surfaced in
+// session health so a caller can see cache behavior without drilling into
+// build logs. `status: null` means no signing team resolved, so the cache
+// was never consulted.
+export const RunnerBuildCacheStatus = Schema.Literal("hit", "miss", "coalesced")
+export type RunnerBuildCacheStatus = typeof RunnerBuildCacheStatus.Type
+
+export const RealDeviceRunnerBuildCacheDetails = Schema.Struct({
+  status: Schema.Union(RunnerBuildCacheStatus, Schema.Null),
+  key: NullableString,
+  invalidationReason: NullableString,
+  signingIdentity: NullableString,
+  profileIdentity: NullableString,
+  profileExpiresAt: NullableString,
+})
+export type RealDeviceRunnerBuildCacheDetails = typeof RealDeviceRunnerBuildCacheDetails.Type
+
 export const RealDeviceLiveRunnerDetails = Schema.Struct({
   kind: Schema.Literal("real-device-live"),
   wrapperProcessId: Schema.Number,
@@ -144,6 +162,7 @@ export const RealDeviceLiveRunnerDetails = Schema.Struct({
   lastCheckedAt: Schema.String,
   note: Schema.String,
   capabilities: Schema.optional(Schema.Array(RunnerCapabilityFlag)),
+  runnerBuildCache: RealDeviceRunnerBuildCacheDetails,
 })
 export type RealDeviceLiveRunnerDetails = typeof RealDeviceLiveRunnerDetails.Type
 
@@ -165,6 +184,7 @@ export const RealDevicePreflightRunnerDetails = Schema.Struct({
   lastCheckedAt: Schema.String,
   note: Schema.String,
   capabilities: Schema.optional(Schema.Array(RunnerCapabilityFlag)),
+  runnerBuildCache: RealDeviceRunnerBuildCacheDetails,
 })
 export type RealDevicePreflightRunnerDetails = typeof RealDevicePreflightRunnerDetails.Type
 

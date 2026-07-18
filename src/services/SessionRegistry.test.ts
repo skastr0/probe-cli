@@ -36,6 +36,7 @@ const openParams = {
 const deviceOpenParams = {
   bundleId: "dev.probe.fixture",
   deviceId: null,
+  signingTeamId: "TEAMID1234",
   projectRoot: "/tmp/probe-test",
   emitProgress: () => undefined,
 } as const
@@ -498,6 +499,19 @@ const createFakeHarness = (options?: {
    * network layer.
    */
   readonly pingResponses?: ReadonlyArray<"ok" | "timeout">
+  /**
+   * PRB-089: consumed in order, once per dispatched command whose action
+   * matches `mutationTransportOutcomesAction` (before any of the
+   * action-specific handling below runs). "timeout" throws the same
+   * ambiguous RunnerTransportError shape as `pingResponses`' "timeout", to
+   * prove `sendRunnerCommand`'s bounded mutation-redelivery loop reuses the
+   * exact same allocated sequence number across attempts instead of
+   * allocating a fresh one per retry. Not specified (or exhausted) defaults
+   * to normal action handling.
+   */
+  readonly mutationTransportOutcomes?: ReadonlyArray<"ok" | "timeout">
+  /** Which action `mutationTransportOutcomes` applies to. Defaults to "uiAction". */
+  readonly mutationTransportOutcomesAction?: RunnerAction
   readonly interceptSnapshot?: (
     snapshot: FakeHarnessSnapshotIntercept,
   ) => FakeHarnessSnapshotInterceptResult | null | undefined
@@ -511,6 +525,7 @@ const createFakeHarness = (options?: {
   )
   const videoFixtureBytes = Buffer.from("fake native simulator video", "utf8")
   let pingCallCount = 0
+  let mutationCallCount = 0
 
   return SimulatorHarness.of({
     openSession: (args) =>
@@ -855,6 +870,7 @@ const createFakeHarness = (options?: {
             stdinProbeStatus: "not-required-http",
             initialPingRttMs: 5,
             nextSequence: 2,
+            runnerEpoch: "fake-runner-epoch",
             capabilities: runnerCapabilities,
             sendCommand: async (_sequence, action: RunnerAction, payload) => {
               options?.captureRunnerCommand?.({
@@ -862,6 +878,27 @@ const createFakeHarness = (options?: {
                 action,
                 payload: payload ?? null,
               })
+
+              if (action === (options?.mutationTransportOutcomesAction ?? "uiAction") && options?.mutationTransportOutcomes) {
+                const outcome = options.mutationTransportOutcomes[
+                  Math.min(mutationCallCount, options.mutationTransportOutcomes.length - 1)
+                ]
+                mutationCallCount += 1
+
+                if (outcome === "timeout") {
+                  throw new RunnerTransportError({
+                    code: "sent-no-response",
+                    action,
+                    endpoint: "fake://runner",
+                    attemptedEndpoints: ["fake://runner"],
+                    phase: "await-response",
+                    elapsedMs: 20_000,
+                    remainingDeadlineMs: 0,
+                    ambiguous: true,
+                    reason: "The runner did not respond within 20000 ms.",
+                  })
+                }
+              }
 
               if (action === "snapshot") {
                 snapshotCallCount += 1
@@ -1113,6 +1150,17 @@ const createFakeRealDeviceHarness = (options?: {
   // PRB-072: default matches production truth — see the comment on the simulator
   // fake's runnerCapabilities default above.
   const runnerCapabilities = options?.runnerCapabilities ?? ["uiAction"]
+  // PRB-095: fixed fake cache summary -- individual cache behavior (hit/miss/
+  // coalesce/revalidation) is covered directly in RunnerBuildCache.test.ts;
+  // this fake only needs to satisfy the OpenedRealDevice*Session contract.
+  const fakeRunnerBuildCache = {
+    status: "hit" as const,
+    key: "fake-cache-key",
+    invalidationReason: null,
+    signingIdentity: "Apple Development: Fake (ABCDE12345)",
+    profileIdentity: "fake-profile-uuid",
+    profileExpiresAt: "2026-12-31T00:00:00.000Z",
+  }
   let connectionIndex = 0
   let pingStatusLabelIndex = 0
   let running = true
@@ -1193,6 +1241,7 @@ const createFakeRealDeviceHarness = (options?: {
               "xcrun devicectl list devices --json-output <path>",
             ],
             warnings: ["Fake real-device preflight warning."],
+            runnerBuildCache: fakeRunnerBuildCache,
             connection: {
               status: nextStatus,
               checkedAt: "2026-04-10T00:00:00.000Z",
@@ -1296,6 +1345,7 @@ const createFakeRealDeviceHarness = (options?: {
               "xcrun devicectl device process launch --device device-1 --terminate-existing <bundle-id> --json-output <path>",
             ],
             warnings: ["Fake real-device live runner warning."],
+            runnerBuildCache: fakeRunnerBuildCache,
             connection: {
               status: nextStatus,
               checkedAt: "2026-04-10T00:00:00.000Z",
@@ -1336,6 +1386,7 @@ const createFakeRealDeviceHarness = (options?: {
             installedAppsJsonPath,
             launchJsonPath,
             nextSequence: 2,
+            runnerEpoch: "fake-device-runner-epoch",
             initialPingRttMs: 18,
             capabilities: [...runnerCapabilities],
             sendCommand: async (sequence, action: RunnerAction) => {
@@ -1990,6 +2041,258 @@ describe("SessionRegistry", () => {
         expect(recovered.state).toBe("ready")
         expect(recovered.healthCheck.lastOk).toBe(true)
         expect(recovered.resources.runner).toBe("ready")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  // PRB-089: an ambiguous mutation delivery failure (the runner may already
+  // have executed the command) is safe to redeliver now that the runner
+  // caches terminal results by (epoch, sequence). `sendRunnerCommand` must
+  // reuse the exact same allocated sequence number for the redelivery, not
+  // allocate a fresh one.
+  const tapAction = {
+    kind: "tap" as const,
+    target: {
+      kind: "semantic" as const,
+      identifier: "fixture.form.applyButton",
+      label: null,
+      value: null,
+      placeholder: null,
+      type: "button",
+      section: null,
+      interactive: true,
+    },
+  }
+
+  test("redelivers an ambiguous mutation failure and reuses the same command sequence", async () => {
+    await withTempRoot(async (root) => {
+      const deliveredSequences: Array<number> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          mutationTransportOutcomes: ["timeout", "ok"],
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              deliveredSequences.push(command.sequence)
+            }
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(registry.performAction({
+          sessionId: session.sessionId,
+          action: tapAction,
+        }))
+
+        expect(result.action).toBe("tap")
+        // Exactly one *logical* command: both delivery attempts carried the
+        // same allocated sequence number, so the runner (in the real
+        // implementation) would see one identity twice, not two identities.
+        expect(deliveredSequences.length).toBe(2)
+        expect(new Set(deliveredSequences).size).toBe(1)
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        expect(health.state).toBe("ready")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("does not redeliver an unambiguous (not-sent) mutation failure", async () => {
+    await withTempRoot(async (root) => {
+      let uiActionCalls = 0
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              uiActionCalls += 1
+            }
+          },
+          interceptUiAction: () => {
+            throw new RunnerTransportError({
+              code: "not-sent",
+              action: "uiAction",
+              endpoint: "fake://runner",
+              attemptedEndpoints: ["fake://runner"],
+              phase: "dispatch",
+              elapsedMs: 5,
+              remainingDeadlineMs: 19_995,
+              ambiguous: false,
+              reason: "Connection refused.",
+            })
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(Effect.either(
+          registry.performAction({
+            sessionId: session.sessionId,
+            action: tapAction,
+          }),
+        ))
+
+        expect(Either.isLeft(result)).toBe(true)
+        // A single attempt: "not-sent" means nothing reached the runner, so
+        // there is no cache entry to redeliver into and no reason to retry.
+        expect(uiActionCalls).toBe(1)
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("gives up after exhausting mutation redelivery and reports a typed indeterminate failure", async () => {
+    await withTempRoot(async (root) => {
+      const deliveredSequences: Array<number> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          mutationTransportOutcomes: Array.from({ length: 100 }, () => "timeout" as const),
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              deliveredSequences.push(command.sequence)
+            }
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(Effect.either(
+          registry.performAction({
+            sessionId: session.sessionId,
+            action: tapAction,
+          }),
+        ))
+
+        expect(Either.isLeft(result)).toBe(true)
+        if (Either.isLeft(result) && result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("session-runner-uiAction-indeterminate")
+          expect(result.left.reason).toContain("indeterminate")
+          expect(result.left.reason).toContain("fake-runner-epoch")
+        } else {
+          throw new Error("Expected an EnvironmentError with the indeterminate code.")
+        }
+
+        // Every redelivery attempt reused the one allocated identity.
+        expect(deliveredSequences.length).toBe(100)
+        expect(new Set(deliveredSequences).size).toBe(1)
+
+        const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+        // Ambiguous + wrapper still running -> degraded, same classification
+        // as the ping gate 5/6 case above; the session is not hard-failed
+        // over an outcome that might still turn out to have succeeded.
+        expect(health.state === "degraded" || health.state === "ready").toBe(true)
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  }, 10_000)
+
+  test("reports indeterminate when an earlier redelivery attempt was ambiguous even though the final attempt is not", async () => {
+    await withTempRoot(async (root) => {
+      const deliveredSequences: Array<number> = []
+      const runtime = makeRuntime(
+        root,
+        createFakeHarness({
+          captureRunnerCommand: (command) => {
+            if (command.action === "uiAction") {
+              deliveredSequences.push(command.sequence)
+            }
+          },
+          // Attempt 1 is ambiguous (sent-no-response — the runner may have
+          // executed the mutation) and is retried. Attempt 2 simulates the
+          // runner crashing between attempts: unambiguous (not-sent,
+          // connection refused), which breaks the redelivery loop
+          // immediately since nothing reached the runner *this* time. The
+          // *final* error is unambiguous, but attempt 1's ambiguity must
+          // still drive the outcome to indeterminate — this is acceptance
+          // criterion #10's execute-then-crash case.
+          interceptUiAction: ({ callIndex }) => {
+            if (callIndex === 1) {
+              throw new RunnerTransportError({
+                code: "sent-no-response",
+                action: "uiAction",
+                endpoint: "fake://runner",
+                attemptedEndpoints: ["fake://runner"],
+                phase: "await-response",
+                elapsedMs: 20_000,
+                remainingDeadlineMs: 0,
+                ambiguous: true,
+                reason: "The runner did not respond within 20000 ms.",
+              })
+            }
+
+            throw new RunnerTransportError({
+              code: "not-sent",
+              action: "uiAction",
+              endpoint: "fake://runner",
+              attemptedEndpoints: ["fake://runner"],
+              phase: "dispatch",
+              elapsedMs: 5,
+              remainingDeadlineMs: 19_995,
+              ambiguous: false,
+              reason: "Connection refused.",
+            })
+          },
+        }),
+      )
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+        const result = await runtime.runPromise(Effect.either(
+          registry.performAction({
+            sessionId: session.sessionId,
+            action: tapAction,
+          }),
+        ))
+
+        expect(Either.isLeft(result)).toBe(true)
+        if (Either.isLeft(result) && result.left instanceof EnvironmentError) {
+          // Must carry the "-indeterminate" suffix, not the plain
+          // "session-runner-uiAction" code: a consumer keying on that
+          // suffix to decide whether the mutation might have run would
+          // otherwise be misled into treating this as a clean failure.
+          expect(result.left.code).toBe("session-runner-uiAction-indeterminate")
+          expect(result.left.reason).toContain("indeterminate")
+        } else {
+          throw new Error("Expected an EnvironmentError with the indeterminate code.")
+        }
+
+        // Both attempts reused the one allocated identity; the loop stopped
+        // after the second (unambiguous, non-retryable) attempt.
+        expect(deliveredSequences.length).toBe(2)
+        expect(new Set(deliveredSequences).size).toBe(1)
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {
@@ -4500,6 +4803,19 @@ describe("SessionRegistry", () => {
         // PRB-072: matches the fake's production-truth default (see runnerCapabilities.ts);
         // this test is about session-open health, not the batch lane.
         expect(session.runner.capabilities).toEqual(["uiAction"])
+        // PRB-095: RealDeviceHarness's cache summary must survive the trip
+        // into session health untouched -- the fake's fixed cache summary
+        // (see `fakeRunnerBuildCache` in `createFakeRealDeviceHarness`).
+        if (session.runner.kind === "real-device-live") {
+          expect(session.runner.runnerBuildCache).toEqual({
+            status: "hit",
+            key: "fake-cache-key",
+            invalidationReason: null,
+            signingIdentity: "Apple Development: Fake (ABCDE12345)",
+            profileIdentity: "fake-profile-uuid",
+            profileExpiresAt: "2026-12-31T00:00:00.000Z",
+          })
+        }
 
         const realDeviceCapability = session.capabilities.find((capability) => capability.area === "real-device")
         const simulatorCapability = session.capabilities.find((capability) => capability.area === "simulator")
@@ -4510,6 +4826,37 @@ describe("SessionRegistry", () => {
         expect(simulatorCapability?.status).toBe("unsupported")
         expect(runnerCapability?.status).toBe("supported")
         expect(perfCapability?.status).toBe("supported")
+
+        await runtime.runPromise(registry.closeSession(session.sessionId))
+      } finally {
+        await runtime.dispose()
+      }
+    })
+  })
+
+  test("PRB-095: emits a compact runner-cache progress event during device session open", async () => {
+    await withTempRoot(async (root) => {
+      const runtime = makeRuntime(root, createFakeHarness(), {
+        realDeviceHarness: createFakeRealDeviceHarness(),
+      })
+
+      try {
+        const registry = await runtime.runPromise(Effect.gen(function* () {
+          return yield* SessionRegistry
+        }))
+
+        const progressCalls: Array<{ readonly stage: string; readonly message: string }> = []
+        const session = await runtime.runPromise(registry.openDeviceSession({
+          ...deviceOpenParams,
+          emitProgress: (stage, message) => {
+            progressCalls.push({ stage, message })
+          },
+        }))
+
+        const cacheEvent = progressCalls.find((call) => call.stage === "runner-cache")
+        expect(cacheEvent).toBeDefined()
+        expect(cacheEvent?.message).toContain("hit")
+        expect(cacheEvent?.message).toContain("fake-cache-key")
 
         await runtime.runPromise(registry.closeSession(session.sessionId))
       } finally {
@@ -4674,6 +5021,204 @@ describe("SessionRegistry", () => {
       } finally {
         await runtime.dispose()
       }
+    })
+  })
+
+  // PRB-096: the target-process (raw perf) trace lease.
+  describe("trace lease (PRB-096)", () => {
+    test("a degraded runner with a still-live target pid can still acquire a trace lease", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(
+          root,
+          createFakeHarness({
+            pingResponses: ["timeout"],
+          }),
+        )
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const degraded = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(degraded.resources.runner).toBe("degraded")
+          expect(degraded.state).toBe("degraded")
+
+          // AC 2: "Runner degraded/failed plus live target PID can record
+          // successfully" -- beginTraceLease gates on the live target pid
+          // (still attached), never on `resources.runner`/session state.
+          const lease = await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+          expect(lease.target.deviceId).toBe(session.target.deviceId)
+
+          await runtime.runPromise(registry.endTraceLease(session.sessionId, { kind: "stopped" }))
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("acquires and releases a trace lease independently of resources.runner, and rejects a second concurrent lease", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          expect(session.resources.trace).toBe("not-requested")
+
+          const lease = await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+          expect(session.runner.targetProcessId).not.toBeNull()
+          expect(lease.target.targetProcessId).toBe(session.runner.targetProcessId as number)
+          expect(lease.target.deviceId).toBe(session.target.deviceId)
+          expect(lease.target.artifactRoot).toBe(session.artifactRoot)
+          expect(lease.signal.aborted).toBe(false)
+
+          const startingHealth = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(startingHealth.resources.trace).toBe("starting")
+          // Acquiring a trace lease never touches the runner/UI lane.
+          expect(startingHealth.resources.runner).toBe("ready")
+          expect(startingHealth.state).toBe("ready")
+
+          const secondLease = await runtime.runPromise(Effect.either(registry.beginTraceLease(session.sessionId)))
+          expect(Either.isLeft(secondLease)).toBe(true)
+          if (Either.isLeft(secondLease)) {
+            expect(secondLease.left).toBeInstanceOf(EnvironmentError)
+            if (secondLease.left instanceof EnvironmentError) {
+              expect(secondLease.left.code).toBe("perf-trace-lease-busy")
+            }
+          }
+
+          await runtime.runPromise(registry.endTraceLease(session.sessionId, { kind: "stopped" }))
+
+          const stoppedHealth = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(stoppedHealth.resources.trace).toBe("stopped")
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("a failed trace lease outcome degrades only the trace lane -- resources.runner and session state stay untouched", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+          await runtime.runPromise(
+            registry.endTraceLease(session.sessionId, { kind: "failed", detail: "xctrace exited with code 1" }),
+          )
+
+          const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(health.resources.trace).toBe("failed")
+          expect(health.resources.runner).toBe("ready")
+          expect(health.state).toBe("ready")
+          expect(health.warnings.some((warning) => warning.includes("Raw perf trace capture failed"))).toBe(true)
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("rejects a trace lease for a disconnected real-device target before starting any capture", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness(), {
+          realDeviceHarness: createFakeRealDeviceHarness({
+            connectionStates: ["connected", "disconnected"],
+          }),
+        })
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openDeviceSession(deviceOpenParams))
+          // Cache a "disconnected" connection status onto the record via
+          // normal health checks, matching how a real caller would observe
+          // it before ever attempting a raw perf capture. `refreshConnection`
+          // consumes `connectionStates` in order starting from index 0
+          // regardless of what `open` used, so the first health check here
+          // reports "connected" and the second reports "disconnected".
+          await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          const refreshed = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(refreshed.connection.status).toBe("disconnected")
+
+          const lease = await runtime.runPromise(Effect.either(registry.beginTraceLease(session.sessionId)))
+          expect(Either.isLeft(lease)).toBe(true)
+          if (Either.isLeft(lease)) {
+            expect(lease.left).toBeInstanceOf(EnvironmentError)
+            if (lease.left instanceof EnvironmentError) {
+              expect(lease.left.code).toBe("perf-target-device-disconnected")
+            }
+          }
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("session close interrupts and joins an in-flight trace lease before finishing teardown", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const lease = await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+
+          let aborted = false
+          lease.signal.addEventListener("abort", () => {
+            aborted = true
+          })
+
+          const closePromise = runtime.runPromise(registry.closeSession(session.sessionId))
+
+          // Close must abort the lease's signal -- the interrupt half --
+          // before it can finish tearing down.
+          await waitFor(async () => aborted, (value) => value === true)
+
+          // Close must not finish while the lease is still unsettled -- the
+          // join half. `endTraceLease` is deliberately not called yet.
+          let closeSettled = false
+          closePromise.then(() => {
+            closeSettled = true
+          })
+          await sleep(50)
+          expect(closeSettled).toBe(false)
+
+          // Simulate the raw capture's own `Effect.onExit` finalizer
+          // acknowledging the interrupt (PerfService's role in production,
+          // reached once the owned xctrace child actually unwinds through
+          // AppleProcessSupervisor's TERM -> grace -> KILL ladder).
+          await runtime.runPromise(
+            registry.endTraceLease(session.sessionId, { kind: "failed", detail: "interrupted by session close" }),
+          )
+
+          const closed = await closePromise
+          expect(closed.state).toBe("closed")
+        } finally {
+          await runtime.dispose()
+        }
+      })
     })
   })
 })

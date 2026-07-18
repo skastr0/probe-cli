@@ -73,6 +73,16 @@ final class FixtureViewController: UIViewController {
   private let logTextView = UITextView()
   private let offscreenButton = UIButton(type: .system)
 
+  // PRB-091 review follow-up: a deliberately narrow pair used to validate
+  // `AttachControlSpikeUITests.swift`'s `boundedSectionMatches` against a
+  // section-token identifier/label collision — see
+  // `configureSectionCollisionFixture` and
+  // `testUIActionSectionTokenIdentifierCollisionResolvesSafely`.
+  private let sectionCollisionContainer = UIStackView()
+  private let sectionCollisionInnerButton = UIButton(type: .system)
+  private let sectionCollisionDecoyLabel = UILabel()
+  private let sectionCollisionToken = "PRB-091 Section Collision Token"
+
   private var logLines: [String] = []
   private var snapshotProfile: SnapshotProfile = .baseline
 
@@ -95,6 +105,7 @@ final class FixtureViewController: UIViewController {
     configureToggle()
     configureTableView()
     configureLogTextView()
+    configureSectionCollisionFixture()
     buildLayout()
     applySnapshotProfile(.baseline)
     resetFixtureState()
@@ -207,6 +218,36 @@ final class FixtureViewController: UIViewController {
     logTextView.accessibilityIdentifier = "fixture.logs.textView"
   }
 
+  // PRB-091 review follow-up: `sectionCollisionContainer`'s accessibility
+  // *label* is set to `sectionCollisionToken`, and `sectionCollisionDecoyLabel`'s
+  // accessibility *identifier* is set to that same string — a deliberate
+  // naming collision, so a `section: sectionCollisionToken` locator hits
+  // both an identifier match (the decoy) and a label match (the container)
+  // in `AttachControlSpikeUITests.swift`'s `boundedSectionMatches`. This
+  // pair exists solely so
+  // `testUIActionSectionTokenIdentifierCollisionResolvesSafely` can prove,
+  // against a real running app, that the resulting ambiguity is caught
+  // (rather than silently narrowed to the wrong element) — see that test's
+  // doc comment for what the collision actually resolves to and why.
+  private func configureSectionCollisionFixture() {
+    sectionCollisionContainer.axis = .vertical
+    sectionCollisionContainer.spacing = 8
+    sectionCollisionContainer.alignment = .fill
+    sectionCollisionContainer.accessibilityIdentifier = "fixture.problem.sectionCollision.container"
+    sectionCollisionContainer.accessibilityLabel = sectionCollisionToken
+
+    sectionCollisionInnerButton.configuration = .bordered()
+    sectionCollisionInnerButton.configuration?.title = "Collision Target"
+    sectionCollisionInnerButton.accessibilityIdentifier = "fixture.problem.sectionCollision.innerButton"
+    sectionCollisionContainer.addArrangedSubview(sectionCollisionInnerButton)
+
+    sectionCollisionDecoyLabel.text = "Decoy element: identifier collides with the section container's label."
+    sectionCollisionDecoyLabel.font = .preferredFont(forTextStyle: .footnote)
+    sectionCollisionDecoyLabel.textColor = .secondaryLabel
+    sectionCollisionDecoyLabel.numberOfLines = 0
+    sectionCollisionDecoyLabel.accessibilityIdentifier = sectionCollisionToken
+  }
+
   private func buildLayout() {
     view.addSubview(scrollView)
     scrollView.addSubview(contentStack)
@@ -267,6 +308,15 @@ final class FixtureViewController: UIViewController {
       offscreenHint,
       spacer,
       offscreenButton,
+      // PRB-091 review follow-up: deliberately placed after the spacer,
+      // alongside `offscreenButton` — this pair requires a scroll to become
+      // hittable, same as every other "Problem shapes" edge case, and
+      // staying below the spacer means adding it never shifts the vertical
+      // position of any element above (Form/Mode/List/Navigation), which is
+      // what every other test in this file depends on staying hittable
+      // without a scroll.
+      sectionCollisionContainer,
+      sectionCollisionDecoyLabel,
       makeSectionLabel(text: "Logs", identifier: "fixture.logs.sectionLabel"),
       logTextView,
     ].forEach(contentStack.addArrangedSubview(_:))

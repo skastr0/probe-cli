@@ -1122,6 +1122,7 @@ export const ProbeKernelLive = Layer.effect(
               ? sessionRegistry.openDeviceSession({
                   bundleId: request.params.bundleId,
                   deviceId: request.params.deviceId,
+                  signingTeamId: request.params.signingTeamId,
                   projectRoot: probeProjectRoot,
                   emitProgress: progress,
                 })

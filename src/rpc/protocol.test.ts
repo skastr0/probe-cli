@@ -48,6 +48,7 @@ describe("rpc protocol", () => {
         sessionMode: "attach-to-running",
         simulatorUdid: null,
         deviceId: null,
+        signingTeamId: null,
       },
     })
 

@@ -71,6 +71,7 @@ Updated: 2026-04-09
 - Prefer a build/execute split for runner startup:
   - build the runner bundle with `build-for-testing`
   - start sessions with `test-without-building`
+  - PRB-095 (2026-07-17): for real-device sessions, the `build-for-testing` half is now content-addressed and cached (`RunnerBuildCache`) rather than re-run on every open -- see `knowledge/devicectl-device-signing/integration-notes.md`'s "PRB-095: signing precedence + signed runner build cache" section for the cache key, revalidation, and measured hit/miss/coalescing behavior. Simulator sessions still use the simpler project-root-reference cache in `SimulatorHarness.ensureSimulatorRunnerPrepared`.
 - Do not rely on teardown for essential state flushes. A crash can skip teardown entirely.
 - Do not rely on XCTest attachments as Probe’s primary artifact transport. They are test-result artifacts and are deleted on success by default unless explicitly retained.
 - For stable Probe refs, prefer accessibility identifiers first, then type/label/value/frame context as fallback.
@@ -196,3 +197,128 @@ Recommended defaults after this simulator-only fixture evidence pass:
   3. collapsed hierarchy view for structural inspection
   4. pruned full tree only on explicit deep-inspection request
   5. raw dictionary output only as a diagnostic/debug path
+
+## PRB-091: bounded `uiAction` query planner
+
+Validated on 2026-07-17 against `ios/ProbeFixture/` on Simulator (iPhone 17
+Pro, iOS 26.4) via `xcodebuild build-for-testing` +
+`test-without-building -only-testing:...testUIActionQueryPlannerResolvesIdentifiersAndDetectsAmbiguity`
+(passed, 3.311s) and the pre-existing
+`testAttachSnapshotAndControlWithoutRelaunch` (passed, 32.447s — unchanged
+behavior for the attach/control + generic finalization path).
+
+Prior state and the problem this closes:
+
+- `resolveUIActionElement`'s candidate resolution called
+  `app.descendants(matching: .any).allElementsBoundByIndex` to resolve a
+  locator's `section` token (a full-app AX enumeration, on every semantic
+  action that used a `section`), and `query.matching(identifier:)
+  .allElementsBoundByIndex` / `query.allElementsBoundByIndex` to resolve the
+  candidate set itself — both force eager, full materialization of every
+  matching `XCUIElement` regardless of how many the caller actually needed.
+- Every response — including `ping`, which touches no UI at all — ran
+  `currentStatusLabelText`, three sequential ProbeFixture-only static-text
+  existence probes (`fixture.status.label`, `fixture.detail.label`,
+  `fixture.detail.summaryLabel`) as part of *generic* response finalization,
+  regardless of target app or command outcome.
+
+Design after PRB-091 (see `api-notes.md`'s new "`XCUIElementQuery` (PRB-091:
+the public-XCUI query planner surface)" section for the exact public methods
+used):
+
+- Point locators resolve to a coordinate with zero AX enumeration (unchanged
+  — this was already true; PRB-091 also removed the last per-response
+  fixture-status probe that used to run *after* a point action too).
+- Identifier locators resolve identifier-first via
+  `XCUIElementQuery.matching(identifier:)`, never
+  `app.descendants(matching: .any).allElementsBoundByIndex`.
+- Label/placeholder locators narrow via a compound `NSPredicate` pushed into
+  the query itself (`label == %@ AND placeholderValue == %@`), the narrowest
+  public query for those fields; `value` stays a post-filter (see
+  `api-notes.md` for why).
+- Ambiguity/ordinal resolution reads a query strictly through
+  `element(boundBy:)`, stopping at 2 matches (enough to prove "ambiguous")
+  or at the requested ordinal — never the full match set. A bounded scan cap
+  (512, documented at `uiActionBoundedScanCap` in
+  `AttachControlSpikeUITests.swift`) bounds the pathological case of a
+  locator that never resolves.
+- `currentStatusLabelText`'s three fixture-identifier probes are gone from
+  generic response finalization; the generic fallback is `app.label`
+  (already-resolved attribute data on the `app` handle the caller already
+  holds — not a fresh query). Fixture-specific status assertions inside the
+  XCTest methods themselves are unaffected.
+- Response telemetry (`LifecycleResponseFrame`) now separates
+  `resolutionMs` / `waitMs` / `interactionMs` (populated for `uiAction`
+  responses only — there is no such phase breakdown for `ping`, `snapshot`,
+  etc.) from a `finalizationMs` that is always populated, since every
+  response goes through the same generic finalization step.
+
+Still open after this pass (see `open-questions.md`):
+
+- The Ripple-incident-scale gate (iPhone 13 Pro, 20/20, ≥5× p95 or <2s p95)
+  is genuinely device-gated — this pass could not close it; see the glyph's
+  acceptance-criteria report for the signing blocker. The hundred-warm-action
+  large-fixture release-budget gate is **not** device-gated (it runs entirely
+  on Simulator) and was closed in a review follow-up pass — see the next
+  section.
+
+## PRB-091 review follow-up: large-fixture identifier-resolution benchmark
+
+Acceptance criterion 7 ("large-fixture identifier resolution meets the
+benchmarked release budget over one hundred warm actions without
+duplicate-target correctness regression") was originally left open on the
+premise that it depended on an unlanded "PRB-087 benchmark" dependency. That
+premise does not hold: the glyph ID `PRB-087` that actually landed in this
+repository is the `rpc-daemon-defects` investigation harness (see
+`knowledge/rpc-daemon-defects/`), unrelated to XCUITest selector-resolution
+timing. No prerequisite benchmark existed, and — unlike criterion 8 — this
+gate requires no physical device, so it was built and closed directly here.
+
+Validated on 2026-07-17 against `ios/ProbeFixture/` on Simulator (iPhone 17
+Pro, iOS 26.4) via `xcodebuild build-for-testing` +
+`test-without-building -only-testing:...testLargeFixtureIdentifierResolutionMeetsReleaseBudget`
+(passed, ~150-155s per run across four repeated runs during development).
+
+Methodology (`AttachControlSpikeUITests.swift`,
+`testLargeFixtureIdentifierResolutionMeetsReleaseBudget`):
+
+- Selects the Large snapshot profile (48 generated cards, 6 sections × 8
+  cards/section — see `FixtureViewController.SnapshotProfile`).
+- Generates 144 distinct, always-present, side-effect-free identifier
+  targets (primary button / secondary button / toggle per card — none of
+  the three has a wired `addTarget` action, so resolving/tapping them does
+  not mutate fixture state other tests depend on).
+- Runs 10 unmeasured warm-up resolutions, then measures 100 calls to the
+  production `resolveUIActionElement` (the exact method `performRunnerUIAction`
+  uses for a real `uiAction` request), recording wall-clock ms per call.
+- Asserts, per action, that the resolved element's `identifier` (and, for
+  primary buttons, its card-unique `label`) matches the requested target
+  exactly — the "no duplicate-target correctness regression" half of the
+  gate, proven across 48 cards' worth of suffix-sharing siblings
+  (`.primaryButton`, `.secondaryButton`, `.toggle` repeat on every card).
+- Computes p95/avg/max and asserts p95 against a release-budget constant.
+
+Measured result (most recent run backing the committed budget): 100/100
+correct resolutions, `avg_ms=989.97 p95_ms=1029 max_ms=1088`. Repeated runs
+during development stayed in the same ~950-1090 ms band. This cost is
+dominated by XCUITest's own fixed cross-process synchronization/quiescence
+wait on every element query, not by the bounded query itself (a single
+`matching(identifier:)` + `element(boundBy: 0)`, which is O(1) regardless of
+fixture size) — the pre-PRB-091
+`descendants(matching: .any).allElementsBoundByIndex` full materialization
+this replaced would have scaled with fixture size instead of staying flat.
+
+Release budget: `largeFixtureIdentifierResolutionReleaseBudgetMs = 1500` (in
+`AttachControlSpikeUITests.swift`, next to the test) — roughly 40% headroom
+over the observed p95 to absorb host/CI scheduling variance while still
+catching a real regression (reintroducing full materialization against the
+405-interactive-node Large profile would push this well past a couple of
+seconds).
+
+A related discovery while building this benchmark's companion regression
+test (`testUIActionSectionTokenIdentifierCollisionResolvesSafely`):
+`XCUIElementQuery.matching(identifier:)`, for a non-accessibility-element
+container, empirically also matches on accessibility *label* — see
+`api-notes.md`'s `XCUIElementQuery` section for the full caveat and why
+`boundedSectionMatches`'s 2-match ambiguity stop is what actually protects
+correctness here, not identifier-only precision.

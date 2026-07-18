@@ -48,6 +48,7 @@ const SessionOpenPayload = Schema.Struct({
   sessionMode: Schema.optional(Schema.Union(SimulatorSessionModeSchema, Schema.Null)),
   simulatorUdid: Schema.optional(NullableString),
   deviceId: Schema.optional(NullableString),
+  signingTeamId: Schema.optional(NullableString),
 })
 
 const SessionLogsPayload = Schema.Struct({
@@ -621,6 +622,7 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
         const sessionMode = openTarget.target === "simulator"
           ? payload?.sessionMode ?? inferSimulatorSessionMode(bundleId)
           : null
+        const signingTeamId = payload?.signingTeamId ?? (yield* optionalOption(rest, "--team-id"))
         const client = yield* DaemonClient
         const health = yield* client.openSession({
           target: openTarget.target,
@@ -628,6 +630,7 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
           sessionMode,
           simulatorUdid: openTarget.simulatorUdid,
           deviceId: openTarget.deviceId,
+          signingTeamId,
           onEvent: eventPrinter(!asJson),
         })
 

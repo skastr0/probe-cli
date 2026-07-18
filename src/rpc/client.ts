@@ -180,6 +180,16 @@ const sendRequest = <TResponse extends RpcFrame>(
 
         let buffer = ""
         let settled = false
+        // PRB-089: the "ambiguous mutation delivery" investigation scenario
+        // (src/investigations/rpc-daemon-defects/scenarios/ambiguousMutationDelivery.ts)
+        // proved a caller could not tell a dropped/reordered progress event
+        // from a complete stream, because `RpcProgressEvent.sequence` was
+        // declared but never validated. This client is the only consumer of
+        // that field, so it is the only place a gap can be detected: track
+        // the last-seen sequence and fail the whole request the moment a
+        // later event skips one, instead of letting it resolve as if
+        // nothing were missing.
+        let lastEventSequence: number | null = null
 
         const detach = () => {
           socket.removeListener("connect", onConnect)
@@ -306,6 +316,21 @@ const sendRequest = <TResponse extends RpcFrame>(
             }
 
             if (frame.kind === "event") {
+              if (lastEventSequence !== null && frame.sequence > lastEventSequence + 1) {
+                finalizeError(
+                  new EnvironmentError({
+                    code: "rpc-progress-sequence-gap",
+                    reason: `The daemon's progress stream for ${request.method} skipped from sequence `
+                      + `${lastEventSequence} to ${frame.sequence}; at least one progress event was lost `
+                      + "or reordered in transit.",
+                    nextStep: "Retry the command. If this recurs, file a bug with the request id and both sequence numbers.",
+                    details: [],
+                  }),
+                )
+                return
+              }
+
+              lastEventSequence = frame.sequence
               options.onEvent?.(frame)
               continue
             }

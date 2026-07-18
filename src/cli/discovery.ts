@@ -48,6 +48,8 @@ export const schemaEntries: ReadonlyArray<SchemaDiscoveryEntry> = [
       bundleId: "string optional; defaults to dev.probe.fixture",
       simulatorUdid: "string|null optional",
       deviceId: "string|null optional",
+      signingTeamId:
+        "string|null optional; device target only. Explicit override for the real-device signing team, taking precedence over persisted ~/.probe/config.json and PROBE_DEVELOPMENT_TEAM.",
     },
     result_shape: { sessionHealth: "SessionHealth" },
   },

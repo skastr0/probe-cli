@@ -12,6 +12,8 @@ import {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
+const testEpoch = "epoch-test-1"
+
 const okResponseBody = (sequence: number): string =>
   JSON.stringify({
     kind: "response",
@@ -27,6 +29,8 @@ const okResponseBody = (sequence: number): string =>
     statusLabel: "ok",
     snapshotNodeCount: null,
     recordedAt: new Date().toISOString(),
+    epoch: testEpoch,
+    replayStatus: "executed",
   })
 
 const withServer = async (
@@ -130,6 +134,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [server.url],
         action: "ping",
         sequence: 1,
+        epoch: testEpoch,
         deadlineMs: 2_000,
       })
 
@@ -157,6 +162,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [unreachable, server.url],
         action: "ping",
         sequence: 1,
+        epoch: testEpoch,
         deadlineMs: 2_000,
       })
 
@@ -195,6 +201,7 @@ describe("RunnerTransportClient", () => {
           endpoints: [unreachable, server.url],
           action: "uiAction",
           sequence: 1,
+          epoch: testEpoch,
           payload: '{"kind":"tap"}',
           deadlineMs: 20_000,
         })
@@ -220,6 +227,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [unreachable],
         action: "ping",
         sequence: 1,
+        epoch: testEpoch,
         deadlineMs: 2_000,
       }),
     ).rejects.toMatchObject({
@@ -250,6 +258,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [bad.url, healthy.url],
         action: "ping",
         sequence: 1,
+        epoch: testEpoch,
         deadlineMs: 2_000,
       }).catch((caught: unknown) => caught)
 
@@ -282,6 +291,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [hangs.url, healthy.url],
         action: "uiAction",
         sequence: 1,
+        epoch: testEpoch,
         payload: '{"kind":"tap"}',
         deadlineMs: 300,
         idempotent: false,
@@ -315,6 +325,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [hangs.url, healthy.url],
         action: "ping",
         sequence: 1,
+        epoch: testEpoch,
         deadlineMs: 5_000,
         idempotent: true,
       })
@@ -335,6 +346,7 @@ describe("RunnerTransportClient", () => {
       endpoints: [],
       action: "ping",
       sequence: 1,
+      epoch: testEpoch,
       deadlineMs: 1_000,
     }).catch((caught: unknown) => caught)
 
@@ -350,6 +362,7 @@ describe("RunnerTransportClient", () => {
       endpoints: [unreachable],
       action: "ping",
       sequence: 1,
+      epoch: testEpoch,
       deadlineMs: 1_000,
     }).catch((caught: unknown) => caught)
 
@@ -386,6 +399,7 @@ describe("RunnerTransportClient", () => {
           endpoints: [hangs.url],
           action: "ping",
           sequence: 1,
+          epoch: testEpoch,
           deadlineMs: 30_000,
         }).pipe(Effect.provide(RunnerTransportClientLive)),
       )
@@ -404,6 +418,7 @@ describe("RunnerTransportClient", () => {
         endpoints: [healthy.url],
         action: "ping",
         sequence: 2,
+        epoch: testEpoch,
         deadlineMs: 2_000,
       })
 

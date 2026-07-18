@@ -25,6 +25,11 @@ final class AttachControlSpikeUITests: XCTestCase {
   // this binary cannot actually perform.
   private static let advertisedRunnerCapabilities: [String] = ["uiAction"]
 
+  // PRB-091 review follow-up: mirrors ProbeFixture's
+  // `FixtureViewController.sectionCollisionToken` exactly — see
+  // `testUIActionSectionTokenIdentifierCollisionResolvesSafely`.
+  private static let sectionCollisionToken = "PRB-091 Section Collision Token"
+
   private struct LifecycleReadyFrame: Codable {
     let kind: String
     let attachLatencyMs: Int
@@ -43,12 +48,20 @@ final class AttachControlSpikeUITests: XCTestCase {
     let runnerTransportContract: String
     let sessionIdentifier: String
     let simulatorUdid: String
+    // PRB-089: fresh random identity for this one live runner process/attach.
+    // Every command and response this runner sends for the rest of its life
+    // carries this value — see `RunnerReplayCoordinator` below for what it
+    // scopes.
+    let runnerEpoch: String
   }
 
   private struct LifecycleCommandFrame: Codable {
     let action: String
     let payload: String?
     let sequence: Int
+    // PRB-089: the epoch the host believes this runner is on. Never
+    // trusted implicitly — see `RunnerReplayCoordinator.disposition(for:)`.
+    let epoch: String
   }
 
   private struct LifecycleResponseFrame: Codable {
@@ -65,6 +78,26 @@ final class AttachControlSpikeUITests: XCTestCase {
     let sequence: Int
     let snapshotNodeCount: Int?
     let statusLabel: String
+    // PRB-091: `handledMs` stays the one total; these four are that total
+    // broken into the phases a caller actually wants to reason about
+    // independently (e.g. "resolution got slow" vs "the tap itself got
+    // slow"). All four are nil for actions that don't go through
+    // `performRunnerUIAction` (ping, snapshot, screenshot, recordVideo,
+    // shutdown) — there is no resolution/wait/interaction phase to report
+    // for those, and reporting a fabricated 0 would be less honest than
+    // reporting nothing. `finalizationMs` is the exception: it is always
+    // populated, since every response goes through the same generic
+    // finalization step in `executeLifecycleCommandFrame`.
+    let resolutionMs: Int?
+    let waitMs: Int?
+    let interactionMs: Int?
+    let finalizationMs: Int
+    // PRB-089: this runner's *current* epoch (always present, even on a
+    // rejected/never-executed command) and how this particular response was
+    // produced relative to the terminal-result cache and executed
+    // high-water mark. See `RunnerReplayCoordinator.Disposition`.
+    let epoch: String
+    let replayStatus: String
   }
 
   private struct LifecycleCommandResult {
@@ -73,6 +106,12 @@ final class AttachControlSpikeUITests: XCTestCase {
     let payload: String?
     let snapshotPayloadPath: String?
     let snapshotNodeCount: Int?
+    // PRB-091: populated only by the `uiAction` case — see
+    // `LifecycleResponseFrame`'s matching fields for why these stay nil
+    // elsewhere instead of a fabricated 0.
+    var resolutionMs: Int? = nil
+    var waitMs: Int? = nil
+    var interactionMs: Int? = nil
   }
 
   private struct ParsedHTTPRequest {
@@ -161,6 +200,48 @@ final class AttachControlSpikeUITests: XCTestCase {
         "Snapshot profile ready: large (48 generated cards)"
       }
     }
+  }
+
+  // PRB-091 acceptance criterion 7 ("large-fixture identifier resolution
+  // meets the benchmarked release budget over one hundred warm actions
+  // without duplicate-target correctness regression"). One target per
+  // `identifier`; `expectedLabel`, when non-nil, is a second, independent
+  // proof that resolution landed on the exact card named by the identifier
+  // rather than a sibling that shares the same element-kind suffix
+  // (`.primaryButton`, `.toggle`, ...) across all 48 Large-profile cards —
+  // `ProbeFixture`'s `FixtureViewController` gives every primary button a
+  // card-unique title ("Primary Action <section>-<card>"), so a label
+  // mismatch here can only mean the query planner resolved the wrong card.
+  private struct LargeFixtureResolutionTarget {
+    let identifier: String
+    let expectedLabel: String?
+  }
+
+  // Generates one target per primary button, secondary button, and toggle
+  // across every section/card of the Large snapshot profile — 3 * 48 = 144
+  // distinct, always-present, side-effect-free identifiers (none of the
+  // three element kinds has a wired `addTarget` action in
+  // `FixtureViewController`, so tapping them does not mutate fixture state
+  // that other tests or assertions depend on). 144 comfortably covers the
+  // "one hundred warm actions" the acceptance criterion asks for with no
+  // repeats.
+  private static func largeFixtureResolutionTargets(sectionCount: Int, cardsPerSection: Int) -> [LargeFixtureResolutionTarget] {
+    var targets: [LargeFixtureResolutionTarget] = []
+
+    for sectionIndex in 0..<sectionCount {
+      for cardIndex in 0..<cardsPerSection {
+        let prefix = "fixture.snapshot.large.section.\(sectionIndex).card.\(cardIndex)"
+
+        targets.append(LargeFixtureResolutionTarget(
+          identifier: "\(prefix).primaryButton",
+          expectedLabel: "Primary Action \(sectionIndex + 1)-\(cardIndex + 1)"
+        ))
+        targets.append(LargeFixtureResolutionTarget(identifier: "\(prefix).secondaryButton", expectedLabel: nil))
+        targets.append(LargeFixtureResolutionTarget(identifier: "\(prefix).toggle", expectedLabel: nil))
+      }
+    }
+
+    return targets
   }
 
   private struct SnapshotBenchmarkSummary: Codable {
@@ -480,6 +561,441 @@ final class AttachControlSpikeUITests: XCTestCase {
     )
   }
 
+  // PRB-089: the runner is its own client for this one. Everything the
+  // glyph's guarantee boundary promises — a fresh epoch, a duplicate cached
+  // command replaying instead of re-executing, a duplicate in-flight
+  // command coalescing, an epoch mismatch and a sequence gap both being
+  // rejected before execution, and the bounded terminal-result cache's
+  // FIFO eviction correctly turning a redelivered-but-evicted identity into
+  // a typed result-expired rejection instead of a silent re-execution — is
+  // proven here against the *real* HTTP command server, at the real
+  // Simulator/XCUITest boundary, not against a Node fake.
+  @MainActor
+  func testCommandLoopReplaySafety() throws {
+    let resolvedControlDirectory = try resolveLifecycleControlDirectory()
+    let isDevice = resolvedControlDirectory.bootstrapSource == .deviceBootstrapManifest
+
+    let controlDirectoryURL = isDevice
+      ? deviceLifecycleControlDirectoryURL(sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier)
+      : URL(
+          fileURLWithPath: resolvedControlDirectory.controlDirectoryPath,
+          isDirectory: true,
+        )
+    try FileManager.default.createDirectory(at: controlDirectoryURL, withIntermediateDirectories: true)
+
+    var lifecycleState = try attachForLifecycleLoop(
+      resolvedControlDirectory: resolvedControlDirectory,
+      controlDirectoryURL: controlDirectoryURL,
+      foregroundFailureMessage: "Fixture app must already be running in the foreground before ProbeRunner enters its replay-safety loop.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before the replay-safety loop starts."
+    )
+
+    let httpCommandServer = try startHTTPCommandServer(
+      desiredPort: resolveRunnerPortFromEnvironment(),
+      controlDirectoryURL: controlDirectoryURL,
+      app: lifecycleState.app,
+      statusLabel: lifecycleState.statusLabel,
+      replayCoordinator: lifecycleState.replayCoordinator
+    )
+    lifecycleState.readyFrame.runnerPort = httpCommandServer.port
+    try emitLifecycleReadyFrame(lifecycleState.readyFrame, controlDirectoryURL: controlDirectoryURL)
+
+    let port = httpCommandServer.port
+    let epoch = lifecycleState.readyFrame.runnerEpoch
+    var driverError: Error?
+
+    // The driver runs on the global concurrent queue — deliberately never a
+    // `Task { @MainActor in ... }` — so it behaves exactly like the
+    // external host process this runner is actually built to talk to, and
+    // never contends with the connection-handling `Task`s that also need
+    // the MainActor executor while this method blocks below in
+    // `waitForShutdown()`. This mirrors every other command-loop test: the
+    // commands always come from something other than the blocked test
+    // method's own execution context.
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        try Self.driveReplaySafetyScenario(port: port, epoch: epoch)
+      } catch {
+        driverError = error
+      }
+    }
+
+    try httpCommandServer.waitForShutdown()
+
+    if let driverError {
+      throw driverError
+    }
+  }
+
+  /// Drives the whole replay-safety proof over real HTTP against the
+  /// already-listening runner. A plain (non-`@MainActor`) static function on
+  /// purpose: nothing here may touch `app`/`statusLabel` directly — it only
+  /// ever sees what the runner chooses to report back over the wire, same
+  /// as any other client.
+  private static func driveReplaySafetyScenario(port: Int, epoch: String) throws {
+    guard let baseUrl = URL(string: "http://127.0.0.1:\(port)/command") else {
+      throw NSError(
+        domain: "ProbeRunnerReplaySafety",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Could not build a command URL for port \(port)."]
+      )
+    }
+
+    // Mirrors the runner's own sentinel and update rule (see
+    // `RunnerReplayCoordinator`): only a command that actually executes
+    // advances this, so "the next valid sequence" stays correct across the
+    // deliberately-rejected commands below.
+    var executedHighWaterMark = 0
+    func nextValidSequence() -> Int { executedHighWaterMark + 1 }
+
+    func send(action: String, payload: String?, sequence: Int, epoch epochOverride: String) throws -> LifecycleResponseFrame {
+      try postLifecycleCommand(to: baseUrl, sequence: sequence, action: action, payload: payload, epoch: epochOverride)
+    }
+
+    defer {
+      // Best-effort, always-attempted shutdown: if an assertion above has
+      // already thrown, the test method's `waitForShutdown()` would
+      // otherwise block until XCTest's own (multi-hour) timeout instead of
+      // reporting the real failure promptly.
+      _ = try? send(action: "shutdown", payload: nil, sequence: nextValidSequence(), epoch: epoch)
+    }
+
+    // 1. A fresh command executes.
+    let executedSequence = nextValidSequence()
+    let firstPing = try send(action: "ping", payload: "replay-safety-1", sequence: executedSequence, epoch: epoch)
+    XCTAssertTrue(firstPing.ok, "Expected the first ping delivery to execute.")
+    XCTAssertEqual(firstPing.replayStatus, "executed")
+    XCTAssertEqual(firstPing.epoch, epoch)
+    executedHighWaterMark = executedSequence
+
+    // 2. One hundred redeliveries of that exact (sequence, epoch) identity
+    //    never re-execute it — every response replays the identical cached
+    //    terminal result. There is no dedicated fixture mutation counter;
+    //    response identity (`recordedAt`, byte-identical across all 100
+    //    replays) is the receipt that only one execution ever happened.
+    for attempt in 0..<100 {
+      let replay = try send(action: "ping", payload: "replay-safety-1", sequence: executedSequence, epoch: epoch)
+      XCTAssertTrue(replay.ok, "Redelivery #\(attempt) should still report ok.")
+      XCTAssertEqual(replay.replayStatus, "cached-replay", "Redelivery #\(attempt) must not re-execute.")
+      XCTAssertEqual(replay.recordedAt, firstPing.recordedAt, "Redelivery #\(attempt) must return the original execution's timestamp verbatim.")
+      XCTAssertEqual(replay.payload, firstPing.payload)
+    }
+
+    // 3. Fault injection: execute a real mutation (one that changes visible
+    //    app state), then redeliver the identical identity — modelling "the
+    //    host executed the command, its first response was dropped, and it
+    //    redelivered" — and observe exactly one mutation plus the cached
+    //    result, never a second `applyInput`.
+    let mutationSequence = nextValidSequence()
+    let firstMutation = try send(action: "applyInput", payload: "probe-replay-safety", sequence: mutationSequence, epoch: epoch)
+    XCTAssertTrue(firstMutation.ok)
+    XCTAssertEqual(firstMutation.replayStatus, "executed")
+    XCTAssertEqual(firstMutation.statusLabel, "Input applied: probe-replay-safety")
+    executedHighWaterMark = mutationSequence
+
+    let redeliveredMutation = try send(action: "applyInput", payload: "probe-replay-safety", sequence: mutationSequence, epoch: epoch)
+    XCTAssertTrue(redeliveredMutation.ok)
+    XCTAssertEqual(redeliveredMutation.replayStatus, "cached-replay")
+    XCTAssertEqual(redeliveredMutation.recordedAt, firstMutation.recordedAt)
+    XCTAssertEqual(redeliveredMutation.statusLabel, firstMutation.statusLabel)
+
+    // 4. Epoch mismatch: a command carrying a stale epoch is rejected
+    //    before it can execute, and does not consume the next valid
+    //    sequence (nothing ran, so nothing advanced).
+    let epochMismatch = try send(
+      action: "applyInput",
+      payload: "should-never-apply",
+      sequence: nextValidSequence(),
+      epoch: "\(epoch)-stale"
+    )
+    XCTAssertFalse(epochMismatch.ok)
+    XCTAssertEqual(epochMismatch.replayStatus, "epoch-mismatch")
+    XCTAssertEqual(epochMismatch.epoch, epoch, "The rejection still reports the runner's real (current) epoch.")
+    XCTAssertEqual(epochMismatch.statusLabel, firstMutation.statusLabel, "A rejected epoch-mismatch command must never touch app state.")
+
+    // 5. Sequence gap: skipping ahead of the executed high-water mark is
+    //    also rejected before execution, and also does not consume the
+    //    next valid sequence.
+    let sequenceGap = try send(
+      action: "applyInput",
+      payload: "should-never-apply-either",
+      sequence: nextValidSequence() + 5,
+      epoch: epoch
+    )
+    XCTAssertFalse(sequenceGap.ok)
+    XCTAssertEqual(sequenceGap.replayStatus, "sequence-gap")
+    XCTAssertEqual(sequenceGap.statusLabel, firstMutation.statusLabel, "A rejected sequence-gap command must never touch app state.")
+
+    // 6. Cache-eviction boundary, driven at the real Simulator/XCUITest
+    //    HTTP boundary (not a Swift-unit test of `RunnerReplayCoordinator`
+    //    in isolation): force the terminal-result cache past its
+    //    `cacheCapacity`-entry FIFO bound so the oldest surviving entry —
+    //    `executedSequence`, the very first ping from step 1 — is evicted,
+    //    then redeliver that exact identity. This is the branch that stops
+    //    a redelivered, executed-but-evicted command from silently
+    //    re-running: the runner must tell "definitely executed once, but
+    //    the cached result is gone" (result-expired) apart from "never
+    //    seen before" (which would wrongly execute it a second time).
+    let cacheCapacity = 64
+    let evictedSequence = executedSequence
+    let preEvictionStatusLabel = firstMutation.statusLabel
+
+    // The cache already holds 2 live entries (`evictedSequence` and
+    // `mutationSequence`, from steps 1 and 3). Execute `cacheCapacity - 1`
+    // new, distinct, non-mutating pings (ping never touches app state — see
+    // `handleLifecycleCommand`'s "ping" case) so the insertion-ordered
+    // eviction list crosses `cacheCapacity` by exactly one entry, which
+    // evicts only the single oldest one (`evictedSequence`) per the FIFO
+    // discipline — never `mutationSequence` or any of the fill entries.
+    for _ in 0..<(cacheCapacity - 1) {
+      let fillSequence = nextValidSequence()
+      let fillResponse = try send(action: "ping", payload: "replay-safety-fill", sequence: fillSequence, epoch: epoch)
+      XCTAssertTrue(fillResponse.ok, "Expected fill ping \(fillSequence) to execute.")
+      XCTAssertEqual(fillResponse.replayStatus, "executed")
+      executedHighWaterMark = fillSequence
+    }
+
+    let evictedRedelivery = try send(
+      action: "ping",
+      payload: "replay-safety-1",
+      sequence: evictedSequence,
+      epoch: epoch
+    )
+    XCTAssertFalse(evictedRedelivery.ok, "A redelivered, executed-but-evicted sequence must never report ok.")
+    XCTAssertEqual(evictedRedelivery.replayStatus, "result-expired")
+    XCTAssertEqual(
+      evictedRedelivery.statusLabel,
+      preEvictionStatusLabel,
+      "A rejected result-expired command must never touch app state."
+    )
+  }
+
+  // PRB-091: contract coverage for the bounded public-XCUI query planner —
+  // identifier-first resolution, bounded ambiguity detection, deterministic
+  // ordinal resolution, and a clean no-match — driven straight through
+  // `performRunnerUIAction`/`resolveUIActionElement` against the live
+  // fixture, the same entry points a real `uiAction` command uses.
+  @MainActor
+  func testUIActionQueryPlannerResolvesIdentifiersAndDetectsAmbiguity() throws {
+    let attached = try attachToFixture(
+      foregroundFailureMessage: "Expected fixture app to be foreground before uiAction query planner checks.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before uiAction query planner checks."
+    )
+    let app = attached.app
+
+    // A strong identifier locator resolves through the identifier-first
+    // typed query with no ambiguity.
+    let tapPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.form.applyButton"}}"#.utf8)
+    )
+    let tapOutcome = try performRunnerUIAction(tapPayload, app: app)
+    XCTAssertTrue(tapOutcome.summary.contains("tapped"), "Expected the identifier locator to resolve and tap.")
+    XCTAssertGreaterThanOrEqual(tapOutcome.resolutionMs, 0)
+    XCTAssertGreaterThanOrEqual(tapOutcome.waitMs, 0)
+    XCTAssertGreaterThanOrEqual(tapOutcome.interactionMs, 0)
+
+    // A weak `type: button` locator with no identifier/label matches many
+    // buttons on the fixture screen (Reset, apply, snapshot profile
+    // segments, ...). The bounded planner must still detect the ambiguity
+    // without ever enumerating the full match set.
+    let ambiguousPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","type":"button"}}"#.utf8)
+    )
+    XCTAssertThrowsError(try performRunnerUIAction(ambiguousPayload, app: app)) { error in
+      let message = String(describing: error)
+      XCTAssertTrue(message.contains("matched more than one element"), "Expected an ambiguity error, got: \(message)")
+    }
+
+    // The same weak locator with an explicit ordinal resolves
+    // deterministically to the same element across repeated calls.
+    let ordinalPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","type":"button","ordinal":1}}"#.utf8)
+    )
+    let firstOrdinalMatch = try resolveUIActionElement(locator: ordinalPayload.locator, app: app)
+    let secondOrdinalMatch = try resolveUIActionElement(locator: ordinalPayload.locator, app: app)
+    XCTAssertEqual(
+      firstOrdinalMatch.identifier,
+      secondOrdinalMatch.identifier,
+      "Expected ordinal resolution to be deterministic across calls."
+    )
+
+    // An identifier absent from the fixture screen resolves to zero matches.
+    let missingPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.does.not.exist"}}"#.utf8)
+    )
+    XCTAssertThrowsError(try performRunnerUIAction(missingPayload, app: app)) { error in
+      let message = String(describing: error)
+      XCTAssertTrue(message.contains("No element matched"), "Expected a no-match error, got: \(message)")
+    }
+  }
+
+  /// PRB-091 review follow-up. The theorized risk: `boundedSectionMatches`
+  /// resolves a `section` token identifier-first and only falls back to a
+  /// `label ==` predicate when zero identifier matches exist, so a token
+  /// that is simultaneously the accessibility *label* of the intended
+  /// container and the accessibility *identifier* of an unrelated element
+  /// elsewhere might narrow to that unrelated decoy instead of the intended
+  /// container.
+  ///
+  /// This test builds exactly that collision against a real
+  /// `ProbeFixture` screen (`sectionCollisionContainer`'s label and
+  /// `sectionCollisionDecoyLabel`'s identifier both equal
+  /// `sectionCollisionToken` — see `FixtureViewController`) and the
+  /// measured, real-Simulator outcome is that it does **not** misresolve:
+  /// `XCUIElementQuery.matching(identifier:)`, evaluated here against a
+  /// live app, matches `sectionCollisionContainer` too — even though its
+  /// own `identifier` is the distinct string
+  /// `"fixture.problem.sectionCollision.container"`, not the token. For a
+  /// non-accessibility-element container (`isAccessibilityElement == false`,
+  /// the default for a plain `UIView`/`UIStackView`, which is what every
+  /// section-token container in this codebase actually is —
+  /// `\(prefix).stack` / `\(prefix).container` throughout this file),
+  /// Apple's own `matching(identifier:)` predicate is evidently *not*
+  /// strict identifier-only equality; it also matches on label. See
+  /// `knowledge/xcuitest-runner/api-notes.md`'s `XCUIElementQuery` section
+  /// for the full caveat.
+  ///
+  /// The practical consequence: `identifierMatches` here comes back with
+  /// *two* elements (the container via this label fallback, the decoy via
+  /// its own identifier) — `boundedMatchingElements`'s 2-match ambiguity
+  /// stop catches exactly that, `sectionMatchCount` is 2, and
+  /// `matchingUIActionElements` correctly treats the section token as
+  /// ambiguous and broadens `queryRoot` to `app`, so the button still
+  /// resolves. This test pins that *safe* outcome down — for the section-
+  /// token container shape this codebase actually uses, the theorized
+  /// mis-narrowing does not reproduce, and any future change to
+  /// `boundedSectionMatches` or its ambiguity threshold that broke this
+  /// safety net would fail this test.
+  @MainActor
+  func testUIActionSectionTokenIdentifierCollisionResolvesSafely() throws {
+    let attached = try attachToFixture(
+      foregroundFailureMessage: "Expected fixture app to be foreground before the section-collision regression check.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before the section-collision regression check."
+    )
+    let app = attached.app
+
+    // The collision fixture sits below the "Problem shapes" spacer (same
+    // scroll band as `offscreenButton`) so adding it never shifts anything
+    // above it — every other test in this file depends on the vertical
+    // position of the elements above that spacer staying hittable without
+    // a scroll. Scroll it into view before either resolution attempt below.
+    // Scrolls until hittable rather than a fixed swipe count so this does
+    // not depend on whatever scroll position an earlier test in the same
+    // run left the (attached-to, not relaunched) fixture app in.
+    let innerButtonElement = app.buttons["fixture.problem.sectionCollision.innerButton"]
+    XCTAssertTrue(
+      innerButtonElement.waitForExistence(timeout: interactionTimeout),
+      "Expected the collision inner button to exist before scrolling to it."
+    )
+    var scrollAttempts = 0
+    while !innerButtonElement.isHittable, scrollAttempts < 8 {
+      app.swipeUp()
+      scrollAttempts += 1
+    }
+    XCTAssertTrue(innerButtonElement.isHittable, "Expected the collision inner button to become hittable after scrolling.")
+
+    // Positive control: the inner button is reachable on its own once
+    // scrolled into view, so any failure below is isolated to section-token
+    // scoping, not to the button itself being missing or unhittable.
+    let directPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(#"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.problem.sectionCollision.innerButton","type":"button"}}"#.utf8)
+    )
+    let directOutcome = try performRunnerUIAction(directPayload, app: app)
+    XCTAssertTrue(directOutcome.summary.contains("tapped"), "Expected the inner button to be directly reachable without a section token.")
+
+    // With the colliding section token, `boundedSectionMatches` finds two
+    // identifier-query matches (the label-matched container and the
+    // identifier-matched decoy — see the doc comment above), so
+    // `matchingUIActionElements` treats the section as ambiguous and
+    // broadens to `app` rather than narrowing to either one. The scoped
+    // lookup for the same button therefore still succeeds.
+    let scopedPayload = try JSONDecoder().decode(
+      RunnerUIActionPayload.self,
+      from: Data(
+        #"{"kind":"tap","locator":{"kind":"semantic","identifier":"fixture.problem.sectionCollision.innerButton","type":"button","section":"\#(Self.sectionCollisionToken)"}}"#.utf8
+      )
+    )
+    let scopedOutcome = try performRunnerUIAction(scopedPayload, app: app)
+    XCTAssertTrue(
+      scopedOutcome.summary.contains("tapped"),
+      "Expected the colliding section token to be treated as ambiguous and broadened to app, still resolving the button."
+    )
+  }
+
+  /// Synchronous (semaphore-bridged) HTTP POST to the runner's own
+  /// `/command` endpoint. Kept separate from `receiveHTTPRequest`'s
+  /// `NWConnection`-based server plumbing on purpose — this is the *client*
+  /// side, modelling an ordinary external caller (like
+  /// `RunnerTransportClient` on the host), not another runner-internal seam.
+  private static func postLifecycleCommand(
+    to url: URL,
+    sequence: Int,
+    action: String,
+    payload: String?,
+    epoch: String,
+  ) throws -> LifecycleResponseFrame {
+    let command = LifecycleCommandFrame(action: action, payload: payload, sequence: sequence, epoch: epoch)
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONEncoder().encode(command)
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: Result<LifecycleResponseFrame, Error>?
+
+    let task = URLSession.shared.dataTask(with: request) { data, _, error in
+      defer { semaphore.signal() }
+
+      if let error {
+        result = .failure(error)
+        return
+      }
+
+      guard let data else {
+        result = .failure(NSError(
+          domain: "ProbeRunnerReplaySafety",
+          code: 2,
+          userInfo: [NSLocalizedDescriptionKey: "Empty response body for \(action) sequence \(sequence)."]
+        ))
+        return
+      }
+
+      do {
+        result = .success(try JSONDecoder().decode(LifecycleResponseFrame.self, from: data))
+      } catch {
+        result = .failure(error)
+      }
+    }
+    task.resume()
+
+    guard semaphore.wait(timeout: .now() + 20) == .success else {
+      task.cancel()
+      throw NSError(
+        domain: "ProbeRunnerReplaySafety",
+        code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for a response to \(action) sequence \(sequence)."]
+      )
+    }
+
+    switch result {
+    case .success(let frame):
+      return frame
+    case .failure(let error):
+      throw error
+    case .none:
+      throw NSError(
+        domain: "ProbeRunnerReplaySafety",
+        code: 4,
+        userInfo: [NSLocalizedDescriptionKey: "No result captured for \(action) sequence \(sequence)."]
+      )
+    }
+  }
+
   @MainActor
   func testLargeAxTreePerformanceSpike() throws {
     let resolvedControlDirectory = try resolveLifecycleControlDirectory()
@@ -513,10 +1029,283 @@ final class AttachControlSpikeUITests: XCTestCase {
     try writeJSON(summary, to: controlDirectoryURL.appendingPathComponent("ax-tree-performance-summary.json"))
   }
 
+  // PRB-091 acceptance criterion 7's release-budget gate, established from a
+  // real Simulator run — see `testLargeFixtureIdentifierResolutionMeetsReleaseBudget`
+  // below for the methodology and `knowledge/xcuitest-runner/integration-notes.md`'s
+  // "PRB-091: large-fixture identifier-resolution benchmark" section for the
+  // full run this number came from (iPhone 17 Pro, iOS 26.4, 2026-07-17:
+  // avg 989.97 ms / p95 1029 ms / max 1088 ms over 100 warm actions against
+  // the Large profile's 48 cards; repeated runs during development stayed in
+  // the same ~950-1090 ms band). That cost is dominated by XCUITest's own
+  // fixed cross-process synchronization/quiescence wait on every element
+  // query — not by the bounded query itself, which is O(1) regardless of
+  // fixture size (`matching(identifier:)` + a single `element(boundBy: 0)`)
+  // — so it does not grow with a larger fixture the way the pre-PRB-091
+  // `descendants(matching: .any).allElementsBoundByIndex` full
+  // materialization would have. Budget is set at 1500 ms: comfortable
+  // headroom (~40% over the observed p95, ~33% over the observed max) to
+  // absorb host/Simulator scheduling variance across machines and CI runs,
+  // while still catching a real regression — reintroducing full-tree
+  // materialization against a 405-interactive-node fixture would push this
+  // well past a couple of seconds, not a few hundred milliseconds. This is
+  // a warm, Simulator-only, per-action p95 for `resolveUIActionElement`
+  // against the Large snapshot profile — not an end-to-end host round trip,
+  // which is what criterion 8's separate, device-gated Ripple p95 budget
+  // covers.
+  private static let largeFixtureIdentifierResolutionReleaseBudgetMs = 1500
+
+  @MainActor
+  func testLargeFixtureIdentifierResolutionMeetsReleaseBudget() throws {
+    let attached = try attachToFixture(
+      foregroundFailureMessage: "Expected fixture app to be foreground before the large-fixture identifier-resolution benchmark.",
+      statusLabelFailureMessage: "Expected fixture status label to exist before the large-fixture identifier-resolution benchmark."
+    )
+    let app = attached.app
+
+    // The fixture app is attached-to, not relaunched, between test methods
+    // in a full run, so selecting "Large" here is process-lifetime state
+    // that would otherwise leak into whatever test runs next (a much taller
+    // generated card stack pushes every element below the snapshot-profile
+    // section further down, off-screen). Restore "Base" on every exit path.
+    defer {
+      let profileControl = app.segmentedControls["fixture.snapshot.profile.control"]
+      if profileControl.waitForExistence(timeout: interactionTimeout) {
+        let baseButton = profileControl.buttons["Base"]
+        if baseButton.waitForExistence(timeout: interactionTimeout), !baseButton.isSelected {
+          baseButton.tap()
+        }
+      }
+    }
+
+    _ = try selectSnapshotBenchmarkProfile(.large, app: app)
+
+    let allTargets = Self.largeFixtureResolutionTargets(sectionCount: 6, cardsPerSection: 8)
+    try requireActionCondition(
+      allTargets.count >= 100,
+      "Expected the Large profile to generate at least one hundred distinct resolvable targets, got \(allTargets.count)."
+    )
+
+    func locator(for target: LargeFixtureResolutionTarget) -> RunnerUIActionLocator {
+      RunnerUIActionLocator(
+        kind: "semantic",
+        identifier: target.identifier,
+        label: nil,
+        value: nil,
+        placeholder: nil,
+        type: nil,
+        section: nil,
+        interactive: nil,
+        ordinal: nil,
+        x: nil,
+        y: nil
+      )
+    }
+
+    // Warm-up: prime XCUITest's own query machinery before measuring — not
+    // counted toward the release-budget statistics below. The acceptance
+    // criterion asks for "warm" actions specifically because a cold first
+    // query pays one-time XCUITest/AX setup cost that is not representative
+    // of steady-state usage.
+    for target in allTargets.prefix(10) {
+      _ = try resolveUIActionElement(locator: locator(for: target), app: app)
+    }
+
+    let measuredTargets = Array(allTargets.prefix(100))
+    var resolutionSamplesMs: [Int] = []
+    resolutionSamplesMs.reserveCapacity(measuredTargets.count)
+
+    for target in measuredTargets {
+      let startedAt = Date()
+      let resolved = try resolveUIActionElement(locator: locator(for: target), app: app)
+      resolutionSamplesMs.append(milliseconds(since: startedAt))
+
+      // Duplicate-target correctness at scale: the resolved element must be
+      // the exact card this identifier names, not a sibling card that
+      // happens to share a suffix (".primaryButton", ".toggle", ...) across
+      // all 48 Large-profile cards.
+      XCTAssertEqual(
+        resolved.identifier,
+        target.identifier,
+        "Expected identifier resolution to hit the exact target among 48 Large-profile cards."
+      )
+
+      if let expectedLabel = target.expectedLabel {
+        XCTAssertEqual(
+          resolved.label,
+          expectedLabel,
+          "Expected the resolved element's label to match its own card, not a sibling's — a label mismatch here is a duplicate-target regression."
+        )
+      }
+    }
+
+    let sortedSamplesMs = resolutionSamplesMs.sorted()
+    let avgMs = Double(sortedSamplesMs.reduce(0, +)) / Double(sortedSamplesMs.count)
+    let p95Index = min(sortedSamplesMs.count - 1, Int((Double(sortedSamplesMs.count) * 0.95).rounded(.up)) - 1)
+    let p95Ms = sortedSamplesMs[p95Index]
+    let maxMs = sortedSamplesMs.last ?? 0
+
+    print(
+      "PROBE_METRIC large_fixture_identifier_resolution_samples=\(sortedSamplesMs.count) avg_ms=\(avgMs) p95_ms=\(p95Ms) max_ms=\(maxMs) budget_ms=\(Self.largeFixtureIdentifierResolutionReleaseBudgetMs)"
+    )
+
+    XCTAssertLessThanOrEqual(
+      p95Ms,
+      Self.largeFixtureIdentifierResolutionReleaseBudgetMs,
+      "Large-fixture (48-card) warm identifier-resolution p95 (\(p95Ms) ms) exceeded the release budget of "
+        + "\(Self.largeFixtureIdentifierResolutionReleaseBudgetMs) ms over \(sortedSamplesMs.count) warm actions."
+    )
+  }
+
   private struct LifecycleLoopState {
     let app: XCUIApplication
     var readyFrame: LifecycleReadyFrame
     let statusLabel: XCUIElement
+    let replayCoordinator: RunnerReplayCoordinator
+  }
+
+  /// PRB-089: at-most-once mutation execution within one live runner epoch.
+  ///
+  /// One instance is created per `attachForLifecycleLoop` call — i.e. once
+  /// per live runner process/attach, the same lifetime as `readyFrame`'s
+  /// `runnerEpoch`. It owns the only two pieces of state the guarantee
+  /// needs:
+  ///  - a bounded terminal-result cache, keyed by command sequence number
+  ///    (bounded so a long-lived runner cannot grow this without limit);
+  ///  - the executed high-water mark, the greatest sequence number this
+  ///    runner has ever executed, which is what lets it distinguish a
+  ///    duplicate whose cache entry has since been evicted ("result
+  ///    expired" — it definitely ran, but the original result is gone, so
+  ///    it must never be silently re-executed) from a sequence it has
+  ///    genuinely never seen.
+  ///
+  /// Every command this runner ever receives goes through
+  /// `disposition(for:)` *before* `handleLifecycleCommand` runs, on the same
+  /// `@MainActor`-serialized HTTP path as execution itself (see
+  /// `receiveHTTPRequest`'s `Task { @MainActor in ... }` and
+  /// `handleLifecycleCommand`, which never `await`s). That serialization is
+  /// what makes "duplicate in-flight command coalesces onto the first
+  /// execution" true without any separate in-flight bookkeeping here: two
+  /// deliveries of the same sequence cannot both be *executing* at once
+  /// (MainActor admits one job at a time), so the second one's call to
+  /// `disposition(for:)` always runs either strictly before the first
+  /// command has been dispatched (impossible — `disposition` and dispatch
+  /// happen in the same synchronous call) or strictly after the first one
+  /// has already recorded its terminal result, in which case the cache-hit
+  /// branch below returns it instead of executing again.
+  private final class RunnerReplayCoordinator {
+    enum Disposition {
+      /// Never seen before (or below the high-water mark's edge case does
+      /// not apply): safe to execute.
+      case execute
+      /// Already executed and still cached: replay the identical result,
+      /// verbatim, without executing again.
+      case replay(LifecycleResponseFrame)
+      /// Refuse to execute, and say exactly why. `replayStatus` is one of
+      /// "epoch-mismatch", "sequence-gap", or "result-expired" — see
+      /// `runnerProtocol.ts`'s `RunnerReplayStatusSchema` for the host-side
+      /// contract these three values are part of.
+      case reject(reason: String, replayStatus: String)
+    }
+
+    let epoch: String
+    private let cacheCapacity: Int
+    private var terminalCache: [Int: LifecycleResponseFrame] = [:]
+    // Insertion-ordered keys, so eviction is FIFO (oldest sequence first) —
+    // simplest bound that still favors the recent commands a redelivery is
+    // actually likely to target.
+    private var cacheEvictionOrder: [Int] = []
+    // 0 is a safe "nothing executed yet" sentinel: real sequence numbers are
+    // always >= 1 (SessionController.ts allocates them starting at 1), so
+    // `sequence > executedHighWaterMark + 1` never misfires against it.
+    private var executedHighWaterMark = 0
+
+    init(epoch: String, cacheCapacity: Int = 64) {
+      self.epoch = epoch
+      self.cacheCapacity = cacheCapacity
+    }
+
+    func disposition(for command: LifecycleCommandFrame) -> Disposition {
+      guard command.epoch == epoch else {
+        return .reject(
+          reason: "Command epoch \(command.epoch) does not match the runner's current epoch \(epoch).",
+          replayStatus: "epoch-mismatch"
+        )
+      }
+
+      if let cached = terminalCache[command.sequence] {
+        // Relabel `replayStatus` to "cached-replay" on the way out — the
+        // stored frame's own `replayStatus` is frozen at whatever it was
+        // the moment it was first executed ("executed"), and that is
+        // exactly the distinction a caller needs: every other field
+        // (`recordedAt`, `handledMs`, `payload`, `statusLabel`, `ok`,
+        // `error`, ...) stays byte-identical to the original execution —
+        // that identity *is* the proof nothing ran a second time.
+        return .replay(
+          LifecycleResponseFrame(
+            action: cached.action,
+            error: cached.error,
+            handledMs: cached.handledMs,
+            inlinePayload: cached.inlinePayload,
+            inlinePayloadEncoding: cached.inlinePayloadEncoding,
+            kind: cached.kind,
+            ok: cached.ok,
+            payload: cached.payload,
+            snapshotPayloadPath: cached.snapshotPayloadPath,
+            recordedAt: cached.recordedAt,
+            sequence: cached.sequence,
+            snapshotNodeCount: cached.snapshotNodeCount,
+            statusLabel: cached.statusLabel,
+            resolutionMs: cached.resolutionMs,
+            waitMs: cached.waitMs,
+            interactionMs: cached.interactionMs,
+            finalizationMs: cached.finalizationMs,
+            epoch: cached.epoch,
+            replayStatus: "cached-replay"
+          )
+        )
+      }
+
+      if command.sequence <= executedHighWaterMark {
+        return .reject(
+          reason: "Sequence \(command.sequence) was already executed but its cached result has since expired.",
+          replayStatus: "result-expired"
+        )
+      }
+
+      if command.sequence > executedHighWaterMark + 1 {
+        return .reject(
+          reason: "Sequence \(command.sequence) skips ahead of the executed high-water mark "
+            + "\(executedHighWaterMark); at least one earlier sequence was never seen by this runner.",
+          replayStatus: "sequence-gap"
+        )
+      }
+
+      return .execute
+    }
+
+    /// Records a freshly-produced terminal result. Called exactly once per
+    /// sequence, and only for a command `disposition(for:)` returned
+    /// `.execute` for — whether `handleLifecycleCommand` itself succeeded or
+    /// threw. A failed *attempt* still ran (with whatever side effects that
+    /// implies), so it is exactly as much "already executed" as a
+    /// successful one; caching it is what stops a redelivery from trying
+    /// the same doomed mutation again.
+    func recordExecuted(sequence: Int, response: LifecycleResponseFrame) {
+      if terminalCache[sequence] == nil {
+        cacheEvictionOrder.append(sequence)
+      }
+
+      terminalCache[sequence] = response
+      executedHighWaterMark = max(executedHighWaterMark, sequence)
+      evictIfNeeded()
+    }
+
+    private func evictIfNeeded() {
+      while cacheEvictionOrder.count > cacheCapacity {
+        let evicted = cacheEvictionOrder.removeFirst()
+        terminalCache.removeValue(forKey: evicted)
+      }
+    }
   }
 
   @MainActor
@@ -551,6 +1340,12 @@ final class AttachControlSpikeUITests: XCTestCase {
       XCTAssertTrue(statusLabelExists, statusLabelFailureMessage)
     }
 
+    // PRB-089: a fresh, unpredictable epoch every time this runner attaches.
+    // UUID (not an incrementing counter) so nothing about a prior epoch —
+    // including how many there have been — leaks into a redelivered
+    // command's chance of colliding with the new one.
+    let runnerEpoch = UUID().uuidString
+
     let readyFrame = LifecycleReadyFrame(
       kind: "ready",
       attachLatencyMs: attachLatencyMs,
@@ -568,10 +1363,16 @@ final class AttachControlSpikeUITests: XCTestCase {
       runnerPort: nil,
       runnerTransportContract: resolvedControlDirectory.config.contractVersion,
       sessionIdentifier: resolvedControlDirectory.config.sessionIdentifier,
-      simulatorUdid: resolvedControlDirectory.config.simulatorUdid
+      simulatorUdid: resolvedControlDirectory.config.simulatorUdid,
+      runnerEpoch: runnerEpoch
     )
 
-    return LifecycleLoopState(app: app, readyFrame: readyFrame, statusLabel: statusLabel)
+    return LifecycleLoopState(
+      app: app,
+      readyFrame: readyFrame,
+      statusLabel: statusLabel,
+      replayCoordinator: RunnerReplayCoordinator(epoch: runnerEpoch)
+    )
   }
 
   private func emitLifecycleReadyFrame(_ readyFrame: LifecycleReadyFrame, controlDirectoryURL: URL) throws {
@@ -591,7 +1392,8 @@ final class AttachControlSpikeUITests: XCTestCase {
       desiredPort: resolveRunnerPortFromEnvironment(),
       controlDirectoryURL: controlDirectoryURL,
       app: lifecycleState.app,
-      statusLabel: lifecycleState.statusLabel
+      statusLabel: lifecycleState.statusLabel,
+      replayCoordinator: lifecycleState.replayCoordinator
     )
     lifecycleState.readyFrame.runnerPort = httpCommandServer.port
 
@@ -797,33 +1599,22 @@ final class AttachControlSpikeUITests: XCTestCase {
     app: XCUIApplication,
     statusLabel: XCUIElement,
     controlDirectoryURL: URL,
+    replayCoordinator: RunnerReplayCoordinator,
   ) -> LifecycleResponseFrame {
-    do {
-      let result = try handleLifecycleCommand(
-        command,
-        app: app,
-        statusLabel: statusLabel,
-        controlDirectoryURL: controlDirectoryURL
-      )
+    // PRB-089: the replay decision is made *before* touching the app at
+    // all. A `.replay` or `.reject` disposition returns without ever
+    // calling `handleLifecycleCommand` — that is the "never re-execute"
+    // half of the guarantee; `recordExecuted` below is the other half.
+    switch replayCoordinator.disposition(for: command) {
+    case .replay(let cached):
+      return cached
+
+    case .reject(let reason, let replayStatus):
+      let finalizationStartedAt = Date()
+      let statusLabelText = Self.genericResponseStatusLabel(app: app)
       return LifecycleResponseFrame(
         action: command.action,
-        error: nil,
-        handledMs: milliseconds(since: startedAt),
-        inlinePayload: result.inlinePayload,
-        inlinePayloadEncoding: result.inlinePayloadEncoding,
-        kind: "response",
-        ok: true,
-        payload: result.payload,
-        snapshotPayloadPath: result.snapshotPayloadPath,
-        recordedAt: Self.iso8601Formatter.string(from: Date()),
-        sequence: command.sequence,
-        snapshotNodeCount: result.snapshotNodeCount,
-        statusLabel: currentStatusLabelText(app: app)
-      )
-    } catch {
-      return LifecycleResponseFrame(
-        action: command.action,
-        error: String(describing: error),
+        error: reason,
         handledMs: milliseconds(since: startedAt),
         inlinePayload: nil,
         inlinePayloadEncoding: nil,
@@ -834,8 +1625,79 @@ final class AttachControlSpikeUITests: XCTestCase {
         recordedAt: Self.iso8601Formatter.string(from: Date()),
         sequence: command.sequence,
         snapshotNodeCount: nil,
-        statusLabel: currentStatusLabelText(app: app)
+        statusLabel: statusLabelText,
+        resolutionMs: nil,
+        waitMs: nil,
+        interactionMs: nil,
+        finalizationMs: milliseconds(since: finalizationStartedAt),
+        epoch: replayCoordinator.epoch,
+        replayStatus: replayStatus
       )
+
+    case .execute:
+      let response: LifecycleResponseFrame
+
+      do {
+        let result = try handleLifecycleCommand(
+          command,
+          app: app,
+          statusLabel: statusLabel,
+          controlDirectoryURL: controlDirectoryURL
+        )
+        let finalizationStartedAt = Date()
+        let statusLabelText = Self.genericResponseStatusLabel(app: app)
+        response = LifecycleResponseFrame(
+          action: command.action,
+          error: nil,
+          handledMs: milliseconds(since: startedAt),
+          inlinePayload: result.inlinePayload,
+          inlinePayloadEncoding: result.inlinePayloadEncoding,
+          kind: "response",
+          ok: true,
+          payload: result.payload,
+          snapshotPayloadPath: result.snapshotPayloadPath,
+          recordedAt: Self.iso8601Formatter.string(from: Date()),
+          sequence: command.sequence,
+          snapshotNodeCount: result.snapshotNodeCount,
+          statusLabel: statusLabelText,
+          resolutionMs: result.resolutionMs,
+          waitMs: result.waitMs,
+          interactionMs: result.interactionMs,
+          finalizationMs: milliseconds(since: finalizationStartedAt),
+          epoch: replayCoordinator.epoch,
+          replayStatus: "executed"
+        )
+      } catch {
+        let finalizationStartedAt = Date()
+        let statusLabelText = Self.genericResponseStatusLabel(app: app)
+        response = LifecycleResponseFrame(
+          action: command.action,
+          error: String(describing: error),
+          handledMs: milliseconds(since: startedAt),
+          inlinePayload: nil,
+          inlinePayloadEncoding: nil,
+          kind: "response",
+          ok: false,
+          payload: nil,
+          snapshotPayloadPath: nil,
+          recordedAt: Self.iso8601Formatter.string(from: Date()),
+          sequence: command.sequence,
+          snapshotNodeCount: nil,
+          statusLabel: statusLabelText,
+          resolutionMs: nil,
+          waitMs: nil,
+          interactionMs: nil,
+          finalizationMs: milliseconds(since: finalizationStartedAt),
+          epoch: replayCoordinator.epoch,
+          replayStatus: "executed"
+        )
+      }
+
+      // A failed attempt still ran (and may have left side effects), so it
+      // is cached exactly like a successful one — never re-execute a
+      // sequence just because its first attempt threw.
+      replayCoordinator.recordExecuted(sequence: command.sequence, response: response)
+      return response
     }
   }
 
@@ -845,6 +1707,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
+    replayCoordinator: RunnerReplayCoordinator,
   ) throws -> HTTPCommandServer {
     let listener = try makeHTTPListener(desiredPort: desiredPort)
     let queue = DispatchQueue(label: "probe.runner.http")
@@ -893,6 +1756,7 @@ final class AttachControlSpikeUITests: XCTestCase {
         controlDirectoryURL: controlDirectoryURL,
         app: app,
         statusLabel: statusLabel,
+        replayCoordinator: replayCoordinator,
         onShutdown: {
           listener.cancel()
           finishLoopIfNeeded()
@@ -944,6 +1808,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
+    replayCoordinator: RunnerReplayCoordinator,
     onShutdown: @escaping () -> Void,
   ) {
     connection.receive(minimumIncompleteLength: 1, maximumLength: 1024 * 1024) { [weak self] data, _, _, error in
@@ -970,6 +1835,7 @@ final class AttachControlSpikeUITests: XCTestCase {
           controlDirectoryURL: controlDirectoryURL,
           app: app,
           statusLabel: statusLabel,
+          replayCoordinator: replayCoordinator,
           onShutdown: onShutdown,
         )
         return
@@ -981,6 +1847,7 @@ final class AttachControlSpikeUITests: XCTestCase {
           controlDirectoryURL: controlDirectoryURL,
           app: app,
           statusLabel: statusLabel,
+          replayCoordinator: replayCoordinator,
         )
         self.sendHTTPResponse(response.data, over: connection) {
           if response.shouldShutdown {
@@ -997,6 +1864,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     controlDirectoryURL: URL,
     app: XCUIApplication,
     statusLabel: XCUIElement,
+    replayCoordinator: RunnerReplayCoordinator,
   ) -> (data: Data, shouldShutdown: Bool) {
     switch request.method.uppercased() {
     case "POST":
@@ -1016,10 +1884,16 @@ final class AttachControlSpikeUITests: XCTestCase {
           app: app,
           statusLabel: statusLabel,
           controlDirectoryURL: controlDirectoryURL,
+          replayCoordinator: replayCoordinator,
         )
         return (
           try encodeHTTPJSONResponse(status: 200, value: responseFrame),
-          command.action == "shutdown"
+          // PRB-089: a shutdown command rejected by the replay coordinator
+          // (wrong epoch, a sequence gap, an expired cache entry) never
+          // executed — `ok` is false — so it must not tear the listener
+          // down. Gate on the actual outcome, not just the requested
+          // action.
+          command.action == "shutdown" && responseFrame.ok
         )
       } catch {
         return (
@@ -1891,8 +2765,122 @@ final class AttachControlSpikeUITests: XCTestCase {
     return true
   }
 
-  private func elementMatchesSectionToken(_ element: XCUIElement, token: String) -> Bool {
-    Self.normalizedText(element.identifier) == token || Self.normalizedText(element.label) == token
+  // PRB-091: the bounded scan ceiling for the query planner below. Every
+  // bounded probe (`boundedMatchingElements`, and the section-token lookups
+  // in `boundedSectionMatches`) walks a query strictly by index via
+  // `element(boundBy:)` and stops the moment it has proven what it needs
+  // (zero, one, more-than-one, or the requested ordinal) — this cap only
+  // bounds the pathological case where a locator never resolves (e.g. an
+  // `interactive` post-filter over a large non-matching subtree), so the
+  // scan is provably bounded rather than an unbounded tree walk. It is sized
+  // generously above the largest fixture-benchmarked interactive/matching
+  // set observed in knowledge/xcuitest-runner (the `Large` AX-tree profile's
+  // interactive-only view: 405 entries) so a legitimate ordinal request
+  // against that scale still resolves within the cap.
+  private static let uiActionBoundedScanCap = 512
+
+  // PRB-091: reads a query strictly by index — never `.allElementsBoundByIndex`
+  // — and stops as soon as it has gathered enough passing matches to answer
+  // the question actually being asked: with no ordinal, 2 matches are
+  // enough to prove "ambiguous" (the exact total beyond that is never
+  // needed); with ordinal N, N matches are enough to return the Nth. This is
+  // the "materializes only enough matches to distinguish zero, one, or many"
+  // requirement — the planner never enumerates the full match set by
+  // default.
+  @MainActor
+  private func boundedMatchingElements(
+    query: XCUIElementQuery,
+    ordinal: Int?,
+    postFilter: (XCUIElement) -> Bool,
+  ) -> [XCUIElement] {
+    let neededCount = max(ordinal ?? 2, 2)
+    var matches: [XCUIElement] = []
+
+    for index in 0..<Self.uiActionBoundedScanCap {
+      let candidate = query.element(boundBy: index)
+      guard candidate.exists else {
+        break
+      }
+
+      if postFilter(candidate) {
+        matches.append(candidate)
+
+        if matches.count >= neededCount {
+          break
+        }
+      }
+    }
+
+    return matches
+  }
+
+  // PRB-091: identifier-first section resolution. A section token names a
+  // container by accessibility identifier first — `matching(identifier:)`
+  // is Apple's own typed identifier predicate, the narrowest public query
+  // for a strong locator — and only falls back to a `label ==` predicate
+  // when no identifier match exists. Both paths are bounded (never
+  // `app.descendants(matching: .any).allElementsBoundByIndex`) and stop at
+  // 2 matches, enough to know "unique" from "ambiguous" without enumerating
+  // every element in the app. See knowledge/xcuitest-runner/integration-notes.md.
+  @MainActor
+  private func boundedSectionMatches(sectionToken: String, app: XCUIApplication) -> [XCUIElement] {
+    let identifierMatches = boundedMatchingElements(
+      query: app.descendants(matching: .any).matching(identifier: sectionToken),
+      ordinal: nil,
+      postFilter: { $0.exists }
+    )
+
+    if !identifierMatches.isEmpty {
+      return identifierMatches
+    }
+
+    let labelPredicate = NSPredicate(format: "label == %@", sectionToken)
+    return boundedMatchingElements(
+      query: app.descendants(matching: .any).matching(labelPredicate),
+      ordinal: nil,
+      postFilter: { $0.exists }
+    )
+  }
+
+  // PRB-091: the narrowest public XCUIElementQuery the locator supports.
+  // Identifier goes through `matching(identifier:)` first (typed, and the
+  // only form the knowledge pack certifies for a strong locator); label and
+  // placeholder — plain String AX attributes — narrow further as a single
+  // compound NSPredicate. `value` deliberately stays out of the predicate:
+  // AX `value` is `Any?` (String, NSNumber, ...) and normalizedValue's
+  // NSNumber → stringValue coercion has no faithful NSPredicate equivalent,
+  // so it is checked only by the `elementMatchesLocator` post-filter over
+  // the few candidates the bounded scan actually fetches — never by
+  // widening the query itself.
+  private func narrowedUIActionQuery(
+    root: XCUIElement,
+    type: XCUIElement.ElementType,
+    locator: RunnerUIActionLocator,
+  ) -> XCUIElementQuery {
+    var query = root.descendants(matching: type)
+
+    if let identifier = Self.normalizedText(locator.identifier) {
+      query = query.matching(identifier: identifier)
+    }
+
+    var predicateFormats: [String] = []
+    var predicateArgs: [Any] = []
+
+    if let label = Self.normalizedText(locator.label) {
+      predicateFormats.append("label == %@")
+      predicateArgs.append(label)
+    }
+
+    if let placeholder = Self.normalizedText(locator.placeholder) {
+      predicateFormats.append("placeholderValue == %@")
+      predicateArgs.append(placeholder)
+    }
+
+    if !predicateFormats.isEmpty {
+      query = query.matching(NSPredicate(format: predicateFormats.joined(separator: " AND "), argumentArray: predicateArgs))
+    }
+
+    return query
   }
 
   @MainActor
@@ -1913,32 +2901,26 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     let type = elementType(for: locator.type)
     let sectionToken = Self.normalizedText(locator.section)
-    let sectionMatches: [XCUIElement]
+    let sectionMatchCount: Int?
+    let queryRoot: XCUIElement
 
     if let sectionToken {
-      sectionMatches = app.descendants(matching: .any).allElementsBoundByIndex.filter { element in
-        element.exists && elementMatchesSectionToken(element, token: sectionToken)
-      }
+      let sectionMatches = boundedSectionMatches(sectionToken: sectionToken, app: app)
+      sectionMatchCount = sectionMatches.count
+      queryRoot = sectionMatches.count == 1 ? sectionMatches[0] : app
     } else {
-      sectionMatches = []
+      sectionMatchCount = nil
+      queryRoot = app
     }
 
-    let queryRoot = sectionMatches.count == 1 ? sectionMatches[0] : app
-    let query = queryRoot.descendants(matching: type)
-    let candidates: [XCUIElement]
-
-    if let identifier = Self.normalizedText(locator.identifier) {
-      candidates = query.matching(identifier: identifier).allElementsBoundByIndex
-    } else {
-      candidates = query.allElementsBoundByIndex
-    }
-
-    return ResolvedUIActionCandidates(
-      matches: candidates.filter { element in
-        element.exists && elementMatchesLocator(element, locator: locator)
-      },
-      sectionMatchCount: sectionToken == nil ? nil : sectionMatches.count
+    let query = narrowedUIActionQuery(root: queryRoot, type: type, locator: locator)
+    let matches = boundedMatchingElements(
+      query: query,
+      ordinal: locator.ordinal,
+      postFilter: { element in element.exists && elementMatchesLocator(element, locator: locator) }
     )
+
+    return ResolvedUIActionCandidates(matches: matches, sectionMatchCount: sectionMatchCount)
   }
 
   @MainActor
@@ -1951,6 +2933,11 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
 
     let resolved = matchingUIActionElements(locator: locator, app: app)
+    // PRB-091: bounded to at most `max(ordinal, 2)` elements by
+    // `boundedMatchingElements` — never the full match set. `matches.count`
+    // below is exact whenever it is below that bound (the true zero/one/N
+    // case), and pinned at the bound otherwise, which is exactly the
+    // "ambiguous"/"at-least-ordinal" signal the branches below need.
     let matches = resolved.matches
 
     let sectionDetail: String = {
@@ -1958,7 +2945,7 @@ final class AttachControlSpikeUITests: XCTestCase {
         return ""
       }
 
-      return " The section token matched \(sectionMatchCount) containers, so the runner could not narrow the duplicate weak target further."
+      return " The section token matched more than one container, so the runner could not narrow the duplicate weak target further."
     }()
 
     if let ordinal = locator.ordinal {
@@ -1971,7 +2958,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       }
 
       throw actionError(
-        "Semantic locator \(describeUIActionLocator(locator)) expected ordinal \(ordinal) but runner found only \(matches.count) matches.\(sectionDetail) Add stronger accessibility identifiers or unique labels to remove ambiguity."
+        "Semantic locator \(describeUIActionLocator(locator)) expected ordinal \(ordinal) but the runner's bounded scan found only \(matches.count) matching element(s).\(sectionDetail) Add stronger accessibility identifiers or unique labels to remove ambiguity."
       )
     }
 
@@ -1988,7 +2975,7 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
 
     throw actionError(
-      "Semantic locator \(describeUIActionLocator(locator)) matched \(matches.count) elements on the runner. Replay can recover ref drift only while the runner-side semantic locator stays unique.\(sectionDetail) Duplicate weak targets still need stronger accessibility identifiers or unique labels."
+      "Semantic locator \(describeUIActionLocator(locator)) matched more than one element on the runner. Replay can recover ref drift only while the runner-side semantic locator stays unique.\(sectionDetail) Duplicate weak targets still need stronger accessibility identifiers or unique labels."
     )
   }
 
@@ -2042,76 +3029,129 @@ final class AttachControlSpikeUITests: XCTestCase {
     coordinate.press(forDuration: 0.01, thenDragTo: coordinate.withOffset(offset))
   }
 
+  // PRB-091: `uiAction`'s timing breakdown. `resolutionMs` is how long the
+  // query planner took to turn a locator into a coordinate/element (zero AX
+  // enumeration for a point locator, a bounded query for a semantic one);
+  // `waitMs` is existence/hittability gating (always zero for a point
+  // locator — there is nothing to wait on); `interactionMs` is the gesture
+  // itself. Kept as three explicit timers rather than one `handledMs` blob
+  // so a caller can tell "the query planner got slow" apart from "the tap
+  // itself got slow" instead of guessing from one number.
+  private struct RunnerUIActionOutcome {
+    let summary: String
+    let resolutionMs: Int
+    let waitMs: Int
+    let interactionMs: Int
+  }
+
   @MainActor
   private func performRunnerUIAction(
     _ action: RunnerUIActionPayload,
     app: XCUIApplication,
-  ) throws -> String {
+  ) throws -> RunnerUIActionOutcome {
     if action.locator.kind == "point" {
+      let resolutionStartedAt = Date()
       let target = try resolveUIActionCoordinate(locator: action.locator, app: app)
+      let resolutionMs = milliseconds(since: resolutionStartedAt)
       let targetDescription = describeUIActionLocator(action.locator)
+
+      func pointOutcome(_ summary: String, interactionStartedAt: Date) -> RunnerUIActionOutcome {
+        RunnerUIActionOutcome(
+          summary: summary,
+          resolutionMs: resolutionMs,
+          // A point locator resolves directly to a coordinate with no
+          // existence/hittability gating to wait on — see the doc comment
+          // above.
+          waitMs: 0,
+          interactionMs: milliseconds(since: interactionStartedAt)
+        )
+      }
 
       switch action.kind {
       case "tap":
+        let interactionStartedAt = Date()
         target.tap()
-        return "tapped \(targetDescription)"
+        return pointOutcome("tapped \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "press":
         let durationMs = action.durationMs ?? 750
         try requireActionCondition(durationMs > 0, "Press duration must be positive.")
+        let interactionStartedAt = Date()
         target.press(forDuration: Double(durationMs) / 1000.0)
-        return "pressed \(targetDescription)"
+        return pointOutcome("pressed \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "swipe":
+        let interactionStartedAt = Date()
         try performDirectionalGesture(on: target, direction: action.direction ?? "")
-        return "swiped \(action.direction ?? "unknown") on \(targetDescription)"
+        return pointOutcome("swiped \(action.direction ?? "unknown") on \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "type":
+        let interactionStartedAt = Date()
         target.tap()
         if let text = action.text, !text.isEmpty {
           app.typeText(text)
         }
-        return "typed into \(targetDescription)"
+        return pointOutcome("typed into \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "scroll":
         let steps = action.steps ?? 1
         try requireActionCondition(steps > 0, "Scroll steps must be positive.")
+        let interactionStartedAt = Date()
         for _ in 0..<steps {
           try performDirectionalGesture(on: target, direction: action.direction ?? "")
         }
-        return "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps"
+        return pointOutcome(
+          "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps",
+          interactionStartedAt: interactionStartedAt
+        )
 
       default:
         throw actionError("Unsupported UI action \(action.kind).")
       }
     }
 
+    let resolutionStartedAt = Date()
     let target = try resolveUIActionElement(locator: action.locator, app: app)
+    let resolutionMs = milliseconds(since: resolutionStartedAt)
     let targetDescription = describeUIActionLocator(action.locator)
+
+    func requireExistsAndHittable(_ waitDescription: String) throws -> Int {
+      let waitStartedAt = Date()
+      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before \(waitDescription).")
+      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before \(waitDescription).")
+      return milliseconds(since: waitStartedAt)
+    }
+
+    func requireExists(_ waitDescription: String) throws -> Int {
+      let waitStartedAt = Date()
+      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before \(waitDescription).")
+      return milliseconds(since: waitStartedAt)
+    }
 
     switch action.kind {
     case "tap":
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before tap.")
-      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before tap.")
+      let waitMs = try requireExistsAndHittable("tap")
+      let interactionStartedAt = Date()
       target.tap()
-      return "tapped \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "tapped \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "press":
       let durationMs = action.durationMs ?? 750
       try requireActionCondition(durationMs > 0, "Press duration must be positive.")
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before press.")
-      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before press.")
+      let waitMs = try requireExistsAndHittable("press")
+      let interactionStartedAt = Date()
       target.press(forDuration: Double(durationMs) / 1000.0)
-      return "pressed \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "pressed \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "swipe":
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before swipe.")
+      let waitMs = try requireExists("swipe")
+      let interactionStartedAt = Date()
       try performDirectionalGesture(on: target, direction: action.direction ?? "")
-      return "swiped \(action.direction ?? "unknown") on \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "swiped \(action.direction ?? "unknown") on \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "type":
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before typing.")
-      try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before typing.")
+      let waitMs = try requireExistsAndHittable("typing")
+      let interactionStartedAt = Date()
       target.tap()
       if action.replace ?? true {
         clearTextIfNeeded(on: target, locator: action.locator)
@@ -2119,40 +3159,44 @@ final class AttachControlSpikeUITests: XCTestCase {
       if let text = action.text, !text.isEmpty {
         target.typeText(text)
       }
-      return "typed into \(targetDescription)"
+      return RunnerUIActionOutcome(summary: "typed into \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "scroll":
       let steps = action.steps ?? 1
       try requireActionCondition(steps > 0, "Scroll steps must be positive.")
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before scrolling.")
+      let waitMs = try requireExists("scrolling")
+      let interactionStartedAt = Date()
       for _ in 0..<steps {
         try performDirectionalGesture(on: target, direction: action.direction ?? "")
       }
-      return "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps"
+      return RunnerUIActionOutcome(
+        summary: "scrolled \(action.direction ?? "unknown") on \(targetDescription) for \(steps) steps",
+        resolutionMs: resolutionMs,
+        waitMs: waitMs,
+        interactionMs: milliseconds(since: interactionStartedAt)
+      )
 
     default:
       throw actionError("Unsupported UI action \(action.kind).")
     }
   }
 
+  // PRB-091: generic (non-fixture) status text for response finalization.
+  // The runner used to probe three ProbeFixture-only static-text
+  // identifiers (`fixture.status.label`, `fixture.detail.label`,
+  // `fixture.detail.summaryLabel`) on *every* response, for *every* target
+  // app — three extra AX existence queries per command that only ever
+  // resolved to anything on ProbeFixture itself, and did nothing but add
+  // latency for every other app. `app.label` is already-resolved attribute
+  // data on the `app` handle the caller already holds, not a fresh query,
+  // so this reads as zero additional AX enumeration. Fixture-specific
+  // status assertions (the `fixture.status.label` waits in `applyInput` and
+  // the attach helpers, and the direct `staticTexts["fixture.status.label"]`
+  // lookups in the test methods below) are unaffected — they are already
+  // test-only and stay that way.
   @MainActor
-  private func currentStatusLabelText(app: XCUIApplication) -> String {
-    let primaryStatus = app.staticTexts["fixture.status.label"]
-    if primaryStatus.exists {
-      return primaryStatus.label
-    }
-
-    let detailLabel = app.staticTexts["fixture.detail.label"]
-    if detailLabel.exists {
-      return detailLabel.label
-    }
-
-    let detailSummary = app.staticTexts["fixture.detail.summaryLabel"]
-    if detailSummary.exists {
-      return detailSummary.label
-    }
-
-    return app.label.isEmpty ? "<status-unavailable>" : app.label
+  private static func genericResponseStatusLabel(app: XCUIApplication) -> String {
+    app.label.isEmpty ? "<status-unavailable>" : app.label
   }
 
   @MainActor
@@ -2217,7 +3261,7 @@ final class AttachControlSpikeUITests: XCTestCase {
       let interactiveNodeCount = Self.interactiveNodeCount(in: compactRoot)
       let payload = RunnerSnapshotPayload(
         capturedAt: Self.iso8601Formatter.string(from: Date()),
-        statusLabel: currentStatusLabelText(app: app),
+        statusLabel: Self.genericResponseStatusLabel(app: app),
         metrics: RunnerSnapshotMetrics(
           rawNodeCount: rawNodeCount,
           prunedNodeCount: compactNodeCount,
@@ -2298,13 +3342,16 @@ final class AttachControlSpikeUITests: XCTestCase {
     case "uiAction":
       let payloadData = Data((command.payload ?? "{}").utf8)
       let actionPayload = try JSONDecoder().decode(RunnerUIActionPayload.self, from: payloadData)
-      let summary = try performRunnerUIAction(actionPayload, app: app)
+      let outcome = try performRunnerUIAction(actionPayload, app: app)
       return LifecycleCommandResult(
         inlinePayload: nil,
         inlinePayloadEncoding: nil,
-        payload: summary,
+        payload: outcome.summary,
         snapshotPayloadPath: nil,
-        snapshotNodeCount: nil
+        snapshotNodeCount: nil,
+        resolutionMs: outcome.resolutionMs,
+        waitMs: outcome.waitMs,
+        interactionMs: outcome.interactionMs
       )
 
     case "shutdown":
