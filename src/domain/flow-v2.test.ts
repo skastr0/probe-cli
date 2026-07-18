@@ -251,9 +251,34 @@ describe("PRB-093 contract-tests the evidence-policy migration against the canon
     expect(validateFlowV2Contract(flow)).toBeNull()
     const sequenceStep = flow.steps[0] as { readonly evidencePolicy?: { readonly success?: string; readonly failure?: string } }
     expect(sequenceStep.evidencePolicy).toEqual({ success: "around", failure: "none" })
-    // The old checkpoint vocabulary is gone -- a payload still carrying it
-    // decodes (Schema.Struct tolerates excess keys) but the key contributes
-    // nothing; no compatibility path was built for it (PRB-093's Notes).
     expect((sequenceStep as { readonly checkpoint?: unknown }).checkpoint).toBeUndefined()
+  })
+
+  // PRB-103: a stale caller still sending the pre-PRB-093 "none"/"end"
+  // checkpoint vocabulary used to decode silently (Schema.Struct's default
+  // tolerates excess keys, so the field vanished and the step quietly fell
+  // back to the *default* evidence policy) -- a caller that meant
+  // checkpoint: "none" (zero snapshots) would silently get one snapshot
+  // instead, with no signal anything changed. Consistent with PRB-082's
+  // rejection idiom (a superseded shape fails closed, not a silent
+  // compatibility adapter), a sequence step now rejects any excess field --
+  // named here for the one the deleted vocabulary actually used.
+  test("rejects a stale sequence.checkpoint field with a typed decode error instead of silently dropping it", () => {
+    const decodeStaleCheckpoint = () =>
+      decodeSessionFlowContract({
+        contract: "probe.session-flow/v2",
+        execution: "fast",
+        steps: [
+          {
+            kind: "sequence",
+            checkpoint: "end",
+            actions: [
+              { kind: "tap", target: { kind: "point", x: 1, y: 2 } },
+            ],
+          },
+        ],
+      })
+
+    expect(decodeStaleCheckpoint).toThrow(/checkpoint/)
   })
 })
