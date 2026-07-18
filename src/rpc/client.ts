@@ -23,8 +23,12 @@ import {
 import type {
     ArtifactDrillRequest,
     ArtifactDrillResponse,
+    PerfAnalyzeRequest,
+    PerfAnalyzeResponse,
     PerfAroundRequest,
     PerfAroundResponse,
+    PerfExportRequest,
+    PerfExportResponse,
     DaemonPingRequest,
     DaemonPingResponse,
     PerfRecordRequest,
@@ -481,6 +485,12 @@ export const sendPerfAround = (options: RpcClientOptions, request: PerfAroundReq
 
 export const sendPerfSummarize = (options: RpcClientOptions, request: PerfSummarizeRequest) =>
   sendRequest<PerfSummarizeResponse>(options, request)
+
+export const sendPerfExport = (options: RpcClientOptions, request: PerfExportRequest) =>
+  sendRequest<PerfExportResponse>(options, request)
+
+export const sendPerfAnalyze = (options: RpcClientOptions, request: PerfAnalyzeRequest) =>
+  sendRequest<PerfAnalyzeResponse>(options, request)
 
 export const sendArtifactDrill = (
   options: RpcClientOptions,

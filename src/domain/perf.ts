@@ -61,12 +61,23 @@ export const PerfDiagnosis = Schema.Struct({
 })
 export type PerfDiagnosis = typeof PerfDiagnosis.Type
 
+// PRB-097: record() is trace-first -- it launches zero schema-export
+// subprocesses. `artifacts` only ever holds the trace bundle and its TOC;
+// the "forty exports" a custom template used to produce eagerly are gone.
 export const PerfArtifacts = Schema.Struct({
   trace: ArtifactRecord,
   toc: ArtifactRecord,
-  exports: Schema.Array(ArtifactRecord),
 })
 export type PerfArtifacts = typeof PerfArtifacts.Type
+
+// PRB-097: the compact schema catalog record() returns instead of eagerly
+// exporting every schema the TOC advertises. One entry per schema name; no
+// row/byte data (that requires an export, which is the lazy `perf.export`/
+// `perf.analyze` capability's job, not record()'s).
+export const PerfSchemaCatalogEntry = Schema.Struct({
+  schema: Schema.String,
+})
+export type PerfSchemaCatalogEntry = typeof PerfSchemaCatalogEntry.Type
 
 export const PerfSessionOutcome = Schema.Struct({
   state: SessionPhase,
@@ -85,6 +96,7 @@ export const PerfRecordResult = Schema.Struct({
   session: PerfSessionOutcome,
   summary: PerfSummary,
   diagnoses: Schema.Array(PerfDiagnosis),
+  schemas: Schema.Array(PerfSchemaCatalogEntry),
   artifacts: PerfArtifacts,
 })
 export type PerfRecordResult = typeof PerfRecordResult.Type
@@ -139,6 +151,59 @@ export const PerfSignpostSummaryResult = Schema.Struct({
   artifacts: PerfSignpostSummaryArtifacts,
 })
 export type PerfSignpostSummaryResult = typeof PerfSignpostSummaryResult.Type
+
+// PRB-097: `perf.export` -- one requested schema/XPath derivative, exported
+// on demand from an already-recorded trace, cached by trace identity + run
+// number + schema + XPath + xctrace version. Never inlines raw XML; the
+// export always lands as a durable ArtifactRecord.
+export const PerfExportArtifacts = Schema.Struct({
+  trace: ArtifactRecord,
+  toc: ArtifactRecord,
+  export: ArtifactRecord,
+})
+export type PerfExportArtifacts = typeof PerfExportArtifacts.Type
+
+export const PerfExportResult = Schema.Struct({
+  sessionId: Schema.String,
+  artifactKey: Schema.String,
+  schema: Schema.String,
+  xpath: Schema.String,
+  runNumber: Schema.String,
+  xctraceVersion: Schema.String,
+  exportedAt: Schema.String,
+  cacheHit: Schema.Boolean,
+  rowCount: Schema.Number,
+  bytesWritten: Schema.Number,
+  artifacts: PerfExportArtifacts,
+})
+export type PerfExportResult = typeof PerfExportResult.Type
+
+// PRB-097: `perf.analyze` -- lazily exports (and caches) only the schemas a
+// single named built-in analyzer needs, then runs that analyzer's existing
+// math. Custom templates have no built-in analyzer, so `analyzer` is scoped
+// to the six built-in templates -- the same set `perf.record --template`
+// accepts.
+export const PerfAnalyzerName = PerfTemplate
+export type PerfAnalyzerName = typeof PerfAnalyzerName.Type
+
+export const PerfAnalyzeArtifacts = Schema.Struct({
+  trace: ArtifactRecord,
+  toc: ArtifactRecord,
+  exports: Schema.Array(ArtifactRecord),
+})
+export type PerfAnalyzeArtifacts = typeof PerfAnalyzeArtifacts.Type
+
+export const PerfAnalyzeResult = Schema.Struct({
+  sessionId: Schema.String,
+  artifactKey: Schema.String,
+  analyzer: PerfAnalyzerName,
+  analyzedAt: Schema.String,
+  xctraceVersion: Schema.String,
+  summary: PerfSummary,
+  diagnoses: Schema.Array(PerfDiagnosis),
+  artifacts: PerfAnalyzeArtifacts,
+})
+export type PerfAnalyzeResult = typeof PerfAnalyzeResult.Type
 
 export interface ParsedPerfCell {
   readonly raw: string | null

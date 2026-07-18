@@ -28,12 +28,18 @@ export const RUNNER_CAPABILITY_REGISTRY: ReadonlyArray<RunnerCapabilityRegistryE
   {
     capability: "uiActionBatch",
     gatedAction: "uiActionBatch",
-    implementedInSwift: false,
+    implementedInSwift: true,
     missingCapabilityErrorCode: "session-runner-capability-ui-action-batch",
     evidence:
-      "ios/ProbeRunner/AttachControlSpikeUITests.swift handleLifecycleCommand has no case \"uiActionBatch\"; "
-      + "it falls through to the default unsupported-lifecycle-action throw. PRB-092 cannot claim production "
-      + "batch support until this entry's implementedInSwift flips to true.",
+      "PRB-092: ios/ProbeRunner/AttachControlSpikeUITests.swift handleLifecycleCommand now has "
+      + "case \"uiActionBatch\" — decodes RunnerUIActionBatchPayload, executes children in order via "
+      + "performRunnerUIActionBatch, stops at the first failure, and reports completed count/failed index/"
+      + "kind/per-child timing/total timing even on partial failure. Boundary-tested against a live "
+      + "Simulator session (iPhone 17 Pro, iOS 26.5) — see "
+      + "testUIActionBatchExecutesChildrenInOrderAndStopsAtFirstFailure, "
+      + "testUIActionBatchMultiTapChildRecognizesFiveTapsThroughOneDomainSchema, and "
+      + "testUIActionBatchAtTheHTTPBoundaryIsOneRPCWithReplaySafeRedelivery, plus "
+      + "knowledge/xcuitest-runner/integration-notes.md's \"PRB-092\" section for the measured receipt.",
   },
 ]
 

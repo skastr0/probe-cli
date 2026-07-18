@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import {
+  buildDirectRunnerUiActionPayload,
   buildRecordedSessionAction,
   buildRunnerUiActionPayload,
   decodeSessionAction,
   evaluateAssertion,
   resolveActionSelectorInSnapshot,
   resolveRecordedActionTargetInSnapshot,
+  validateSessionAction,
   type RecordedActionTarget,
   type ResolvedSnapshotTarget,
 } from "./action"
@@ -677,5 +679,164 @@ describe("action domain", () => {
       throw new Error("Expected absence action with a semantic negate selector.")
     }
     expect(absenceAction.target.negate.type).toBe("other")
+  })
+
+  // PRB-092: multiTap's domain-schema coverage. Boundary/correctness proof
+  // against the real production Swift runner lives in
+  // ios/ProbeRunner/AttachControlSpikeUITests.swift; this is the host-side
+  // schema/payload-building contract that feeds it.
+  test("decodes a multiTap action and preserves tapCount/interTapDelayMs", () => {
+    const action = decodeSessionAction({
+      kind: "multiTap",
+      target: {
+        kind: "semantic",
+        identifier: "fixture.gesture.multiTapTarget",
+        label: null,
+        value: null,
+        placeholder: null,
+        type: "button",
+        section: null,
+        interactive: true,
+      },
+      tapCount: 5,
+      interTapDelayMs: 60,
+    })
+
+    if (action.kind !== "multiTap") {
+      throw new Error(`Expected multiTap action, received ${action.kind}.`)
+    }
+
+    expect(action.tapCount).toBe(5)
+    expect(action.interTapDelayMs).toBe(60)
+  })
+
+  test("rejects a multiTap tapCount outside 2..20 with a typed decode error", () => {
+    expect(() =>
+      decodeSessionAction({
+        kind: "multiTap",
+        target: { kind: "point", x: 10, y: 10 },
+        tapCount: 1,
+        interTapDelayMs: 60,
+      })
+    ).toThrow()
+
+    expect(() =>
+      decodeSessionAction({
+        kind: "multiTap",
+        target: { kind: "point", x: 10, y: 10 },
+        tapCount: 21,
+        interTapDelayMs: 60,
+      })
+    ).toThrow()
+  })
+
+  test("rejects a multiTap interTapDelayMs outside the empirically validated 0..500ms bound", () => {
+    expect(() =>
+      decodeSessionAction({
+        kind: "multiTap",
+        target: { kind: "point", x: 10, y: 10 },
+        tapCount: 5,
+        interTapDelayMs: -1,
+      })
+    ).toThrow()
+
+    expect(() =>
+      decodeSessionAction({
+        kind: "multiTap",
+        target: { kind: "point", x: 10, y: 10 },
+        tapCount: 5,
+        interTapDelayMs: 501,
+      })
+    ).toThrow()
+  })
+
+  test("validateSessionAction rejects an absence selector for multiTap", () => {
+    expect(
+      validateSessionAction({
+        kind: "multiTap",
+        target: {
+          kind: "absence",
+          negate: {
+            kind: "semantic",
+            identifier: "fixture.gesture.multiTapTarget",
+            label: null,
+            value: null,
+            placeholder: null,
+            type: "button",
+            section: null,
+            interactive: null,
+          },
+        },
+        tapCount: 5,
+        interTapDelayMs: 60,
+        retryPolicy: undefined,
+      }),
+    ).toBe("Absence selectors can only be used with assert actions.")
+  })
+
+  test("builds a runner payload for multiTap carrying tapCount/interTapDelayMs, and null for a plain tap", () => {
+    const multiTapPayload = buildDirectRunnerUiActionPayload(
+      {
+        kind: "multiTap",
+        target: { kind: "point", x: 4, y: 8 },
+        tapCount: 5,
+        interTapDelayMs: 60,
+        retryPolicy: undefined,
+      },
+      { kind: "point", x: 4, y: 8 },
+    )
+    expect(multiTapPayload.kind).toBe("multiTap")
+    expect(multiTapPayload.tapCount).toBe(5)
+    expect(multiTapPayload.interTapDelayMs).toBe(60)
+
+    const tapPayload = buildDirectRunnerUiActionPayload(
+      { kind: "tap", target: { kind: "point", x: 4, y: 8 }, retryPolicy: undefined },
+      { kind: "point", x: 4, y: 8 },
+    )
+    expect(tapPayload.tapCount).toBeNull()
+    expect(tapPayload.interTapDelayMs).toBeNull()
+  })
+
+  test("records a multiTap action with its tapCount/interTapDelayMs for replay", () => {
+    const resolved: ResolvedSnapshotTarget = {
+      kind: "snapshot",
+      ref: "@e9",
+      resolvedBy: "semantic",
+      section: null,
+      node: storedNode({
+        ref: "@e9",
+        type: "button",
+        identifier: "fixture.gesture.multiTapTarget",
+        interactive: true,
+        identity: "strong",
+      }),
+    }
+
+    const recorded = buildRecordedSessionAction(
+      {
+        kind: "multiTap",
+        target: {
+          kind: "semantic",
+          identifier: "fixture.gesture.multiTapTarget",
+          label: null,
+          value: null,
+          placeholder: null,
+          type: "button",
+          section: null,
+          interactive: true,
+        },
+        tapCount: 5,
+        interTapDelayMs: 60,
+        retryPolicy: undefined,
+      },
+      resolved,
+    )
+
+    if (recorded.kind !== "multiTap") {
+      throw new Error(`Expected recorded multiTap action, received ${recorded.kind}.`)
+    }
+
+    expect(recorded.tapCount).toBe(5)
+    expect(recorded.interTapDelayMs).toBe(60)
   })
 })

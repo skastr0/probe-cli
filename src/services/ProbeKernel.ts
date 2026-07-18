@@ -35,7 +35,9 @@ import {
   SessionActionResponse,
   ArtifactDrillResponse,
   DaemonPingResponse,
+  PerfAnalyzeResponse,
   PerfAroundResponse,
+  PerfExportResponse,
   PerfRecordResponse,
   PerfSummarizeResponse,
   PROBE_PROTOCOL_VERSION,
@@ -1487,6 +1489,47 @@ export const ProbeKernelLive = Layer.effect(
               method: request.method,
               result,
             } satisfies PerfSummarizeResponse
+          }
+
+          case "perf.export": {
+            progress(
+              "perf.export",
+              `Exporting ${request.params.schema} from artifact ${request.params.artifactKey} for session ${request.params.sessionId}.`,
+            )
+            const result = yield* perfService.exportSchema({
+              sessionId: request.params.sessionId,
+              artifactKey: request.params.artifactKey,
+              schema: request.params.schema,
+              xpath: request.params.xpath,
+              emitProgress: progress,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies PerfExportResponse
+          }
+
+          case "perf.analyze": {
+            progress(
+              "perf.analyze",
+              `Analyzing artifact ${request.params.artifactKey} with ${request.params.analyzer} for session ${request.params.sessionId}.`,
+            )
+            const result = yield* perfService.analyzeTrace({
+              sessionId: request.params.sessionId,
+              artifactKey: request.params.artifactKey,
+              analyzer: request.params.analyzer,
+              emitProgress: progress,
+            })
+            return {
+              kind: "response",
+              protocolVersion: PROBE_PROTOCOL_VERSION,
+              requestId: request.requestId,
+              method: request.method,
+              result,
+            } satisfies PerfAnalyzeResponse
           }
 
           case "artifact.drill": {

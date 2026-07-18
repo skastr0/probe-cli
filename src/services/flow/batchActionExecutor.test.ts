@@ -43,11 +43,30 @@ describe("buildRunnerBatchSequencePayload / toFlowSequenceActionKind", () => {
   })
 
   test("round-trips every known child action kind, and rejects an unknown one", () => {
-    for (const kind of ["tap", "press", "swipe", "type", "scroll", "wait"] as const) {
+    for (const kind of ["tap", "multiTap", "press", "swipe", "type", "scroll", "wait"] as const) {
       expect(toFlowSequenceActionKind(kind)).toBe(kind)
     }
     expect(toFlowSequenceActionKind("not-a-kind")).toBeNull()
     expect(toFlowSequenceActionKind(undefined)).toBeNull()
+  })
+
+  // PRB-092: multiTap as a batch child goes through the exact same
+  // direct-runner-payload builder as tap/press/swipe/type/scroll — "one
+  // domain schema" for both the direct-action and batch-child shapes.
+  test("encodes a multiTap child carrying tapCount/interTapDelayMs", () => {
+    const payload = buildRunnerBatchSequencePayload([
+      {
+        kind: "multiTap",
+        target: { kind: "point", x: 1, y: 2 },
+        tapCount: 5,
+        interTapDelayMs: 60,
+      } as never,
+    ])
+    expect(payload.actions).toHaveLength(1)
+    const child = payload.actions[0] as { kind: string; tapCount?: number; interTapDelayMs?: number }
+    expect(child.kind).toBe("multiTap")
+    expect(child.tapCount).toBe(5)
+    expect(child.interTapDelayMs).toBe(60)
   })
 })
 

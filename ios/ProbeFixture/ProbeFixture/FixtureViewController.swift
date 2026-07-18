@@ -73,6 +73,20 @@ final class FixtureViewController: UIViewController {
   private let logTextView = UITextView()
   private let offscreenButton = UIButton(type: .system)
 
+  // PRB-092: a declared, self-contained "N taps inside a window" recognizer
+  // used to prove the runner's `multiTap` gesture end to end — `multiTap`
+  // sends discrete `XCUIElement.tap()` events with an explicit inter-tap
+  // delay (not the native `tapWithNumberOfTaps(_:numberOfTouches:)` gesture,
+  // which exposes no timing control), so this fixture proves recognition
+  // the same way a real five-tap-unlock gesture would: by tracking tap
+  // timestamps and requiring all of them to land inside one declared
+  // window. See `handleMultiTapTarget` for the window logic and
+  // `AttachControlSpikeUITests.swift`'s
+  // `testFixtureFiveTapRecognizerPassesRepeatedWarmMultiTapActions` for the
+  // 100/100 Simulator gate this fixture exists to satisfy.
+  private let multiTapButton = UIButton(type: .system)
+  private let multiTapStatusLabel = UILabel()
+
   // PRB-091 review follow-up: a deliberately narrow pair used to validate
   // `AttachControlSpikeUITests.swift`'s `boundedSectionMatches` against a
   // section-token identifier/label collision — see
@@ -85,6 +99,25 @@ final class FixtureViewController: UIViewController {
 
   private var logLines: [String] = []
   private var snapshotProfile: SnapshotProfile = .baseline
+
+  // PRB-092: declared five-tap-inside-a-window state. `multiTapWindowSeconds`
+  // is this fixture's own declared window (not a UIKit gesture-recognizer
+  // constant). An initial 3.0s estimate (5 taps * up to a 500ms programmed
+  // `interTapDelayMs`, plus slack) undercounted real elapsed time by a wide
+  // margin: XCUITest's own per-tap cross-process synchronization/quiescence
+  // wait (the same fixed cost knowledge/xcuitest-runner/integration-notes.md's
+  // PRB-091 section measured for element resolution) dominates the programmed
+  // delay, and a measured 100-iteration run at `interTapDelayMs: 40`
+  // consistently spanned ~2.9-3.0s from first tap to fifth — right at the
+  // 3.0s boundary, which produced a real flake at iteration 93/100. 6.0s
+  // (roughly 2x the measured typical span) is the corrected, evidence-based
+  // window: comfortable headroom for scheduling jitter under sustained test
+  // load, while still tight enough that a stuck or massively delayed run
+  // genuinely fails recognition instead of always passing.
+  private let multiTapRequiredCount = 5
+  private let multiTapWindowSeconds: TimeInterval = 6.0
+  private var multiTapTimestamps: [Date] = []
+  private var multiTapRecognizedCount = 0
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -106,6 +139,7 @@ final class FixtureViewController: UIViewController {
     configureTableView()
     configureLogTextView()
     configureSectionCollisionFixture()
+    configureMultiTapFixture()
     buildLayout()
     applySnapshotProfile(.baseline)
     resetFixtureState()
@@ -248,6 +282,19 @@ final class FixtureViewController: UIViewController {
     sectionCollisionDecoyLabel.accessibilityIdentifier = sectionCollisionToken
   }
 
+  private func configureMultiTapFixture() {
+    multiTapButton.configuration = .filled()
+    multiTapButton.configuration?.title = "Multi-tap Target"
+    multiTapButton.addTarget(self, action: #selector(handleMultiTapTarget), for: .touchUpInside)
+    multiTapButton.accessibilityIdentifier = "fixture.gesture.multiTapTarget"
+
+    multiTapStatusLabel.font = .preferredFont(forTextStyle: .subheadline)
+    multiTapStatusLabel.numberOfLines = 0
+    multiTapStatusLabel.textColor = .secondaryLabel
+    multiTapStatusLabel.accessibilityIdentifier = "fixture.gesture.multiTapStatus"
+    multiTapStatusLabel.text = "Multi-tap progress: 0/\(multiTapRequiredCount)"
+  }
+
   private func buildLayout() {
     view.addSubview(scrollView)
     scrollView.addSubview(contentStack)
@@ -317,6 +364,13 @@ final class FixtureViewController: UIViewController {
       // without a scroll.
       sectionCollisionContainer,
       sectionCollisionDecoyLabel,
+      // PRB-092: same post-spacer scroll band as the section-collision pair
+      // above, for the same reason — appending here never shifts the
+      // vertical position of Form/Mode/List/Navigation, which every other
+      // test in this file depends on staying hittable without a scroll.
+      makeSectionLabel(text: "Gestures", identifier: "fixture.gesture.sectionLabel"),
+      multiTapButton,
+      multiTapStatusLabel,
       makeSectionLabel(text: "Logs", identifier: "fixture.logs.sectionLabel"),
       logTextView,
     ].forEach(contentStack.addArrangedSubview(_:))
@@ -338,6 +392,9 @@ final class FixtureViewController: UIViewController {
     inputField.text = ""
     modeControl.selectedSegmentIndex = 0
     enabledSwitch.isOn = true
+    multiTapTimestamps.removeAll()
+    multiTapRecognizedCount = 0
+    multiTapStatusLabel.text = "Multi-tap progress: 0/\(multiTapRequiredCount)"
     appendLog("fixture reset")
     updateStatus("Ready for attach/control validation")
   }
@@ -578,6 +635,35 @@ final class FixtureViewController: UIViewController {
   private func handleOffscreenTap() {
     updateStatus("Offscreen action reached")
     appendLog("offscreen action tapped")
+  }
+
+  // PRB-092: recognizes `multiTapRequiredCount` (5) taps landing inside
+  // `multiTapWindowSeconds` of the *first* tap in the current run. A tap
+  // that arrives after the window has elapsed since the first one starts a
+  // fresh run (counting itself as tap 1 of the new run) rather than being
+  // dropped — this mirrors how a real five-tap-unlock gesture behaves: a
+  // slow, spread-out sequence of taps never accidentally accumulates into a
+  // recognition.
+  @objc
+  private func handleMultiTapTarget() {
+    let now = Date()
+
+    if let first = multiTapTimestamps.first, now.timeIntervalSince(first) > multiTapWindowSeconds {
+      multiTapTimestamps.removeAll()
+    }
+
+    multiTapTimestamps.append(now)
+
+    if multiTapTimestamps.count >= multiTapRequiredCount {
+      multiTapRecognizedCount += 1
+      multiTapTimestamps.removeAll()
+      multiTapStatusLabel.text = "Five-tap recognized (count: \(multiTapRecognizedCount))"
+      appendLog("multi-tap target recognized five taps (run \(multiTapRecognizedCount))")
+      return
+    }
+
+    multiTapStatusLabel.text = "Multi-tap progress: \(multiTapTimestamps.count)/\(multiTapRequiredCount)"
+    appendLog("multi-tap target tapped (\(multiTapTimestamps.count)/\(multiTapRequiredCount) within window)")
   }
 }
 

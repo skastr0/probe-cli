@@ -40,12 +40,13 @@ export type ActionVerdict = typeof ActionVerdict.Type
 export const ActionDirection = Schema.Literal("up", "down", "left", "right")
 export type ActionDirection = typeof ActionDirection.Type
 
-export const ActionKind = Schema.Literal("tap", "press", "swipe", "type", "scroll", "wait", "assert", "screenshot", "video")
+export const ActionKind = Schema.Literal("tap", "multiTap", "press", "swipe", "type", "scroll", "wait", "assert", "screenshot", "video")
 export type ActionKind = typeof ActionKind.Type
 
 export const FlowStepKind = Schema.Literal(
   "snapshot",
   "tap",
+  "multiTap",
   "press",
   "swipe",
   "type",
@@ -183,6 +184,35 @@ export const TapActionSchema = Schema.Struct({
 })
 export type TapAction = typeof TapActionSchema.Type
 
+// PRB-092: bounds shared with FlowSequenceMultiTapActionSchema (flow-v2.ts) so the
+// direct-action and batch-child shapes of multiTap can never drift apart — one
+// declared bound, reused everywhere multiTap's tapCount/interTapDelayMs appear.
+// tapCount 2..20 and interTapDelayMs 0..500ms are the acceptance-criteria bound and
+// the empirically validated bound respectively; see
+// knowledge/xcuitest-runner/integration-notes.md's "PRB-092" section for the
+// Simulator boundary evidence backing 0..500ms specifically (Swift enforces the
+// same range as its own defense-in-depth rejection — see
+// `multiTapInterTapDelayMsRange` in AttachControlSpikeUITests.swift).
+export const MultiTapCountSchema = Schema.Number.pipe(
+  Schema.int(),
+  Schema.greaterThanOrEqualTo(2),
+  Schema.lessThanOrEqualTo(20),
+)
+export const MultiTapInterTapDelayMsSchema = Schema.Number.pipe(
+  Schema.int(),
+  Schema.greaterThanOrEqualTo(0),
+  Schema.lessThanOrEqualTo(500),
+)
+
+export const MultiTapActionSchema = Schema.Struct({
+  kind: Schema.Literal("multiTap"),
+  target: ActionSelectorSchema,
+  tapCount: MultiTapCountSchema,
+  interTapDelayMs: MultiTapInterTapDelayMsSchema,
+  retryPolicy: OptionalRetryPolicy,
+})
+export type MultiTapAction = typeof MultiTapActionSchema.Type
+
 export const PressActionSchema = Schema.Struct({
   kind: Schema.Literal("press"),
   target: ActionSelectorSchema,
@@ -266,6 +296,12 @@ export const FlowTapStepSchema = Schema.Struct({
 })
 export type FlowTapStep = typeof FlowTapStepSchema.Type
 
+export const FlowMultiTapStepSchema = Schema.Struct({
+  ...MultiTapActionSchema.fields,
+  continueOnError: OptionalContinueOnError,
+})
+export type FlowMultiTapStep = typeof FlowMultiTapStepSchema.Type
+
 export const FlowPressStepSchema = Schema.Struct({
   ...PressActionSchema.fields,
   continueOnError: OptionalContinueOnError,
@@ -332,6 +368,7 @@ export type FlowSleepStep = typeof FlowSleepStepSchema.Type
 
 export const FlowSessionActionStepSchema = Schema.Union(
   FlowTapStepSchema,
+  FlowMultiTapStepSchema,
   FlowPressStepSchema,
   FlowSwipeStepSchema,
   FlowTypeStepSchema,
@@ -353,6 +390,7 @@ export type FlowStep = typeof FlowStepSchema.Type
 
 export const SessionActionSchema = Schema.Union(
   TapActionSchema,
+  MultiTapActionSchema,
   PressActionSchema,
   SwipeActionSchema,
   TypeActionSchema,
@@ -364,8 +402,8 @@ export const SessionActionSchema = Schema.Union(
 )
 export type SessionAction = typeof SessionActionSchema.Type
 
-export type RunnerUiSessionAction = TapAction | PressAction | SwipeAction | TypeAction | ScrollAction
-export type RunnerUiRecordedSessionAction = RecordedTapAction | RecordedPressAction | RecordedSwipeAction | RecordedTypeAction | RecordedScrollAction
+export type RunnerUiSessionAction = TapAction | MultiTapAction | PressAction | SwipeAction | TypeAction | ScrollAction
+export type RunnerUiRecordedSessionAction = RecordedTapAction | RecordedMultiTapAction | RecordedPressAction | RecordedSwipeAction | RecordedTypeAction | RecordedScrollAction
 type RunnerUiActionSource = RunnerUiSessionAction | RunnerUiRecordedSessionAction
 
 export const RecordedActionTargetSchema = Schema.Struct({
@@ -380,6 +418,14 @@ export const RecordedTapActionSchema = Schema.Struct({
   target: RecordedActionTargetSchema,
 })
 export type RecordedTapAction = typeof RecordedTapActionSchema.Type
+
+export const RecordedMultiTapActionSchema = Schema.Struct({
+  kind: Schema.Literal("multiTap"),
+  target: RecordedActionTargetSchema,
+  tapCount: MultiTapCountSchema,
+  interTapDelayMs: MultiTapInterTapDelayMsSchema,
+})
+export type RecordedMultiTapAction = typeof RecordedMultiTapActionSchema.Type
 
 export const RecordedPressActionSchema = Schema.Struct({
   kind: Schema.Literal("press"),
@@ -440,6 +486,7 @@ export type RecordedVideoAction = typeof RecordedVideoActionSchema.Type
 
 export const RecordedSessionActionSchema = Schema.Union(
   RecordedTapActionSchema,
+  RecordedMultiTapActionSchema,
   RecordedPressActionSchema,
   RecordedSwipeActionSchema,
   RecordedTypeActionSchema,
@@ -625,6 +672,10 @@ export interface RunnerUiActionPayload {
   readonly replace: boolean | null
   readonly steps: number | null
   readonly durationMs: number | null
+  // PRB-092: populated only for kind "multiTap" — see `RunnerUIActionPayload` in
+  // AttachControlSpikeUITests.swift, the runner-side mirror of this shape.
+  readonly tapCount: number | null
+  readonly interTapDelayMs: number | null
 }
 
 interface FlattenArgs {
@@ -1047,6 +1098,8 @@ export const buildRecordedSessionAction = (
   switch (action.kind) {
     case "tap":
       return { kind: action.kind, target }
+    case "multiTap":
+      return { kind: action.kind, target, tapCount: action.tapCount, interTapDelayMs: action.interTapDelayMs }
     case "press":
       return { kind: action.kind, target, durationMs: action.durationMs }
     case "swipe":
@@ -1232,6 +1285,18 @@ export const validateSessionAction = (action: SessionAction): string | null => {
     case "swipe":
     case "type":
       return action.target.kind === "absence" ? "Absence selectors can only be used with assert actions." : null
+    case "multiTap":
+      if (action.target.kind === "absence") {
+        return "Absence selectors can only be used with assert actions."
+      }
+
+      if (!Number.isInteger(action.tapCount) || action.tapCount < 2 || action.tapCount > 20) {
+        return "Multi-tap tapCount must be an integer between 2 and 20."
+      }
+
+      return Number.isInteger(action.interTapDelayMs) && action.interTapDelayMs >= 0 && action.interTapDelayMs <= 500
+        ? null
+        : "Multi-tap interTapDelayMs must be an integer between 0 and 500."
     case "press":
       if (action.target.kind === "absence") {
         return "Absence selectors can only be used with assert actions."
@@ -1304,6 +1369,7 @@ export const validateSessionAction = (action: SessionAction): string | null => {
 
 export const isRunnerUiSessionAction = (action: SessionAction): action is RunnerUiSessionAction =>
   action.kind === "tap"
+  || action.kind === "multiTap"
   || action.kind === "press"
   || action.kind === "swipe"
   || action.kind === "type"
@@ -1311,6 +1377,7 @@ export const isRunnerUiSessionAction = (action: SessionAction): action is Runner
 
 export const isFlowSessionActionStep = (step: FlowStep): step is FlowSessionActionStep =>
   step.kind === "tap"
+  || step.kind === "multiTap"
   || step.kind === "press"
   || step.kind === "swipe"
   || step.kind === "type"
@@ -1324,6 +1391,7 @@ export const isRunnerUiRecordedSessionAction = (
   action: RecordedSessionAction,
 ): action is RunnerUiRecordedSessionAction =>
   action.kind === "tap"
+  || action.kind === "multiTap"
   || action.kind === "press"
   || action.kind === "swipe"
   || action.kind === "type"
@@ -1417,6 +1485,20 @@ const buildRunnerUiActionPayloadWithLocator = (
         replace: null,
         steps: null,
         durationMs: null,
+        tapCount: null,
+        interTapDelayMs: null,
+      }
+    case "multiTap":
+      return {
+        kind: action.kind,
+        locator,
+        direction: null,
+        text: null,
+        replace: null,
+        steps: null,
+        durationMs: null,
+        tapCount: action.tapCount,
+        interTapDelayMs: action.interTapDelayMs,
       }
     case "press":
       return {
@@ -1427,6 +1509,8 @@ const buildRunnerUiActionPayloadWithLocator = (
         replace: null,
         steps: null,
         durationMs: action.durationMs,
+        tapCount: null,
+        interTapDelayMs: null,
       }
     case "swipe":
       return {
@@ -1437,6 +1521,8 @@ const buildRunnerUiActionPayloadWithLocator = (
         replace: null,
         steps: null,
         durationMs: null,
+        tapCount: null,
+        interTapDelayMs: null,
       }
     case "type":
       return {
@@ -1447,6 +1533,8 @@ const buildRunnerUiActionPayloadWithLocator = (
         replace: action.replace,
         steps: null,
         durationMs: null,
+        tapCount: null,
+        interTapDelayMs: null,
       }
     case "scroll":
       return {
@@ -1457,6 +1545,8 @@ const buildRunnerUiActionPayloadWithLocator = (
         replace: null,
         steps: action.steps,
         durationMs: null,
+        tapCount: null,
+        interTapDelayMs: null,
       }
   }
 }
@@ -1489,6 +1579,7 @@ export const buildDirectRunnerUiActionPayload = (
 export const flowStepToSessionAction = (step: FlowSessionActionStep): SessionAction => {
   switch (step.kind) {
     case "tap":
+    case "multiTap":
     case "press":
     case "swipe":
     case "type":
@@ -1553,6 +1644,7 @@ const normalizeSessionActionInput = (value: unknown): unknown => {
 
   if (
     record.kind === "tap"
+    || record.kind === "multiTap"
     || record.kind === "press"
     || record.kind === "swipe"
     || record.kind === "type"
