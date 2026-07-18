@@ -131,6 +131,63 @@ Legend:
 - **Observed:** Probe's own `AppleProcessSupervisor` timeout (`timeLimitMs + recordingOverheadMs` = 243,000 ms for this template) correctly killed the stalled process and surfaced a typed `command-timeout` `ChildProcessError` instead of hanging the daemon forever. The session's own `state` stayed `ready` afterward (PRB-096 AC 7: a profiler failure degrades only the trace lane, never the UI lane), and `probe session close` still tore the session down cleanly on the first try.
 - **Inference:** this run is genuine evidence the PRB-096 code path executes correctly against a real Simulator (lease acquisition, fresh pid-identity verification, `xctrace record` invocation, bounded timeout/kill, UI-lane isolation on failure) but is **not** evidence of a *successful* raw capture completing within budget on this host -- the gate this pack's PRB-096 glyph asked to prove ("disable runner HTTP while app lives, raw capture succeeds") stays partial pending a host/Xcode environment where `xctrace` itself finalizes promptly.
 
+### 7c. CoreSimulator reset bounded attempt (PRB-102, 2026-07-18)
+
+The glyph's HOST item authorized one bounded, non-destructive attempt at a
+user-level CoreSimulator reset (`xcrun simctl shutdown all`; `killall -9
+com.apple.CoreSimulator.CoreSimulatorService` -- no `sudo`, no reboot) to see
+whether it clears the finalize stall documented in 7b above, plus one
+bounded (max 10 min) 5s `xctrace record` on either side. Both receipts below
+are from this pass, same host, same day, `xcrun xctrace` under Xcode 26.6.
+
+- **Before receipt:** a fresh `xctrace record --template "Time Profiler"
+  --attach <live ProbeFixture pid> --time-limit 5s` against a simulator that
+  was already booted from earlier in this session printed only `Starting
+  recording ... Time limit: 5.0 s` and never progressed further. Killed after
+  a bounded ~100s wall-clock wait (well short of the historical
+  345-731s+ range this pack already documents, deliberately -- this was a
+  fresh confirmation the defect still reproduces today, not a full
+  re-measurement). CPU time for the `xctrace` process over that window: ~2s
+  out of ~100s wall -- the same near-zero-CPU-while-wall-clock-climbs
+  signature as every prior stall observation in this pack.
+- **Reset performed:** `xcrun simctl shutdown all` (stopped all 3 then-booted
+  simulators) followed immediately by `killall -9
+  com.apple.CoreSimulator.CoreSimulatorService`. The service restarts on
+  demand, as documented; no `sudo`, no reboot, no other destructive action.
+- **After receipt:** a freshly booted simulator (same device, cold-booted
+  post-reset) and a freshly relaunched `ProbeFixture` process. The very
+  first `xctrace record --attach <pid>` attempt immediately after boot
+  failed fast with `Cannot find process for provided pid` (exit 21) even
+  though the host's own `ps`/`launchctl list` confirmed that exact pid was
+  alive at that moment -- plausibly CoreSimulatorService's own device/process
+  index not yet warm immediately after a forced restart; not the finalize
+  stall this attempt was testing for. A second attempt against the same
+  (still live) pid a few seconds later did start recording, ran past the 5s
+  window, and then reproduced the identical finalize stall: `Starting
+  recording ... Time limit: 5.0 s` with no further output, near-zero CPU
+  time (`0:00.01`-`0:05.7` CPU across the whole run), killed at the
+  authorized ~10-minute bound (~573s wall-clock, from `2026-07-18T06:50:07Z`
+  to `2026-07-18T06:59:40Z`) still stuck in the same phase, never producing
+  a completed `.trace` bundle.
+- **Verdict: the CoreSimulator reset did not clear the stall.** Both the
+  before and after attempts reproduce the identical symptom (near-zero CPU,
+  no output past the "Starting recording" line, requires an external kill)
+  on this exact host/Xcode combination (26.6/17F113). This is consistent
+  with 7b's existing inference that the stall is `xctrace`-side host/Xcode
+  state, not something a CoreSimulator service restart reaches -- the
+  service was never a live suspect distinct from `xctrace`/Instruments
+  itself, and this pass confirms restarting it changes nothing observable.
+- **Remaining remediation is the human's, per the glyph's own bound:** the
+  next non-destructive lever this pack has not yet tried is a host reboot
+  (out of scope for an agent session) or an Xcode/Instruments
+  reinstall-and-first-launch pass (`xcodebuild -runFirstLaunch
+  -checkForNewerComponents`, itself unlikely to touch `xctrace`'s recording
+  finalize path specifically but the next reasonable non-reboot step). No
+  further code-side workaround is possible from Probe's side: this is the
+  same `AppleProcessSupervisor`-bounded-timeout-and-typed-failure path 7b
+  already validated as the correct *handling* of the stall, not a fix for
+  the stall itself.
+
 ### 8. Target-process lease, decoupled from XCUITest runner health (PRB-096, 2026-07-17)
 
 - **Observed:** `xctrace record --attach <pid> --device <deviceId>` only needs the target app's process id and device identifier -- it never talks to Probe's own XCUITest runner wrapper at all. The runner-coupled preflight (`getSessionHealth`'s `wrapperRunning`/`ready|degraded` gate), the runner keepalive fiber during the recording, and the post-record runner health refresh that used to wrap raw `perf record` were all Probe-side policy, not an xctrace requirement.

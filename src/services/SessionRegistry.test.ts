@@ -21,7 +21,7 @@ import { OutputPolicy } from "./OutputPolicy"
 import { RealDeviceHarness } from "./RealDeviceHarness"
 import { RunnerTransportError } from "./RunnerTransportClient"
 import type { RunnerAction } from "./runnerProtocol"
-import { buildSessionCoordination, SessionRegistry, SessionRegistryLive } from "./SessionRegistry"
+import { buildSessionCoordination, makeSessionRegistryLive, SessionRegistry, SessionRegistryLive, type SessionRegistryConfig } from "./SessionRegistry"
 import { SimulatorHarness } from "./SimulatorHarness"
 import { type LldbBridgeHandle, LldbBridgeFactory, type LldbBridgeResponseFrame } from "./LldbBridge"
 
@@ -1520,6 +1520,12 @@ const makeRuntime = (
     }
     readonly lldbBridgeFactory?: ReturnType<typeof createFakeLldbBridgeFactory>["factory"]
     readonly realDeviceHarness?: ReturnType<typeof createFakeRealDeviceHarness>
+    // PRB-102: lets a test force a small, deterministic TTL/sweep interval
+    // (see the "TTL/sweep config" describe block) instead of the real
+    // 15-minute/10-second defaults -- makeRuntime uses `SessionRegistryLive`
+    // (the process.env-backed production Layer) whenever this is omitted, so
+    // every pre-existing test here is unaffected.
+    readonly sessionRegistryConfig?: SessionRegistryConfig
   },
 ) => {
   const fakeLldbBridgeFactory = LldbBridgeFactory.of({
@@ -1551,7 +1557,9 @@ const makeRuntime = (
       }),
     ),
   )
-  const registryLayer = SessionRegistryLive.pipe(Layer.provide(baseLayer))
+  const registryLayer = (
+    options?.sessionRegistryConfig ? makeSessionRegistryLive(options.sessionRegistryConfig) : SessionRegistryLive
+  ).pipe(Layer.provide(baseLayer))
 
   return ManagedRuntime.make(Layer.mergeAll(baseLayer, registryLayer))
 }
@@ -5807,6 +5815,102 @@ describe("SessionRegistry", () => {
 
           const closed = await closePromise
           expect(closed.state).toBe("closed")
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
+
+  // PRB-102: PRB-096 AC5 ("session TTL/sweep config injectable ... plus a
+  // dedicated test proving an active trace lease exempts a session from TTL
+  // cleanup") was not executable before this glyph -- `defaultSessionTtlMs`/
+  // `ttlSweepIntervalMs` were `Number(process.env...)` top-level `const`s
+  // resolved once at module load, so no test could force a fast, bounded TTL
+  // sweep without mutating `process.env` before the module's first import
+  // (already too late in a `bun test` process). `makeRuntime`'s
+  // `sessionRegistryConfig` option (backed by `makeSessionRegistryLive`) is
+  // the fix -- these tests exercise it directly.
+  describe("TTL/sweep config (PRB-102)", () => {
+    test("a session with no active trace lease is swept once its injected TTL elapses", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness(), {
+          sessionRegistryConfig: { sessionTtlMs: 200, ttlSweepIntervalMs: 40 },
+        })
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+
+          // Deliberately never calls getSessionHealth while waiting --
+          // getSessionHealth's own health-check body refreshes `expiresAt`
+          // (see its `expiresAtIso()` call), which would silently keep
+          // renewing the TTL out from under this assertion.
+          await waitFor(
+            () => runtime.runPromise(registry.listActiveSessions()),
+            (sessions) => sessions.every((entry) => entry.id !== session.sessionId),
+            2_000,
+          )
+
+          const result = await runtime.runPromise(Effect.either(registry.getSessionHealth(session.sessionId)))
+          expect(Either.isLeft(result)).toBe(true)
+          if (Either.isLeft(result)) {
+            expect(result.left).toBeInstanceOf(SessionNotFoundError)
+          }
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("an active trace lease exempts a session from TTL cleanup, and cleanup resumes once the lease ends", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness(), {
+          sessionRegistryConfig: { sessionTtlMs: 200, ttlSweepIntervalMs: 40 },
+        })
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+
+          // Comfortably longer than the TTL/sweep window used above (which
+          // was enough to sweep an unleased session): several sweep cycles
+          // run against this session too, but `activeTraceLeaseStates`
+          // ("starting"/"ready"/"stopping") must keep every one of them from
+          // closing it while the lease is still open.
+          await sleep(600)
+
+          const stillActive = await runtime.runPromise(registry.listActiveSessions())
+          expect(stillActive.some((entry) => entry.id === session.sessionId)).toBe(true)
+
+          const healthWhileLeased = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(healthWhileLeased.resources.trace).toBe("starting")
+          expect(healthWhileLeased.state).not.toBe("closed")
+
+          // Ending the lease both moves `resources.trace` out of the
+          // exemption set and (like every other health mutation here)
+          // refreshes `expiresAt` -- so the sweep clock restarts from this
+          // point, not from the original open.
+          await runtime.runPromise(registry.endTraceLease(session.sessionId, { kind: "stopped" }))
+
+          await waitFor(
+            () => runtime.runPromise(registry.listActiveSessions()),
+            (sessions) => sessions.every((entry) => entry.id !== session.sessionId),
+            2_000,
+          )
+
+          const result = await runtime.runPromise(Effect.either(registry.getSessionHealth(session.sessionId)))
+          expect(Either.isLeft(result)).toBe(true)
+          if (Either.isLeft(result)) {
+            expect(result.left).toBeInstanceOf(SessionNotFoundError)
+          }
         } finally {
           await runtime.dispose()
         }

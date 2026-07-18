@@ -1,5 +1,5 @@
 import { Effect } from "effect"
-import type { ActiveSessionRecord } from "../SessionRegistry"
+import type { ActiveSessionRecord } from "../sessionShared"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 
 /**

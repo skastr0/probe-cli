@@ -28,7 +28,7 @@ import {
   type ActionExecutionOutcome,
   type ActiveSessionRecord,
   type ExtendedSessionActionResult,
-} from "../SessionRegistry"
+} from "../sessionShared"
 import { classifyFastFailureCode } from "./flowStepResultAssembly"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 

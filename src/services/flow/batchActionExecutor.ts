@@ -26,7 +26,7 @@ import {
   withOffscreenNextStep,
   type ActiveSessionRecord,
   type SessionActionError,
-} from "../SessionRegistry"
+} from "../sessionShared"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 import {
   buildFlowStepResult,

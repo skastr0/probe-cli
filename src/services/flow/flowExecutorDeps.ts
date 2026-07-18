@@ -11,7 +11,7 @@ import type {
   ActiveSessionRecord,
   RunnerBackedActiveSessionRecord,
   VideoArtifactMode,
-} from "../SessionRegistry"
+} from "../sessionShared"
 
 /**
  * PRB-073: the explicit port bag `runFlow`'s executors take instead of

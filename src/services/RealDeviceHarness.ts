@@ -740,6 +740,14 @@ const resolveRunnerBuildCacheKeyInput = async (args: {
     // a team id today (see the glyph notes), so these stay pinned to a
     // sentinel in the *key* while the concrete discovered values still drive
     // revalidation (see `RunnerBuildCache`'s header comment).
+    // PRB-102: investigated and deliberately kept pinned rather than upgraded
+    // to a discovered concrete identity -- `security find-identity` cannot
+    // reliably attribute an identity to a team on this host, and the
+    // existing hit-time revalidation (live `codesign --verify` + profile
+    // expiry) already forces a rebuild for the failure modes that actually
+    // surface. See knowledge/devicectl-device-signing/integration-notes.md's
+    // "PRB-102: signing-identity cache-key decision" section for the full
+    // receipt.
     signingIdentity: "automatic",
     profileIdentity: "automatic",
     buildSettingsHash: computeBuildSettingsHash(),

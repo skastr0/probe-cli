@@ -102,16 +102,34 @@ describe("PerfService process helpers (real spawn, via AppleProcessSupervisor)",
         command: "/bin/sh",
         commandArgs: [
           "-c",
-          `notifyutil -p ${startupNotificationKey}; trap 'exit 0' INT; while true; do sleep 0.05; done`,
+          // PRB-102: notifyutil's post/wait handshake is two independently
+          // scheduled real processes racing a Darwin distributed-notification
+          // registration. `liveStartRecording` starts the `notifyutil -1`
+          // wait before spawning this command (see PerfService.ts), but a
+          // single one-shot `-p` post here is still a genuine race against
+          // that wait side's own fork/exec/registration time: under host
+          // contention (this file's other process-helper cases each spawn
+          // real children too; a full-suite parallel run adds far more), a
+          // post fired before the wait side finishes registering is silently
+          // dropped -- not delayed, gone -- and the wait then reliably runs
+          // out its full startupTimeoutMs before failing. Widening the
+          // timeout (the prior fix) cannot help a dropped notification; it
+          // only changes how long the test waits before reporting the same
+          // failure. This reproduced for real on this host under generated
+          // background load (a fresh flake, not the historical two flakes
+          // this comment used to cite): 1 timeout in 8 runs at the previous
+          // 15s/one-shot-post setup.
+          //
+          // The fix: repost every 50ms instead of once. A dropped post no
+          // longer matters because another one follows shortly after,
+          // comfortably inside startupTimeoutMs regardless of how long the
+          // wait side took to register -- this is a test-fixture change only
+          // (xctrace, the real producer in production, posts on its own
+          // schedule and stays untouched; `liveStartRecording`'s wait-side
+          // code is identical either way).
+          `trap 'exit 0' INT; while true; do notifyutil -p ${startupNotificationKey}; sleep 0.05; done`,
         ],
         startupNotificationKey,
-        // notifyutil's post/wait handshake is two independently-scheduled real
-        // processes racing a Darwin distributed-notification registration --
-        // under host contention (this file's other process-helper cases each
-        // spawn real children too) the wait side has been observed to take
-        // noticeably longer than 5s to register before the post fires,
-        // without the handshake itself being broken; 5s reproducibly timed
-        // this specific case out under contention even in this file alone.
         startupTimeoutMs: 15_000,
         timeoutMs: 30_000,
         gracePeriodMs: 1_000,

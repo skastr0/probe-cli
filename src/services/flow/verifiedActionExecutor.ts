@@ -2,7 +2,7 @@ import type { Effect } from "effect"
 import { flowV2StepToSessionAction, isFlowV2SessionActionStep, type FlowV2Step } from "../../domain/flow-v2"
 import type { SessionAction } from "../../domain/action"
 import type { EnvironmentError, SessionNotFoundError, UnsupportedCapabilityError, UserInputError } from "../../domain/errors"
-import type { ActionExecutionOutcome } from "../SessionRegistry"
+import type { ActionExecutionOutcome } from "../sessionShared"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 
 /**

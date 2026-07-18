@@ -305,6 +305,50 @@ crash after dispatch cannot produce success" case.
   `testCommandLoopReplaySafety` eviction step above ran — that step was not
   re-attempted in this pass — but it is a genuine, reproducible third
   bootstrap-injection path for any future spike blocked the same way.
+- **Consolidated into a reusable, tested script (2026-07-18, PRB-102).** The
+  three scattered mentions above (this file, `open-questions.md` question 6,
+  and `integration-notes.md`'s PRB-092 section) are now one script:
+  `ios/ProbeRunner/scripts/validate-lifecycle-xctestrun-bootstrap.sh`. It
+  reproduces the ENOENT defect's root cause fresh on this exact host
+  (Xcode 26.6/17F113) via the unmodified, pre-existing
+  `validate-lifecycle.sh` (`testCommandLoopLifecycle`, same
+  "could not be decoded ... couldn't be read because it is missing" error
+  against a bootstrap manifest the host shell confirms exists), then applies
+  the injection fix and runs `testCommandLoopReplaySafety` --
+  this glyph's own named acceptance target -- twice against a booted
+  iPhone 17 Pro (iOS 26.4):
+  - **The ENOENT defect itself is gone on both runs.** The ready frame
+    printed `"bootstrapPath":"env:PROBE_BOOTSTRAP_JSON"` (not a file path) on
+    both attempts -- the runner never touched
+    `/tmp/probe-runner-bootstrap/<udid>.json` at all, so the intermittent
+    cross-process file-read race has no path left to occur on. Both runs got
+    from cold start through attach, HTTP command-server bring-up, and 3 of
+    `driveReplaySafetyScenario`'s 6 steps (fresh execute, 100 cached
+    redeliveries, a real `applyInput` mutation) before failing --
+    dramatically further than the prior two attempts, both of which failed
+    at the bootstrap read before test logic ever began.
+  - **A second, distinct defect surfaced once the ENOENT blocker cleared,
+    and stayed out of this glyph's scope.** Both runs failed identically at
+    the same assertion
+    (`AttachControlSpikeUITests.swift:769`,
+    `XCTAssertEqual failed: ("ProbeFixture") is not equal to ("Input applied:
+    probe-replay-safety")`) -- reading `app.staticTexts["fixture.status.label"].label`
+    after the `applyInput` mutation returned the app's own bundle/product
+    name instead of the expected status text, on both attempts, in the same
+    place. This is deterministic on this host/iOS combination, not a flake,
+    and it is a *different* failure mode than the ENOENT defect this script
+    was built to fix -- it never reproduced the bootstrap-read error at all.
+    Root-causing it (a stale/wrong element resolution after the "Reset"
+    button interaction, or a status-label update race, are both plausible
+    but unconfirmed) is unstarted; it needs its own investigation and is not
+    something this glyph's acceptance criterion asked for. Filed here rather
+    than chased inline.
+  - **Net effect on this glyph's acceptance criterion:** "PRB-089's live
+    simulator replay receipt can run" is **partial**, not met. The
+    bootstrap-JSON ENOENT blocker this criterion names is root-caused and
+    has a working, reusable, tested fix -- `testCommandLoopReplaySafety` now
+    *runs* past it, twice, reproducibly. It does not yet *pass* end to end
+    on this host, but for a reason this glyph did not ask to fix.
 
 ## Historical evidence (superseded)
 
