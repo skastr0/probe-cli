@@ -5,7 +5,9 @@ import { decodeSessionFlowContract } from "../../domain/flow-v2"
 import {
   defaultPerfTimeLimitForTemplate,
   formatNanoseconds,
+  type PerfAnalyzeResult,
   type PerfAroundFlowResult,
+  type PerfExportResult,
   perfTemplateChoiceText,
   perfTemplateChoices,
   type PerfRecordResult,
@@ -181,6 +183,58 @@ const formatPerfResult = (result: PerfRecordResult): string => {
     "diagnoses:",
     ...diagnosisLines,
     "",
+    "schemas:",
+    ...(result.schemas.length > 0 ? result.schemas.map((entry) => `- ${entry.schema}`) : ["- none"]),
+    "",
+    "artifacts:",
+    `- trace: ${result.artifacts.trace.absolutePath}`,
+    `- toc: ${result.artifacts.toc.absolutePath}`,
+  ].join("\n")
+}
+
+const formatPerfExportResult = (result: PerfExportResult): string =>
+  [
+    `session: ${result.sessionId}`,
+    `artifact: ${result.artifactKey}`,
+    `schema: ${result.schema}`,
+    `xpath: ${result.xpath}`,
+    `run number: ${result.runNumber}`,
+    `exported at: ${result.exportedAt}`,
+    `xctrace: ${result.xctraceVersion}`,
+    `cache hit: ${result.cacheHit}`,
+    `rows: ${result.rowCount}`,
+    `bytes: ${result.bytesWritten}`,
+    "",
+    "artifacts:",
+    `- trace: ${result.artifacts.trace.absolutePath}`,
+    `- toc: ${result.artifacts.toc.absolutePath}`,
+    `- export: ${result.artifacts.export.absolutePath}`,
+  ].join("\n")
+
+const formatPerfAnalyzeResult = (result: PerfAnalyzeResult): string => {
+  const metricLines = result.summary.metrics.map((metric) => `- ${metric.label}: ${metric.value}`)
+  const diagnosisLines = result.diagnoses.map((diagnosis) => {
+    const prefix = diagnosis.wall ? "wall" : diagnosis.severity
+    const details = diagnosis.details.map((detail) => `    ${detail}`).join("\n")
+    return details.length > 0
+      ? `- [${prefix}] ${diagnosis.summary}\n${details}`
+      : `- [${prefix}] ${diagnosis.summary}`
+  })
+
+  return [
+    `session: ${result.sessionId}`,
+    `artifact: ${result.artifactKey}`,
+    `analyzer: ${result.analyzer}`,
+    `analyzed at: ${result.analyzedAt}`,
+    `xctrace: ${result.xctraceVersion}`,
+    `summary: ${result.summary.headline}`,
+    "",
+    "metrics:",
+    ...metricLines,
+    "",
+    "diagnoses:",
+    ...diagnosisLines,
+    "",
     "artifacts:",
     `- trace: ${result.artifacts.trace.absolutePath}`,
     `- toc: ${result.artifacts.toc.absolutePath}`,
@@ -342,6 +396,52 @@ export const runPerfCommand = (args: ReadonlyArray<string>) =>
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(result, null, 2) : formatSignpostSummary(result))
+        })
+        return
+      }
+
+      case "export": {
+        const sessionId = yield* requireOption(rest, "--session-id")
+        const artifactKey = yield* requireOption(rest, "--artifact")
+        const schema = yield* requireOption(rest, "--schema")
+        const xpath = yield* optionalOption(rest, "--xpath")
+        const client = yield* DaemonClient
+        const result = yield* client.exportPerfSchema({
+          sessionId,
+          artifactKey,
+          schema,
+          xpath: xpath ?? undefined,
+          onEvent: asJson
+            ? undefined
+            : (stage, message) => {
+                console.error(`[${stage}] ${message}`)
+              },
+        })
+
+        yield* Effect.sync(() => {
+          console.log(asJson ? JSON.stringify(result, null, 2) : formatPerfExportResult(result))
+        })
+        return
+      }
+
+      case "analyze": {
+        const sessionId = yield* requireOption(rest, "--session-id")
+        const artifactKey = yield* requireOption(rest, "--artifact")
+        const analyzer = yield* parseTemplate(yield* requireOption(rest, "--analyzer"))
+        const client = yield* DaemonClient
+        const result = yield* client.analyzePerfTrace({
+          sessionId,
+          artifactKey,
+          analyzer,
+          onEvent: asJson
+            ? undefined
+            : (stage, message) => {
+                console.error(`[${stage}] ${message}`)
+              },
+        })
+
+        yield* Effect.sync(() => {
+          console.log(asJson ? JSON.stringify(result, null, 2) : formatPerfAnalyzeResult(result))
         })
         return
       }

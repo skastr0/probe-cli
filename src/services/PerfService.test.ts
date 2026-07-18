@@ -294,6 +294,45 @@ const createArtifactStore = () => {
   }
 }
 
+// PRB-097: registers an already-recorded trace artifact directly (bypassing
+// record()) so exportSchema()/analyzeTrace() tests exercise the lazy-access
+// path -- `perf.export`/`perf.analyze` start from a stored artifact key, not
+// a live trace lease. Deliberately does not pre-register a sibling `-toc`
+// artifact: resolveTraceAnalysisContext's self-heal (re-derive the TOC via a
+// fresh `xctrace export --toc`) is exercised by every test that uses this,
+// matching the existing summarizeBySignpost fixture pattern below.
+const registerTraceFixture = async (args: {
+  readonly artifactStore: ReturnType<typeof createArtifactStore>
+  readonly root: string
+  readonly slug: string
+  readonly targetProcessId?: number
+}) => {
+  const tracesDirectory = join(args.root, "traces")
+  const tracePath = join(tracesDirectory, `${args.slug}.trace`)
+  await mkdir(tracePath, { recursive: true })
+
+  if (args.targetProcessId !== undefined) {
+    await writeFile(
+      join(tracesDirectory, `${args.slug}.perf-meta.json`),
+      `${JSON.stringify({ targetProcessId: args.targetProcessId }, null, 2)}\n`,
+      "utf8",
+    )
+  }
+
+  return Effect.runPromise(
+    args.artifactStore.service.registerArtifact("session-1", {
+      key: `${args.slug}-trace`,
+      label: `${args.slug}-trace`,
+      kind: "directory",
+      summary: `${args.slug} trace`,
+      absolutePath: tracePath,
+      relativePath: `traces/${args.slug}.trace`,
+      external: false,
+      createdAt: "2026-04-14T00:00:00.000Z",
+    }),
+  )
+}
+
 const createSessionHealth = (
   root: string,
   state: "ready" | "degraded" | "failed",
@@ -634,6 +673,8 @@ const neverReachedDaemonClient = DaemonClient.of({
   recordPerf: () => Effect.die("unexpected daemon client call"),
   recordPerfAroundFlow: () => Effect.die("unexpected daemon client call"),
   summarizePerfBySignpost: () => Effect.die("unexpected daemon client call"),
+  exportPerfSchema: () => Effect.die("unexpected daemon client call"),
+  analyzePerfTrace: () => Effect.die("unexpected daemon client call"),
   drillArtifact: () => Effect.die("unexpected daemon client call"),
 })
 
@@ -679,11 +720,12 @@ describe("PerfService", () => {
       expect(getSessionHealthCalls).toBe(0)
       expect(result.session.state).toBe("failed")
       expect(result.diagnoses.some((diagnosis) => diagnosis.code === "perf-target-identity-verified")).toBe(true)
+      // PRB-097: record() is trace-first -- no schema export artifact.
       expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
         "time-profiler-trace",
         "time-profiler-toc",
-        "time-profiler-time-sample",
       ])
+      expect(commandRunner.stats.exportCalls).toBe(0)
     })
   })
 
@@ -893,7 +935,10 @@ describe("PerfService", () => {
     })
   })
 
-  test("records custom templates with TOC-discovered exports and minimal analysis", async () => {
+  // PRB-097: record() is trace-first -- a custom template exposing many
+  // schemas returns trace + TOC + a compact schema catalog, never forty
+  // (or here, two) eager exports.
+  test("record() returns a compact schema catalog with zero export subprocesses for a custom template", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = createSessionRegistryMock(root)
@@ -926,17 +971,11 @@ describe("PerfService", () => {
       expect(result.template).toBe("custom")
       expect(result.templateName).toBe("GPU Counters")
       expect(result.customTemplatePath).toBe(templatePath)
-      expect(result.summary.headline).toBe("Custom template recording completed. No built-in summary available.")
-      expect(result.diagnoses).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ code: "custom-template-no-analysis", wall: true }),
-        ]),
-      )
-      expect(result.artifacts.exports).toHaveLength(2)
-      expect(commandRunner.stats.budgets).toEqual([
-        { schema: "custom-main", maxBytes: 4 * mib, maxRows: 20_000 },
-        { schema: "custom-secondary", maxBytes: 4 * mib, maxRows: 20_000 },
-      ])
+      expect(result.schemas).toEqual([{ schema: "custom-main" }, { schema: "custom-secondary" }])
+      expect(result.summary.headline).toContain("2 schema(s)")
+      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual(["custom-trace", "custom-toc"])
+      expect(commandRunner.stats.exportCalls).toBe(0)
+      expect(commandRunner.stats.budgets).toEqual([])
     })
   })
 
@@ -967,50 +1006,6 @@ describe("PerfService", () => {
         expect(result.left.reason).toContain("cannot be combined with --template")
       }
     }
-  })
-
-  test("maps export file size overrun into a typed environment failure", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "time-sample": timeProfilerXml,
-        },
-        onExport: async ({ outputPath, schema }) => {
-          // Write a file that exceeds the maxExportFileSizeBytes (8 MiB)
-          const { writeFile } = await import("node:fs/promises")
-          const largeContent = "x".repeat(9 * 1024 * 1024) // 9 MiB
-          await writeFile(outputPath, `<schema name="${schema}"></schema>${largeContent}`, "utf8")
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        Effect.either(
-          perfService.record({
-            sessionId: "session-1",
-            template: "time-profiler",
-            timeLimit: "3s",
-            emitProgress: () => undefined,
-          }),
-        ),
-      )
-
-      expect(Either.isLeft(result)).toBe(true)
-
-      if (Either.isLeft(result)) {
-        expect(result.left).toBeInstanceOf(EnvironmentError)
-
-        if (result.left instanceof EnvironmentError) {
-          expect(result.left.code).toBe("perf-export-file-too-large")
-        }
-      }
-    })
   })
 
   test("rejects over-long system trace windows before xctrace runs", async () => {
@@ -1046,252 +1041,6 @@ describe("PerfService", () => {
           expect(result.left.code).toBe("perf-template-time-limit-too-large")
         }
       }
-    })
-  })
-
-  test("skips optional system trace exports that exceed the budget", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "thread-state": systemThreadOnlyXml,
-          "cpu-state": systemCpuXml,
-        },
-        onExport: ({ schema }) => {
-          if (schema === "cpu-state") {
-            throw new ExportBudgetExceededError({
-              kind: "rows",
-              limit: 50_000,
-              observed: 50_001,
-            })
-          }
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        perfService.record({
-          sessionId: "session-1",
-          template: "system-trace",
-          timeLimit: "3s",
-          emitProgress: () => undefined,
-        }),
-      )
-
-      expect(commandRunner.stats.exportCalls).toBe(2)
-      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
-        "system-trace-trace",
-        "system-trace-toc",
-        "system-trace-thread-state",
-      ])
-      expect(result.artifacts.exports).toHaveLength(1)
-      expect(result.artifacts.exports[0]?.label).toBe("system-trace-thread-state")
-      expect(result.summary.headline).toContain("1 target thread intervals")
-      expect(result.summary.metrics.find((metric) => metric.label === "Target CPU intervals")?.value).toBe("0")
-      expect(result.summary.metrics.find((metric) => metric.label === "Busy cores")?.value).toBe("none")
-    })
-  })
-
-  test("fails when a required system trace export exceeds the budget", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "thread-state": systemThreadOnlyXml,
-          "cpu-state": systemCpuXml,
-        },
-        onExport: ({ schema }) => {
-          if (schema === "thread-state") {
-            throw new ExportBudgetExceededError({
-              kind: "rows",
-              limit: 20_000,
-              observed: 20_001,
-            })
-          }
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        Effect.either(
-          perfService.record({
-            sessionId: "session-1",
-            template: "system-trace",
-            timeLimit: "3s",
-            emitProgress: () => undefined,
-          }),
-        ),
-      )
-
-      expect(Either.isLeft(result)).toBe(true)
-      expect(commandRunner.stats.exportCalls).toBe(1)
-      expect(artifactStore.artifacts.map((artifact) => artifact.label)).toEqual([
-        "system-trace-trace",
-        "system-trace-toc",
-      ])
-
-      if (Either.isLeft(result)) {
-        expect(result.left).toBeInstanceOf(EnvironmentError)
-
-        if (result.left instanceof EnvironmentError) {
-          expect(result.left.code).toBe("perf-export-row-budget")
-          expect(result.left.reason).toContain("thread-state")
-        }
-      }
-    })
-  })
-
-  test("system trace uses targeted budgets and time limits", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "thread-state": loadPerfFixture("system-trace.thread-state.no-target.xml"),
-          "cpu-state": loadPerfFixture("system-trace.cpu-state.no-target.xml"),
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        perfService.record({
-          sessionId: "session-1",
-          template: "system-trace",
-          timeLimit: "5s",
-          emitProgress: () => undefined,
-        }),
-      )
-
-      // Verify system trace uses the targeted budgets
-      expect(commandRunner.stats.budgets).toEqual([
-        { schema: "thread-state", maxBytes: 6 * mib, maxRows: 20_000 },
-        { schema: "cpu-state", maxBytes: 12 * mib, maxRows: 50_000 },
-      ])
-      expect(result.template).toBe("system-trace")
-      expect(result.artifacts.exports).toHaveLength(2)
-    })
-  })
-
-  test("metal system trace exports gpu, driver, and encoder tables with the extended budgets", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "metal-gpu-intervals": loadPerfFixture("metal-system-trace.metal-gpu-intervals.xml"),
-          "metal-driver-event-intervals": metalDriverIntervalsXml,
-          "metal-application-encoders-list": metalEncoderListXml,
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        perfService.record({
-          sessionId: "session-1",
-          template: "metal-system-trace",
-          timeLimit: "90s",
-          emitProgress: () => undefined,
-        }),
-      )
-
-      expect(commandRunner.stats.budgets).toEqual([
-        { schema: "metal-gpu-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
-        { schema: "metal-driver-event-intervals", maxBytes: 4 * mib, maxRows: 12_000 },
-        { schema: "metal-application-encoders-list", maxBytes: 4 * mib, maxRows: 12_000 },
-      ])
-      expect(result.template).toBe("metal-system-trace")
-      expect(result.timeLimit).toBe("90s")
-      expect(result.artifacts.exports).toHaveLength(3)
-      expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
-      expect(result.summary.metrics.find((metric) => metric.label === "Per-encoder summary")?.value).toContain("command buffer")
-    })
-  })
-
-  test("records hangs traces and returns structured hang diagnostics", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "potential-hangs": potentialHangsXml,
-          "hang-risks": hangRisksXml,
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        perfService.record({
-          sessionId: "session-1",
-          template: "hangs",
-          timeLimit: "10s",
-          emitProgress: () => undefined,
-        }),
-      )
-
-      expect(result.template).toBe("hangs")
-      expect(result.templateName).toBe("Hangs")
-      expect(result.artifacts.exports).toHaveLength(2)
-      expect(result.summary.headline).toContain("Detected 2 hang events")
-      expect(result.summary.metrics.find((metric) => metric.label === "Call stack hints")?.value).toBe("available")
-      expect(result.diagnoses.find((diagnosis) => diagnosis.code === "hangs-longest-event")?.details.join(" ")).toContain("LayoutPass.render")
-    })
-  })
-
-  test("records swift concurrency traces and returns task and actor diagnostics", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "swift-task-state": swiftTaskStateXml,
-          "swift-task-lifetime": swiftTaskLifetimeXml,
-          "swift-actor-execution": swiftActorExecutionXml,
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        perfService.record({
-          sessionId: "session-1",
-          template: "swift-concurrency",
-          timeLimit: "10s",
-          emitProgress: () => undefined,
-        }),
-      )
-
-      expect(result.template).toBe("swift-concurrency")
-      expect(result.templateName).toBe("Swift Concurrency")
-      expect(result.artifacts.exports).toHaveLength(3)
-      expect(result.summary.headline).toContain("Observed 2 Swift tasks")
-      expect(result.summary.metrics.find((metric) => metric.label === "Task creations")?.value).toBe("2")
-      expect(result.summary.metrics.find((metric) => metric.label === "Actor executions")?.value).toBe("2")
-      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "swift-concurrency-long-running-tasks")).toBe(true)
     })
   })
 
@@ -1332,44 +1081,6 @@ describe("PerfService", () => {
     })
   })
 
-  test("surfaces export schema drift as a typed contract failure", async () => {
-    await withTempRoot(async (root) => {
-      const artifactStore = createArtifactStore()
-      const sessionRegistry = createSessionRegistryMock(root)
-      const commandRunner = createCommandRunner({
-        exports: {
-          "time-sample": timeProfilerXml.replace('<col><mnemonic>sample-type</mnemonic></col>', ""),
-        },
-      })
-      const perfService = createPerfService({
-        artifactStore: artifactStore.service,
-        sessionRegistry,
-        commandRunner: commandRunner.runner,
-      })
-
-      const result = await Effect.runPromise(
-        Effect.either(
-          perfService.record({
-            sessionId: "session-1",
-            template: "time-profiler",
-            timeLimit: "3s",
-            emitProgress: () => undefined,
-          }),
-        ),
-      )
-
-      expect(Either.isLeft(result)).toBe(true)
-
-      if (Either.isLeft(result)) {
-        expect(result.left).toBeInstanceOf(EnvironmentError)
-
-        if (result.left instanceof EnvironmentError) {
-          expect(result.left.code).toBe("perf-analyze-export-contract")
-          expect(result.left.reason).toContain("sample-type")
-        }
-      }
-    })
-  })
 
   test("records a trace around a bounded flow and returns the flow report", async () => {
     await withTempRoot(async (root) => {
@@ -1729,6 +1440,570 @@ describe("PerfService", () => {
           expect(result.left.capability).toBe("perf.summarize.group-by.signpost")
         }
       }
+    })
+  })
+})
+
+// PRB-097: exportSchema() -- one requested schema/XPath derivative, exported
+// on demand from an already-recorded trace and cached by trace identity +
+// run number + schema + XPath + xctrace version.
+describe("PerfService exportSchema", () => {
+  test("exports a requested schema on demand and registers a durable artifact (no raw XML returned inline)", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "time-profiler" })
+      const commandRunner = createCommandRunner({ exports: { "time-sample": timeProfilerXml } })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.exportSchema({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          schema: "time-sample",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.exportCalls).toBe(1)
+      expect(result.schema).toBe("time-sample")
+      expect(result.cacheHit).toBe(false)
+      expect(result.rowCount).toBeGreaterThan(0)
+      expect(result.artifacts.export.kind).toBe("xml")
+      expect(result.artifacts.export.absolutePath).toContain("time-sample")
+      // The result carries an artifact reference, never the raw XML text.
+      expect(Object.values(result)).not.toContain(timeProfilerXml)
+    })
+  })
+
+  test("reuses a cached export without rerunning xctrace", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "time-profiler" })
+      const commandRunner = createCommandRunner({ exports: { "time-sample": timeProfilerXml } })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+      const request = {
+        sessionId: "session-1",
+        artifactKey: traceArtifact.key,
+        schema: "time-sample",
+        emitProgress: () => undefined,
+      } as const
+
+      const first = await Effect.runPromise(perfService.exportSchema(request))
+      const second = await Effect.runPromise(perfService.exportSchema(request))
+
+      expect(first.cacheHit).toBe(false)
+      expect(second.cacheHit).toBe(true)
+      expect(second.artifacts.export.key).toBe(first.artifacts.export.key)
+      expect(commandRunner.stats.exportCalls).toBe(1)
+    })
+  })
+
+  test("a different schema is a different cache entry and reruns xctrace", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "custom" })
+      const commandRunner = createCommandRunner({
+        tocXml: customTemplateTocXml,
+        exports: {
+          "custom-main": buildGenericPerfExportXml("custom-main"),
+          "custom-secondary": buildGenericPerfExportXml("custom-secondary"),
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const main = await Effect.runPromise(
+        perfService.exportSchema({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          schema: "custom-main",
+          emitProgress: () => undefined,
+        }),
+      )
+      const secondary = await Effect.runPromise(
+        perfService.exportSchema({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          schema: "custom-secondary",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.exportCalls).toBe(2)
+      expect(main.artifacts.export.key).not.toBe(secondary.artifacts.export.key)
+    })
+  })
+
+  test("rejects a schema the TOC does not advertise", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "custom" })
+      // A TOC that advertises schemas (unlike the default fixture, which
+      // declares none) so the pre-flight "does the TOC expose this schema"
+      // check has something to check against.
+      const commandRunner = createCommandRunner({ tocXml: customTemplateTocXml, exports: {} })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.exportSchema({
+            sessionId: "session-1",
+            artifactKey: traceArtifact.key,
+            schema: "does-not-exist",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(commandRunner.stats.exportCalls).toBe(0)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(UserInputError)
+
+        if (result.left instanceof UserInputError) {
+          expect(result.left.code).toBe("perf-export-schema-missing")
+        }
+      }
+    })
+  })
+
+  // PRB-097: `perf.export`'s single explicit request always fails closed on
+  // a budget overrun -- it never silently skips (that behavior is reserved
+  // for analyzeTrace's optional schemas).
+  test("fails closed (never skips) when the requested schema exceeds its export budget", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "time-profiler" })
+      const commandRunner = createCommandRunner({
+        exports: { "time-sample": timeProfilerXml },
+        onExport: () => {
+          throw new ExportBudgetExceededError({ kind: "rows", limit: 20_000, observed: 20_001 })
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.exportSchema({
+            sessionId: "session-1",
+            artifactKey: traceArtifact.key,
+            schema: "time-sample",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-export-row-budget")
+        }
+      }
+    })
+  })
+
+  test("maps an oversized export file into a typed environment failure", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "time-profiler" })
+      const commandRunner = createCommandRunner({
+        exports: { "time-sample": timeProfilerXml },
+        onExport: async ({ outputPath, schema }) => {
+          const largeContent = "x".repeat(9 * 1024 * 1024)
+          await writeFile(outputPath, `<schema name="${schema}"></schema>${largeContent}`, "utf8")
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.exportSchema({
+            sessionId: "session-1",
+            artifactKey: traceArtifact.key,
+            schema: "time-sample",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-export-file-too-large")
+        }
+      }
+    })
+  })
+})
+
+// PRB-097: analyzeTrace() -- lazily exports (and caches) only the schemas
+// one named built-in analyzer needs, then runs that analyzer's existing,
+// unchanged math. These replace the pre-PRB-097 record()-level assertions
+// for the same behavior -- record() no longer runs any of this eagerly.
+describe("PerfService analyzeTrace", () => {
+  test("system-trace skips an optional export that exceeds its budget but keeps the required one, using targeted budgets", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "system-trace", targetProcessId: 123 })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "thread-state": systemThreadOnlyXml,
+          "cpu-state": systemCpuXml,
+        },
+        onExport: ({ schema }) => {
+          if (schema === "cpu-state") {
+            throw new ExportBudgetExceededError({ kind: "rows", limit: 50_000, observed: 50_001 })
+          }
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "system-trace",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.exportCalls).toBe(2)
+      expect(commandRunner.stats.budgets).toEqual([
+        { schema: "thread-state", maxBytes: 6 * mib, maxRows: 20_000 },
+        { schema: "cpu-state", maxBytes: 12 * mib, maxRows: 50_000 },
+      ])
+      expect(result.artifacts.exports).toHaveLength(1)
+      expect(result.artifacts.exports[0]?.label).toBe("thread-state-export")
+      expect(result.summary.headline).toContain("1 target thread intervals")
+      expect(result.summary.metrics.find((metric) => metric.label === "Target CPU intervals")?.value).toBe("0")
+    })
+  })
+
+  test("system-trace fails the whole analysis when the required export exceeds its budget", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "system-trace", targetProcessId: 123 })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "thread-state": systemThreadOnlyXml,
+          "cpu-state": systemCpuXml,
+        },
+        onExport: ({ schema }) => {
+          if (schema === "thread-state") {
+            throw new ExportBudgetExceededError({ kind: "rows", limit: 20_000, observed: 20_001 })
+          }
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.analyzeTrace({
+            sessionId: "session-1",
+            artifactKey: traceArtifact.key,
+            analyzer: "system-trace",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+      expect(commandRunner.stats.exportCalls).toBe(1)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-export-row-budget")
+          expect(result.left.reason).toContain("thread-state")
+        }
+      }
+    })
+  })
+
+  test("system-trace fails with a typed error when the trace has no recorded target-pid metadata", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      // No `targetProcessId` -- simulates a trace recorded before PRB-097.
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "system-trace" })
+      const sessionRegistry = createSessionRegistryMock(root)
+      const commandRunner = createCommandRunner({
+        exports: { "thread-state": systemThreadOnlyXml, "cpu-state": systemCpuXml },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.analyzeTrace({
+            sessionId: "session-1",
+            artifactKey: traceArtifact.key,
+            analyzer: "system-trace",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-analyze-missing-target-pid")
+        }
+      }
+    })
+  })
+
+  test("metal-system-trace analyzes gpu, driver, and encoder tables with the extended budgets", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "metal-system-trace" })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "metal-gpu-intervals": loadPerfFixture("metal-system-trace.metal-gpu-intervals.xml"),
+          "metal-driver-event-intervals": metalDriverIntervalsXml,
+          "metal-application-encoders-list": metalEncoderListXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "metal-system-trace",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(commandRunner.stats.budgets).toEqual([
+        { schema: "metal-gpu-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
+        { schema: "metal-driver-event-intervals", maxBytes: 4 * mib, maxRows: 12_000 },
+        { schema: "metal-application-encoders-list", maxBytes: 4 * mib, maxRows: 12_000 },
+      ])
+      expect(result.artifacts.exports).toHaveLength(3)
+      expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
+      expect(result.summary.metrics.find((metric) => metric.label === "Per-encoder summary")?.value).toContain("command buffer")
+    })
+  })
+
+  test("hangs analyzer returns structured hang diagnostics", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "hangs" })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "potential-hangs": potentialHangsXml,
+          "hang-risks": hangRisksXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "hangs",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.artifacts.exports).toHaveLength(2)
+      expect(result.summary.headline).toContain("Detected 2 hang events")
+      expect(result.summary.metrics.find((metric) => metric.label === "Call stack hints")?.value).toBe("available")
+      expect(result.diagnoses.find((diagnosis) => diagnosis.code === "hangs-longest-event")?.details.join(" ")).toContain("LayoutPass.render")
+    })
+  })
+
+  test("swift-concurrency analyzer returns task and actor diagnostics", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "swift-concurrency" })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "swift-task-state": swiftTaskStateXml,
+          "swift-task-lifetime": swiftTaskLifetimeXml,
+          "swift-actor-execution": swiftActorExecutionXml,
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "swift-concurrency",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.artifacts.exports).toHaveLength(3)
+      expect(result.summary.headline).toContain("Observed 2 Swift tasks")
+      expect(result.summary.metrics.find((metric) => metric.label === "Task creations")?.value).toBe("2")
+      expect(result.summary.metrics.find((metric) => metric.label === "Actor executions")?.value).toBe("2")
+      expect(result.diagnoses.some((diagnosis) => diagnosis.code === "swift-concurrency-long-running-tasks")).toBe(true)
+    })
+  })
+
+  test("surfaces export schema drift as a typed contract failure", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "time-profiler" })
+      const commandRunner = createCommandRunner({
+        exports: {
+          "time-sample": timeProfilerXml.replace('<col><mnemonic>sample-type</mnemonic></col>', ""),
+        },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        Effect.either(
+          perfService.analyzeTrace({
+            sessionId: "session-1",
+            artifactKey: traceArtifact.key,
+            analyzer: "time-profiler",
+            emitProgress: () => undefined,
+          }),
+        ),
+      )
+
+      expect(Either.isLeft(result)).toBe(true)
+
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(EnvironmentError)
+
+        if (result.left instanceof EnvironmentError) {
+          expect(result.left.code).toBe("perf-analyze-export-contract")
+          expect(result.left.reason).toContain("sample-type")
+        }
+      }
+    })
+  })
+
+  test("logging analyzer returns signpost interval diagnostics", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "logging" })
+      const commandRunner = createCommandRunner({
+        exports: { "os-signpost-interval": signpostIntervalsXml },
+      })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+
+      const result = await Effect.runPromise(
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "logging",
+          emitProgress: () => undefined,
+        }),
+      )
+
+      expect(result.artifacts.exports).toHaveLength(1)
+      expect(result.summary.metrics.find((metric) => metric.label === "Signpost intervals")?.value).toBe("3")
+      expect(result.summary.headline).toContain("loadData dominated")
+    })
+  })
+
+  test("reuses exportSchema's cache across two analyze calls on the same trace", async () => {
+    await withTempRoot(async (root) => {
+      const artifactStore = createArtifactStore()
+      const sessionRegistry = createSessionRegistryMock(root)
+      const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "time-profiler" })
+      const commandRunner = createCommandRunner({ exports: { "time-sample": timeProfilerXml } })
+      const perfService = createPerfService({
+        artifactStore: artifactStore.service,
+        sessionRegistry,
+        commandRunner: commandRunner.runner,
+      })
+      const request = {
+        sessionId: "session-1",
+        artifactKey: traceArtifact.key,
+        analyzer: "time-profiler" as const,
+        emitProgress: () => undefined,
+      }
+
+      await Effect.runPromise(perfService.analyzeTrace(request))
+      await Effect.runPromise(perfService.analyzeTrace(request))
+
+      // Two `analyzeTrace` calls, one xctrace schema-export subprocess: the
+      // second run's `time-sample` pull is a cache hit.
+      expect(commandRunner.stats.exportCalls).toBe(1)
     })
   })
 })

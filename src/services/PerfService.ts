@@ -1,12 +1,15 @@
 import { constants, createWriteStream, statSync } from "node:fs"
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
 import { basename, dirname, join, relative } from "node:path"
 import { pipeline } from "node:stream/promises"
 import { Cause, Context, Effect, Either, Exit, Fiber, Layer, Option } from "effect"
 import { runAppleProcess, spawnAppleProcessHandle, type AppleProcessHandle } from "./AppleProcessSupervisor"
 import { type ExportBudget, ExportBudgetExceededError, ExportBudgetTransform, formatBytes } from "./ArtifactExportPolicy"
 import {
+  PerfAnalyzeResult,
   PerfAroundFlowResult,
+  PerfExportResult,
   PerfRecordResult,
   PerfSignpostSummaryResult,
   PerfTemplate,
@@ -19,6 +22,7 @@ import {
   analyzeTimeProfilerTable,
   parsePerfTableExport,
   type CustomTemplateRef,
+  type PerfAnalyzerName,
   type PerfDiagnosis,
   type PerfSummary,
   type ParsedPerfTable,
@@ -81,10 +85,18 @@ interface StreamedCommandResult extends CommandResult {
   readonly rowCount: number
 }
 
-type ExportAttempt =
+// PRB-097: the outcome of a single lazy schema export attempt, shared by
+// `exportSchema` (one explicit request, always fails closed on a budget
+// overrun) and `analyzeTrace` (per-analyzer required/optional schemas, where
+// an optional overrun is skipped instead of failing the whole analysis).
+type SchemaExportOutcome =
   | {
       readonly kind: "exported"
-      readonly result: StreamedCommandResult
+      readonly artifact: ArtifactRecord
+      readonly xpath: string
+      readonly cacheHit: boolean
+      readonly rowCount: number
+      readonly bytesWritten: number
     }
   | {
       readonly kind: "skipped-budget"
@@ -319,13 +331,61 @@ const validateCustomTemplatePath = (templatePath: string) =>
     return buildCustomTemplateRef(templatePath)
   })
 
-const buildDynamicExportSpecs = (availableSchemas: ReadonlySet<string>): ReadonlyArray<TemplateExportSpec> =>
-  [...availableSchemas]
-    .sort((left, right) => left.localeCompare(right))
-    .map((schema) => ({
-      schema,
-      budget: defaultCustomTemplateExportBudget,
-    }))
+// PRB-097: reverse lookup from a schema name to the budget a built-in
+// template already knows for it, so an on-demand `perf.export`/`perf.analyze`
+// call reuses the same tuned budget record() used to use eagerly. Schemas
+// outside every built-in template's contract (the bulk of a 40+-schema
+// custom template) fall back to `defaultCustomTemplateExportBudget`.
+const schemaExportBudgets: Record<string, ExportBudget> = Object.values(templateSpecs).reduce(
+  (map, spec) => {
+    for (const exportSpec of spec.exportSchemas) {
+      if (!(exportSpec.schema in map)) {
+        map[exportSpec.schema] = exportSpec.budget
+      }
+    }
+
+    return map
+  },
+  {} as Record<string, ExportBudget>,
+)
+
+const resolveExportBudgetForSchema = (schema: string): ExportBudget => schemaExportBudgets[schema] ?? defaultCustomTemplateExportBudget
+
+const buildSchemaExportXpath = (runNumber: string, schema: string): string =>
+  `/trace-toc/run[@number=\"${runNumber}\"]/data/table[@schema=\"${schema}\"]`
+
+// PRB-097: export cache key -- trace identity (the trace artifact's own key,
+// unique per recording) + run number + schema + XPath + xctrace version.
+// Any of those changing (a different run, a different XPath override, an
+// Xcode upgrade) is a different cache entry, never a stale hit.
+const buildExportCacheKey = (args: {
+  readonly traceArtifactKey: string
+  readonly runNumber: string
+  readonly schema: string
+  readonly xpath: string
+  readonly xctraceVersion: string
+}): string => {
+  const digest = createHash("sha1")
+    .update(`${args.traceArtifactKey} ${args.runNumber} ${args.schema} ${args.xpath} ${args.xctraceVersion}`)
+    .digest("hex")
+    .slice(0, 20)
+  const safeSchema = args.schema.replace(/[^a-zA-Z0-9_-]/g, "_")
+
+  return `export-${safeSchema}-${digest}`
+}
+
+// PRB-097: record() and recordAroundFlow() key a trace's TOC artifact as
+// `${baseName}-toc` next to the trace's own `${baseName}-trace` -- lazy
+// export/analyze derives the TOC key from the trace key it was handed
+// instead of re-deriving `baseName` structurally, so it stays correct even
+// if the baseName format changes as long as the `-trace`/`-toc` suffix pair
+// does not.
+const traceArtifactKeySuffix = "-trace"
+
+const deriveTocArtifactKey = (traceArtifactKey: string): string | null =>
+  traceArtifactKey.endsWith(traceArtifactKeySuffix)
+    ? `${traceArtifactKey.slice(0, -traceArtifactKeySuffix.length)}-toc`
+    : null
 
 const parseTimeLimitMs = (timeLimit: string): number | null => {
   const match = timeLimit.match(/^(\d+)(ms|s|m|h)$/)
@@ -366,6 +426,31 @@ const fileExists = async (path: string): Promise<boolean> => {
 
 const ensureDirectory = async (path: string): Promise<void> => {
   await mkdir(path, { recursive: true })
+}
+
+// PRB-097: record()'s per-trace sidecar path -- lives next to the trace
+// bundle and its TOC, keyed off the same base name, so a later lazy
+// `perf.analyze` call can recover the recorded target pid without a live
+// trace lease.
+const perfMetaPathForTrace = (tracePath: string): string => tracePath.replace(/\.trace$/, ".perf-meta.json")
+
+interface PerfTraceMeta {
+  readonly targetProcessId?: number
+}
+
+const readPerfTraceMeta = async (tracePath: string): Promise<PerfTraceMeta | null> => {
+  try {
+    const raw = await readFile(perfMetaPathForTrace(tracePath), "utf8")
+    const parsed = JSON.parse(raw) as unknown
+
+    if (parsed && typeof parsed === "object" && typeof (parsed as PerfTraceMeta).targetProcessId === "number") {
+      return { targetProcessId: (parsed as PerfTraceMeta).targetProcessId }
+    }
+
+    return {}
+  } catch {
+    return null
+  }
 }
 
 const parseFirstRunNumber = (tocXml: string): string | null => {
@@ -811,6 +896,41 @@ export class PerfService extends Context.Tag("@probe/PerfService")<
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
       typeof PerfSignpostSummaryResult.Type,
+      | ArtifactNotFoundError
+      | UserInputError
+      | EnvironmentError
+      | SessionNotFoundError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+    >
+    // PRB-097: one requested schema/XPath derivative, exported on demand
+    // from an already-recorded trace and cached by trace identity + run
+    // number + schema + XPath + xctrace version.
+    readonly exportSchema: (args: {
+      readonly sessionId: string
+      readonly artifactKey: string
+      readonly schema: string
+      readonly xpath?: string
+      readonly emitProgress: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      typeof PerfExportResult.Type,
+      | ArtifactNotFoundError
+      | UserInputError
+      | EnvironmentError
+      | SessionNotFoundError
+      | UnsupportedCapabilityError
+      | ChildProcessError
+    >
+    // PRB-097: lazily exports (and reuses the same export cache as
+    // `exportSchema`) only the schemas one named built-in analyzer needs,
+    // then runs that analyzer's existing math.
+    readonly analyzeTrace: (args: {
+      readonly sessionId: string
+      readonly artifactKey: string
+      readonly analyzer: PerfAnalyzerName
+      readonly emitProgress: (stage: string, message: string) => void
+    }) => Effect.Effect<
+      typeof PerfAnalyzeResult.Type,
       | ArtifactNotFoundError
       | UserInputError
       | EnvironmentError
@@ -1429,160 +1549,38 @@ export const createPerfService = (dependencies: {
         })
       }
 
-      const exportArtifacts: Array<ArtifactRecord> = []
-      const parsedTables: Record<string, ParsedPerfTable> = {}
+      // PRB-097: record() is trace-first -- it stops here. No schema is
+      // exported, parsed, or analyzed eagerly; the TOC's advertised schema
+      // names become a compact catalog, and `probe perf export`/`probe perf
+      // analyze` pull specific tables lazily, on demand, from this same
+      // trace bundle.
       const availableSchemas = parseAvailableSchemaNames(tocXml)
-      const tocAdvertisesSchemas = availableSchemas.size > 0
-      const exportSpecs = spec.exportSchemas.length > 0
-        ? spec.exportSchemas
-        : buildDynamicExportSpecs(availableSchemas)
+      const schemaCatalog = [...availableSchemas]
+        .sort((left, right) => left.localeCompare(right))
+        .map((schema) => ({ schema }))
 
-      for (const exportSpec of exportSpecs) {
-        if (tocAdvertisesSchemas && !availableSchemas.has(exportSpec.schema)) {
-          if (exportSpec.required) {
-            return yield* new EnvironmentError({
-              code: "perf-export-schema-missing",
-              reason: `${spec.displayName} TOC did not expose the expected ${exportSpec.schema} schema.`,
-              nextStep: "Inspect the saved TOC export and align Probe's supported schema contract before retrying.",
-              details: [...availableSchemas].sort(),
-            })
-          }
+      emitProgress(
+        "perf.record",
+        `Discovered ${schemaCatalog.length} schema(s) in the TOC; launched zero schema-export subprocesses.`,
+      )
 
-          continue
-        }
-
-        const { schema, budget } = exportSpec
-        const exportPath = join(tracesDirectory, `${baseName}.${schema}.xml`)
-        emitProgress(
-          "perf.export",
-          `Exporting ${schema} rows for ${spec.displayName} (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
-        )
-
-        const exportAttempt: ExportAttempt = yield* Effect.tryPromise({
-          try: async (signal) => {
-            try {
-              const result = await commandRunner.exportToFile({
-                command: "xcrun",
-                commandArgs: [
-                  "xctrace",
-                  "export",
-                  "--input",
-                  tracePath,
-                  "--xpath",
-                  `/trace-toc/run[@number=\"${runNumber}\"]/data/table[@schema=\"${schema}\"]`,
-                ],
-                timeoutMs: defaultCommandOverheadMs,
-                outputPath: exportPath,
-                budget,
-                signal: withLeaseSignal(signal),
-              })
-
-              return {
-                kind: "exported",
-                result,
-              } satisfies ExportAttempt
-            } catch (error) {
-              if (error instanceof ExportBudgetExceededError && !exportSpec.required) {
-                await cleanupOutputFile(exportPath)
-                return {
-                  kind: "skipped-budget",
-                  error,
-                } satisfies ExportAttempt
-              }
-
-              throw error
-            }
-          },
-          catch: (error) =>
-            error instanceof ChildProcessError
-              ? error
-              : error instanceof ExportBudgetExceededError
-                ? buildExportBudgetError({ templateName: spec.displayName, schema, error })
-                : new EnvironmentError({
-                    code: "perf-export-schema",
-                    reason: error instanceof Error ? error.message : String(error),
-                    nextStep: `Inspect the TOC export and retry the ${schema} export.`,
-                    details: [],
-                  }),
-        })
-
-        if (exportAttempt.kind === "skipped-budget") {
-          const budgetLabel = exportAttempt.error.kind === "bytes"
-            ? formatBytes(exportAttempt.error.limit)
-            : `${exportAttempt.error.limit} rows`
-          emitProgress(
-            "perf.export",
-            `Skipping optional ${schema} export for ${spec.displayName} after it exceeded the ${budgetLabel} budget.`,
-          )
-          continue
-        }
-
-        const exportResult = exportAttempt.result
-
-        const artifact = yield* dependencies.artifactStore.registerArtifact(
-          sessionId,
-          createArtifactRecord({
-            artifactRoot: target.artifactRoot,
-            key: `${baseName}-${schema}`,
-            label: `${spec.slug}-${schema}`,
-            kind: "xml",
-            absolutePath: exportPath,
-            summary: `${schema} export for ${spec.displayName} (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
-          }),
-        )
-
-        exportArtifacts.push(artifact)
-
-        let maybeOversized: EnvironmentError | undefined
-        try {
-          const stats = statSync(exportPath)
-          if (stats.size > maxExportFileSizeBytes) {
-            maybeOversized = new EnvironmentError({
-              code: "perf-export-file-too-large",
-              reason: `${spec.displayName} ${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
-              nextStep: "Reduce --time-limit or use a narrower recording window; inspect the saved .trace directly for full data.",
-              details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
-            })
-          }
-        } catch {
-          // File stat failed; let downstream readFile fail with a better error
-        }
-
-        if (maybeOversized !== undefined) {
-          return yield* Effect.fail(maybeOversized)
-        }
-
-        const exportXml = yield* Effect.tryPromise({
-          try: () => readFile(exportPath, "utf8"),
-          catch: (error) =>
-            new EnvironmentError({
-              code: "perf-read-schema-export",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: `Inspect the saved ${schema} export XML and retry the profiling command.`,
-              details: [],
-            }),
-        })
-
-        parsedTables[schema] = yield* Effect.try({
-          try: () => parsePerfTableExport(exportXml),
-          catch: (error) =>
-            new EnvironmentError({
-              code: "perf-parse-export",
-              reason: error instanceof Error ? error.message : String(error),
-              nextStep: `Inspect the saved ${schema} export XML and retry the profiling command.`,
-              details: [],
-            }),
-        })
-      }
-
-      const analysis = yield* Effect.try({
-        try: () => spec.analyze(parsedTables, target.targetProcessId),
+      // Persist the target pid alongside the trace so a later `perf analyze
+      // --analyzer system-trace` call -- which has no live trace lease, and
+      // so no other way to learn the recorded app's pid -- can still filter
+      // thread/cpu rows to the target process (see resolveTraceAnalysisContext).
+      yield* Effect.tryPromise({
+        try: () =>
+          writeFile(
+            perfMetaPathForTrace(tracePath),
+            `${JSON.stringify({ targetProcessId: target.targetProcessId, template: templateKind, recordedAt: nowIso() }, null, 2)}\n`,
+            "utf8",
+          ),
         catch: (error) =>
           new EnvironmentError({
-            code: "perf-analyze-export-contract",
+            code: "perf-write-meta",
             reason: error instanceof Error ? error.message : String(error),
-            nextStep: "Inspect the saved schema exports and align Probe's supported xctrace contract before retrying.",
-            details: exportSpecs.map((exportSpec) => exportSpec.schema),
+            nextStep: "Check write access to the session traces directory and retry the profiling command.",
+            details: [],
           }),
       })
 
@@ -1594,9 +1592,16 @@ export const createPerfService = (dependencies: {
         timeLimit,
         recordedAt: nowIso(),
         xctraceVersion: xctraceVersionResult.stdout.trim(),
-        summary: analysis.summary,
+        summary: {
+          headline: schemaCatalog.length === 0
+            ? `Recorded ${spec.displayName} in ${timeLimit}; the TOC did not advertise any schema names.`
+            : `Recorded ${spec.displayName} in ${timeLimit}; the TOC advertises ${schemaCatalog.length} schema(s). Call \`probe perf analyze\` for built-in diagnostics or \`probe perf export\` for a specific schema.`,
+          metrics: [
+            { label: "Schemas discovered", value: String(schemaCatalog.length) },
+            { label: "Run number", value: runNumber },
+          ],
+        },
         diagnoses: [
-          ...analysis.diagnoses,
           {
             code: "perf-target-identity-verified",
             severity: "info" as const,
@@ -1605,10 +1610,10 @@ export const createPerfService = (dependencies: {
             wall: false,
           },
         ],
+        schemas: schemaCatalog,
         artifacts: {
           trace: traceArtifact,
           toc: tocArtifact,
-          exports: exportArtifacts,
         },
       } satisfies Omit<typeof PerfRecordResult.Type, "session">
     }).pipe(
@@ -1781,6 +1786,21 @@ export const createPerfService = (dependencies: {
           summary: `${spec.displayName} raw .trace bundle recorded around a bounded flow.`,
         }),
       )
+
+      // Best-effort sidecar (mirrors record()'s) so a later `perf analyze
+      // --analyzer system-trace` on this trace can recover the target pid.
+      // Non-fatal: an around-flow trace and its diagnoses are already
+      // complete by this point and must not be discarded over a sidecar
+      // write failure.
+      yield* Effect.tryPromise({
+        try: () =>
+          writeFile(
+            perfMetaPathForTrace(tracePath),
+            `${JSON.stringify({ targetProcessId: runnerDetails.targetProcessId, template, recordedAt: nowIso() }, null, 2)}\n`,
+            "utf8",
+          ),
+        catch: (error) => error,
+      }).pipe(Effect.ignore)
 
       emitProgress("perf.around", `Refreshing session health after recording ${spec.displayName}.`)
       const sessionHealthRefresh = yield* Effect.either(dependencies.sessionRegistry.getSessionHealth(sessionId))
@@ -2059,10 +2079,502 @@ export const createPerfService = (dependencies: {
       } satisfies typeof PerfSignpostSummaryResult.Type
     })
 
+  // PRB-097: resolves the already-recorded TOC for a trace artifact --
+  // preferring the sibling TOC record() already wrote (read straight off
+  // disk, no subprocess) and only falling back to re-deriving it via a
+  // fresh `xctrace export --toc` when that sibling is missing or its file
+  // no longer exists (e.g. an older recording, or manual cleanup).
+  const resolveTocForTrace = ({ sessionId, artifactRoot, traceArtifact, emitProgress, progressStage }: {
+    readonly sessionId: string
+    readonly artifactRoot: string
+    readonly traceArtifact: ArtifactRecord
+    readonly emitProgress: (stage: string, message: string) => void
+    readonly progressStage: string
+  }) =>
+    Effect.gen(function* () {
+      const getArtifact = dependencies.artifactStore.getArtifact!
+      const tocKey = deriveTocArtifactKey(traceArtifact.key)
+
+      if (tocKey) {
+        const existing = yield* Effect.either(getArtifact(sessionId, tocKey))
+
+        if (Either.isRight(existing)) {
+          const stillExists = yield* Effect.promise(() => fileExists(existing.right.absolutePath))
+
+          if (stillExists) {
+            emitProgress(
+              progressStage,
+              `Reusing the TOC already exported for ${basename(traceArtifact.absolutePath)} (no xctrace subprocess).`,
+            )
+
+            const tocXml = yield* Effect.tryPromise({
+              try: () => readFile(existing.right.absolutePath, "utf8"),
+              catch: (error) =>
+                new EnvironmentError({
+                  code: "perf-read-toc",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: "Inspect the saved TOC export and retry the request.",
+                  details: [],
+                }),
+            })
+
+            return { tocXml, tocArtifact: existing.right }
+          }
+        }
+      }
+
+      const tracesDirectory = dirname(traceArtifact.absolutePath)
+      const rebuiltBase = `${timestampForFile()}-${basename(traceArtifact.absolutePath).replace(/\.trace$/, "")}`
+
+      return yield* exportTocArtifact({
+        sessionId,
+        artifactRoot,
+        tracePath: traceArtifact.absolutePath,
+        tocPath: join(tracesDirectory, `${rebuiltBase}.toc.xml`),
+        artifactKey: `${rebuiltBase}-toc`,
+        artifactLabel: "trace-toc",
+        artifactSummary: `TOC export re-derived for lazy analysis of ${traceArtifact.key}.`,
+        emitProgress,
+      })
+    })
+
+  // PRB-097: shared entry seam for `perf.export` and `perf.analyze` -- both
+  // start from an already-registered trace artifact key, not a live trace
+  // lease, so they resolve the trace, its TOC (lazily, see above), the run
+  // number, the TOC's advertised schema names, and the target pid recorded
+  // alongside the trace (see readPerfTraceMeta).
+  const resolveTraceAnalysisContext = ({ sessionId, artifactKey, emitProgress, progressStage, capabilitySlug }: {
+    readonly sessionId: string
+    readonly artifactKey: string
+    readonly emitProgress: (stage: string, message: string) => void
+    readonly progressStage: string
+    readonly capabilitySlug: string
+  }) =>
+    Effect.gen(function* () {
+      const getArtifact = dependencies.artifactStore.getArtifact
+
+      if (!getArtifact) {
+        return yield* new EnvironmentError({
+          code: "perf-artifact-lookup-unavailable",
+          reason: "The current PerfService wiring does not expose artifact lookup.",
+          nextStep: `Provide ArtifactStore.getArtifact when constructing PerfService and retry the perf ${capabilitySlug} request.`,
+          details: [],
+        })
+      }
+
+      const traceArtifact = yield* getArtifact(sessionId, artifactKey)
+
+      if (traceArtifact.kind !== "directory" || !traceArtifact.absolutePath.endsWith(".trace")) {
+        return yield* new UserInputError({
+          code: `perf-${capabilitySlug}-artifact-not-trace`,
+          reason: `Artifact ${artifactKey} is not a .trace bundle.`,
+          nextStep: `Pass the perf trace artifact key and retry the perf ${capabilitySlug} command.`,
+          details: [],
+        })
+      }
+
+      const xctraceVersionResult = yield* Effect.tryPromise({
+        try: (signal) =>
+          commandRunner.capture({
+            command: "xcrun",
+            commandArgs: ["xctrace", "version"],
+            timeoutMs: defaultCommandOverheadMs,
+            signal,
+          }),
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : new EnvironmentError({
+                code: "perf-xctrace-version",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Verify xctrace is installed and retry the profiling command.",
+                details: [],
+              }),
+      })
+
+      const artifactRoot = artifactRootFromArtifact(traceArtifact)
+      const { tocXml, tocArtifact } = yield* resolveTocForTrace({
+        sessionId,
+        artifactRoot,
+        traceArtifact,
+        emitProgress,
+        progressStage,
+      })
+
+      const runNumber = parseFirstRunNumber(tocXml)
+
+      if (!runNumber) {
+        return yield* new EnvironmentError({
+          code: "perf-run-number-missing",
+          reason: `Could not resolve a run number from the TOC for ${artifactKey}.`,
+          nextStep: "Inspect the TOC export and retry the request.",
+          details: [],
+        })
+      }
+
+      const availableSchemas = parseAvailableSchemaNames(tocXml)
+      const meta = yield* Effect.promise(() => readPerfTraceMeta(traceArtifact.absolutePath))
+
+      return {
+        traceArtifact,
+        tocArtifact,
+        artifactRoot,
+        runNumber,
+        availableSchemas,
+        xctraceVersion: xctraceVersionResult.stdout.trim(),
+        targetProcessId: meta?.targetProcessId,
+      } as const
+    })
+
+  // PRB-097: one schema/XPath export, cached by trace identity + run number
+  // + schema + XPath + xctrace version (see buildExportCacheKey). A cache
+  // hit never reruns xctrace; a miss exports, budget-guards, and registers
+  // the result under the deterministic cache key so the next identical
+  // request is a hit.
+  const exportSchemaWithCache = ({
+    sessionId,
+    artifactRoot,
+    traceArtifact,
+    runNumber,
+    schema,
+    xpath,
+    budget,
+    xctraceVersion,
+    emitProgress,
+    failClosedOnBudget,
+  }: {
+    readonly sessionId: string
+    readonly artifactRoot: string
+    readonly traceArtifact: ArtifactRecord
+    readonly runNumber: string
+    readonly schema: string
+    readonly xpath?: string
+    readonly budget: ExportBudget
+    readonly xctraceVersion: string
+    readonly emitProgress: (stage: string, message: string) => void
+    readonly failClosedOnBudget: boolean
+  }): Effect.Effect<SchemaExportOutcome, EnvironmentError | ChildProcessError> =>
+    Effect.gen(function* () {
+      const getArtifact = dependencies.artifactStore.getArtifact!
+      const resolvedXpath = xpath ?? buildSchemaExportXpath(runNumber, schema)
+      const cacheKey = buildExportCacheKey({
+        traceArtifactKey: traceArtifact.key,
+        runNumber,
+        schema,
+        xpath: resolvedXpath,
+        xctraceVersion,
+      })
+
+      const cached = yield* Effect.either(getArtifact(sessionId, cacheKey))
+
+      if (Either.isRight(cached)) {
+        const stillExists = yield* Effect.promise(() => fileExists(cached.right.absolutePath))
+
+        if (stillExists) {
+          emitProgress("perf.export", `Reusing the cached ${schema} export (xctrace was not rerun).`)
+
+          const stats = yield* Effect.tryPromise({
+            try: async () => {
+              const content = await readFile(cached.right.absolutePath, "utf8")
+              return {
+                bytesWritten: Buffer.byteLength(content, "utf8"),
+                rowCount: (content.match(/<row>/g) ?? []).length,
+              }
+            },
+            catch: (error) =>
+              new EnvironmentError({
+                code: "perf-read-cached-export",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep: "Inspect the cached export artifact and retry the request.",
+                details: [],
+              }),
+          })
+
+          return {
+            kind: "exported",
+            artifact: cached.right,
+            xpath: resolvedXpath,
+            cacheHit: true,
+            rowCount: stats.rowCount,
+            bytesWritten: stats.bytesWritten,
+          } satisfies SchemaExportOutcome
+        }
+      }
+
+      const tracesDirectory = dirname(traceArtifact.absolutePath)
+      const exportPath = join(tracesDirectory, `${cacheKey}.xml`)
+      emitProgress(
+        "perf.export",
+        `Exporting ${schema} rows (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
+      )
+
+      const exportOutcome = yield* Effect.tryPromise({
+        try: async (signal) => {
+          try {
+            const result = await commandRunner.exportToFile({
+              command: "xcrun",
+              commandArgs: ["xctrace", "export", "--input", traceArtifact.absolutePath, "--xpath", resolvedXpath],
+              timeoutMs: defaultCommandOverheadMs,
+              outputPath: exportPath,
+              budget,
+              signal,
+            })
+
+            return { kind: "exported" as const, result }
+          } catch (error) {
+            if (error instanceof ExportBudgetExceededError && !failClosedOnBudget) {
+              await cleanupOutputFile(exportPath)
+              return { kind: "skipped-budget" as const, error }
+            }
+
+            throw error
+          }
+        },
+        catch: (error) =>
+          error instanceof ChildProcessError
+            ? error
+            : error instanceof ExportBudgetExceededError
+              ? buildExportBudgetError({ templateName: schema, schema, error })
+              : new EnvironmentError({
+                  code: "perf-export-schema",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: `Inspect the TOC export and retry the ${schema} export.`,
+                  details: [],
+                }),
+      })
+
+      if (exportOutcome.kind === "skipped-budget") {
+        const budgetLabel = exportOutcome.error.kind === "bytes"
+          ? formatBytes(exportOutcome.error.limit)
+          : `${exportOutcome.error.limit} rows`
+        emitProgress("perf.export", `Skipping optional ${schema} export after it exceeded the ${budgetLabel} budget.`)
+        return { kind: "skipped-budget", error: exportOutcome.error } satisfies SchemaExportOutcome
+      }
+
+      const exportResult = exportOutcome.result
+      let maybeOversized: EnvironmentError | undefined
+
+      try {
+        const stats = statSync(exportPath)
+
+        if (stats.size > maxExportFileSizeBytes) {
+          maybeOversized = new EnvironmentError({
+            code: "perf-export-file-too-large",
+            reason: `${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
+            nextStep: "Reduce the requested window or inspect the saved .trace directly for full data.",
+            details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
+          })
+        }
+      } catch {
+        // File stat failed; let downstream readFile fail with a better error
+      }
+
+      if (maybeOversized !== undefined) {
+        yield* Effect.promise(() => cleanupOutputFile(exportPath))
+        return yield* Effect.fail(maybeOversized)
+      }
+
+      const artifact = yield* dependencies.artifactStore.registerArtifact(
+        sessionId,
+        createArtifactRecord({
+          artifactRoot,
+          key: cacheKey,
+          label: `${schema}-export`,
+          kind: "xml",
+          absolutePath: exportPath,
+          summary: `${schema} export (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
+        }),
+      )
+
+      return {
+        kind: "exported",
+        artifact,
+        xpath: resolvedXpath,
+        cacheHit: false,
+        rowCount: exportResult.rowCount,
+        bytesWritten: exportResult.bytesWritten,
+      } satisfies SchemaExportOutcome
+    })
+
+  const exportSchema = ({ sessionId, artifactKey, schema, xpath, emitProgress }: {
+    readonly sessionId: string
+    readonly artifactKey: string
+    readonly schema: string
+    readonly xpath?: string
+    readonly emitProgress: (stage: string, message: string) => void
+  }) =>
+    Effect.gen(function* () {
+      const context = yield* resolveTraceAnalysisContext({
+        sessionId,
+        artifactKey,
+        emitProgress,
+        progressStage: "perf.export",
+        capabilitySlug: "export",
+      })
+
+      if (context.availableSchemas.size > 0 && xpath === undefined && !context.availableSchemas.has(schema)) {
+        return yield* new UserInputError({
+          code: "perf-export-schema-missing",
+          reason: `${artifactKey}'s TOC did not expose the ${schema} schema.`,
+          nextStep: "Inspect the saved TOC export and request a schema it advertises, or pass an explicit --xpath.",
+          details: [...context.availableSchemas].sort(),
+        })
+      }
+
+      // `failClosedOnBudget: true` -- a caller who explicitly asked for this
+      // schema gets a typed budget failure, never a silent skip.
+      const outcome = yield* exportSchemaWithCache({
+        sessionId,
+        artifactRoot: context.artifactRoot,
+        traceArtifact: context.traceArtifact,
+        runNumber: context.runNumber,
+        schema,
+        xpath,
+        budget: resolveExportBudgetForSchema(schema),
+        xctraceVersion: context.xctraceVersion,
+        emitProgress,
+        failClosedOnBudget: true,
+      })
+
+      if (outcome.kind === "skipped-budget") {
+        return yield* Effect.fail(buildExportBudgetError({ templateName: schema, schema, error: outcome.error }))
+      }
+
+      return {
+        sessionId,
+        artifactKey,
+        schema,
+        xpath: outcome.xpath,
+        runNumber: context.runNumber,
+        xctraceVersion: context.xctraceVersion,
+        exportedAt: nowIso(),
+        cacheHit: outcome.cacheHit,
+        rowCount: outcome.rowCount,
+        bytesWritten: outcome.bytesWritten,
+        artifacts: {
+          trace: context.traceArtifact,
+          toc: context.tocArtifact,
+          export: outcome.artifact,
+        },
+      } satisfies typeof PerfExportResult.Type
+    })
+
+  const analyzeTrace = ({ sessionId, artifactKey, analyzer, emitProgress }: {
+    readonly sessionId: string
+    readonly artifactKey: string
+    readonly analyzer: PerfAnalyzerName
+    readonly emitProgress: (stage: string, message: string) => void
+  }) =>
+    Effect.gen(function* () {
+      const context = yield* resolveTraceAnalysisContext({
+        sessionId,
+        artifactKey,
+        emitProgress,
+        progressStage: "perf.analyze",
+        capabilitySlug: "analyze",
+      })
+      const spec = templateSpecs[analyzer]
+      const tocAdvertisesSchemas = context.availableSchemas.size > 0
+      const parsedTables: Record<string, ParsedPerfTable> = {}
+      const exportArtifacts: Array<ArtifactRecord> = []
+
+      for (const exportSpec of spec.exportSchemas) {
+        if (tocAdvertisesSchemas && !context.availableSchemas.has(exportSpec.schema)) {
+          if (exportSpec.required) {
+            return yield* new EnvironmentError({
+              code: "perf-export-schema-missing",
+              reason: `${spec.displayName} analysis needs the ${exportSpec.schema} schema, but ${artifactKey}'s TOC did not expose it.`,
+              nextStep: "Inspect the saved TOC export and align Probe's supported schema contract before retrying.",
+              details: [...context.availableSchemas].sort(),
+            })
+          }
+
+          continue
+        }
+
+        const outcome = yield* exportSchemaWithCache({
+          sessionId,
+          artifactRoot: context.artifactRoot,
+          traceArtifact: context.traceArtifact,
+          runNumber: context.runNumber,
+          schema: exportSpec.schema,
+          budget: exportSpec.budget,
+          xctraceVersion: context.xctraceVersion,
+          emitProgress,
+          failClosedOnBudget: exportSpec.required === true,
+        })
+
+        if (outcome.kind === "skipped-budget") {
+          continue
+        }
+
+        exportArtifacts.push(outcome.artifact)
+
+        const exportXml = yield* Effect.tryPromise({
+          try: () => readFile(outcome.artifact.absolutePath, "utf8"),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "perf-read-schema-export",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: `Inspect the saved ${exportSpec.schema} export XML and retry the analyze command.`,
+              details: [],
+            }),
+        })
+
+        parsedTables[exportSpec.schema] = yield* Effect.try({
+          try: () => parsePerfTableExport(exportXml),
+          catch: (error) =>
+            new EnvironmentError({
+              code: "perf-parse-export",
+              reason: error instanceof Error ? error.message : String(error),
+              nextStep: `Inspect the saved ${exportSpec.schema} export XML and retry the analyze command.`,
+              details: [],
+            }),
+        })
+      }
+
+      if (analyzer === "system-trace" && context.targetProcessId === undefined) {
+        return yield* new EnvironmentError({
+          code: "perf-analyze-missing-target-pid",
+          reason: `${artifactKey} has no recorded target-process metadata, which the System Trace analyzer needs to filter thread/cpu rows to the app.`,
+          nextStep: "Re-record this trace with `probe perf record --template system-trace` and retry; recordings persist target-pid metadata for later lazy analysis.",
+          details: [],
+        })
+      }
+
+      const analysis = yield* Effect.try({
+        try: () => spec.analyze(parsedTables, context.targetProcessId ?? -1),
+        catch: (error) =>
+          new EnvironmentError({
+            code: "perf-analyze-export-contract",
+            reason: error instanceof Error ? error.message : String(error),
+            nextStep: "Inspect the saved schema exports and align Probe's supported xctrace contract before retrying.",
+            details: spec.exportSchemas.map((exportSpec) => exportSpec.schema),
+          }),
+      })
+
+      return {
+        sessionId,
+        artifactKey,
+        analyzer,
+        analyzedAt: nowIso(),
+        xctraceVersion: context.xctraceVersion,
+        summary: analysis.summary,
+        diagnoses: analysis.diagnoses,
+        artifacts: {
+          trace: context.traceArtifact,
+          toc: context.tocArtifact,
+          exports: exportArtifacts,
+        },
+      } satisfies typeof PerfAnalyzeResult.Type
+    })
+
   return PerfService.of({
     record,
     recordAroundFlow,
     summarizeBySignpost,
+    exportSchema,
+    analyzeTrace,
   })
 }
 
