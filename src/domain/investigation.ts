@@ -610,4 +610,4 @@ export const mergeInvestigationEvidenceReports = (
 }
 
 export { compareEvidenceReports }
-export type { PerfEvidenceComparisonType, PerfEvidenceFindingType, PerfEvidenceReportType }
+export type { PerfEvidenceComparisonType, PerfEvidenceReportType }

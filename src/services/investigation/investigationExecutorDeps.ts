@@ -91,37 +91,3 @@ export interface InvestigationExecutorDeps {
 
   readonly sleep: (ms: number) => Effect.Effect<void>
 }
-
-/**
- * Deterministic fake builder for contract tests -- mirrors
- * `flowExecutorTestSupport.ts#makeUnusedFlowExecutorDeps`: every member
- * throws by default so an un-stubbed call fails loudly (a test that forgot
- * to stub a dependency it actually exercises fails with a clear message,
- * never a silent no-op).
- */
-export const makeUnusedInvestigationExecutorDeps = (): InvestigationExecutorDeps => ({
-  nowIso: () => {
-    throw new Error("nowIso: not stubbed for this test")
-  },
-  newInvestigationId: () => {
-    throw new Error("newInvestigationId: not stubbed for this test")
-  },
-  checkSessionReady: () => {
-    throw new Error("checkSessionReady: not stubbed for this test")
-  },
-  reserveRecorder: () => {
-    throw new Error("reserveRecorder: not stubbed for this test")
-  },
-  releaseRecorder: () => {
-    throw new Error("releaseRecorder: not stubbed for this test")
-  },
-  runFlow: () => {
-    throw new Error("runFlow: not stubbed for this test")
-  },
-  captureRepetition: () => {
-    throw new Error("captureRepetition: not stubbed for this test")
-  },
-  sleep: () => {
-    throw new Error("sleep: not stubbed for this test")
-  },
-})

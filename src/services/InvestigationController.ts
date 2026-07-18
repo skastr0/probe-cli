@@ -1,10 +1,12 @@
 import { Context, Effect, Layer } from "effect"
-import { boundedCollectionAllShown, sliceBoundedCollection, type BoundedCollection } from "../domain/bounded"
+import { boundedCollectionAllShown, type BoundedCollection } from "../domain/bounded"
 import {
   assembleInvestigationReport,
   buildInvestigationEvent,
   compareEvidenceReports,
   decodeInvestigationRecipe,
+  deriveComparisonVerdict,
+  identifyRegressedMetrics,
   mergeInvestigationEvidenceReports,
   planInvestigation,
   validateInvestigationRecipe,
@@ -15,6 +17,7 @@ import {
   type InvestigationReport,
   type InvestigationStageName,
   type InvestigationValidation,
+  type InvestigationWall,
   type PerfEvidenceComparisonType,
   type PerfEvidenceReportType,
 } from "../domain/investigation"
@@ -160,6 +163,146 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
           return state
         })
 
+      // Each stage's own work, one function per stage -- kept separate
+      // (rather than inlined as `switch` case bodies in `executeStage`)
+      // purely for size/readability; behavior and the "return a patch,
+      // fail with the stage's error, or raise `StageCancelledSignal`"
+      // contract are identical to what a single big function would do.
+
+      const runPreflightStage = (state: InvestigationState) =>
+        Effect.gen(function* () {
+          yield* deps.checkSessionReady(state.sessionId)
+          yield* deps.reserveRecorder({ sessionId: state.sessionId, investigationId: state.investigationId })
+          return {} satisfies Partial<InvestigationState>
+        })
+
+      const runFlowStage = (state: InvestigationState, flow: InvestigationRecipe["setup"]) =>
+        Effect.gen(function* () {
+          yield* deps.runFlow({ sessionId: state.sessionId, flow: flow! })
+          return {} satisfies Partial<InvestigationState>
+        })
+
+      // Loops from the last already-verified repetition (0 on a fresh run,
+      // or wherever a crashed/interrupted prior attempt left off -- see
+      // `InvestigationState.capturedRepetitions`'s header comment) through
+      // the recipe's declared repetition count. Re-checks `cancelRequested`
+      // before every repetition, not just once per stage, so a cancel
+      // arriving mid-capture stops before the *next* repetition rather than
+      // waiting for the whole stage to finish.
+      const runCaptureStage = (state: InvestigationState, recipe: InvestigationRecipe) =>
+        Effect.gen(function* () {
+          const alreadyCaptured = [...state.capturedRepetitions]
+
+          for (let index = alreadyCaptured.length; index < recipe.repetitions; index += 1) {
+            const cancelled = yield* store.read(state.investigationId)
+
+            if (cancelled?.cancelRequested) {
+              return yield* Effect.fail(new StageCancelledSignal({ capturedRepetitions: alreadyCaptured }))
+            }
+
+            const { evidenceReport, traceArtifactKey } = yield* deps.captureRepetition({
+              sessionId: state.sessionId,
+              investigationId: state.investigationId,
+              repetitionIndex: index,
+              capture: recipe.capture,
+              measuredFlow: recipe.measuredFlow,
+              recipeHash: state.recipeHash,
+            })
+
+            alreadyCaptured.push({ index, traceArtifactKey, evidenceReport })
+            yield* store.update(state.investigationId, (current) => ({
+              ...current,
+              capturedRepetitions: alreadyCaptured,
+              updatedAt: deps.nowIso(),
+            }))
+
+            if (index < recipe.repetitions - 1 && recipe.cooldown.minIntervalMs > 0) {
+              yield* deps.sleep(recipe.cooldown.minIntervalMs)
+            }
+          }
+
+          return { capturedRepetitions: alreadyCaptured } satisfies Partial<InvestigationState>
+        })
+
+      const runAnalyzeStage = (state: InvestigationState) => {
+        const merged = mergeInvestigationEvidenceReports(
+          state.capturedRepetitions.map((repetition) => repetition.evidenceReport as PerfEvidenceReportType),
+        )
+        return Effect.succeed({ mergedEvidenceReport: merged } satisfies Partial<InvestigationState>)
+      }
+
+      const resolveBaselineReport = (baseline: NonNullable<InvestigationRecipe["baseline"]>) =>
+        baseline.kind === "report"
+          ? Effect.succeed(baseline.report)
+          : Effect.gen(function* () {
+              const baselineState = yield* requireState(baseline.investigationId)
+
+              if (!baselineState.mergedEvidenceReport) {
+                return yield* userInputError(
+                  "investigation-baseline-not-ready",
+                  `Baseline investigation ${baseline.investigationId} has no merged evidence report yet.`,
+                  "Wait for the baseline investigation to reach or pass its \"analyze\" stage, then retry.",
+                )
+              }
+
+              return baselineState.mergedEvidenceReport as PerfEvidenceReportType
+            })
+
+      const runCompareStage = (state: InvestigationState, recipe: InvestigationRecipe) =>
+        Effect.gen(function* () {
+          const baselineReport = yield* resolveBaselineReport(recipe.baseline!)
+          const comparison = compareEvidenceReports(baselineReport, state.mergedEvidenceReport!)
+          return { comparisonResult: comparison } satisfies Partial<InvestigationState>
+        })
+
+      // A regressed comparison names the channel(s) that regressed as an
+      // explicit wall -- this is the "identifies the planted channel and
+      // phase" half of the ProbeFixture planted-regression AC
+      // (`identifyRegressedMetrics`, domain/investigation.ts): a metric key
+      // is already channel-scoped, so no separate phase-attribution step
+      // is needed.
+      const buildComparisonWalls = (comparisonResult: PerfEvidenceComparisonType | null): ReadonlyArray<InvestigationWall> => {
+        if (!comparisonResult || deriveComparisonVerdict(comparisonResult) !== "regressed") {
+          return []
+        }
+
+        const regressed = identifyRegressedMetrics(comparisonResult)
+        return [{
+          code: "comparison-regressed",
+          summary: `Comparison against the baseline regressed on ${regressed.length} metric(s).`,
+          details: regressed.map((metric) => `${metric.key}: +${(metric.relativeDelta * 100).toFixed(1)}% relative to baseline.`),
+        }]
+      }
+
+      const runReportStage = (state: InvestigationState) => {
+        const report = assembleInvestigationReport({
+          investigationId: state.investigationId,
+          recipeHash: state.recipeHash,
+          status: "completed",
+          repetitionFindings: state.capturedRepetitions.map((repetition) => repetition.evidenceReport.findings),
+          walls: buildComparisonWalls(state.comparisonResult),
+          comparison: state.comparisonResult,
+          repetitionReportKeys: state.capturedRepetitions.map((repetition) => repetition.traceArtifactKey),
+          generatedAt: deps.nowIso(),
+        })
+        return Effect.succeed({ report } satisfies Partial<InvestigationState>)
+      }
+
+      const runStageWork = (state: InvestigationState, stage: InvestigationStageName): Effect.Effect<Partial<InvestigationState>, unknown> => {
+        const recipe = state.recipe as InvestigationRecipe
+
+        switch (stage) {
+          case "preflight": return runPreflightStage(state)
+          case "setup": return runFlowStage(state, recipe.setup)
+          case "warmup": return runFlowStage(state, recipe.warmup)
+          case "capture": return runCaptureStage(state, recipe)
+          case "analyze": return runAnalyzeStage(state)
+          case "compare": return runCompareStage(state, recipe)
+          case "report": return runReportStage(state)
+          default: return Effect.succeed({})
+        }
+      }
+
       // One stage's worth of work. Returns the next persisted state; never
       // throws for an expected stage failure -- a failed capture/flow is
       // reported via `status: "failed"` + `failureReason`, not an Effect
@@ -172,7 +315,6 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
       }): Effect.Effect<InvestigationState, EnvironmentError> =>
         Effect.gen(function* () {
           const { state, stage } = args
-          const recipe = state.recipe as InvestigationRecipe
 
           yield* store.appendEvent(state.investigationId, (sequence) =>
             buildInvestigationEvent({
@@ -183,114 +325,7 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
               timestamp: deps.nowIso(),
             }))
 
-          const stageEffect: Effect.Effect<Partial<InvestigationState>, unknown> = Effect.gen(function* () {
-            switch (stage) {
-              case "preflight": {
-                yield* deps.checkSessionReady(state.sessionId)
-                yield* deps.reserveRecorder({ sessionId: state.sessionId, investigationId: state.investigationId })
-                return {}
-              }
-
-              case "setup": {
-                yield* deps.runFlow({ sessionId: state.sessionId, flow: recipe.setup! })
-                return {}
-              }
-
-              case "warmup": {
-                yield* deps.runFlow({ sessionId: state.sessionId, flow: recipe.warmup! })
-                return {}
-              }
-
-              case "capture": {
-                const alreadyCaptured = [...state.capturedRepetitions]
-
-                for (let index = alreadyCaptured.length; index < recipe.repetitions; index += 1) {
-                  const cancelled = yield* store.read(state.investigationId)
-
-                  if (cancelled?.cancelRequested) {
-                    return yield* Effect.fail(new StageCancelledSignal({ capturedRepetitions: alreadyCaptured }))
-                  }
-
-                  const { evidenceReport, traceArtifactKey } = yield* deps.captureRepetition({
-                    sessionId: state.sessionId,
-                    investigationId: state.investigationId,
-                    repetitionIndex: index,
-                    capture: recipe.capture,
-                    measuredFlow: recipe.measuredFlow,
-                    recipeHash: state.recipeHash,
-                  })
-
-                  alreadyCaptured.push({ index, traceArtifactKey, evidenceReport })
-                  yield* store.update(state.investigationId, (current) => ({
-                    ...current,
-                    capturedRepetitions: alreadyCaptured,
-                    updatedAt: deps.nowIso(),
-                  }))
-
-                  if (index < recipe.repetitions - 1 && recipe.cooldown.minIntervalMs > 0) {
-                    yield* deps.sleep(recipe.cooldown.minIntervalMs)
-                  }
-                }
-
-                return { capturedRepetitions: alreadyCaptured }
-              }
-
-              case "analyze": {
-                const merged = mergeInvestigationEvidenceReports(
-                  state.capturedRepetitions.map((repetition) => repetition.evidenceReport as PerfEvidenceReportType),
-                )
-                return { mergedEvidenceReport: merged }
-              }
-
-              case "compare": {
-                const baseline = recipe.baseline!
-                const baselineReport: PerfEvidenceReportType = baseline.kind === "report"
-                  ? baseline.report
-                  : yield* Effect.gen(function* () {
-                      const baselineState = yield* requireState(baseline.investigationId)
-
-                      if (!baselineState.mergedEvidenceReport) {
-                        return yield* userInputError(
-                          "investigation-baseline-not-ready",
-                          `Baseline investigation ${baseline.investigationId} has no merged evidence report yet.`,
-                          "Wait for the baseline investigation to reach or pass its \"analyze\" stage, then retry.",
-                        )
-                      }
-
-                      return baselineState.mergedEvidenceReport
-                    })
-
-                const comparison = compareEvidenceReports(baselineReport, state.mergedEvidenceReport!)
-                return { comparisonResult: comparison }
-              }
-
-              case "report": {
-                const report = assembleInvestigationReport({
-                  investigationId: state.investigationId,
-                  recipeHash: state.recipeHash,
-                  status: "completed",
-                  repetitionFindings: state.capturedRepetitions.map((repetition) => repetition.evidenceReport.findings),
-                  walls: [],
-                  comparison: state.comparisonResult,
-                  repetitionReportKeys: state.capturedRepetitions.map((repetition) => repetition.traceArtifactKey),
-                  generatedAt: deps.nowIso(),
-                  boundFindings: (findings, maxInlineFindings) => {
-                    const { shown, omitted } = sliceBoundedCollection(findings, maxInlineFindings)
-                    return omitted === 0
-                      ? boundedCollectionAllShown(findings)
-                      : { total: findings.length, shown, omitted, drill: null }
-                  },
-                })
-                return { report }
-              }
-
-              default: {
-                return {}
-              }
-            }
-          })
-
-          const outcome = yield* stageEffect.pipe(Effect.either)
+          const outcome = yield* runStageWork(state, stage).pipe(Effect.either)
 
           if (outcome._tag === "Left" && isStageCancelledSignal(outcome.left)) {
             // Mid-stage cancellation (currently only reachable from

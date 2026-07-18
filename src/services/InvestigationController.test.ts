@@ -7,6 +7,7 @@ import type { PerfEvidenceReport } from "../domain/perf-evidence"
 import { InvestigationController, InvestigationControllerLayer } from "./InvestigationController"
 import { InvestigationStore, InvestigationStoreLive } from "./InvestigationStore"
 import type { InvestigationExecutorDeps } from "./investigation/investigationExecutorDeps"
+import { makeUnusedInvestigationExecutorDeps } from "./investigation/investigationExecutorTestSupport"
 
 // PRB-099 contract tests: "Run state, events, artifacts, cancellation, and
 // read/resume semantics are contract-tested" (AC). Every test here uses a
@@ -96,6 +97,7 @@ const makeFakeDeps = (options: FakeDepsOptions = {}) => {
   const captureRepetitionRef: { current: InvestigationExecutorDeps["captureRepetition"] } = { current: baseCaptureRepetition }
 
   const deps: InvestigationExecutorDeps = {
+    ...makeUnusedInvestigationExecutorDeps(),
     nowIso: () => new Date().toISOString(),
     newInvestigationId: () => `inv-${idCounter++}`,
     checkSessionReady: () => Effect.succeed({ state: "ready" }),

@@ -1,5 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
-import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises"
+import { mkdir, open, readFile, readdir, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import {
@@ -325,16 +325,24 @@ export const InvestigationStoreLive = Layer.succeed(
   }),
 )
 
-/** Exposed for `probe doctor`/tests that need to sweep orphaned investigation directories; not part of the core contract. */
+/**
+ * Every investigation id with a state document on disk -- used by
+ * `reserveRecorder` (single-recorder-per-session enforcement) and by tests
+ * that need to recover a durable id after a simulated process crash (see
+ * `InvestigationController.test.ts`'s read/resume test). A missing
+ * `investigations/` root (no investigation has ever run yet) is the
+ * legitimate "none" case, not corruption -- any other read failure
+ * (permissions, a non-directory at that path) propagates instead of being
+ * folded into the same empty result.
+ */
 export const listInvestigationIds = async (): Promise<ReadonlyArray<string>> => {
   try {
     return await readdir(investigationsRoot())
-  } catch {
-    return []
-  }
-}
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return []
+    }
 
-export const removeInvestigationTempSiblings = async (investigationId: string): Promise<void> => {
-  await unlink(`${statePath(investigationId)}.tmp`).catch(() => undefined)
-  await unlink(`${eventsPath(investigationId)}.tmp`).catch(() => undefined)
+    throw error
+  }
 }
