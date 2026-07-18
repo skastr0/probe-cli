@@ -21,7 +21,7 @@
       "kind": "assert",
       "target": {
         "kind": "semantic",
-        "identifier": "fixture.detail.title",
+        "identifier": "fixture.detail.label",
         "label": null,
         "value": null,
         "placeholder": null,
@@ -34,7 +34,7 @@
         "visible": null,
         "hidden": null,
         "text": null,
-        "label": "Detail",
+        "label": "Detail view active",
         "value": null,
         "type": "staticText",
         "enabled": null,

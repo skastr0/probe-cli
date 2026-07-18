@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect } from "effect"
 import { formatProbeError, isProbeError } from "../src/domain/errors"
+import { decodeSessionFlowContract, type SessionFlowContract, type SessionFlowResult } from "../src/domain/flow-v2"
 import type { PerfRecordResult } from "../src/domain/perf"
 import type { SessionAction } from "../src/domain/action"
 import type { SessionHealth, SimulatorSessionMode } from "../src/domain/session"
@@ -13,6 +14,11 @@ import type { SessionSnapshotResult, SnapshotPreviewItem, StoredSnapshotArtifact
 import { probeRuntime } from "../src/runtime"
 import { ArtifactStore } from "../src/services/ArtifactStore"
 import { DaemonClient } from "../src/services/DaemonClient"
+import {
+  discoverFlowExampleFiles,
+  pendingRunnerCapabilities,
+  type DiscoveredFlowExample,
+} from "../src/services/flowExampleInventory"
 
 const defaultFixtureBundleId = "dev.probe.fixture"
 const daemonReadyTimeoutMs = 20_000
@@ -29,7 +35,7 @@ interface Options {
 
 interface StepResult {
   readonly name: string
-  readonly status: "passed" | "failed"
+  readonly status: "passed" | "failed" | "skipped"
   readonly durationMs: number
   readonly detail: string
 }
@@ -587,8 +593,15 @@ const printSummary = (args: {
   console.log("Steps")
 
   for (const result of args.results) {
-    const prefix = result.status === "passed" ? "✓" : "✗"
+    const prefix = result.status === "passed" ? "✓" : result.status === "skipped" ? "○ SKIP" : "✗"
     console.log(`${prefix} ${result.name} (${formatDuration(result.durationMs)})${result.detail ? ` — ${result.detail}` : ""}`)
+  }
+
+  const skippedCount = args.results.filter((result) => result.status === "skipped").length
+
+  if (skippedCount > 0) {
+    console.log("")
+    console.log(`${skippedCount} hardware-only recipe(s) explicitly skipped (see ○ SKIP rows above) — not silently passing.`)
   }
 
   if (args.artifactLines.length > 0) {
@@ -637,6 +650,107 @@ const runStep = async <T>(
     })
     throw error
   }
+}
+
+/**
+ * Records a step as explicitly skipped, without executing anything. Distinct
+ * from a passed or failed step: it never throws, never flips the overall run
+ * to FAIL, and is called out separately in the summary (superseding gate 6 —
+ * CI reports skipped hardware-only recipes explicitly, never silently
+ * treating them as passing).
+ */
+const recordSkippedStep = (results: Array<StepResult>, name: string, detail: string): void => {
+  results.push({ name, status: "skipped", durationMs: 0, detail })
+}
+
+/**
+ * Runs one representative docs/examples/flows example end to end against a
+ * fresh ProbeFixture session (open -> runSessionFlow -> close), so the
+ * examples that ship in docs are proven against the product, not just
+ * schema-validated (superseding gate 3). Each example gets its own session
+ * because flows that navigate (e.g. into the detail screen) would otherwise
+ * leave stale UI state for the next example.
+ */
+const runFlowExample = async (options: Options, flow: SessionFlowContract): Promise<SessionFlowResult> => {
+  const health = await openSession(options)
+
+  if (health.state !== "ready") {
+    throw new Error(`Session ${health.sessionId} opened in state ${health.state} while running a flow example.`)
+  }
+
+  let result: SessionFlowResult
+
+  try {
+    result = await probeRuntime.runPromise(
+      Effect.gen(function* () {
+        const client = yield* DaemonClient
+        return yield* client.runSessionFlow({ sessionId: health.sessionId, flow, onEvent: daemonEvent })
+      }),
+    )
+  } catch (error) {
+    // A cleanup failure here must never mask the real error that triggered
+    // it — best-effort close, then rethrow what actually went wrong.
+    await closeSession(health.sessionId).catch(() => undefined)
+    throw error
+  }
+
+  await closeSession(health.sessionId)
+
+  if (result.verdict !== "passed") {
+    throw new Error(
+      `Flow verdict was "${result.verdict}" instead of "passed": ${result.summary}`
+        + (result.failedStep ? ` (failed step ${result.failedStep.index}: ${result.failedStep.summary})` : ""),
+    )
+  }
+
+  return result
+}
+
+/**
+ * Runs every representative flow example that targets the fixture bundle
+ * through a live session, and explicitly skips (never silently drops) any
+ * example that needs a runner capability the production Swift runner does
+ * not implement yet — see flowExampleInventory.ts for the shared discovery
+ * and pending-capability truth this shares with the schema/domain test.
+ */
+const runFlowExamplesPhase = async (options: Options, results: Array<StepResult>): Promise<void> => {
+  if (options.bundleId !== defaultFixtureBundleId) {
+    return
+  }
+
+  const examples = discoverFlowExampleFiles()
+
+  for (const example of examples) {
+    await runFlowExampleStep(options, results, example)
+  }
+}
+
+const runFlowExampleStep = async (
+  options: Options,
+  results: Array<StepResult>,
+  example: DiscoveredFlowExample,
+): Promise<void> => {
+  const stepName = `run flow example: ${example.fileName}`
+  const flow = decodeSessionFlowContract(example.raw)
+  const pending = pendingRunnerCapabilities(flow)
+
+  if (pending.length > 0) {
+    recordSkippedStep(
+      results,
+      stepName,
+      `requires ${pending.join(", ")}, which the production runner does not implement yet `
+        + "(see RUNNER_CAPABILITY_REGISTRY / KNOWN_PENDING_CAPABILITY_EXAMPLES)",
+    )
+    return
+  }
+
+  await runStep(results, stepName, async () => {
+    const result = await runFlowExample(options, flow)
+    return {
+      value: result,
+      detail: `${result.executedSteps.length} step(s), verdict ${result.verdict}: ${result.summary}`,
+    }
+  })
 }
 
 const main = async () => {
@@ -747,6 +861,8 @@ const main = async () => {
         detail: `closed at ${result.closedAt}`,
       }
     })
+
+    await runFlowExamplesPhase(options, results)
 
     await runStep(results, "stop daemon", async () => {
       if (!daemon) {
