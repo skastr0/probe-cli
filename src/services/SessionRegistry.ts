@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { statSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { basename, dirname, join, relative } from "node:path"
-import { Context, Duration, Effect, Either, FiberRef, Layer, Ref } from "effect"
+import { Context, Deferred, Duration, Effect, Either, FiberRef, Layer, Ref } from "effect"
 import { runAppleProcess } from "./AppleProcessSupervisor"
 import {
   buildRecordedSessionAction,
@@ -76,6 +76,7 @@ import type {
 } from "../domain/output"
 import { appendSessionLogMarkers, summarizeContent } from "../domain/output"
 import {
+  isLiveRunnerDetails,
   SessionHealth,
   type SessionConnectionDetails,
   type SessionHealthCheck,
@@ -1277,6 +1278,41 @@ const isRealDeviceRecord = (record: ActiveSessionRecord): record is RealDeviceAc
 export const isRunnerBackedRecord = (record: ActiveSessionRecord): record is RunnerBackedActiveSessionRecord =>
   isSimulatorRecord(record) || record.sendRunnerCommand !== null
 
+// PRB-096: the target-process lease surface. `resources.trace` (already part
+// of the frozen `SessionResourceStates` contract in domain/session.ts) is the
+// independent trace lane ARCHITECTURE.md describes ("xctrace recorder ...
+// SessionRegistry with PerfService helpers"). These types are the seam
+// PerfService's raw record path uses instead of `getSessionHealth` — no
+// runner ping, no `wrapperRunning`/`ready|degraded` gate, just the device,
+// bundle, live target pid, and artifact root a raw capture actually needs.
+export interface TraceTargetSnapshot {
+  readonly sessionId: string
+  readonly platform: "simulator" | "device"
+  readonly deviceId: string
+  readonly deviceName: string
+  readonly bundleId: string
+  readonly targetProcessId: number
+  readonly artifactRoot: string
+}
+
+export interface TraceLeaseHandle {
+  readonly target: TraceTargetSnapshot
+  /**
+   * Aborts when the owning session starts closing (explicit close, TTL
+   * expiry, runner exit, or daemon shutdown) — combine with a caller's own
+   * per-attempt signal via `AbortSignal.any([signal, lease.signal])` so a
+   * session close interrupts an in-flight raw capture through the same
+   * `AppleProcessSupervisor` TERM -> grace -> KILL ladder every other owned
+   * child process already uses, instead of orphaning it.
+   */
+  readonly signal: AbortSignal
+}
+
+export type TraceLeaseOutcome =
+  | { readonly kind: "stopped" }
+  | { readonly kind: "degraded"; readonly detail: string }
+  | { readonly kind: "failed"; readonly detail: string }
+
 // PRB-073: hoisted out of `SessionRegistryLive`'s Effect.gen body — this has
 // no dependency on any layer-scoped service (ArtifactStore, harnesses, …),
 // only on the module-level `nowIso`/`expiresAtIso`/`deriveSessionPhase`
@@ -1345,6 +1381,39 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
     >
     readonly getSessionHealth: (sessionId: string) => Effect.Effect<SessionHealth, SessionNotFoundError | EnvironmentError>
     readonly sendRunnerKeepalive: (sessionId: string) => Effect.Effect<void, SessionNotFoundError | EnvironmentError>
+    /**
+     * PRB-096: a passive, non-mutating read of the session's last-known
+     * health snapshot. Unlike `getSessionHealth`, this never pings the
+     * runner, never mutates `record.health`, and never persists — it is the
+     * "no runner ping side effect" seam PerfService's raw record path uses
+     * to report a best-effort `session` outcome without coupling the raw
+     * capture to XCUITest runner liveness.
+     */
+    readonly peekSessionHealth: (sessionId: string) => Effect.Effect<SessionHealth, SessionNotFoundError>
+    /**
+     * PRB-096: acquires the target-process lease a raw perf capture needs —
+     * device, live target pid, bundle, and artifact root — gated only on a
+     * live runner-backed record having ever attached (so the pid is known)
+     * and the device connection's last-known status, never on
+     * `wrapperRunning`/`ready|degraded` XCUITest runner health. Sets
+     * `resources.trace` to "starting" and fails if another trace lease is
+     * already active for this session (Probe records at most one trace per
+     * session at a time).
+     */
+    readonly beginTraceLease: (sessionId: string) => Effect.Effect<
+      TraceLeaseHandle,
+      SessionNotFoundError | EnvironmentError | UnsupportedCapabilityError
+    >
+    /**
+     * PRB-096: releases a lease acquired via `beginTraceLease`, moving
+     * `resources.trace` to its terminal state ("stopped"/"degraded"/"failed")
+     * independently of `resources.runner` — a profiler failure never
+     * corrupts the UI/runner lane. Also resolves the join point
+     * `closeSessionInternal` awaits after aborting `lease.signal`, so a
+     * concurrent session close can never hang forever on an orphaned trace.
+     * Idempotent and safe to call after the owning session has fully closed.
+     */
+    readonly endTraceLease: (sessionId: string, outcome: TraceLeaseOutcome) => Effect.Effect<void>
     readonly getSessionLogs: (params: {
       readonly sessionId: string
       readonly source: SessionLogSource
@@ -1479,6 +1548,20 @@ export const SessionRegistryLive = Layer.scoped(
     const closedRecordsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
     const openingRef = yield* Ref.make<OpeningSessionReservation | null>(null)
     const openMutex = yield* Effect.makeSemaphore(1)
+    // PRB-096: at most one active target-process (trace) lease per session —
+    // the `AbortController` is what `closeSessionInternal` aborts to
+    // interrupt an in-flight raw capture through the owned
+    // `AppleProcessSupervisor` child, and `settled` is the join point it
+    // awaits (bounded) so a raw capture can never orphan a session close.
+    const activeTraceLeasesRef = yield* Ref.make(
+      new Map<string, { readonly controller: AbortController; readonly settled: Deferred.Deferred<void> }>(),
+    )
+    // Resource states in which a trace lease is doing real work — the TTL
+    // sweeper must never expire a session while one of these holds, even
+    // though PRB-096 stops the raw capture path from sending runner
+    // keepalives ("Active target/trace lease prevents TTL cleanup without
+    // runner keepalives").
+    const activeTraceLeaseStates = new Set<SessionResourceState>(["starting", "ready", "stopping"])
 
     // PRB-083: the ambient handle for "we are currently executing inside
     // this session's controller fiber". Every top-level entry point that
@@ -3812,6 +3895,28 @@ export const SessionRegistryLive = Layer.scoped(
               yield* persistHealth(sessionId, record.health)
             }
 
+            // PRB-096: interrupt and join any in-flight raw perf trace lease
+            // through the same scoped AppleProcessSupervisor every other
+            // owned child process uses, instead of orphaning it. Aborting
+            // `lease.signal` races into PerfService's `AbortSignal.any`
+            // combination, which reaches `AppleProcessSupervisor.run`'s
+            // `spec.signal` and drives the usual TERM -> grace -> KILL
+            // ladder. The bounded wait below is the "join": `endTraceLease`
+            // resolves `settled` once the capture has actually unwound
+            // (success, failure, or interruption), so teardown never
+            // proceeds while a trace is still writing into an artifact root
+            // it is about to help tear down -- but a wedged trace can never
+            // hang the close forever either.
+            const activeTraceLease = (yield* Ref.get(activeTraceLeasesRef)).get(sessionId)
+
+            if (activeTraceLease) {
+              activeTraceLease.controller.abort(`session ${sessionId} is ${closeReason}`)
+              yield* Deferred.await(activeTraceLease.settled).pipe(
+                Effect.timeout(Duration.seconds(90)),
+                Effect.catchAll(() => Effect.void),
+              )
+            }
+
             yield* closeDebuggerBridgeInternal(sessionId, record).pipe(Effect.catchAll(() => Effect.succeed(false)))
 
             if (closeReason !== "runner-exit" && isRunnerBackedRecord(record) && record.isRunnerRunning()) {
@@ -3900,8 +4005,14 @@ export const SessionRegistryLive = Layer.scoped(
     const sweeper = Effect.forever(
       Effect.gen(function* () {
         const sessions = yield* Ref.get(sessionsRef)
+        // PRB-096: an active trace lease keeps the session alive on its own,
+        // independent of runner keepalives -- the raw perf path deliberately
+        // sends none of those now, so gating expiry on `expiresAt` alone
+        // would let a long recording get TTL-swept out from under itself.
         const expiredIds = [...sessions.values()]
-          .filter((record) => Date.parse(record.health.expiresAt) <= Date.now())
+          .filter((record) =>
+            Date.parse(record.health.expiresAt) <= Date.now()
+            && !activeTraceLeaseStates.has(record.health.resources.trace))
           .map((record) => record.health.sessionId)
 
         for (const sessionId of expiredIds) {
@@ -4847,6 +4958,170 @@ export const SessionRegistryLive = Layer.scoped(
           yield* record.controller.submit((ctx) =>
             withControllerContext(ctx, sendRunnerCommand(sessionId, record, "ping", "perf-keepalive")),
           ).pipe(Effect.asVoid)
+        }),
+      peekSessionHealth: (sessionId) =>
+        Effect.gen(function* () {
+          const sessions = yield* Ref.get(sessionsRef)
+          const record = sessions.get(sessionId)
+
+          if (record) {
+            return record.health
+          }
+
+          const closedSessions = yield* Ref.get(closedRecordsRef)
+          const closedRecord = closedSessions.get(sessionId)
+
+          if (closedRecord) {
+            return closedRecord.health
+          }
+
+          // A passive peek never touches the artifact manifest (that read
+          // can itself fail with EnvironmentError) -- a generic next step is
+          // an honest tradeoff for a method whose entire point is "no side
+          // effects, no extra I/O."
+          return yield* new SessionNotFoundError({
+            sessionId,
+            nextStep: "Open a new session or inspect the artifact root directly if the session has already closed.",
+          })
+        }),
+      beginTraceLease: (sessionId) =>
+        Effect.gen(function* () {
+          const record = yield* requireSessionRecord(sessionId)
+
+          return yield* record.controller.submit((_ctx) =>
+            Effect.gen(function* () {
+              const runnerDetails = record.health.runner
+
+              if (!isLiveRunnerDetails(runnerDetails)) {
+                return yield* new UnsupportedCapabilityError({
+                  code: "perf-session-real-device-runner",
+                  capability: "perf.record.trace-lease",
+                  reason: "The current session does not expose a live runner-backed target pid for perf recording.",
+                  nextStep: "Retry on a simulator-backed runner session, or wait for the real-device runner/perf seam to be validated.",
+                  details: [],
+                  wall: false,
+                })
+              }
+
+              // Last-known cached status, not a fresh ping -- a fresh
+              // pid-liveness/identity check happens right before xctrace
+              // spawns (PerfService's job); this is just an honest,
+              // side-effect-free early reject for a device already known to
+              // be disconnected.
+              if (record.health.connection.status === "disconnected") {
+                return yield* new EnvironmentError({
+                  code: "perf-target-device-disconnected",
+                  reason: `Device ${record.health.target.deviceName} (${record.health.target.deviceId}) is currently disconnected; Probe will not start a raw perf capture against it.`,
+                  nextStep: "Reconnect the device, refresh session health, and retry the profiling command.",
+                  details: [],
+                })
+              }
+
+              const existingLeases = yield* Ref.get(activeTraceLeasesRef)
+
+              if (existingLeases.has(sessionId)) {
+                return yield* new EnvironmentError({
+                  code: "perf-trace-lease-busy",
+                  reason: `Session ${sessionId} already has an active raw perf trace recording.`,
+                  nextStep: "Wait for the in-flight profiling command to finish, then retry.",
+                  details: [],
+                })
+              }
+
+              const controller = new AbortController()
+              const settled = yield* Deferred.make<void>()
+
+              yield* Ref.update(activeTraceLeasesRef, (current) => new Map(current).set(sessionId, { controller, settled }))
+
+              record.health = {
+                ...record.health,
+                updatedAt: nowIso(),
+                expiresAt: expiresAtIso(),
+                resources: setSessionResourceStates(record.health.resources, { trace: "starting" }),
+              }
+              yield* persistHealth(sessionId, record.health)
+              yield* syncDaemonMetadata
+
+              return {
+                target: {
+                  sessionId,
+                  platform: record.health.target.platform,
+                  deviceId: record.health.target.deviceId,
+                  deviceName: record.health.target.deviceName,
+                  bundleId: record.health.target.bundleId,
+                  targetProcessId: runnerDetails.targetProcessId,
+                  artifactRoot: record.health.artifactRoot,
+                },
+                signal: controller.signal,
+              } satisfies TraceLeaseHandle
+            }),
+          )
+        }),
+      endTraceLease: (sessionId, outcome) =>
+        Effect.gen(function* () {
+          const applyOutcome = (health: SessionHealth): SessionHealth => {
+            const nextTraceState: SessionResourceState =
+              outcome.kind === "stopped" ? "stopped" : outcome.kind === "degraded" ? "degraded" : "failed"
+
+            return {
+              ...health,
+              updatedAt: nowIso(),
+              expiresAt: expiresAtIso(),
+              // Only `resources.trace` moves here -- `state` and
+              // `resources.runner` stay untouched, so a profiler failure
+              // degrades the trace lane without corrupting the UI lane.
+              resources: setSessionResourceStates(health.resources, { trace: nextTraceState }),
+              warnings: outcome.kind === "stopped"
+                ? health.warnings
+                : dedupeStrings([...health.warnings, `Raw perf trace capture ${outcome.kind}: ${outcome.detail}`]),
+            }
+          }
+
+          const mutateRecord = (record: ActiveSessionRecord) =>
+            Effect.sync(() => {
+              record.health = applyOutcome(record.health)
+            }).pipe(
+              Effect.flatMap(() => persistHealth(sessionId, record.health)),
+              // Best-effort persistence: `endTraceLease` is called from
+              // PerfService's `Effect.onExit` finalizer and awaited (via the
+              // Deferred below) by a concurrent session close, so it must
+              // never itself fail.
+              Effect.catchAll(() => Effect.void),
+            )
+
+          const sessions = yield* Ref.get(sessionsRef)
+          const record = sessions.get(sessionId)
+
+          if (record) {
+            yield* record.controller.submit((_ctx) => mutateRecord(record)).pipe(
+              Effect.tap(() => syncDaemonMetadata),
+              // The owning session may already be mid-close (a terminal
+              // controller rejects with `session-closed`) -- exactly the
+              // case `closeSessionInternal` is blocked awaiting `settled`
+              // for below, so no other fiber can be racing this direct
+              // mutation.
+              Effect.catchAll(() => mutateRecord(record)),
+            )
+          } else {
+            const closedSessions = yield* Ref.get(closedRecordsRef)
+            const closedRecord = closedSessions.get(sessionId)
+
+            if (closedRecord) {
+              yield* mutateRecord(closedRecord)
+            }
+          }
+
+          const leases = yield* Ref.get(activeTraceLeasesRef)
+          const lease = leases.get(sessionId)
+
+          if (lease) {
+            yield* Ref.update(activeTraceLeasesRef, (current) => {
+              const next = new Map(current)
+              next.delete(sessionId)
+              return next
+            })
+            yield* Deferred.succeed(lease.settled, undefined)
+          }
         }),
       getSessionLogs: ({
         sessionId,

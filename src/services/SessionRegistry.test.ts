@@ -4965,4 +4965,202 @@ describe("SessionRegistry", () => {
       }
     })
   })
+
+  // PRB-096: the target-process (raw perf) trace lease.
+  describe("trace lease (PRB-096)", () => {
+    test("a degraded runner with a still-live target pid can still acquire a trace lease", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(
+          root,
+          createFakeHarness({
+            pingResponses: ["timeout"],
+          }),
+        )
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const degraded = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(degraded.resources.runner).toBe("degraded")
+          expect(degraded.state).toBe("degraded")
+
+          // AC 2: "Runner degraded/failed plus live target PID can record
+          // successfully" -- beginTraceLease gates on the live target pid
+          // (still attached), never on `resources.runner`/session state.
+          const lease = await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+          expect(lease.target.deviceId).toBe(session.target.deviceId)
+
+          await runtime.runPromise(registry.endTraceLease(session.sessionId, { kind: "stopped" }))
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("acquires and releases a trace lease independently of resources.runner, and rejects a second concurrent lease", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          expect(session.resources.trace).toBe("not-requested")
+
+          const lease = await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+          expect(session.runner.targetProcessId).not.toBeNull()
+          expect(lease.target.targetProcessId).toBe(session.runner.targetProcessId as number)
+          expect(lease.target.deviceId).toBe(session.target.deviceId)
+          expect(lease.target.artifactRoot).toBe(session.artifactRoot)
+          expect(lease.signal.aborted).toBe(false)
+
+          const startingHealth = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(startingHealth.resources.trace).toBe("starting")
+          // Acquiring a trace lease never touches the runner/UI lane.
+          expect(startingHealth.resources.runner).toBe("ready")
+          expect(startingHealth.state).toBe("ready")
+
+          const secondLease = await runtime.runPromise(Effect.either(registry.beginTraceLease(session.sessionId)))
+          expect(Either.isLeft(secondLease)).toBe(true)
+          if (Either.isLeft(secondLease)) {
+            expect(secondLease.left).toBeInstanceOf(EnvironmentError)
+            if (secondLease.left instanceof EnvironmentError) {
+              expect(secondLease.left.code).toBe("perf-trace-lease-busy")
+            }
+          }
+
+          await runtime.runPromise(registry.endTraceLease(session.sessionId, { kind: "stopped" }))
+
+          const stoppedHealth = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(stoppedHealth.resources.trace).toBe("stopped")
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("a failed trace lease outcome degrades only the trace lane -- resources.runner and session state stay untouched", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+          await runtime.runPromise(
+            registry.endTraceLease(session.sessionId, { kind: "failed", detail: "xctrace exited with code 1" }),
+          )
+
+          const health = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(health.resources.trace).toBe("failed")
+          expect(health.resources.runner).toBe("ready")
+          expect(health.state).toBe("ready")
+          expect(health.warnings.some((warning) => warning.includes("Raw perf trace capture failed"))).toBe(true)
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("rejects a trace lease for a disconnected real-device target before starting any capture", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness(), {
+          realDeviceHarness: createFakeRealDeviceHarness({
+            connectionStates: ["connected", "disconnected"],
+          }),
+        })
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openDeviceSession(deviceOpenParams))
+          // Cache a "disconnected" connection status onto the record via
+          // normal health checks, matching how a real caller would observe
+          // it before ever attempting a raw perf capture. `refreshConnection`
+          // consumes `connectionStates` in order starting from index 0
+          // regardless of what `open` used, so the first health check here
+          // reports "connected" and the second reports "disconnected".
+          await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          const refreshed = await runtime.runPromise(registry.getSessionHealth(session.sessionId))
+          expect(refreshed.connection.status).toBe("disconnected")
+
+          const lease = await runtime.runPromise(Effect.either(registry.beginTraceLease(session.sessionId)))
+          expect(Either.isLeft(lease)).toBe(true)
+          if (Either.isLeft(lease)) {
+            expect(lease.left).toBeInstanceOf(EnvironmentError)
+            if (lease.left instanceof EnvironmentError) {
+              expect(lease.left.code).toBe("perf-target-device-disconnected")
+            }
+          }
+
+          await runtime.runPromise(registry.closeSession(session.sessionId))
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+
+    test("session close interrupts and joins an in-flight trace lease before finishing teardown", async () => {
+      await withTempRoot(async (root) => {
+        const runtime = makeRuntime(root, createFakeHarness())
+
+        try {
+          const registry = await runtime.runPromise(Effect.gen(function* () {
+            return yield* SessionRegistry
+          }))
+
+          const session = await runtime.runPromise(registry.openSimulatorSession(openParams))
+          const lease = await runtime.runPromise(registry.beginTraceLease(session.sessionId))
+
+          let aborted = false
+          lease.signal.addEventListener("abort", () => {
+            aborted = true
+          })
+
+          const closePromise = runtime.runPromise(registry.closeSession(session.sessionId))
+
+          // Close must abort the lease's signal -- the interrupt half --
+          // before it can finish tearing down.
+          await waitFor(async () => aborted, (value) => value === true)
+
+          // Close must not finish while the lease is still unsettled -- the
+          // join half. `endTraceLease` is deliberately not called yet.
+          let closeSettled = false
+          closePromise.then(() => {
+            closeSettled = true
+          })
+          await sleep(50)
+          expect(closeSettled).toBe(false)
+
+          // Simulate the raw capture's own `Effect.onExit` finalizer
+          // acknowledging the interrupt (PerfService's role in production,
+          // reached once the owned xctrace child actually unwinds through
+          // AppleProcessSupervisor's TERM -> grace -> KILL ladder).
+          await runtime.runPromise(
+            registry.endTraceLease(session.sessionId, { kind: "failed", detail: "interrupted by session close" }),
+          )
+
+          const closed = await closePromise
+          expect(closed.state).toBe("closed")
+        } finally {
+          await runtime.dispose()
+        }
+      })
+    })
+  })
 })
