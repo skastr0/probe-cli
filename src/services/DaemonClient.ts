@@ -42,7 +42,7 @@ import type {
   PerfSignpostSummaryResult,
   PerfTemplate,
 } from "../domain/perf"
-import type { BoundedSessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
+import type { BoundedSessionHealth, BoundedSessionList, SimulatorSessionMode } from "../domain/session"
 import { ArtifactStore } from "./ArtifactStore"
 import { resolveDevelopmentTeamFromHost } from "./DeviceSigningConfig"
 import {
@@ -97,7 +97,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
     readonly listSessions: (params: {
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      ReadonlyArray<SessionListEntry>,
+      BoundedSessionList,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError

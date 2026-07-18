@@ -33,7 +33,7 @@ import {
   PerfSummaryGroupBy,
   PerfTemplate,
 } from "../domain/perf"
-import { BoundedSessionHealthSchema, SessionListEntry, SimulatorSessionMode } from "../domain/session"
+import { BoundedSessionHealthSchema, BoundedSessionListSchema, SimulatorSessionMode } from "../domain/session"
 import { SessionSnapshotResultSchema } from "../domain/snapshot"
 
 export const PROBE_PROTOCOL_VERSION = "probe-rpc/v1"
@@ -469,12 +469,15 @@ export const SessionOpenResponse = Schema.Struct({
 })
 export type SessionOpenResponse = typeof SessionOpenResponse.Type
 
+// PRB-094 AC3 review finding (minor): `result` used to inline every active
+// session unbounded -- see `BoundedSessionListSchema` (domain/session.ts)
+// for why nothing in the daemon caps concurrent active sessions.
 export const SessionListResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.list"),
-  result: Schema.Array(SessionListEntry),
+  result: BoundedSessionListSchema,
 })
 export type SessionListResponse = typeof SessionListResponse.Type
 

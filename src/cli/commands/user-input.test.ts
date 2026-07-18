@@ -1814,4 +1814,81 @@ describe("cli user input handling", () => {
       },
     })
   })
+
+  // PRB-094 AC3 review fix: `session list` now renders a bounded collection
+  // (see ProbeKernel.bounded.test.ts's 10k-session budget test for the
+  // RPC-boundary half of this fix) -- this proves the CLI's own text/JSON
+  // rendering handles the bounded shape's shown/omitted/drill fields
+  // instead of assuming a plain array.
+  test("session list renders the bounded shown/omitted/drill shape", async () => {
+    const boundedSessions = {
+      total: 2,
+      shown: [
+        {
+          id: "session-1",
+          target: { platform: "simulator" as const, deviceId: "sim-1", deviceName: "iPhone 16", runtime: "iOS 18.0" },
+          bundleId: "com.example.app",
+          state: "ready" as const,
+          openedAt: "2026-04-14T12:00:00.000Z",
+        },
+      ],
+      omitted: 1,
+      drill: {
+        contractVersion: 1 as const,
+        sessionId: "workspace-diagnostics",
+        artifactKey: "derived-session-list-overflow",
+        query: { kind: "collection" as const, offset: 0, limit: 200 },
+      },
+    }
+
+    const client = DaemonClient.of({
+      ping: unexpectedClientCall,
+      listSessions: () => Effect.succeed(boundedSessions),
+      openSession: unexpectedClientCall,
+      showSession: unexpectedClientCall,
+      getSessionHealth: unexpectedClientCall,
+      closeSession: unexpectedClientCall,
+      getSessionLogs: unexpectedClientCall,
+      markSessionLog: unexpectedClientCall,
+      captureLogWindow: unexpectedClientCall,
+      getLogDoctorReport: unexpectedClientCall,
+      runSessionDebugCommand: unexpectedClientCall,
+      captureSnapshot: unexpectedClientCall,
+      captureScreenshot: unexpectedClientCall,
+      recordVideo: unexpectedClientCall,
+      performSessionAction: unexpectedClientCall,
+      runSessionFlow: unexpectedClientCall,
+      exportSessionRecording: unexpectedClientCall,
+      replaySessionRecording: unexpectedClientCall,
+      getSessionResultSummary: unexpectedClientCall,
+      getSessionResultAttachments: unexpectedClientCall,
+      recordPerf: unexpectedClientCall,
+      recordPerfAroundFlow: unexpectedClientCall,
+      summarizePerfBySignpost: unexpectedClientCall,
+      exportPerfSchema: unexpectedClientCall,
+      analyzePerfTrace: unexpectedClientCall,
+      drillArtifact: unexpectedClientCall,
+      captureDiagnosticBundle: unexpectedClientCall,
+    } as any)
+
+    const output = await captureConsoleLogs(
+      runSessionCommand(["list"]).pipe(
+        Effect.provideService(DaemonClient, client),
+      ),
+    )
+
+    expect(output).toContain("sessions (1 of 2, 1 omitted -- drill derived-session-list-overflow):")
+    expect(output).toContain("session id: session-1")
+
+    const jsonOutput = await captureConsoleLogs(
+      runSessionCommand(["list", "--output-json"]).pipe(
+        Effect.provideService(DaemonClient, client),
+      ),
+    )
+
+    const parsed = JSON.parse(jsonOutput)
+    expect(parsed.total).toBe(2)
+    expect(parsed.omitted).toBe(1)
+    expect(parsed.drill.artifactKey).toBe("derived-session-list-overflow")
+  })
 })

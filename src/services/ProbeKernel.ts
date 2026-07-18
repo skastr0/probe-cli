@@ -86,6 +86,10 @@ const probeProjectRoot = resolveProbeRuntimeRoot()
 // 10k-item fixtures for the budget measurement these were tuned against.
 const sessionHealthArtifactsShownLimit = 3
 const sessionHealthWarningsShownLimit = 5
+// PRB-094 AC3 review finding (minor): `session.list` has no per-session
+// artifact/warning budget to inherit -- it reports every in-memory active
+// session the daemon tracks, and nothing caps concurrent active sessions.
+const sessionListShownLimit = 10
 const flowExecutedStepsShownLimit = 5
 const flowArtifactsShownLimit = 3
 const flowWarningsShownLimit = 5
@@ -1247,7 +1251,17 @@ export const ProbeKernelLive = Layer.effect(
 
           case "session.list": {
             progress("session.list", "Listing active sessions.")
-            const result = yield* sessionRegistry.listActiveSessions()
+            const sessions = yield* sessionRegistry.listActiveSessions()
+            // PRB-094 AC3 review fix: bound the same way session
+            // health/flow results are bound at the RPC boundary -- scoped
+            // under `workspaceDiagnosticsSessionId` since this reports on
+            // every active session the daemon tracks, not one session.
+            const result = yield* bindBoundedCollection(artifactStore, {
+              sessionId: workspaceDiagnosticsSessionId,
+              collectionLabel: "session-list",
+              items: sessions,
+              shownLimit: sessionListShownLimit,
+            })
             return {
               kind: "response",
               protocolVersion: PROBE_PROTOCOL_VERSION,

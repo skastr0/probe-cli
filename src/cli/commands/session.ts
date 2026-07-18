@@ -28,6 +28,7 @@ import {
   SimulatorSessionMode as SimulatorSessionModeSchema,
   type SimulatorSessionMode,
   type BoundedSessionHealth,
+  type BoundedSessionList,
   type SessionListEntry,
 } from "../../domain/session"
 import type { SessionSnapshotResult } from "../../domain/snapshot"
@@ -163,18 +164,33 @@ const formatSessionListTarget = (target: SessionListEntry["target"]): string => 
   return `${target.deviceName} (${target.deviceId}) [${target.platform}${runtimeSuffix}]`
 }
 
-const formatSessionList = (sessions: ReadonlyArray<SessionListEntry>): string => {
-  if (sessions.length === 0) {
+// PRB-094 AC3 review fix: `sessions` is now a bounded collection (see
+// domain/bounded.ts) -- `.shown` is the inline preview, `.omitted`/`.drill`
+// surface how to reach the rest instead of the CLI ever iterating an
+// unbounded array, same "N of total, M omitted -- drill <key>" idiom as
+// `session health`'s artifacts/warnings formatter above.
+const formatSessionList = (sessions: BoundedSessionList): string => {
+  if (sessions.total === 0) {
     return "no active sessions"
   }
 
-  return sessions.map((session) => [
-    `session id: ${session.id}`,
-    `state: ${session.state}`,
-    `bundle id: ${session.bundleId}`,
-    `target: ${formatSessionListTarget(session.target)}`,
-    `opened at: ${session.openedAt}`,
-  ].join("\n")).join("\n\n")
+  const header = `sessions (${sessions.shown.length} of ${sessions.total}${
+    sessions.omitted > 0
+      ? `, ${sessions.omitted} omitted -- drill ${sessions.drill?.artifactKey}`
+      : ""
+  }):`
+
+  return [
+    header,
+    "",
+    sessions.shown.map((session) => [
+      `session id: ${session.id}`,
+      `state: ${session.state}`,
+      `bundle id: ${session.bundleId}`,
+      `target: ${formatSessionListTarget(session.target)}`,
+      `opened at: ${session.openedAt}`,
+    ].join("\n")).join("\n\n"),
+  ].join("\n")
 }
 
 const printSessionHealth = (health: BoundedSessionHealth, asJson: boolean) =>

@@ -299,6 +299,86 @@ describe("ProbeKernel bounded-collection RPC boundary (PRB-094)", () => {
     }
   })
 
+  // PRB-094 AC3 review finding (minor): `session.list` reported every
+  // in-memory active session unbounded -- nothing caps concurrent active
+  // sessions the way a single session's artifacts/warnings are capped by
+  // that session's own lifetime activity. This proves a long-lived daemon
+  // juggling many sessions still stays within the generic budget.
+  test("session.list stays within the generic 4 KiB / 100 line budget with 10k active sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
+
+    try {
+      const sessions = Array.from({ length: 10_000 }, (_, index) => ({
+        id: `session-${index}`,
+        target: {
+          platform: "simulator" as const,
+          deviceId: `sim-${index}`,
+          deviceName: "iPhone 16",
+          runtime: "iOS 18.0",
+        },
+        bundleId: "com.example.app",
+        state: "ready" as const,
+        openedAt: "2026-04-14T12:00:00.000Z",
+      }))
+
+      const runtime = buildKernel(root, {
+        listActiveSessions: () => Effect.succeed(sessions),
+      })
+
+      try {
+        const kernel = await runtime.runPromise(Effect.gen(function* () {
+          return yield* ProbeKernel
+        }))
+        const response: any = await runtime.runPromise(kernel.handleRpcRequest({
+          kind: "request",
+          protocolVersion: PROBE_PROTOCOL_VERSION,
+          requestId: "req-1",
+          method: "session.list",
+          params: {},
+        }, () => {}))
+
+        const serialized = JSON.stringify(response)
+        const bytes = Buffer.byteLength(serialized, "utf8")
+        const lines = countLines(serialized)
+
+        expect(bytes).toBeLessThanOrEqual(maxInlineBytes)
+        expect(lines).toBeLessThanOrEqual(maxInlineLines)
+
+        expect(response.result.total).toBe(10_000)
+        expect(response.result.shown.length).toBeLessThan(10_000)
+        expect(response.result.omitted).toBe(10_000 - response.result.shown.length)
+        expect(response.result.drill).not.toBeNull()
+        expect(response.result.drill.sessionId).toBe("workspace-diagnostics")
+
+        const handle = response.result.drill
+        const drilled: any = await runtime.runPromise(kernel.handleRpcRequest({
+          kind: "request",
+          protocolVersion: PROBE_PROTOCOL_VERSION,
+          requestId: "req-2",
+          method: "artifact.drill",
+          params: {
+            sessionId: "workspace-diagnostics",
+            artifactKey: handle.artifactKey,
+            outputMode: "inline",
+            query: { kind: "collection", offset: 9_999, limit: 10 },
+          },
+        }, () => {}))
+
+        expect(drilled.result.kind).toBe("inline")
+
+        if (drilled.result.kind === "inline") {
+          const page = JSON.parse(drilled.result.content) as Array<{ readonly id: string }>
+          expect(page).toHaveLength(1)
+          expect(page[0]?.id).toBe("session-9999")
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("session.run stays within the generic 4 KiB / 100 line budget with a 10k-step flow", async () => {
     const root = await mkdtemp(join(tmpdir(), "probe-kernel-bounded-"))
 
