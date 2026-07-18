@@ -318,6 +318,39 @@ describe("InvestigationController -- cancellation preserves verified artifacts",
     })
   })
 
+  test("cancelling during cooldown does not wait out the full interval (AC#5 review fix)", async () => {
+    let investigationId = ""
+    const { deps, capturedIndices, captureRepetitionRef } = makeFakeDeps({
+      onReserveRecorder: (id) => {
+        investigationId = id
+      },
+    })
+    // `sleep` never resolves on its own -- if the cooldown were awaited to
+    // completion instead of raced against a cancellation poll
+    // (`interruptibleCooldown`, InvestigationController.ts), this test would
+    // hang until bun's test timeout rather than observing "cancelled".
+    const neverCooldownDeps: InvestigationExecutorDeps = { ...deps, sleep: () => Effect.never }
+
+    await withController(neverCooldownDeps, async ({ controller, store }) => {
+      const originalCapture = captureRepetitionRef.current
+      captureRepetitionRef.current = (args) =>
+        Effect.gen(function* () {
+          if (args.repetitionIndex === 0) {
+            yield* store.requestCancel(investigationId)
+          }
+
+          return yield* originalCapture(args)
+        })
+
+      const inspection = await Effect.runPromise(controller.run({
+        recipeInput: { ...baseRecipe, cooldown: { minIntervalMs: 60_000 } },
+      }))
+
+      expect(inspection.status).toBe("cancelled")
+      expect(capturedIndices).toEqual([0])
+    })
+  })
+
   test("a terminal (cancelled) investigation cannot be resumed", async () => {
     let investigationId = ""
     const { deps, captureRepetitionRef } = makeFakeDeps({ onReserveRecorder: (id) => { investigationId = id } })

@@ -53,6 +53,26 @@ const perfChannelSchemas: ReadonlyArray<{
   { key: "thermalState", schema: "device-thermal-state-intervals" },
 ]
 
+// Review fix (AC#10, major): "Reference custom-template run performs zero
+// eager schema exports." A custom `.tracetemplate`'s schema set is unknown
+// to Probe ahead of time -- the exact reason `perf record --custom-template`
+// already ships zero eager schema exports of its own
+// (`buildCustomTemplateSpec`'s `exportSchemas: []`, PerfService.ts, PRB-097).
+// Looping PRB-098's six known preset schemas against an arbitrary custom
+// trace was performing exactly the eager, speculative probing PRB-097
+// deliberately avoided at record time. A preset template's known schemas are
+// still exported eagerly here (unchanged) since Probe knows in advance which
+// of the six a given preset template can produce; a custom capture instead
+// returns an evidence report with every channel "unavailable" (the same
+// `buildEvidenceReport` fallback an absent table already produces) --
+// `probe drill` against the preserved raw trace artifact is the documented
+// path for custom-template insight (see the "custom-template-no-analysis"
+// diagnosis, PerfService.ts).
+const eagerlyExportedChannelSchemas = (
+  capture: { readonly kind: "preset" | "custom" },
+): ReadonlyArray<{ readonly key: keyof PerfEvidenceChannelTables; readonly schema: string }> =>
+  capture.kind === "preset" ? perfChannelSchemas : []
+
 let cachedXcodeVersion: string | null = null
 
 const resolveXcodeVersion = async (): Promise<string> => {
@@ -173,7 +193,7 @@ export const makeInvestigationExecutorDepsLive = (daemonClient: Context.Tag.Serv
 
       const tables: Record<string, ParsedPerfTable | undefined> = {}
 
-      for (const { key, schema } of perfChannelSchemas) {
+      for (const { key, schema } of eagerlyExportedChannelSchemas(capture)) {
         const exported = yield* daemonClient
           .exportPerfSchema({ sessionId, artifactKey: traceArtifactKey, schema })
           .pipe(Effect.either)

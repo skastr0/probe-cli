@@ -1,5 +1,5 @@
 import { Context, Effect, Layer } from "effect"
-import { boundedCollectionAllShown, type BoundedCollection } from "../domain/bounded"
+import { BOUNDED_COLLECTION_CONTRACT_VERSION, boundedCollectionAllShown, type BoundedCollection } from "../domain/bounded"
 import {
   assembleInvestigationReport,
   buildInvestigationEvent,
@@ -11,8 +11,10 @@ import {
   mergeInvestigationEvidenceReports,
   overallFindingsConfidence,
   planInvestigation,
+  summarizeInvestigationComparison,
   validateInvestigationRecipe,
   validateInvestigationRecipeDomain,
+  type InvestigationComparisonSummary,
   type InvestigationEvent,
   type InvestigationExecutionPlan,
   type InvestigationRecipe,
@@ -192,6 +194,40 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
           return {} satisfies Partial<InvestigationState>
         })
 
+      // Review fix (AC#5, major): "cancellation interrupts ... cooldown."
+      // Before this fix the cooldown was a bare `deps.sleep(ms)` -- a cancel
+      // requested mid-sleep only took effect once the sleep itself returned
+      // and the *next* per-repetition check (top of `runCaptureStage`'s
+      // loop) ran, so a long cooldown was not actually interruptible.
+      // Racing the sleep against a short poll of the persisted
+      // `cancelRequested` flag lets a cancel win almost immediately instead
+      // of waiting out the whole interval; `Effect.race` interrupts
+      // whichever side loses, so neither leaks a dangling fiber. This does
+      // NOT address the AC's other two clauses ("interrupts ... flow,
+      // recording") -- `InvestigationExecutorDeps` has no abort-capable RPC
+      // surface for a running `runFlow`/`captureRepetition` call, and racing
+      // away from one without a real daemon-side abort would leave a flow or
+      // recording running unobserved on the device, which is worse than the
+      // current "wait for it to finish" behavior. That gap is real and
+      // tracked as a follow-up, not attempted here.
+      const cooldownCancelPollMs = 250
+
+      const waitForCancellation = (investigationId: string): Effect.Effect<void, EnvironmentError> =>
+        Effect.gen(function* () {
+          while (true) {
+            const current = yield* store.read(investigationId)
+
+            if (current?.cancelRequested) {
+              return
+            }
+
+            yield* Effect.sleep(cooldownCancelPollMs)
+          }
+        })
+
+      const interruptibleCooldown = (investigationId: string, ms: number): Effect.Effect<void, EnvironmentError> =>
+        Effect.race(deps.sleep(ms), waitForCancellation(investigationId))
+
       // Loops from the last already-verified repetition (0 on a fresh run,
       // or wherever a crashed/interrupted prior attempt left off -- see
       // `InvestigationState.capturedRepetitions`'s header comment) through
@@ -227,7 +263,7 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
             }))
 
             if (index < recipe.repetitions - 1 && recipe.cooldown.minIntervalMs > 0) {
-              yield* deps.sleep(recipe.cooldown.minIntervalMs)
+              yield* interruptibleCooldown(state.investigationId, recipe.cooldown.minIntervalMs)
             }
           }
 
@@ -266,23 +302,75 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
         })
 
       // A regressed comparison names the channel(s) that regressed as an
-      // explicit wall -- this is the "identifies the planted channel and
-      // phase" half of the ProbeFixture planted-regression AC
-      // (`identifyRegressedMetrics`, domain/investigation.ts): a metric key
-      // is already channel-scoped, so no separate phase-attribution step
-      // is needed.
-      const buildComparisonWalls = (comparisonResult: PerfEvidenceComparisonType | null): ReadonlyArray<InvestigationWall> => {
-        if (!comparisonResult || deriveComparisonVerdict(comparisonResult) !== "regressed") {
+      // explicit wall -- the "identifies the planted channel and phase"
+      // ProbeFixture planted-regression AC. Review fix (AC#8): a metric key
+      // is channel-scoped but not phase-scoped, so `identifyRegressedMetrics`
+      // now also takes the candidate (post-change) merged report's findings
+      // and surfaces any genuinely correlated phase label alongside the
+      // channel, never a fabricated one (domain/investigation.ts's own
+      // header comment there explains which channels have real correlation
+      // evidence and which do not).
+      const buildComparisonWalls = (
+        comparisonResult: PerfEvidenceComparisonType | null,
+        candidateReport: PerfEvidenceReportType | null,
+      ): ReadonlyArray<InvestigationWall> => {
+        if (!comparisonResult || !candidateReport || deriveComparisonVerdict(comparisonResult) !== "regressed") {
           return []
         }
 
-        const regressed = identifyRegressedMetrics(comparisonResult)
+        const regressed = identifyRegressedMetrics(comparisonResult, candidateReport.findings)
         return [{
           code: "comparison-regressed",
           summary: `Comparison against the baseline regressed on ${regressed.length} metric(s).`,
-          details: regressed.map((metric) => `${metric.key}: +${(metric.relativeDelta * 100).toFixed(1)}% relative to baseline.`),
+          details: regressed.map((metric) =>
+            `${metric.key}: +${(metric.relativeDelta * 100).toFixed(1)}% relative to baseline.`
+            + (metric.phases.length > 0 ? ` Phase(s) temporally correlated: ${metric.phases.join(", ")}.` : "")),
         }]
       }
+
+      // Review fix (AC#6, critical): the ONLY place PRB-098's full
+      // `PerfEvidenceComparison` (raw pooled samples included) is allowed to
+      // reach durable state -- `InvestigationState.comparisonResult` itself
+      // -- never the terminal `report`. Persists the complete comparison
+      // (samples included) as one artifact unconditionally whenever a
+      // comparison exists, then returns the sample-free summary
+      // (`summarizeInvestigationComparison`, domain/investigation.ts) plus a
+      // typed drill handle at the persisted artifact, exactly mirroring
+      // `bindBoundedCollection`'s atomic-persist-before-summary contract for
+      // findings above.
+      const bindInvestigationComparison = (
+        state: InvestigationState,
+        comparisonResult: PerfEvidenceComparisonType | null,
+      ): Effect.Effect<InvestigationComparisonSummary | null, EnvironmentError> =>
+        Effect.gen(function* () {
+          if (!comparisonResult) {
+            return null
+          }
+
+          const summary = summarizeInvestigationComparison(comparisonResult)
+
+          if (!comparisonResult.comparable) {
+            return { ...summary, rawSamplesDrill: null }
+          }
+
+          const artifact = yield* artifactStore.writeDerivedOutput({
+            sessionId: state.sessionId,
+            label: `investigation-${state.investigationId}-comparison-samples`,
+            format: "json",
+            content: `${JSON.stringify(comparisonResult, null, 2)}\n`,
+            summary: `Full baseline/candidate comparison for investigation ${state.investigationId}, including every pooled raw sample across ${comparisonResult.metrics.length} metric(s).`,
+          })
+
+          return {
+            ...summary,
+            rawSamplesDrill: {
+              contractVersion: BOUNDED_COLLECTION_CONTRACT_VERSION,
+              sessionId: state.sessionId,
+              artifactKey: artifact.key,
+              query: { kind: "json" as const, pointer: "" },
+            },
+          }
+        })
 
       const runReportStage = (state: InvestigationState) =>
         Effect.gen(function* () {
@@ -301,14 +389,16 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
             shownLimit: findingsInlineLimit,
           })
 
+          const comparison = yield* bindInvestigationComparison(state, state.comparisonResult)
+
           const report = assembleInvestigationReport({
             investigationId: state.investigationId,
             recipeHash: state.recipeHash,
             status: "completed",
             findings,
             confidence: overallFindingsConfidence(merged),
-            walls: buildComparisonWalls(state.comparisonResult),
-            comparison: state.comparisonResult,
+            walls: buildComparisonWalls(state.comparisonResult, state.mergedEvidenceReport as PerfEvidenceReportType | null),
+            comparison,
             repetitionReportKeys: state.capturedRepetitions.map((repetition) => repetition.traceArtifactKey),
             generatedAt: deps.nowIso(),
           })

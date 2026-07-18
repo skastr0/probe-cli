@@ -1,12 +1,11 @@
 import { Schema } from "effect"
-import { BoundedCollectionSchema, type BoundedCollection } from "./bounded"
+import { BoundedCollectionDrillHandle, BoundedCollectionSchema, type BoundedCollection } from "./bounded"
 import { EvidencePolicyInputSchema, resolveEvidencePolicy, type EvidencePolicy, type EvidencePolicyInput } from "./evidence"
 import { isBatchSequencePlannedStep, isFastSinglePlannedStep, planFlowExecution } from "./flow-planner"
 import { decodeSessionFlowContract, type SessionFlowContract } from "./flow-v2"
 import { PerfTemplate } from "./perf"
 import {
   compareEvidenceReports,
-  PerfEvidenceComparison,
   PerfEvidenceFinding,
   PerfEvidenceReport,
   type PerfEvidenceComparison as PerfEvidenceComparisonType,
@@ -415,6 +414,21 @@ export type InvestigationOverallVerdict = typeof InvestigationOverallVerdict.Typ
 // number both `deriveComparisonVerdict` and its test agree on.
 export const DEFAULT_REGRESSION_THRESHOLD = 0.05
 
+// Structural (not nominal) input `deriveComparisonVerdict` needs -- only
+// `comparable` and each metric's `relativeDelta`, which both PRB-098's full
+// `PerfEvidenceComparisonType` (raw samples included) and this module's own
+// bounded `InvestigationComparisonSummaryType` (raw samples stripped, see
+// below) carry identically. Widened from the concrete `PerfEvidenceComparisonType`
+// so the SAME verdict derivation runs against either shape without a second
+// copy of this logic -- `assembleInvestigationReport` calls it against the
+// already-bounded summary, `buildComparisonWalls` (InvestigationController.ts)
+// against the full comparison, and both agree because samples never factor
+// into the verdict math.
+export interface ComparisonVerdictInput {
+  readonly comparable: boolean
+  readonly metrics: ReadonlyArray<{ readonly relativeDelta: number | null }>
+}
+
 /**
  * Turns PRB-098's per-metric `PerfEvidenceComparison` into the single
  * top-level verdict word the terminal report needs. A comparison is
@@ -425,7 +439,7 @@ export const DEFAULT_REGRESSION_THRESHOLD = 0.05
  * verdict meaningless, per PRB-098's own `comparable` gate).
  */
 export const deriveComparisonVerdict = (
-  comparison: PerfEvidenceComparisonType,
+  comparison: ComparisonVerdictInput,
   threshold: number = DEFAULT_REGRESSION_THRESHOLD,
 ): InvestigationComparisonVerdict => {
   if (!comparison.comparable) {
@@ -458,22 +472,124 @@ export const deriveComparisonVerdict = (
   return "unchanged"
 }
 
+// Review fix (AC#8): a metric key is channel-scoped (e.g.
+// "gpu-interval-duration-ns"), but "identifies the planted channel and
+// phase" is two distinct claims -- the channel is not the phase. The one
+// genuine per-row phase correlation this codebase already derives is
+// `buildHangPhaseInferences` (perf-evidence.ts), which stamps each
+// "potential-hangs" inference finding's `windowLabel` with the signpost
+// phase it temporally overlaps. The other four known metrics
+// (`gpu-interval-duration-ns`, `main-thread-cpu-ns`, `main-thread-wait-ns`,
+// `thermal-interval-duration-ns`) have no equivalent: `buildMetricSeries`
+// (perf-evidence.ts) keeps only each row's numeric value, discarding the
+// row's own timestamp, so there is no honest way to name *which* phase a
+// regressed sample from those channels fell in -- fabricating one would
+// violate this same file's "no causal claim from temporal correlation
+// alone" rule. Reporting an empty `phases` array for those channels is the
+// same "unavailable, never nominal" posture `perf-evidence.ts` already uses
+// for its thermal channel, applied here instead of a fabricated phase.
+const regressedMetricPhaseSourceSchema: Readonly<Record<string, string>> = {
+  "hang-duration-ns": "potential-hangs",
+}
+
 /**
  * Identifies which metric key(s) drove a "regressed" verdict, ranked by
  * relative delta descending -- the "identifies the planted channel and
- * phase" half of the ProbeFixture planted-regression AC. A metric key is
- * already channel-scoped (e.g. "gpu-interval-duration-ns", domain/
- * perf-evidence.ts `buildMetricSeries`), so no separate phase-attribution
- * step is needed: the key itself names the regressed channel.
+ * phase" ProbeFixture planted-regression AC. `candidateFindings` is the
+ * candidate (post-change) merged evidence report's own findings
+ * (`InvestigationState.mergedEvidenceReport.findings` -- see
+ * `InvestigationController.ts`'s `buildComparisonWalls`), read only for the
+ * phase labels a genuine existing correlation already names.
  */
 export const identifyRegressedMetrics = (
   comparison: PerfEvidenceComparisonType,
+  candidateFindings: ReadonlyArray<PerfEvidenceFindingType>,
   threshold: number = DEFAULT_REGRESSION_THRESHOLD,
-): ReadonlyArray<{ readonly key: string; readonly relativeDelta: number }> =>
-  comparison.metrics
+): ReadonlyArray<{ readonly key: string; readonly relativeDelta: number; readonly phases: ReadonlyArray<string> }> => {
+  const phasesForSourceSchema = (schema: string): ReadonlyArray<string> =>
+    [...new Set(
+      candidateFindings
+        .filter((finding) => finding.kind === "inference" && finding.source.schema === schema)
+        .map((finding) => finding.windowLabel),
+    )]
+
+  return comparison.metrics
     .filter((metric): metric is typeof metric & { relativeDelta: number } => metric.relativeDelta !== null && metric.relativeDelta > threshold)
-    .map((metric) => ({ key: metric.key, relativeDelta: metric.relativeDelta }))
+    .map((metric) => {
+      const phaseSourceSchema = regressedMetricPhaseSourceSchema[metric.key]
+      return {
+        key: metric.key,
+        relativeDelta: metric.relativeDelta,
+        phases: phaseSourceSchema ? phasesForSourceSchema(phaseSourceSchema) : [],
+      }
+    })
     .sort((left, right) => right.relativeDelta - left.relativeDelta)
+}
+
+// Review fix (AC#6, critical): PRB-098's `PerfEvidenceComparisonMetric`
+// carries `baselineSamples`/`candidateSamples` -- the FULL pooled raw sample
+// arrays across every repetition (`mergeInvestigationEvidenceReports`
+// concatenates every repetition's samples per key). Surfacing
+// `PerfEvidenceComparison` verbatim in the terminal report was exactly the
+// unbounded-terminal-JSON violation AC#6 exists to prevent: a multi-thousand-
+// interval trace x N repetitions comparison would inline tens of thousands
+// of numbers. This mirrors every other stat here -- median/p95/delta/count
+// are already small, fixed-size summaries; only the raw arrays are bulk
+// evidence, so only they move to an artifact (`bindInvestigationComparison`,
+// services/InvestigationController.ts), leaving a typed drill handle behind
+// exactly like `BoundedCollection`'s overflow artifact does for findings.
+export const InvestigationComparisonMetricSummary = Schema.Struct({
+  key: Schema.String,
+  unit: Schema.Literal("ns"),
+  baselineMedian: Schema.NullOr(Schema.Number),
+  candidateMedian: Schema.NullOr(Schema.Number),
+  baselineP95: Schema.NullOr(Schema.Number),
+  candidateP95: Schema.NullOr(Schema.Number),
+  absoluteDelta: Schema.NullOr(Schema.Number),
+  relativeDelta: Schema.NullOr(Schema.Number),
+  baselineCount: Schema.Number,
+  candidateCount: Schema.Number,
+})
+export type InvestigationComparisonMetricSummary = typeof InvestigationComparisonMetricSummary.Type
+
+export const InvestigationComparisonSummary = Schema.Struct({
+  comparable: Schema.Boolean,
+  reason: Schema.optional(Schema.String),
+  provenanceDiff: Schema.Array(Schema.String),
+  appBuildChanged: Schema.Boolean,
+  metrics: Schema.Array(InvestigationComparisonMetricSummary),
+  // Non-null exactly when `comparable` -- a non-comparable comparison has no
+  // metrics (PRB-098's `compareEvidenceReports` already short-circuits to
+  // `metrics: []` on provenance mismatch), so there is no bulk sample
+  // evidence to persist. Comparable runs always persist the full comparison
+  // (including every raw sample) as one artifact, never conditionally on
+  // sample count -- "bulk evidence stays artifacts" applies unconditionally,
+  // not just past some inline threshold.
+  rawSamplesDrill: Schema.Union(BoundedCollectionDrillHandle, Schema.Null),
+})
+export type InvestigationComparisonSummary = typeof InvestigationComparisonSummary.Type
+
+/** Pure: strips each metric's raw sample arrays, keeping every already-small summary statistic. Caller (services/InvestigationController.ts) attaches `rawSamplesDrill` after persisting the full comparison. */
+export const summarizeInvestigationComparison = (
+  comparison: PerfEvidenceComparisonType,
+): Omit<InvestigationComparisonSummary, "rawSamplesDrill"> => ({
+  comparable: comparison.comparable,
+  ...(comparison.reason !== undefined ? { reason: comparison.reason } : {}),
+  provenanceDiff: comparison.provenanceDiff,
+  appBuildChanged: comparison.appBuildChanged,
+  metrics: comparison.metrics.map((metric) => ({
+    key: metric.key,
+    unit: metric.unit,
+    baselineMedian: metric.baselineMedian,
+    candidateMedian: metric.candidateMedian,
+    baselineP95: metric.baselineP95,
+    candidateP95: metric.candidateP95,
+    absoluteDelta: metric.absoluteDelta,
+    relativeDelta: metric.relativeDelta,
+    baselineCount: metric.baselineCount,
+    candidateCount: metric.candidateCount,
+  })),
+})
 
 export const InvestigationReport = Schema.Struct({
   investigationId: Schema.String,
@@ -483,7 +599,7 @@ export const InvestigationReport = Schema.Struct({
   confidence: Schema.Literal("high", "medium", "low"),
   findings: BoundedCollectionSchema(PerfEvidenceFinding),
   walls: Schema.Array(InvestigationWall),
-  comparison: Schema.Union(PerfEvidenceComparison, Schema.Null),
+  comparison: Schema.Union(InvestigationComparisonSummary, Schema.Null),
   comparisonVerdict: InvestigationComparisonVerdict,
   repetitionReportKeys: Schema.Array(Schema.String),
   generatedAt: Schema.String,
@@ -530,8 +646,11 @@ export const mergeAndRankFindings = (
  * bounded ranked findings, confidence, walls, comparison verdict, and typed
  * drill refs; bulk evidence stays artifacts"). Takes an already-merged,
  * already-bounded `findings` collection (see `mergeAndRankFindings` +
- * `bindBoundedCollection` above) rather than computing it itself -- this
- * function's only job is assembling the final envelope around it.
+ * `bindBoundedCollection` above) and an already-bounded `comparison`
+ * (`summarizeInvestigationComparison` + a persisted `rawSamplesDrill`, see
+ * `services/InvestigationController.ts`'s `bindInvestigationComparison`)
+ * rather than computing either itself -- this function's only job is
+ * assembling the final envelope around them.
  */
 export const assembleInvestigationReport = (args: {
   readonly investigationId: string
@@ -540,7 +659,7 @@ export const assembleInvestigationReport = (args: {
   readonly findings: BoundedCollection<PerfEvidenceFindingType>
   readonly confidence: "high" | "medium" | "low"
   readonly walls: ReadonlyArray<InvestigationWall>
-  readonly comparison: PerfEvidenceComparisonType | null
+  readonly comparison: InvestigationComparisonSummary | null
   readonly repetitionReportKeys: ReadonlyArray<string>
   readonly generatedAt: string
 }): InvestigationReport => {

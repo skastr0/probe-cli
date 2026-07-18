@@ -12,6 +12,7 @@ import {
   mergeInvestigationEvidenceReports,
   overallFindingsConfidence,
   planInvestigation,
+  summarizeInvestigationComparison,
   validateInvestigationRecipe,
   validateInvestigationRecipeDomain,
   type InvestigationRecipe,
@@ -27,6 +28,16 @@ const boundFindingsForTest = (findings: ReadonlyArray<PerfEvidenceFinding>, show
   const { shown, omitted } = sliceBoundedCollection(findings, shownLimit)
   return omitted === 0 ? boundedCollectionAllShown(findings) : { total: findings.length, shown, omitted, drill: null }
 }
+
+// Pure test-only stand-in for `services/InvestigationController.ts#bindInvestigationComparison`
+// (which needs `ArtifactStore` + an Effect to persist the full comparison) --
+// these domain-level tests only assert the sample-stripped summary shape,
+// never a real drill handle; `InvestigationController.test.ts` covers the
+// real, persisted-artifact drill handle end to end.
+const summarizeComparisonForTest = (comparison: PerfEvidenceComparison) => ({
+  ...summarizeInvestigationComparison(comparison),
+  rawSamplesDrill: null,
+})
 
 // PRB-099: pure-domain tests for the `probe investigate` orbit's core --
 // recipe decode/validation, planning, recipe-digest determinism, the
@@ -205,8 +216,48 @@ describe("ProbeFixture planted-regression recipe (fake capture lanes)", () => {
     const comparison: PerfEvidenceComparison = compareReports(baselineReport, regressedReport)
     expect(comparison.comparable).toBe(true)
     expect(deriveComparisonVerdict(comparison)).toBe("regressed")
-    const regressedMetrics = identifyRegressedMetrics(comparison)
+    const regressedMetrics = identifyRegressedMetrics(comparison, regressedReport.findings)
     expect(regressedMetrics.map((metric) => metric.key)).toEqual(["gpu-interval-duration-ns"])
+    // Review fix (AC#8): no genuine per-row phase correlation exists for the
+    // gpu channel (`buildMetricSeries` keeps only each row's numeric value,
+    // never its timestamp) -- an honest empty array, never a fabricated
+    // phase.
+    expect(regressedMetrics[0]?.phases).toEqual([])
+  })
+
+  test("a hang-duration-ns regression surfaces the phase(s) its hang-phase-overlap findings already name", () => {
+    const hangPhaseFinding: PerfEvidenceFinding = {
+      id: "hang-phase-overlap-0-onboarding",
+      kind: "inference",
+      summary: "A 500.00ms hang temporally overlaps phase \"onboarding\". This is a temporal correlation only, not a causal claim.",
+      windowLabel: "onboarding",
+      source: { schema: "potential-hangs", rowSelector: "row[0]" },
+      confidence: "medium",
+      basis: ["potential-hangs interval rows", "phase window \"onboarding\" (signpost)"],
+    }
+    const regressedHangs = { ...makeReport({ appBuild: "2", cpuSamples: [1_000_000] }), findings: [hangPhaseFinding] }
+    const hangComparison: PerfEvidenceComparison = {
+      comparable: true,
+      provenanceDiff: [],
+      appBuildChanged: true,
+      metrics: [{
+        key: "hang-duration-ns",
+        unit: "ns",
+        baselineSamples: [10_000_000],
+        candidateSamples: [500_000_000],
+        baselineMedian: 10_000_000,
+        candidateMedian: 500_000_000,
+        baselineP95: 10_000_000,
+        candidateP95: 500_000_000,
+        absoluteDelta: 490_000_000,
+        relativeDelta: 49,
+        baselineCount: 1,
+        candidateCount: 1,
+      }],
+    }
+
+    const regressedMetrics = identifyRegressedMetrics(hangComparison, regressedHangs.findings)
+    expect(regressedMetrics).toEqual([{ key: "hang-duration-ns", relativeDelta: 49, phases: ["onboarding"] }])
   })
 
   test("regressed -> fixed reports improved (recovers toward baseline)", () => {
@@ -301,12 +352,18 @@ describe("assembleInvestigationReport", () => {
       findings: boundFindingsForTest(merged, 20),
       confidence: overallFindingsConfidence(merged),
       walls: [],
-      comparison,
+      comparison: summarizeComparisonForTest(comparison),
       repetitionReportKeys: ["rep-0"],
       generatedAt: "2026-01-01T00:00:00.000Z",
     })
     expect(report.overallVerdict).toBe("before-after-proof")
     expect(report.comparisonVerdict).toBe("regressed")
+    // Review fix (AC#6): the terminal report's comparison never carries the
+    // raw per-metric sample arrays -- only the already-small summary
+    // statistics survive.
+    expect(report.comparison?.metrics[0]).not.toHaveProperty("baselineSamples")
+    expect(report.comparison?.metrics[0]).not.toHaveProperty("candidateSamples")
+    expect(report.comparison?.metrics[0]?.candidateMedian).toBe(2_000_000)
   })
 
   test("bounds findings and reports the true total/omitted count", () => {
