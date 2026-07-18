@@ -124,13 +124,25 @@ interface TemplateSpec {
   readonly xctraceTemplateName: string
   readonly exportSchemas: ReadonlyArray<TemplateExportSpec>
   readonly maxRecordingTimeLimitMs?: number
+}
+
+// PRB-103: `analyze` only ever lives on a *built-in* template's spec.
+// `analyzeTrace`'s `analyzer: PerfAnalyzerName` is exactly `PerfTemplate`
+// (excludes "custom" by design -- see `PerfAnalyzerName` in domain/perf.ts)
+// and `analyzeTrace` always looks its spec up from `templateSpecs` (built-ins
+// only, keyed by `PerfTemplate`), never from a custom template's spec. This
+// narrower interface makes that exclusion structural instead of a
+// same-shaped `analyze` field on `buildCustomTemplateSpec`'s output that
+// happened to be unreachable at runtime (record()/recordAroundFlow() never
+// call `.analyze()` -- only analyzeTrace does, and only for a built-in spec).
+interface AnalyzableTemplateSpec extends TemplateSpec {
   readonly analyze: (tables: Record<string, ParsedPerfTable>, targetPid: number) => {
     readonly summary: PerfSummary
     readonly diagnoses: ReadonlyArray<PerfDiagnosis>
   }
 }
 
-const templateSpecs: Record<PerfTemplate, TemplateSpec> = {
+const templateSpecs: Record<PerfTemplate, AnalyzableTemplateSpec> = {
   "time-profiler": {
     slug: "time-profiler",
     displayName: "Time Profiler",
@@ -285,25 +297,19 @@ const buildCustomTemplateRef = (templatePath: string): CustomTemplateRef => ({
   name: customTemplateNameFromPath(templatePath),
 })
 
+// PRB-103: no `analyze` field -- see AnalyzableTemplateSpec's doc comment.
+// Custom templates have no built-in schema/diagnosis contract to lazily
+// analyze against (an arbitrary `.tracetemplate` can declare any schema set;
+// Probe's built-in analyzers are hand-written per named template), so this
+// was never wired to a lazy-analysis path rather than left dead: `probe perf
+// export`/`probe drill` remain the supported way to inspect custom-template
+// output, unchanged from before this fix.
 const buildCustomTemplateSpec = (templatePath: string): TemplateSpec => ({
   slug: "custom",
   displayName: customTemplateNameFromPath(templatePath),
   xctraceTemplateName: templatePath,
   exportSchemas: [],
   maxRecordingTimeLimitMs: 120_000,
-  analyze: () => ({
-    summary: {
-      headline: "Custom template recording completed. No built-in summary available.",
-      metrics: [],
-    },
-    diagnoses: [{
-      code: "custom-template-no-analysis",
-      severity: "info" as const,
-      summary: "Custom templates do not have built-in Probe analysis. Use `probe drill` to inspect the trace artifacts.",
-      details: ["Exported schemas are available from the TOC artifact."],
-      wall: true,
-    }],
-  }),
 })
 
 const validateCustomTemplatePath = (templatePath: string) =>
