@@ -78,6 +78,45 @@ const makeFrameWriter = (socket: Socket) => (frame: OutboundFrame): void => {
   }
 }
 
+/**
+ * Bounds how long a terminal write may wait for the kernel to accept the remaining response bytes
+ * before the connection finalizer destroys the socket anyway.
+ */
+const TERMINAL_FLUSH_TIMEOUT_MS = 5_000
+
+/**
+ * Ends the socket only after the outbound buffer reaches the kernel. The per-connection finalizer
+ * destroys the socket unconditionally; ending without this wait lets that destroy discard everything
+ * beyond the first flushed chunk, truncating any terminal frame larger than ~8KB mid-line.
+ */
+const endAndAwaitFlush = (socket: Socket): Effect.Effect<void> =>
+  Effect.async<void>((resume) => {
+    if (socket.destroyed || socket.writableFinished) {
+      resume(Effect.void)
+      return
+    }
+
+    const settle = () => {
+      cleanup()
+      resume(Effect.void)
+    }
+    const cleanup = () => {
+      socket.off("finish", settle)
+      socket.off("close", settle)
+      socket.off("error", settle)
+    }
+
+    socket.once("finish", settle)
+    socket.once("close", settle)
+    socket.once("error", settle)
+
+    if (!socket.writableEnded) {
+      socket.end()
+    }
+
+    return Effect.sync(cleanup)
+  }).pipe(Effect.timeout(TERMINAL_FLUSH_TIMEOUT_MS), Effect.ignore)
+
 const fallbackRequest = (requestId: string, method: RpcMethod = "daemon.ping"): RpcRequest =>
   ({
     kind: "request",
@@ -241,7 +280,7 @@ const handleConnection = (socket: Socket, config: RpcServerConfig): Effect.Effec
           )
 
       writeFrame(failure)
-      socket.end()
+      yield* endAndAwaitFlush(socket)
       return
     }
 
@@ -258,7 +297,7 @@ const handleConnection = (socket: Socket, config: RpcServerConfig): Effect.Effec
           "Send a valid JSON request that matches the Probe RPC schema.",
         ),
       )
-      socket.end()
+      yield* endAndAwaitFlush(socket)
       return
     }
 
@@ -272,7 +311,7 @@ const handleConnection = (socket: Socket, config: RpcServerConfig): Effect.Effec
           { expectedVersion: PROBE_PROTOCOL_VERSION, receivedVersion: decoded.receivedVersion },
         ),
       )
-      socket.end()
+      yield* endAndAwaitFlush(socket)
       return
     }
 
@@ -289,19 +328,19 @@ const handleConnection = (socket: Socket, config: RpcServerConfig): Effect.Effec
           ? createFailureFrame(request, toFailurePayload(error))
           : environmentFailure(request, String(error)),
       )
-      socket.end()
+      yield* endAndAwaitFlush(socket)
       return
     }
 
     writeFrame(result.right)
-    socket.end()
+    yield* endAndAwaitFlush(socket)
   }).pipe(
     Effect.catchAllCause((cause) =>
       Cause.isInterruptedOnly(cause)
         ? Effect.void
-        : Effect.sync(() => {
+        : Effect.suspend(() => {
             writeFrame(environmentFailure(fallbackRequest("invalid-request"), Cause.pretty(cause)))
-            socket.end()
+            return endAndAwaitFlush(socket)
           }),
     ),
     Effect.ensuring(
