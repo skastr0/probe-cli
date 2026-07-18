@@ -8,6 +8,7 @@ import {
   buildRunnerHttpCommandUrls,
   detectRealDeviceInterruption,
   decodeRunnerVideoArtifactManifest,
+  downloadRunnerHttpArtifact,
   extractDeviceCandidate,
   extractDeviceTunnelIp,
   injectBootstrapJsonIntoXctestrunPlist,
@@ -375,6 +376,69 @@ describe("materializeDeviceRunnerVideoArtifacts", () => {
       await rm(tempRoot, { recursive: true, force: true })
     }
   })
+})
+
+describe("downloadRunnerHttpArtifact (PRB-101 absolute deadline)", () => {
+  test(
+    "gives each candidate whatever remains of one shared deadline, instead of a fraction pre-divided by candidate count",
+    async () => {
+      const originalFetch = globalThis.fetch
+      const startedAt = Date.now()
+      let attemptCount = 0
+      let secondAttemptAbortedAtMs: number | null = null
+
+      globalThis.fetch = (async (_input, init) => {
+        attemptCount += 1
+        const signal = init?.signal as AbortSignal | undefined
+
+        if (attemptCount === 1) {
+          // The first candidate fails instantly and unambiguously.
+          return new Response("unavailable", { status: 503 })
+        }
+
+        if (attemptCount === 2) {
+          // The second candidate never itself resolves -- only the shared
+          // deadline's abort ends it. Before this fix, dividing 300ms across
+          // 3 candidates (floored at 1_000ms) would have given this
+          // candidate at least 1_000ms regardless of the requested total;
+          // the fix gives it whatever remains of the *one* 300ms deadline,
+          // barely touched by the first candidate's instant failure.
+          return await new Promise<Response>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => {
+              secondAttemptAbortedAtMs = Date.now() - startedAt
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+            }, { once: true })
+          })
+        }
+
+        return new Response("should never be reached", { status: 500 })
+      }) as typeof fetch
+
+      try {
+        await expect(
+          downloadRunnerHttpArtifact({
+            artifactUrls: ["http://endpoint-a/artifact", "http://endpoint-b/artifact", "http://endpoint-c/artifact"],
+            description: "test artifact",
+            totalTimeoutMs: 300,
+          }),
+        ).rejects.toThrow(/Runner HTTP artifact download failed/)
+
+        // Only the first two candidates were ever attempted -- the one
+        // shared 300ms deadline was already spent by the second candidate's
+        // abort, so the third candidate must never be reached.
+        expect(attemptCount).toBe(2)
+        expect(secondAttemptAbortedAtMs).not.toBeNull()
+        // The second candidate's abort landed close to the full 300ms
+        // deadline -- comfortably more than a naive "300ms / 3 candidates"
+        // pre-divided slice (100ms) would have allowed, proving it was
+        // handed whatever remained of the one shared deadline instead.
+        expect(secondAttemptAbortedAtMs!).toBeGreaterThan(200)
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    },
+    5_000,
+  )
 })
 
 describe("detectRealDeviceInterruption", () => {

@@ -284,3 +284,24 @@ Accessed: 2026-07-17.
   dedicated look, not a same-pass patch bolted onto an already-large diff --
   flagged here as a follow-up, not filed against any of this pass's own
   call sites.
+- **Fixed (PRB-101):** the follow-up above is closed. `waitForClose` (not
+  `escalateIfRunning`'s `hasExited` bail, which stays as the cheap common-path
+  fast-return for a genuinely fully-exited process/group) now self-heals: it
+  listens for `'exit'` in addition to `'close'`, and if `'exit'` fires without
+  a prompt `'close'` -- exactly the "grandchild still holds the pipe" shape
+  above -- it re-signals the process group (still a valid target even after
+  the tracked leader has exited, as long as any member survives; a fully
+  empty group is a harmless no-op via `trySignalGroup`'s ESRCH fallback)
+  through the same TERM -> grace -> KILL ladder, then gives the pipe one
+  bounded window before giving up and resolving with the exit's own
+  code/signal. This closes the hang at its actual root cause: the previous
+  code never reached any kill-escalation logic at all once the tracked leader
+  had already exited, because the whole `runManaged`/`spawnHandleManaged`
+  wait was blocked forever on `'close'` before the acquireRelease finalizer
+  (which is what called `escalateIfRunning`) could ever run. Proven by
+  `AppleProcessSupervisor.test.ts`'s "grandchild fault test: a backgrounded
+  job outliving the leader while holding stdout is signaled and cannot hang
+  waitForClose" -- a `sh -c "echo leader-done; sleep 30 &"` leader (no
+  `wait`, so it exits immediately while the backgrounded `sleep` still holds
+  the inherited stdout pipe) now resolves promptly and leaves zero surviving
+  process-group members, instead of hanging.

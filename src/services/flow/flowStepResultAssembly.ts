@@ -12,7 +12,7 @@ import type { PlannedStep } from "../../domain/flow-planner"
 import type { ArtifactRecord } from "../../domain/output"
 import { emptyEvidenceReport, resolveEvidencePolicy, type EvidenceReport } from "../../domain/evidence"
 import { EnvironmentError, SessionNotFoundError } from "../../domain/errors"
-import { dedupeStrings, selectorDriftContractWarning, type ActionExecutionOutcome, type SessionActionError } from "../SessionRegistry"
+import { dedupeStrings, selectorDriftContractWarning, type ActionExecutionOutcome, type SessionActionError } from "../sessionShared"
 
 /**
  * PRB-073: pure step-result assembly, extracted from `runFlow`'s body. No

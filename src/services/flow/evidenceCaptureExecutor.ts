@@ -18,7 +18,7 @@ import {
   sanitizeFileComponent,
   timestampForFile,
   type ActiveSessionRecord,
-} from "../SessionRegistry"
+} from "../sessionShared"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 import {
   buildFlowStepResult,

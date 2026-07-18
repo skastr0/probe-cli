@@ -330,6 +330,20 @@ export const FlowSequenceStepSchema = Schema.Struct({
   // regardless of child count.
   evidencePolicy: Schema.optional(EvidencePolicyInputSchema),
   continueOnError: Schema.optional(Schema.Boolean),
+}).annotations({
+  // PRB-103: a stale caller still sending the pre-PRB-093 `checkpoint`
+  // field (see above) would otherwise decode silently -- Schema.Struct's
+  // default `onExcessProperty: "ignore"` drops unknown keys rather than
+  // rejecting them, so `checkpoint: "none"` would vanish and the step would
+  // silently fall back to the *default* evidence policy (success="end"),
+  // which is not what a caller asking for "none" meant. Consistent with
+  // PRB-082's rejection idiom (a superseded shape fails closed with a typed
+  // decode error instead of silently adapting through), `onExcessProperty:
+  // "error"` is scoped to just this one step kind -- the step shape that
+  // actually changed vocabulary -- rather than a project-wide strict-decode
+  // policy that would risk rejecting unrelated, still-tolerated extra
+  // fields elsewhere in the flow contract.
+  parseOptions: { onExcessProperty: "error" },
 })
 export type FlowSequenceStep = typeof FlowSequenceStepSchema.Type
 

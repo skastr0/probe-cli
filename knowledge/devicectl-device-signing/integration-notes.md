@@ -180,6 +180,70 @@ implementation).
   which this host does not have. The `RunnerBuildCache.test.ts` timing-free
   hit/miss-count assertions are the closest coverage available without one.
 
+### PRB-102: signing-identity cache-key decision (2026-07-18)
+
+PRB-102 asked for one of two outcomes: upgrade the cache key from the pinned
+`"automatic"` signing/profile-identity sentinel to the discovered concrete
+identity, or document with a receipt why automatic-mode rotation cannot
+silently reuse stale products. This is that receipt; the key stays pinned to
+`"automatic"` -- upgrading it was investigated and rejected, not skipped.
+
+**Why a concrete pre-build key was investigated and rejected.** The only
+locally-available signal for "which identities exist" is `security
+find-identity -v -p codesigning`. Run fresh on this host for this decision:
+
+```
+$ security find-identity -v -p codesigning
+  1) A385961F81800DC72F796D0D2E93351352770708 "Developer ID Application: Guilherme Silva (4452968868)"
+  2) A19CF69EBBA8BD26EDA97509DA7720DCC594A218 "iPhone Distribution: Guilherme Silva (4452968868)"
+  3) DB0CAEA8763140C561701721676335C1ADFADF83 "Apple Development: Guilherme Silva (3WQ8B23QHR)"
+     3 valid identities found
+```
+
+Three genuinely different identity *kinds* (Developer ID Application, iPhone
+Distribution, Apple Development) resolve for one Apple account, and only the
+last one's parenthetical happens to be a Team ID (`3WQ8B23QHR`, the same team
+`RunnerBuildCache.test.ts`'s "Measured for real on this host" entry above
+used) -- the other two show an account identifier (`4452968868`) in the same
+position, not a team ID. `security find-identity` has no team-scoping flag;
+attributing an identity to *the* team Probe's `developmentTeam` session-open
+field carries would mean parsing a field whose meaning already differs
+between identity kinds on this host's own output, with no portal-backed way
+to confirm the guess. A pre-build key component built on that parse would be
+guessing, not discovering -- worse than the honest sentinel it would replace.
+
+**Why the existing revalidation is the real safety net instead.** Every
+cache **hit** (not just a fresh build) re-runs `verifyProduct` against the
+cached `.app` bundles before trusting them
+(`revalidateEntry` in `RunnerBuildCache.ts`): a live `codesign --verify
+--deep --strict` against the *current* trust store, plus the stored
+`profileExpiresAt` checked against `now()`. Both are already exercised, not
+theoretical -- `RunnerBuildCache.test.ts`'s `"a tampered cached signature is
+invalidated and rebuilt"` and `"an expired cached profile is invalidated and
+rebuilt with a recorded invalidation reason"` cases cover exactly these two
+paths. That means the two ways automatic-mode rotation actually surfaces --
+a certificate revoked or aged out of the trust store, or a profile expiring
+-- already force a rebuild on the very next cache hit, with no key change
+needed. The one residual gap a concrete-identity key would additionally
+catch is a *voluntary* rotation to a second identity that is simultaneously
+still valid under the same team (e.g. an operator adds a new distribution
+certificate without revoking the old one) -- genuinely unreachable to
+validate on this host, which has no `DEVELOPMENT_TEAM` configured at all
+(`PROBE_DEVELOPMENT_TEAM` unset here; see this pack's "Signing input
+precedence" section above), and is a narrow enough scenario (deliberately
+keeping two valid identities live for one team, with no revocation) that
+inventing unverifiable pre-build discovery machinery for it fails this
+project's own bar against building for a case that has never been observed.
+
+**Disposition:** cache key stays pinned to `"automatic"` for
+`signingIdentity`/`profileIdentity`, unchanged from PRB-095. If a future pass
+gets a live `DEVELOPMENT_TEAM` and observes the voluntary-dual-identity
+scenario actually causing a stale reuse, that observation -- not a guess --
+is the trigger to revisit this, most likely via the discovered concrete
+identity carried as cache-entry metadata already (`RunnerBuildCacheOutcome.signingIdentity`)
+compared against a `security find-identity` sample at hit time, gated behind
+a live-signing test that does not exist on this host today.
+
 ### Local host spike observations, updated
 
 - `xcrun devicectl list devices --json-output ...` now reports 2 connected

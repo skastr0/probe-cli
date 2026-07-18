@@ -1295,8 +1295,20 @@ final class AttachControlSpikeUITests: XCTestCase {
     var recognizedCount = 0
 
     for iteration in 1...iterations {
-      let outcome = try performRunnerUIAction(multiTapPayload, app: app)
-      multiTapSamplesMs.append(outcome.resolutionMs + outcome.waitMs + outcome.interactionMs)
+      // PRB-103: wall-clock the whole call the same way the baseline burst
+      // below is measured (`Date()` immediately before, `milliseconds(since:)`
+      // immediately after) instead of summing `performRunnerUIAction`'s three
+      // internal component timers (resolutionMs/waitMs/interactionMs). The
+      // component sum is reconstructed from separately-placed `Date()` reads
+      // inside the callee and is not guaranteed to equal true wall-clock
+      // elapsed time for the call as observed by the caller -- the baseline
+      // side was already wall-clocked this way, so the prior comparison was
+      // effectively "callee-internal sum" vs "caller-observed wall-clock,"
+      // not apples-to-apples. See knowledge/xcuitest-runner/integration-notes.md's
+      // "PRB-103" section for the re-derived numbers this produced.
+      let callStartedAt = Date()
+      _ = try performRunnerUIAction(multiTapPayload, app: app)
+      multiTapSamplesMs.append(milliseconds(since: callStartedAt))
 
       let recognized = waitForLabel(
         multiTapStatusLabel,
@@ -1385,6 +1397,25 @@ final class AttachControlSpikeUITests: XCTestCase {
     // integration-notes.md's "Measured receipts" Run 3 for the numbers.
     // Lowered to `>=1.1x`, which every run to date (including the one that
     // failed `>=1.2x`) clears with room to spare.
+    //
+    // PRB-103: the two samples above were also methodologically mismatched
+    // until this glyph -- `multiTapSamplesMs` summed `performRunnerUIAction`'s
+    // three internal component timers while `baselineSamplesMs` wall-clocked
+    // the whole burst; both sides now wall-clock the same way (see the loop
+    // above). Re-measured on this host (100/100 recognized, real
+    // `xcodebuild test-without-building` run, not the CLI proxy):
+    // multi_tap_p95_ms=6364, baseline_five_separate_taps_p95_ms=8257 (~1.298x
+    // faster -- 6364*1.1=7000.4 <= 8257, clearing `>=1.1x` with ~18% headroom
+    // to spare). This lands inside the same ~1.16x-1.37x band every prior
+    // (methodologically mismatched) run already measured, which is itself
+    // the evidence the fix did not change the underlying system's true
+    // behavior, only how honestly it is measured -- the `>=1.1x` floor is
+    // re-derived from, and kept at, the same value: it already has
+    // comfortable headroom under the corrected measurement, and only one
+    // fresh run (not the four-run repeat the original investigation
+    // afforded) was budgeted for this pass. See integration-notes.md's
+    // "PRB-103" section for the full writeup and the exact PROBE_METRIC
+    // line this run produced.
     XCTAssertLessThanOrEqual(
       Double(multiTapP95Ms) * 1.1,
       Double(baselineP95Ms),
