@@ -98,14 +98,27 @@ export const runOutputPolicyBoundsScenario = async (): Promise<DefectFinding> =>
       },
     }
   } catch (error) {
+    // PRB-094: Pulsar TS-LD-09 error-channel-opacity -- a bare `String(error)`
+    // fallback would hide *what kind* of failure this was (a real
+    // EnvironmentError from `bindBoundedCollection`'s persist step vs. an
+    // unrelated fs/harness bug) behind one opaque message. `errorKind`
+    // exposes the failure's own identity (a tagged error's `_tag`, or the
+    // thrown value's constructor name) as its own evidence line, distinct
+    // from the message/stack, so a reader triaging a `not-run` verdict does
+    // not have to parse prose to tell which failure surface broke.
+    const errorKind = error !== null && typeof error === "object" && "_tag" in error && typeof (error as { _tag: unknown })._tag === "string"
+      ? (error as { _tag: string })._tag
+      : error instanceof Error
+        ? error.constructor.name
+        : typeof error
     const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
 
     return {
       id: "output-policy-overflow-01",
       category: "output-policy-overflow",
       verdict: "not-run",
-      summary: `Scenario harness failed before it could measure the bounded-collection wire budget: ${message}`,
-      evidence: [message],
+      summary: `Scenario harness failed before it could measure the bounded-collection wire budget (${errorKind}): ${message}`,
+      evidence: [`error kind: ${errorKind}`, message],
       metrics: {},
     }
   } finally {
