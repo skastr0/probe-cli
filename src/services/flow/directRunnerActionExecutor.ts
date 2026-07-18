@@ -174,8 +174,20 @@ export const executeDirectRunnerActionStep = (args: {
     })
 
     if (!actionResult.ok) {
+      // Best-effort, additive only -- never replaces the original mutation
+      // failure below. A successful capture is still reported through
+      // `evidence` rather than silently discarded (PRB-093 review finding).
       if (shouldCaptureFailureEvidence(policy.failure)) {
-        yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+        const failureCapture = yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
+
+        if (failureCapture._tag === "Right") {
+          evidenceCaptures.push({
+            reason: "policy-failure",
+            phase: "post",
+            snapshotId: failureCapture.right.artifact.snapshotId,
+            ms: failureCapture.right.handledMs,
+          })
+        }
       }
 
       yield* deps.persistActionFailure(sessionId, record, step.kind)
@@ -184,6 +196,7 @@ export const executeDirectRunnerActionStep = (args: {
         ok: false,
         error: actionResult.error,
         retry: actionResult.retry,
+        evidence: buildEvidenceReport(policy, evidenceCaptures),
       } satisfies ActionExecutionOutcome
     }
 

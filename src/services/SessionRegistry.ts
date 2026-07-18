@@ -54,6 +54,7 @@ import {
   shouldCaptureFailureEvidence,
   type EvidenceCapture,
   type EvidenceCaptureReason,
+  type EvidenceReport,
 } from "../domain/evidence"
 import {
   type DebugBreakpointLocation,
@@ -501,6 +502,12 @@ export type ActionExecutionOutcome =
       readonly ok: false
       readonly error: SessionActionError
       readonly retry: RetryAttemptMetadata
+      // PRB-093: every outcome reports its evidence, failure included -- a
+      // best-effort failure snapshot is real capture work and must not be
+      // silently discarded just because the mutation itself failed. See
+      // evidence.ts's module doc: failure evidence never replaces or masks
+      // the original failure, it only rides alongside it.
+      readonly evidence: EvidenceReport
     }
 
 export const emptyRetryAttemptMetadata = (): RetryAttemptMetadata => ({
@@ -660,6 +667,7 @@ const buildReplayStepReport = (args: {
   readonly matchedRef: string | null
   readonly artifact: ArtifactRecord | null
   readonly summary: string
+  readonly evidence: EvidenceReport
   readonly exhausted?: boolean
 }): ReplayStepReport => {
   const outcome = classifyReplayStepOutcome({
@@ -676,6 +684,7 @@ const buildReplayStepReport = (args: {
     resolvedBy: args.resolvedBy,
     matchedRef: args.matchedRef,
     artifact: args.artifact,
+    evidence: args.evidence,
     summary: withReplayStepOutcomeLabel({
       outcome,
       summary: args.summary,
@@ -1955,6 +1964,10 @@ export const SessionRegistryLive = Layer.scoped(
               ok: false,
               error: captureResult.error,
               retry: captureResult.retry,
+              // A failed screenshot capture has no separate failure-evidence
+              // concept: the capture that failed IS the action, not a
+              // discretionary policy capture around a mutation.
+              evidence: emptyEvidenceReport(resolveEvidencePolicy()),
             } satisfies ActionExecutionOutcome
           }
 
@@ -2004,6 +2017,9 @@ export const SessionRegistryLive = Layer.scoped(
               ok: false,
               error: captureResult.left,
               retry: emptyRetryAttemptMetadata(),
+              // A failed video capture has no separate failure-evidence
+              // concept, same reasoning as the screenshot failure above.
+              evidence: emptyEvidenceReport(resolveEvidencePolicy()),
             } satisfies ActionExecutionOutcome
           }
 
@@ -2091,6 +2107,11 @@ export const SessionRegistryLive = Layer.scoped(
               ok: false,
               error: result.error,
               retry: result.retry,
+              // assert has no evidencePolicy field (unaffected by evidence
+              // policy) -- but the resolution snapshots taken across its
+              // retry attempts are still real capture work, so report them
+              // here exactly like the passing branch below does.
+              evidence: buildEvidenceReport(resolveEvidencePolicy(), evidenceCaptures),
             } satisfies ActionExecutionOutcome
           }
 
@@ -2274,6 +2295,11 @@ export const SessionRegistryLive = Layer.scoped(
               retryCount: Math.max(0, attempts - 1),
               retryReasons,
             },
+            // wait has no evidencePolicy field, same "resolution, not
+            // policy" accounting as assert above -- report the polling
+            // snapshots taken across the timed-out attempts rather than
+            // discarding that capture work.
+            evidence: buildEvidenceReport(resolveEvidencePolicy(), evidenceCaptures),
           } satisfies ActionExecutionOutcome
         }
 
@@ -2413,9 +2439,20 @@ export const SessionRegistryLive = Layer.scoped(
         if (!actionResult.ok) {
           // Failure evidence: best-effort, additive only -- never replaces
           // the original mutation failure above. Swallowed via Effect.either
-          // exactly like the fast direct-runner lane (directRunnerActionExecutor.ts).
+          // exactly like the fast direct-runner lane (directRunnerActionExecutor.ts),
+          // but a successful capture is still reported through `evidence`
+          // below rather than silently discarded (PRB-093 review finding).
           if (shouldCaptureFailureEvidence(policy.failure)) {
-            yield* Effect.either(captureSnapshotArtifactInternal(args.sessionId, record))
+            const failureCapture = yield* Effect.either(captureSnapshotArtifactInternal(args.sessionId, record))
+
+            if (failureCapture._tag === "Right") {
+              evidenceCaptures.push({
+                reason: "policy-failure",
+                phase: "post",
+                snapshotId: failureCapture.right.artifact.snapshotId,
+                ms: failureCapture.right.handledMs,
+              })
+            }
           }
 
           yield* persistActionFailure(args.sessionId, record, args.action.kind)
@@ -2423,6 +2460,7 @@ export const SessionRegistryLive = Layer.scoped(
             ok: false,
             error: actionResult.error,
             retry: actionResult.retry,
+            evidence: buildEvidenceReport(policy, evidenceCaptures),
           } satisfies ActionExecutionOutcome
         }
 
@@ -5948,6 +5986,10 @@ export const SessionRegistryLive = Layer.scoped(
           let retriedStepCount = 0
           let semanticFallbackCount = 0
           let finalSnapshotId: string | null = record.snapshotState.latest?.snapshotId ?? null
+          // PRB-093 review finding: an aggregate roll-up of every step's
+          // evidence captures, in step order, surfaced on the top-level
+          // SessionReplayResult -- mirrors retriedStepCount/semanticFallbackCount.
+          const allEvidenceCaptures: Array<EvidenceCapture> = []
 
           for (const [index, step] of script.steps.entries()) {
             let attempt = 0
@@ -5955,6 +5997,10 @@ export const SessionRegistryLive = Layer.scoped(
             let lastFailure = "unknown replay failure"
             let lastResolvedBy: ReplayStepReport["resolvedBy"] = "none"
             let lastMatchedRef: string | null = null
+            // Reset per step -- captures accumulate across this step's own
+            // retry attempts only (mirrors the assert/wait accounting in
+            // executeSessionAction above).
+            const evidenceCaptures: Array<EvidenceCapture> = []
 
             while (attempt < defaultReplayAttemptLimit && !succeeded) {
               attempt += 1
@@ -5989,6 +6035,10 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: null,
                   artifact: capture.right.artifact,
                   summary: `Captured replay screenshot artifact ${capture.right.artifact.absolutePath}.`,
+                  // Screenshot captures are explicit, not policy-driven --
+                  // see evidence.ts's module doc (acceptance criterion #11),
+                  // mirroring the live screenshot action above.
+                  evidence: emptyEvidenceReport(replayEvidencePolicy),
                 }))
                 succeeded = true
                 continue
@@ -6028,6 +6078,10 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: null,
                   artifact: capture.right.artifact,
                   summary: `Captured replay ${modeSummary} artifact ${capture.right.artifact.absolutePath}.${clampNote}`,
+                  // Video captures are explicit, not policy-driven -- see
+                  // evidence.ts's module doc (acceptance criterion #11),
+                  // mirroring the live video action above.
+                  evidence: emptyEvidenceReport(replayEvidencePolicy),
                 }))
                 succeeded = true
                 continue
@@ -6048,7 +6102,8 @@ export const SessionRegistryLive = Layer.scoped(
               // capture) instead of forcing a redundant fresh one; only a
               // true bootstrap (no snapshot yet) forces a fresh capture.
               const cachedSnapshot = record.snapshotState.latest
-              const preSnapshot = step.kind === "assert" || (wantsResolution && cachedSnapshot === null)
+              const forcesFreshResolution = step.kind === "assert" || (wantsResolution && cachedSnapshot === null)
+              const preSnapshot = forcesFreshResolution
                 ? yield* captureSnapshotArtifactInternal(sessionId, record)
                 : wantsResolution && cachedSnapshot !== null
                   ? { artifact: cachedSnapshot, handledMs: 0 }
@@ -6056,6 +6111,19 @@ export const SessionRegistryLive = Layer.scoped(
 
               if (preSnapshot !== null) {
                 finalSnapshotId = preSnapshot.artifact.snapshotId
+              }
+
+              // A capture is only reported when one actually happened --
+              // reusing the cached snapshot (ms: 0) is not discretionary
+              // capture work, exactly like the live mutation lane's cached
+              // pre-reuse above never adds an evidence entry either.
+              if (forcesFreshResolution && preSnapshot !== null) {
+                evidenceCaptures.push({
+                  reason: "resolution",
+                  phase: "pre",
+                  snapshotId: preSnapshot.artifact.snapshotId,
+                  ms: preSnapshot.handledMs,
+                })
               }
 
               const resolution = resolveRecordedActionTargetInSnapshot(preSnapshot?.artifact ?? null, recordedTarget)
@@ -6090,6 +6158,7 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: evaluation.matchedRef,
                   artifact: null,
                   summary,
+                  evidence: buildEvidenceReport(replayEvidencePolicy, evidenceCaptures),
                 }))
                 succeeded = true
                 continue
@@ -6138,6 +6207,12 @@ export const SessionRegistryLive = Layer.scoped(
 
               if (postSnapshot !== null) {
                 finalSnapshotId = postSnapshot.artifact.snapshotId
+                evidenceCaptures.push({
+                  reason: "policy-post",
+                  phase: "post",
+                  snapshotId: postSnapshot.artifact.snapshotId,
+                  ms: postSnapshot.handledMs,
+                })
               }
 
               if (attempt > 1) {
@@ -6163,9 +6238,17 @@ export const SessionRegistryLive = Layer.scoped(
                   matchedRef: resolvedTarget.kind === "snapshot" ? resolvedTarget.ref : null,
                   artifact: null,
                   summary,
+                  evidence: buildEvidenceReport(replayEvidencePolicy, evidenceCaptures),
                 }))
                 succeeded = true
             }
+
+            // Folded into the run-wide aggregate regardless of whether this
+            // step succeeded or exhausted its retries -- harmless either
+            // way, since the exhausted branch below returns early via a
+            // typed error before the final result (the only place
+            // `allEvidenceCaptures` is read) is ever built.
+            allEvidenceCaptures.push(...evidenceCaptures)
 
             if (!succeeded) {
               const failedStepReport = buildReplayStepReport({
@@ -6176,6 +6259,7 @@ export const SessionRegistryLive = Layer.scoped(
                 matchedRef: lastMatchedRef,
                 artifact: null,
                 summary: lastFailure,
+                evidence: buildEvidenceReport(replayEvidencePolicy, evidenceCaptures),
                 exhausted: true,
               })
               const warnings = buildReplayWarnings(semanticFallbackCount)
@@ -6267,6 +6351,7 @@ export const SessionRegistryLive = Layer.scoped(
             retriedStepCount,
             semanticFallbackCount,
             finalSnapshotId,
+            evidence: buildEvidenceReport(replayEvidencePolicy, allEvidenceCaptures),
           } satisfies SessionReplayResult
           })))
         }),

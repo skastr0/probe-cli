@@ -198,6 +198,46 @@ describe("executeDirectRunnerActionStep", () => {
     if (!outcome.ok) {
       expect(outcome.error).toBeInstanceOf(EnvironmentError)
       expect(outcome.error instanceof EnvironmentError ? outcome.error.reason : null).toBe("no element matched")
+      // The failure capture itself failed, so no capture is reported --
+      // but `evidence` must still be present and reflect the requested
+      // policy rather than being omitted from the outcome entirely.
+      expect(outcome.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+      expect(outcome.evidence.captures).toEqual([])
+    }
+  })
+
+  test("a runner failure reports the best-effort failure snapshot's id and cost in evidence (PRB-093 review finding)", async () => {
+    const record = makeFakeSimulatorRecord()
+    const deps: FlowExecutorDeps = {
+      ...makeUnusedFlowExecutorDeps(),
+      sendRunnerCommand: () =>
+        Effect.succeed({
+          ...baseRunnerCommandResult,
+          ok: false,
+          error: "no element matched",
+        }),
+      captureSnapshotArtifactInternal: () =>
+        Effect.succeed({
+          artifact: { snapshotId: "@failure-1" },
+          artifactRecord: { key: "snapshot-@failure-1" },
+          handledMs: 11,
+        } as never),
+      persistActionFailure: () => Effect.void,
+    }
+    const step: FlowV2FastSingleStep = { kind: "tap", target: { kind: "point", x: 1, y: 2 } } as never
+
+    const outcome = await Effect.runPromise(
+      executeDirectRunnerActionStep({ sessionId: "s1", record, step, deps }),
+    )
+
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      // Before this fix, a failed `ActionExecutionOutcome` carried only
+      // {error, retry} -- the successful failure snapshot's reason,
+      // snapshotId, and cost were captured but never reported anywhere.
+      expect(outcome.evidence.requested).toEqual({ success: "end", failure: "snapshot" })
+      expect(outcome.evidence.captures).toEqual([{ reason: "policy-failure", phase: "post", snapshotId: "@failure-1", ms: 11 }])
+      expect(outcome.evidence.evidenceMs).toBe(11)
     }
   })
 

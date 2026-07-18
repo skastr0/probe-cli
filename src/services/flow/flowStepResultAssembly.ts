@@ -176,6 +176,11 @@ export const buildActionOutcomeStepResult = (args: {
         error: outcome.right.error,
         continued: continueOnError,
       }),
+      // PRB-093 review finding: the executor's best-effort failure snapshot
+      // (or resolution captures accumulated across retries) must survive
+      // into the flow step result -- defaulting to `emptyEvidenceReport`
+      // here hid a real capture that had already happened.
+      evidence: outcome.right.evidence,
     })
   }
 

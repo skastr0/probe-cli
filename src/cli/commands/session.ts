@@ -312,6 +312,10 @@ const formatReplayResult = (result: SessionReplayResult): string => {
     `retried steps: ${result.retriedStepCount}`,
     `semantic fallback recoveries: ${result.semanticFallbackCount}`,
     `final snapshot: ${result.finalSnapshotId ?? "n/a"}`,
+    // PRB-093 review finding: mirrors formatFlowV2StepResult's evidence
+    // line below -- an aggregate across every replayed step rather than
+    // requiring the caller to open the replay report artifact.
+    `evidence: policy success=${result.evidence.requested.success} failure=${result.evidence.requested.failure}, ${result.evidence.captures.length} capture(s), ${result.evidence.evidenceMs}ms`,
     `artifact: ${result.artifact.absolutePath}`,
   ].join("\n")
 }

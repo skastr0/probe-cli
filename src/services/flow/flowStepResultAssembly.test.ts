@@ -194,11 +194,19 @@ describe("buildActionOutcomeStepResult", () => {
     expect(result.latestSnapshotId).toBe("prior-snap")
   })
 
-  test("Right with ok:false folds into a failed step carrying the executor's retry metadata", () => {
+  test("Right with ok:false folds into a failed step carrying the executor's retry metadata and evidence", () => {
+    // PRB-093 review finding: a failed step's best-effort failure snapshot
+    // must survive into the flow step result instead of being defaulted
+    // away to an empty evidence report.
     const outcome: Either.Either<ActionExecutionOutcome, never> = Either.right({
       ok: false,
       error: new EnvironmentError({ code: "session-action-failed", reason: "no element", nextStep: "n", details: [] }),
       retry: { retryCount: 2, retryReasons: ["not-found: x"] },
+      evidence: {
+        requested: { success: "end", failure: "snapshot" },
+        captures: [{ reason: "policy-failure", phase: "post", snapshotId: "@failure-1", ms: 9 }],
+        evidenceMs: 9,
+      },
     })
     const result = buildActionOutcomeStepResult({
       plannedStep: tapPlannedStep,
@@ -211,6 +219,8 @@ describe("buildActionOutcomeStepResult", () => {
     expect(result.verdict).toBe("failed")
     expect(result.retryCount).toBe(2)
     expect(result.retryReasons).toEqual(["not-found: x"])
+    expect(result.evidence.captures).toEqual([{ reason: "policy-failure", phase: "post", snapshotId: "@failure-1", ms: 9 }])
+    expect(result.evidence.evidenceMs).toBe(9)
   })
 
   test("Right with ok:true folds into a passed step using the executor's result", () => {
