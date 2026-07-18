@@ -99,6 +99,22 @@ mutation again on the second candidate.
   exercised once for a single-endpoint (simulator-shaped) call and once for a
   two-endpoint (device-shaped) call in `RunnerTransportClient.test.ts`.
 
+### The GET/artifact path had the same shape (PRB-101)
+
+`downloadRunnerHttpArtifact` (`src/services/RealDeviceHarness.ts`) — the
+real-device video artifact manifest/frame `GET /artifact` download used by
+`materializeDeviceRunnerVideoArtifacts` — is a separate code path from
+`RunnerTransportClient` (a raw `fetch` loop, not routed through the command
+transport client above), and it carried the identical pre-PRB-081 defect
+shape: `perEndpointTimeoutMs` divided `runnerArtifactDownloadTimeoutMs`
+evenly across every candidate URL up front (floored at 1s), so a candidate
+late in the list only ever got its pre-carved slice regardless of how fast
+earlier candidates failed, and a long enough candidate list could push the
+floor past the intended total budget. PRB-101 gives it the same fix as
+`RunnerTransportClient`: one absolute deadline computed once, each attempt
+gets whatever remains. See `RealDeviceHarness.test.ts`'s "downloadRunnerHttpArtifact
+(PRB-101 absolute deadline)" for the contract test.
+
 ## Replay-safety contract (PRB-089)
 
 PRB-081 made a mutation's ambiguous transport failure stop instead of

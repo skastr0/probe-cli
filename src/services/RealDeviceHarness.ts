@@ -1311,19 +1311,37 @@ export const decodeRunnerVideoArtifactManifest = (value: unknown): RunnerVideoAr
 const buildRunnerVideoFrameFileName = (frameIndex: number): string =>
   `frame-${String(frameIndex).padStart(5, "0")}.png`
 
-const downloadRunnerHttpArtifact = async (args: {
+// PRB-101: previously divided `runnerArtifactDownloadTimeoutMs` evenly across
+// every candidate endpoint up front (`perEndpointTimeoutMs`) -- the same
+// defect shape PRB-081 fixed for runner command dispatch. Dividing the
+// budget ahead of time means a candidate late in the list gets only its
+// pre-carved slice even if every earlier candidate failed in milliseconds,
+// and a long candidate list can push the floor (`Math.max(1_000, ...)`) past
+// the intended total budget entirely. One absolute deadline, computed once,
+// gives each attempt whatever actually remains -- exactly like
+// RunnerTransportClient's `sendWithClient` does for command dispatch.
+//
+// Exported for direct test coverage of the PRB-101 absolute-deadline fix, in
+// addition to its normal use inside materializeDeviceRunnerVideoArtifacts.
+export const downloadRunnerHttpArtifact = async (args: {
   readonly artifactUrls: ReadonlyArray<string>
   readonly description: string
+  /** Total budget across every candidate endpoint. Defaults to runnerArtifactDownloadTimeoutMs; test-only override. */
+  readonly totalTimeoutMs?: number
 }): Promise<Uint8Array> => {
-  const perEndpointTimeoutMs = Math.max(
-    1_000,
-    Math.ceil(runnerArtifactDownloadTimeoutMs / Math.max(args.artifactUrls.length, 1)),
-  )
+  const deadlineAt = Date.now() + Math.max(0, args.totalTimeoutMs ?? runnerArtifactDownloadTimeoutMs)
   const failures: Array<string> = []
 
   for (const artifactUrl of args.artifactUrls) {
+    const remainingMs = deadlineAt - Date.now()
+
+    if (remainingMs <= 0) {
+      failures.push(`${artifactUrl} was never attempted: the transport deadline had already elapsed`)
+      break
+    }
+
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), perEndpointTimeoutMs)
+    const timeout = setTimeout(() => controller.abort(), remainingMs)
 
     try {
       const response = await fetch(artifactUrl, {
@@ -1340,7 +1358,7 @@ const downloadRunnerHttpArtifact = async (args: {
       return new Uint8Array(await response.arrayBuffer())
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        failures.push(`${artifactUrl} timed out after ${perEndpointTimeoutMs} ms`)
+        failures.push(`${artifactUrl} timed out after ${remainingMs} ms (transport deadline)`)
       } else {
         failures.push(`${artifactUrl} failed: ${error instanceof Error ? error.message : String(error)}`)
       }

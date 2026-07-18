@@ -156,6 +156,14 @@ const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ??
 // than this many concurrent commands against one session gets a typed
 // session-busy error instead of unbounded memory growth.
 const sessionControllerQueueCapacity = Number(process.env.PROBE_SESSION_QUEUE_CAPACITY ?? 512)
+// PRB-101: `closedRecordsRef` (below) exists only so a repeat close call, a
+// late peekSessionHealth, or endTraceLease's best-effort mutate can still
+// find a session's terminal controller/health after closeSessionInternal has
+// removed it from the main sessionsRef table -- but nothing ever evicted an
+// entry from it, so a daemon that opens and closes many sessions over its
+// lifetime grows this side table without bound. Comfortably above any
+// realistic "repeat close arrives shortly after" or "late peek" race window.
+const closedSessionRecordCapacity = Number(process.env.PROBE_CLOSED_SESSION_RECORD_CAP ?? 200)
 const maxSessionLogCaptureSeconds = 30
 const defaultDebugCommandTimeoutMs = Number(process.env.PROBE_LLDB_COMMAND_TIMEOUT_MS ?? 60_000)
 const maxDebugFrameLimit = 200
@@ -787,6 +795,31 @@ interface DebugProcessSnapshot {
 
 const nowIso = (): string => new Date().toISOString()
 const expiresAtIso = (): string => new Date(Date.now() + defaultSessionTtlMs).toISOString()
+
+/**
+ * PRB-101: bounds `closedRecordsRef`'s growth. `Map` preserves insertion
+ * order, so the oldest-inserted entries -- the ones least likely to still be
+ * needed by a repeat close or a late peek -- are always the first evicted
+ * once the table exceeds `closedSessionRecordCapacity`.
+ */
+const withBoundedClosedRecords = (
+  records: Map<string, ActiveSessionRecord>,
+): Map<string, ActiveSessionRecord> => {
+  const overflow = records.size - closedSessionRecordCapacity
+
+  if (overflow <= 0) {
+    return records
+  }
+
+  const next = new Map(records)
+  const oldestKeys = [...next.keys()].slice(0, overflow)
+
+  for (const key of oldestKeys) {
+    next.delete(key)
+  }
+
+  return next
+}
 
 const makeSessionResources = (runner: SessionResourceState): SessionResourceStates => ({
   runner,
@@ -1574,7 +1607,10 @@ export const SessionRegistryLive = Layer.scoped(
     // rather than SessionNotFoundError. This small side-table is what makes
     // that possible: it keeps just the closed record's controller (already
     // memoized/terminal) reachable by session id after removal from the
-    // main table.
+    // main table. PRB-101: bounded to `closedSessionRecordCapacity` entries
+    // (oldest-inserted evicted first, see `withBoundedClosedRecords`) so a
+    // daemon that opens and closes many sessions over its lifetime does not
+    // grow this table without bound.
     const closedRecordsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
     const openingRef = yield* Ref.make<OpeningSessionReservation | null>(null)
     const openMutex = yield* Effect.makeSemaphore(1)
@@ -2311,6 +2347,28 @@ export const SessionRegistryLive = Layer.scoped(
             details: [],
           })
         }
+
+        // PRB-101: the isRunnerBackedRecord check above only proves a live
+        // runner transport is connected -- not that it advertises uiAction
+        // support. runFlow's fast lane (directRunnerActionExecutor.ts)
+        // already gates the same dispatch through requireRunnerCapability;
+        // the single-action path asks the same reusable gate before sending
+        // the same "uiAction" command, instead of trusting an old or
+        // partial runner binary to reject it on its own.
+        yield* requireRunnerCapability({
+          record,
+          isRunnerBacked: isRunnerBackedRecord,
+          advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
+          capability: "uiAction",
+          capabilityTag: "session.action",
+          usageDescription: "session UI actions (tap, press, swipe, type, scroll)",
+          notRunnerBacked: {
+            code: "session-action-real-device-runner",
+            reason: "This session does not currently expose a live runner transport for UI actions.",
+            nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+          },
+          missingCapabilityNextStep: "Open a session against a runner that reports uiAction capability before retrying this action.",
+        })
 
         const action = args.action
         const retryPolicy = action.retryPolicy ?? defaultMutationRetryPolicy
@@ -4164,7 +4222,7 @@ export const SessionRegistryLive = Layer.scoped(
           next.delete(sessionId)
           return next
         })
-        yield* Ref.update(closedRecordsRef, (current) => new Map(current).set(sessionId, record))
+        yield* Ref.update(closedRecordsRef, (current) => withBoundedClosedRecords(new Map(current).set(sessionId, record)))
         yield* syncDaemonMetadata
 
         return record.health
