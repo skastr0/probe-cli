@@ -672,3 +672,65 @@ speedup assertion's constant changed, not `performRunnerUIActionBatch`
 itself), so re-running it would have re-derived an unchanged fact, not
 tested new code. `testCommandLoopReplaySafety`'s base-commit flake claim
 remains unchanged from both prior rounds' caveat.
+
+## PRB-103: apples-to-apples multiTap speedup re-measurement
+
+PRB-103 follow-up flagged the committed
+`testFixtureFiveTapRecognizerPassesRepeatedWarmMultiTapActions` benchmark as
+not actually apples-to-apples: the `multiTap` side measured
+`performRunnerUIAction`'s three *internal* component timers
+(`resolutionMs + waitMs + interactionMs`, each an independently placed
+`Date()` read inside the callee) while the baseline side wall-clocked its
+five-tap burst directly (`Date()` immediately before, `milliseconds(since:)`
+immediately after, wrapping the whole burst as observed by the *caller*).
+Comparing a callee-reconstructed sum against a caller-observed wall-clock is
+not the same measurement methodology on both sides, even though in practice
+the component boundaries are contiguous (no gap between resolution ending
+and wait starting, or wait ending and interaction starting) — the fix
+removes the discrepancy at the source rather than argue it does not matter.
+
+Fix: the `multiTap` side now wall-clocks the whole `performRunnerUIAction`
+call the identical way the baseline already does (`callStartedAt = Date()`
+before the call, `milliseconds(since: callStartedAt)` after) — both samples
+now come from the same instrument, at the same caller-observed boundary, for
+every run this benchmark produces going forward.
+
+**Re-measured receipt (2026-07-18, Simulator, iPhone 17 Pro, iOS 26.5, real
+`xcodebuild test-without-building -only-testing:ProbeRunnerUITests/AttachControlSpikeUITests/testFixtureFiveTapRecognizerPassesRepeatedWarmMultiTapActions`
+run against the fixed measurement code, ~834s wall):**
+
+- 100/100 iterations recognized (AC8 unchanged, still passes clean); `** TEST
+  EXECUTE SUCCEEDED **`.
+- `PROBE_METRIC multi_tap_five_tap_recognizer_gate iterations=100
+  recognized=100 multi_tap_p95_ms=6364 baseline_five_separate_taps_p95_ms=8257
+  baseline_burst_count=20` — multiTap is ~1.298x faster than five separate
+  fast taps, now measured with both sides wall-clocked identically (no more
+  callee-component-sum vs caller-wall-clock mismatch).
+- The committed `>=1.1x` assertion: `6364 * 1.1 = 7000.4 <= 8257` — clears
+  with ~1256.6ms (~18%) of headroom to spare.
+
+This run's ~1.298x lands squarely inside the ~1.16x-1.37x band every prior
+run measured under the old (methodologically mismatched) instrument — direct
+evidence the fix corrected *how* the ratio is measured, not *what* the
+underlying system actually does; multiTap's real advantage was never
+misrepresented in direction, only quantified through a comparison that
+mixed two different clocks.
+
+Regression floor: kept at `>=1.1x` rather than moved, and that is the
+re-derivation, not an omission — the same floor-selection reasoning the
+original `>=1.2x` -> `>=1.1x` correction used (pick a `>=` guard with real
+headroom under the observed band, not flush against the fastest run) still
+holds against this run's own clean number, and this run's ~1.298x sits
+comfortably inside, not at the edge of, the historical band the floor was
+already sized against. Only one fresh run was budgeted for this pass (each
+run costs ~14 minutes wall; the original investigation's four-run repeat to
+characterize variance was judged disproportionate for a measurement-hygiene
+fix that does not change the asserted floor) — a future pass with budget for
+repeated runs could tighten the floor further if the corrected methodology's
+own run-to-run spread turns out to be narrower than the old one's, but
+nothing here forecloses that.
+
+AC10 ("at least three times faster") is unchanged by this fix and remains
+**unmet/partial**, per the existing "Proposed scope decision" section above
+— this glyph does not touch that ruling, only the measurement machinery and
+the regression floor beneath it, as directed.
