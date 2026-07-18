@@ -91,4 +91,85 @@ describe("flow v2 contract", () => {
 
     expect(validateFlowV2Contract(flow)).toContain("runner-resolvable target")
   })
+
+  // PRB-092: multiTap as a direct flow step and as a sequence (batch) child
+  // both decode and validate through the same domain schema.
+  test("accepts multiTap as a direct fast flow step", () => {
+    const flow = decodeFlowV2Contract({
+      contract: "probe.session-flow/v2",
+      execution: "fast",
+      steps: [
+        {
+          kind: "multiTap",
+          target: {
+            kind: "semantic",
+            identifier: "fixture.gesture.multiTapTarget",
+            label: null,
+            value: null,
+            placeholder: null,
+            type: "button",
+            section: null,
+            interactive: true,
+          },
+          tapCount: 5,
+          interTapDelayMs: 60,
+        },
+      ],
+    })
+
+    expect(validateFlowV2Contract(flow)).toBeNull()
+  })
+
+  test("accepts multiTap as a sequence (batch) child", () => {
+    const flow = decodeFlowV2Contract({
+      contract: "probe.session-flow/v2",
+      execution: "fast",
+      steps: [
+        {
+          kind: "sequence",
+          actions: [
+            {
+              kind: "multiTap",
+              target: {
+                kind: "semantic",
+                identifier: "fixture.gesture.multiTapTarget",
+                label: null,
+                value: null,
+                placeholder: null,
+                type: "button",
+                section: null,
+                interactive: true,
+              },
+              tapCount: 5,
+              interTapDelayMs: 60,
+            },
+          ],
+        },
+      ],
+    })
+
+    expect(validateFlowV2Contract(flow)).toBeNull()
+  })
+
+  test("rejects a sequence multiTap child outside the tapCount/interTapDelayMs bounds", () => {
+    expect(() =>
+      decodeFlowV2Contract({
+        contract: "probe.session-flow/v2",
+        execution: "fast",
+        steps: [
+          {
+            kind: "sequence",
+            actions: [
+              {
+                kind: "multiTap",
+                target: { kind: "point", x: 1, y: 2 },
+                tapCount: 21,
+                interTapDelayMs: 60,
+              },
+            ],
+          },
+        ],
+      })
+    ).toThrow()
+  })
 })

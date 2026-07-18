@@ -58,6 +58,7 @@ export const buildRunnerBatchSequencePayload = (actions: ReadonlyArray<FlowSeque
           timeoutMs: action.timeoutMs,
         }
       case "tap":
+      case "multiTap":
       case "press":
       case "swipe":
       case "type":
@@ -70,6 +71,7 @@ export const buildRunnerBatchSequencePayload = (actions: ReadonlyArray<FlowSeque
 export const toFlowSequenceActionKind = (value: string | null | undefined): FlowSequenceAction["kind"] | null => {
   switch (value) {
     case "tap":
+    case "multiTap":
     case "press":
     case "swipe":
     case "type":

@@ -295,11 +295,17 @@ probe session action --session-id <id> --file action.json --output-json
 probe session action \
   --input-json '{ "sessionId": "<id>", "action": { "kind": "tap", "target": { "kind": "ref", "ref": "@e5", "fallback": null } } }' \
   --output-json
+
+# multiTap: N discrete taps (2..20) at a bounded inter-tap delay (0..500ms),
+# one runner command for the whole gesture
+probe session action \
+  --input-json '{ "sessionId": "<id>", "action": { "kind": "multiTap", "target": { "kind": "ref", "ref": "@e5", "fallback": null }, "tapCount": 5, "interTapDelayMs": 60 } }' \
+  --output-json
 ```
 
 `session action` accepts either a full payload with `sessionId` and `action`, or a bare action payload when `--session-id` is provided separately. `--json <payload>` is intentionally rejected; use `--input-json <payload>` for input and `--output-json` for machine output.
 
-**Supported action kinds:** `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`
+**Supported action kinds:** `tap`, `multiTap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`
 
 See `actions-reference.md` for full schemas: selectors (ref / semantic / point / absence), assertion expectations, retry policy, and the recording contract.
 
@@ -318,7 +324,7 @@ Flow contract:
 
 `probe.session-flow/v1` was removed. Old v1 input fails with a typed `unsupported-flow-contract` error naming the migration step: re-tag `contract` as `probe.session-flow/v2` — existing v1 step shapes decode unchanged.
 
-Shared step kinds: `snapshot`, `tap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`, `logMark`, `sleep`. Flow v2 also adds `sequence` for runner-batched fast actions. Any step may set `continueOnError: true` to keep the flow running when that step fails.
+Shared step kinds: `snapshot`, `tap`, `multiTap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`, `logMark`, `sleep`. Flow v2 also adds `sequence` for runner-batched fast actions — `multiTap` is a valid `sequence` child too, dispatched through the same runner batch command as its siblings. Any step may set `continueOnError: true` to keep the flow running when that step fails.
 
 Fast execution is opt-in. It trades host-side evidence collection for speed, so prefer a final verified assert or an explicit sequence `checkpoint: "end"` when you need end-state proof.
 
