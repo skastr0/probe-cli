@@ -29,6 +29,7 @@ import {
   validateFlowStep,
   validateSessionAction,
 } from "./action"
+import { BoundedCollectionSchema } from "./bounded"
 import { EvidencePolicyInputSchema, EvidenceReportSchema } from "./evidence"
 import { ArtifactRecord, NullableString } from "./output"
 import { UnsupportedFlowContractError } from "./errors"
@@ -420,6 +421,24 @@ export type SessionFlowContract = typeof SessionFlowContractSchema.Type
 
 export const SessionFlowResultSchema = FlowV2ResultSchema
 export type SessionFlowResult = typeof SessionFlowResultSchema.Type
+
+// PRB-094: the RPC/CLI-boundary contract for `session.run`. `FlowV2Result`
+// above stays the *internal* engine shape -- `SessionRegistry.runFlow` and
+// its tests still build and assert against a plain `executedSteps` array,
+// since a flow's own executor loop needs the full, ungrouped step list to
+// fold verdicts/retries/artifacts as it runs. Only the outermost RPC
+// response (built in `ProbeKernel.ts`, the one place a `FlowV2Result`
+// actually gets serialized to a caller) swaps `executedSteps`/`artifacts`/
+// `warnings` for their bounded-collection form, so a 10k-step flow's wire
+// response stays inside the generic 4 KiB / 100 line inline budget instead
+// of inlining every step.
+export const BoundedFlowV2ResultSchema = Schema.Struct({
+  ...FlowV2ResultSchema.fields,
+  executedSteps: BoundedCollectionSchema(FlowV2StepResultSchema),
+  artifacts: BoundedCollectionSchema(ArtifactRecord),
+  warnings: BoundedCollectionSchema(Schema.String),
+})
+export type BoundedFlowV2Result = typeof BoundedFlowV2ResultSchema.Type
 
 export const resolveFlowExecutionProfile = (
   flowExecution?: FlowExecutionProfile,

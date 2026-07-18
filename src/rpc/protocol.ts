@@ -6,7 +6,7 @@ import {
   SessionRecordingExportResultSchema,
   SessionReplayResultSchema,
 } from "../domain/action"
-import { SessionFlowContractSchema, SessionFlowResultSchema } from "../domain/flow-v2"
+import { BoundedFlowV2ResultSchema, SessionFlowContractSchema } from "../domain/flow-v2"
 import { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
 import { ProtocolMismatchError } from "../domain/errors"
@@ -33,7 +33,7 @@ import {
   PerfSummaryGroupBy,
   PerfTemplate,
 } from "../domain/perf"
-import { SessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
+import { BoundedSessionHealthSchema, SessionListEntry, SimulatorSessionMode } from "../domain/session"
 import { SessionSnapshotResultSchema } from "../domain/snapshot"
 
 export const PROBE_PROTOCOL_VERSION = "probe-rpc/v1"
@@ -465,7 +465,7 @@ export const SessionOpenResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.open"),
-  result: SessionHealth,
+  result: BoundedSessionHealthSchema,
 })
 export type SessionOpenResponse = typeof SessionOpenResponse.Type
 
@@ -483,7 +483,7 @@ export const SessionShowResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.show"),
-  result: SessionHealth,
+  result: BoundedSessionHealthSchema,
 })
 export type SessionShowResponse = typeof SessionShowResponse.Type
 
@@ -492,7 +492,7 @@ export const SessionHealthResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.health"),
-  result: SessionHealth,
+  result: BoundedSessionHealthSchema,
 })
 export type SessionHealthResponse = typeof SessionHealthResponse.Type
 
@@ -595,7 +595,7 @@ export const SessionRunResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.run"),
-  result: SessionFlowResultSchema,
+  result: BoundedFlowV2ResultSchema,
 })
 export type SessionRunResponse = typeof SessionRunResponse.Type
 

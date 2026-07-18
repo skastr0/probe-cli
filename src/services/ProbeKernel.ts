@@ -4,6 +4,8 @@ import { basename, join } from "node:path"
 import { Context, Effect, Either, Layer } from "effect"
 import { CapabilityReport } from "../domain/capabilities"
 import { DiagnosticReport, KnownWall } from "../domain/diagnostics"
+import type { BoundedFlowV2Result, SessionFlowResult } from "../domain/flow-v2"
+import type { BoundedSessionHealth, SessionHealth } from "../domain/session"
 import {
   ArtifactNotFoundError,
   ChildProcessError,
@@ -14,12 +16,14 @@ import {
   UnsupportedCapabilityError,
   UserInputError,
 } from "../domain/errors"
+import { resolveCollectionDrillPage } from "../domain/bounded"
 import { perfTemplateChoiceText } from "../domain/perf"
 import type { ArtifactRecord, DrillQuery, SessionLogMarker } from "../domain/output"
 import { appendSessionLogMarkers, isTextArtifactKind, summarizeContent } from "../domain/output"
 import type { WorkspaceStatus } from "../domain/workspace"
 import { disposeAppleProcessSupervisorRuntime, runAppleProcess } from "./AppleProcessSupervisor"
 import { ArtifactStore } from "./ArtifactStore"
+import { bindBoundedCollection } from "./boundedCollections"
 import { OutputPolicy } from "./OutputPolicy"
 import { PerfService } from "./PerfService"
 import { resolveProbeRuntimeRoot } from "./ProjectRoot"
@@ -67,6 +71,19 @@ import {
 
 const nowIso = (): string => new Date().toISOString()
 const probeProjectRoot = resolveProbeRuntimeRoot()
+
+// PRB-094: how many items of each RPC-boundary collection stay inline
+// before the rest overflows to a persisted, drillable artifact (see
+// `bindBoundedCollection`, services/boundedCollections.ts). Sized well
+// under what the generic 4 KiB / 100 line inline budget
+// (`OutputPolicy`/`shouldInlineOutput`) can hold alongside the rest of a
+// session-health or flow-result response -- see ProbeKernel.test.ts's
+// 10k-item fixtures for the budget measurement these were tuned against.
+const sessionHealthArtifactsShownLimit = 3
+const sessionHealthWarningsShownLimit = 5
+const flowExecutedStepsShownLimit = 5
+const flowArtifactsShownLimit = 3
+const flowWarningsShownLimit = 5
 
 interface HostCommandResult {
   readonly stdout: string
@@ -396,6 +413,56 @@ export const ProbeKernelLive = Layer.effect(
     const simulatorHarness = yield* SimulatorHarness
     const daemonStartedAt = nowIso()
 
+    // PRB-094: the RPC-boundary bind step for `session.health`/`session.open`/
+    // `session.show` -- `sessionRegistry.getSessionHealth` keeps returning the
+    // full, internal `SessionHealth` (still used unbounded elsewhere in this
+    // file, e.g. `requireSessionResultBundleArtifact`'s `.artifacts.find`);
+    // only the response actually handed back to the RPC caller is bounded.
+    const bindSessionHealthForWire = (health: SessionHealth): Effect.Effect<BoundedSessionHealth, EnvironmentError> =>
+      Effect.gen(function* () {
+        const artifacts = yield* bindBoundedCollection(artifactStore, {
+          sessionId: health.sessionId,
+          collectionLabel: "session-artifacts",
+          items: health.artifacts,
+          shownLimit: sessionHealthArtifactsShownLimit,
+        })
+        const warnings = yield* bindBoundedCollection(artifactStore, {
+          sessionId: health.sessionId,
+          collectionLabel: "session-warnings",
+          items: health.warnings,
+          shownLimit: sessionHealthWarningsShownLimit,
+        })
+
+        return { ...health, artifacts, warnings }
+      })
+
+    // PRB-094: the RPC-boundary bind step for `session.run` -- mirrors
+    // `bindSessionHealthForWire` above for `FlowV2Result`'s three
+    // potentially-unbounded fields.
+    const bindFlowResultForWire = (result: SessionFlowResult): Effect.Effect<BoundedFlowV2Result, EnvironmentError> =>
+      Effect.gen(function* () {
+        const executedSteps = yield* bindBoundedCollection(artifactStore, {
+          sessionId: result.sessionId,
+          collectionLabel: "flow-executed-steps",
+          items: result.executedSteps,
+          shownLimit: flowExecutedStepsShownLimit,
+        })
+        const artifacts = yield* bindBoundedCollection(artifactStore, {
+          sessionId: result.sessionId,
+          collectionLabel: "flow-artifacts",
+          items: result.artifacts,
+          shownLimit: flowArtifactsShownLimit,
+        })
+        const warnings = yield* bindBoundedCollection(artifactStore, {
+          sessionId: result.sessionId,
+          collectionLabel: "flow-warnings",
+          items: result.warnings,
+          shownLimit: flowWarningsShownLimit,
+        })
+
+        return { ...result, executedSteps, artifacts, warnings }
+      })
+
     const isRecord = (value: unknown): value is Record<string, unknown> =>
       typeof value === "object" && value !== null
 
@@ -621,6 +688,24 @@ export const ProbeKernelLive = Layer.effect(
                 nextStep: "Target a concrete xcresult-aware surface, or use text/json/xml drill options against a file artifact.",
                 details: [],
               })
+
+            // PRB-094: resolves a bounded-collection drill handle's `query`
+            // (see domain/bounded.ts) against the full JSON array a
+            // `bindBoundedCollection` overflow persisted. Deterministic
+            // across repeated reads: the backing artifact is written once,
+            // atomically, and never mutated, so the same { offset, limit }
+            // always slices the same page.
+            case "collection": {
+              const parsed = JSON.parse(raw) as unknown
+              const items = Array.isArray(parsed) ? parsed : []
+              const page = resolveCollectionDrillPage(items, query)
+              const content = JSON.stringify(page.items, null, 2)
+              return {
+                format: "json" as const,
+                content,
+                summary: `${page.items.length} of ${page.total} item(s) from offset ${page.offset} in ${basename(artifactAbsolutePath)}`,
+              }
+            }
 
             default:
               return query satisfies never
@@ -1103,7 +1188,8 @@ export const ProbeKernelLive = Layer.effect(
 
           case "session.show": {
             progress("session.show", `Loading session ${request.params.sessionId}.`)
-            const result = yield* sessionRegistry.getSessionHealth(request.params.sessionId)
+            const health = yield* sessionRegistry.getSessionHealth(request.params.sessionId)
+            const result = yield* bindSessionHealthForWire(health)
             return {
               kind: "response",
               protocolVersion: PROBE_PROTOCOL_VERSION,
@@ -1120,7 +1206,7 @@ export const ProbeKernelLive = Layer.effect(
                 ? "Opening the real-device runner session."
                 : "Opening the simulator-backed runner session.",
             )
-            const result = yield* (request.params.target === "device"
+            const health = yield* (request.params.target === "device"
               ? sessionRegistry.openDeviceSession({
                   bundleId: request.params.bundleId,
                   deviceId: request.params.deviceId,
@@ -1135,6 +1221,7 @@ export const ProbeKernelLive = Layer.effect(
                   projectRoot: probeProjectRoot,
                   emitProgress: progress,
                 }))
+            const result = yield* bindSessionHealthForWire(health)
             return {
               kind: "response",
               protocolVersion: PROBE_PROTOCOL_VERSION,
@@ -1146,7 +1233,8 @@ export const ProbeKernelLive = Layer.effect(
 
           case "session.health": {
             progress("session.health", `Checking runner health for session ${request.params.sessionId}.`)
-            const result = yield* sessionRegistry.getSessionHealth(request.params.sessionId)
+            const health = yield* sessionRegistry.getSessionHealth(request.params.sessionId)
+            const result = yield* bindSessionHealthForWire(health)
             return {
               kind: "response",
               protocolVersion: PROBE_PROTOCOL_VERSION,
@@ -1276,10 +1364,11 @@ export const ProbeKernelLive = Layer.effect(
 
           case "session.run": {
             progress("session.run", `Executing ${request.params.flow.steps.length} flow steps for session ${request.params.sessionId}.`)
-            const result = yield* sessionRegistry.runFlow({
+            const flowResult = yield* sessionRegistry.runFlow({
               sessionId: request.params.sessionId,
               flow: request.params.flow,
             })
+            const result = yield* bindFlowResultForWire(flowResult)
             return {
               kind: "response",
               protocolVersion: PROBE_PROTOCOL_VERSION,

@@ -7,7 +7,7 @@ import type {
   SessionRecordingExportResult,
   SessionReplayResult,
 } from "../domain/action"
-import type { SessionFlowContract, SessionFlowResult } from "../domain/flow-v2"
+import type { BoundedFlowV2Result, SessionFlowContract } from "../domain/flow-v2"
 import type { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import {
   ArtifactNotFoundError,
@@ -42,7 +42,7 @@ import type {
   PerfSignpostSummaryResult,
   PerfTemplate,
 } from "../domain/perf"
-import type { SessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
+import type { BoundedSessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
 import { ArtifactStore } from "./ArtifactStore"
 import { resolveDevelopmentTeamFromHost } from "./DeviceSigningConfig"
 import {
@@ -118,7 +118,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly signingTeamId?: string | null
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      SessionHealth,
+      BoundedSessionHealth,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError
@@ -133,7 +133,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly sessionId: string
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      SessionHealth,
+      BoundedSessionHealth,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError
@@ -148,7 +148,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly sessionId: string
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      SessionHealth,
+      BoundedSessionHealth,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError
@@ -349,7 +349,7 @@ export class DaemonClient extends Context.Tag("@probe/DaemonClient")<
       readonly flow: SessionFlowContract
       readonly onEvent?: (stage: string, message: string) => void
     }) => Effect.Effect<
-      SessionFlowResult,
+      BoundedFlowV2Result,
       | DaemonNotRunningError
       | EnvironmentError
       | ProtocolMismatchError
