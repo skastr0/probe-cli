@@ -96,12 +96,6 @@ export const emptyEvidenceReport = (requested: EvidencePolicy): EvidenceReport =
   evidenceMs: 0,
 })
 
-export const addEvidenceCapture = (report: EvidenceReport, capture: EvidenceCapture): EvidenceReport => ({
-  ...report,
-  captures: [...report.captures, capture],
-  evidenceMs: report.evidenceMs + capture.ms,
-})
-
 /** Builds a report from a requested policy and the captures actually taken (in order). */
 export const buildEvidenceReport = (
   requested: EvidencePolicy,
