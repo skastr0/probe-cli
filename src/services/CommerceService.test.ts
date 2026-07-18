@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer, ManagedRuntime } from "effect"
+import { boundedCollectionAllShown } from "../domain/bounded"
 import { decodeCommerceValidationPlan } from "../domain/commerce"
 import { ArtifactStore } from "./ArtifactStore"
 import { CommerceService, CommerceServiceLive } from "./CommerceService"
@@ -165,12 +166,12 @@ const buildDaemonClientStub = () =>
       sessionId: "session-1",
       summary: "probe flow passed",
       verdict: "passed",
-      executedSteps: [],
+      executedSteps: boundedCollectionAllShown([]),
       failedStep: null,
       retries: 0,
-      artifacts: [],
+      artifacts: boundedCollectionAllShown([]),
       finalSnapshotId: null,
-      warnings: [],
+      warnings: boundedCollectionAllShown([]),
     }),
     exportSessionRecording: () => Effect.die("unused exportSessionRecording"),
     replaySessionRecording: () => Effect.die("unused replaySessionRecording"),

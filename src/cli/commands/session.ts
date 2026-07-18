@@ -9,7 +9,8 @@ import {
 import { UserInputError } from "../../domain/errors"
 import {
   decodeSessionFlowContract,
-  type SessionFlowResult,
+  type BoundedFlowV2Result,
+  type FlowV2StepResult,
 } from "../../domain/flow-v2"
 import { OutputMode, SessionLogSource } from "../../domain/output"
 import type {
@@ -26,7 +27,7 @@ import {
   isLiveRunnerTransport,
   SimulatorSessionMode as SimulatorSessionModeSchema,
   type SimulatorSessionMode,
-  type SessionHealth,
+  type BoundedSessionHealth,
   type SessionListEntry,
 } from "../../domain/session"
 import type { SessionSnapshotResult } from "../../domain/snapshot"
@@ -176,16 +177,20 @@ const formatSessionList = (sessions: ReadonlyArray<SessionListEntry>): string =>
   ].join("\n")).join("\n\n")
 }
 
-const printSessionHealth = (health: SessionHealth, asJson: boolean) =>
+const printSessionHealth = (health: BoundedSessionHealth, asJson: boolean) =>
   Effect.sync(() => {
     console.log(asJson ? JSON.stringify(health, null, 2) : formatSessionHealth(health))
   })
 
-const formatSessionHealth = (health: SessionHealth): string => {
+const formatSessionHealth = (health: BoundedSessionHealth): string => {
   const capabilityLines = health.capabilities.map(
     (capability) => `- ${capability.area} [${capability.status}] ${capability.summary}`,
   )
-  const artifactLines = health.artifacts.map((artifact) => `- ${artifact.key}: ${artifact.absolutePath}`)
+  // PRB-094: `artifacts`/`warnings` are now bounded collections (see
+  // domain/bounded.ts) -- `.shown` is the inline preview, `.omitted`/`.drill`
+  // surface how to reach the rest instead of the CLI ever iterating an
+  // unbounded array.
+  const artifactLines = health.artifacts.shown.map((artifact) => `- ${artifact.key}: ${artifact.absolutePath}`)
 
   const transportLines = isLiveRunnerTransport(health.transport)
     ? [
@@ -232,10 +237,10 @@ const formatSessionHealth = (health: SessionHealth): string => {
     "capabilities:",
     ...capabilityLines,
     "",
-    "warnings:",
-    ...health.warnings.map((warning) => `- ${warning}`),
+    `warnings (${health.warnings.shown.length} of ${health.warnings.total}${health.warnings.omitted > 0 ? `, ${health.warnings.omitted} omitted -- drill ${health.warnings.drill?.artifactKey}` : ""}):`,
+    ...health.warnings.shown.map((warning) => `- ${warning}`),
     "",
-    "artifacts:",
+    `artifacts (${health.artifacts.shown.length} of ${health.artifacts.total}${health.artifacts.omitted > 0 ? `, ${health.artifacts.omitted} omitted -- drill ${health.artifacts.drill?.artifactKey}` : ""}):`,
     ...artifactLines,
   ].join("\n")
 }
@@ -320,8 +325,11 @@ const formatReplayResult = (result: SessionReplayResult): string => {
   ].join("\n")
 }
 
-type FlowV2CliResult = Extract<SessionFlowResult, { readonly contract: "probe.session-flow/report-v2" }>
-type FlowV2CliStepResult = FlowV2CliResult["executedSteps"][number]
+type FlowV2CliResult = Extract<BoundedFlowV2Result, { readonly contract: "probe.session-flow/report-v2" }>
+// PRB-094: named directly from flow-v2's own step-result type rather than
+// indexed through `executedSteps["shown"][number]` -- same type, shallower
+// indirection for readers and static analysis alike.
+type FlowV2CliStepResult = FlowV2StepResult
 
 const formatFlowV2SequenceChildFailure = (step: FlowV2CliStepResult): string => {
   if (step.kind !== "sequence") {
@@ -354,28 +362,31 @@ const formatFlowV2StepResult = (step: FlowV2CliStepResult): string => {
 }
 
 const formatFlowV2Result = (result: FlowV2CliResult): string => {
-  const stepLines = result.executedSteps.length === 0
+  const stepLines = result.executedSteps.shown.length === 0
     ? ["- none"]
-    : result.executedSteps.flatMap((step) => [formatFlowV2StepResult(step)])
+    : result.executedSteps.shown.flatMap((step) => [formatFlowV2StepResult(step)])
+  const executedStepsOmittedNote = result.executedSteps.omitted > 0
+    ? `, ${result.executedSteps.omitted} omitted -- drill ${result.executedSteps.drill?.artifactKey}`
+    : ""
 
   return [
     result.summary,
     `verdict: ${result.verdict}`,
-    `executed steps: ${result.executedSteps.length}`,
+    `executed steps: ${result.executedSteps.shown.length} of ${result.executedSteps.total}${executedStepsOmittedNote}`,
     `failed step: ${result.failedStep?.index ?? "n/a"}`,
     `retries: ${result.retries}`,
     `final snapshot: ${result.finalSnapshotId ?? "n/a"}`,
-    `artifacts: ${result.artifacts.length}`,
-    `warnings: ${result.warnings.length}`,
+    `artifacts: ${result.artifacts.total}`,
+    `warnings: ${result.warnings.total}`,
     "",
     "steps:",
     ...stepLines,
   ].join("\n")
 }
 
-// SessionFlowResult has a single canonical shape (probe.session-flow/report-v2)
+// BoundedFlowV2Result has a single canonical shape (probe.session-flow/report-v2)
 // since PRB-082 removed the v1 result contract, so this always formats as v2.
-const formatFlowResult = (result: SessionFlowResult): string => formatFlowV2Result(result)
+const formatFlowResult = (result: BoundedFlowV2Result): string => formatFlowV2Result(result)
 
 const formatSummaryArtifactResult = (result: SummaryArtifactResult): string => {
   return [

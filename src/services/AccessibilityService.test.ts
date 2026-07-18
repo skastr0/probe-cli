@@ -59,8 +59,8 @@ const buildSessionHealthStub = () => ({
     trace: "not-requested",
   },
   capabilities: [],
-  warnings: [],
-  artifacts: [],
+  warnings: { total: 0, shown: [], omitted: 0, drill: null },
+  artifacts: { total: 0, shown: [], omitted: 0, drill: null },
   transport: {
     kind: "simulator-runner",
     contract: "probe.runner.transport/hybrid-v1",

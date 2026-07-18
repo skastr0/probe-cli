@@ -38,6 +38,36 @@ const parseDrillQuery = (args: ReadonlyArray<string>) =>
     const xpath = yield* optionalOption(args, "--xpath")
     const lines = yield* optionalOption(args, "--lines")
     const match = yield* optionalOption(args, "--match")
+    // PRB-094: pages a bounded-collection overflow artifact (`total`/
+    // `shown`/`omitted`/`drill` -- see domain/bounded.ts) without requiring
+    // the caller to reconstruct the query from the handle's raw fields --
+    // `--collection-offset`/`--collection-limit` map 1:1 onto the handle's
+    // own `query.offset`/`query.limit`.
+    const collectionOffset = yield* optionalOption(args, "--collection-offset")
+    const collectionLimit = yield* optionalOption(args, "--collection-limit")
+
+    if (collectionOffset || collectionLimit) {
+      if (xcresult || jsonPointer || xpath || lines || match) {
+        return yield* invalidOption(
+          "--collection-offset",
+          "collection drill queries cannot be combined with --xcresult, --json-pointer, --xpath, --lines, or --match.",
+          "Use --collection-offset/--collection-limit alone against a bounded-collection overflow artifact.",
+        )
+      }
+
+      const offset = Number(collectionOffset ?? "0")
+      const limit = Number(collectionLimit ?? "200")
+
+      if (!Number.isFinite(offset) || offset < 0 || !Number.isFinite(limit) || limit < 0) {
+        return yield* invalidOption(
+          "--collection-offset",
+          `invalid value; expected non-negative integers for --collection-offset/--collection-limit.`,
+          "Provide non-negative integers for --collection-offset/--collection-limit and retry.",
+        )
+      }
+
+      return { kind: "collection", offset, limit } as const satisfies DrillQuery
+    }
 
     if (xcresult) {
       if (jsonPointer || xpath || lines || match) {

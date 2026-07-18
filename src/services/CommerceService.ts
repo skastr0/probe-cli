@@ -16,7 +16,7 @@ import {
   type CommerceValidationReport,
   type CommerceValidationStepResult,
 } from "../domain/commerce"
-import type { SessionFlowResult } from "../domain/flow-v2"
+import type { BoundedFlowV2Result } from "../domain/flow-v2"
 import {
   ArtifactNotFoundError,
   ChildProcessError,
@@ -541,10 +541,10 @@ const formatThrownError = (error: unknown): string =>
       ? error.message
       : String(error)
 
-const flowResultToStepVerdict = (flow: SessionFlowResult): CommerceValidationStepResult["verdict"] =>
+const flowResultToStepVerdict = (flow: BoundedFlowV2Result): CommerceValidationStepResult["verdict"] =>
   flow.verdict === "passed" ? "verified" : "blocked"
 
-const buildStepDetails = (flow: SessionFlowResult): Array<string> => [
+const buildStepDetails = (flow: BoundedFlowV2Result): Array<string> => [
   `flow verdict: ${flow.verdict}`,
   `flow retries: ${flow.retries}`,
   ...(flow.failedStep ? [`failed flow step ${flow.failedStep.index}: ${flow.failedStep.summary}`] : []),
@@ -1459,7 +1459,7 @@ export const CommerceServiceLive = Layer.effect(
                 ...buildStepDetails(flowResult),
                 ...(provider === "revenuecat" ? buildRevenueCatStepNotes(step.kind) : []),
               ],
-              warnings: [...flowResult.warnings],
+              warnings: [...flowResult.warnings.shown],
               flowResult,
             }
             executedSteps.push(stepResult)

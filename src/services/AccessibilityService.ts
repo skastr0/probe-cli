@@ -22,7 +22,7 @@ import {
   formatProbeError,
   isProbeError,
 } from "../domain/errors"
-import { isLiveRunnerTransport, type SessionHealth } from "../domain/session"
+import { isLiveRunnerTransport, type BoundedSessionHealth } from "../domain/session"
 import { decodeStoredSnapshotArtifact, type StoredSnapshotArtifact } from "../domain/snapshot"
 import { ArtifactStore } from "./ArtifactStore"
 import { DaemonClient } from "./DaemonClient"
@@ -71,7 +71,7 @@ const readStoredSnapshotArtifact = (absolutePath: string) =>
     })
   })
 
-const buildLiveRunnerCheck = (session: SessionHealth): AccessibilityDoctorCheck => {
+const buildLiveRunnerCheck = (session: BoundedSessionHealth): AccessibilityDoctorCheck => {
   if (!isLiveRunnerTransport(session.transport)) {
     return makeCheck({
       key: "session.live-runner",
@@ -175,7 +175,7 @@ export const AccessibilityServiceLive = Layer.effect(
       doctor: ({ sessionId }) =>
         Effect.gen(function* () {
           const session = yield* daemonClient.getSessionHealth({ sessionId })
-          const warnings = [...session.warnings]
+          const warnings = [...session.warnings.shown]
           const checks: Array<AccessibilityDoctorCheck> = [buildLiveRunnerCheck(session)]
 
           let snapshotArtifact: AccessibilityDoctorReport["snapshotArtifact"] = null

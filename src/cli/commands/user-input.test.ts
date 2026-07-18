@@ -4,7 +4,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Either } from "effect"
 import { UserInputError } from "../../domain/errors"
-import type { SessionFlowResult } from "../../domain/flow-v2"
+import { boundedCollectionAllShown } from "../../domain/bounded"
+import type { BoundedFlowV2Result } from "../../domain/flow-v2"
 import type { DrillQuery, OutputMode } from "../../domain/output"
 import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
@@ -241,7 +242,7 @@ const buildCapturedFlowClient = (capture: (params: CapturedFlowParams) => void) 
     captureDiagnosticBundle: unexpectedClientCall,
   })
 
-const buildReturningFlowClient = (result: SessionFlowResult) =>
+const buildReturningFlowClient = (result: BoundedFlowV2Result) =>
   DaemonClient.of({
     ping: unexpectedClientCall,
     openSession: unexpectedClientCall,
@@ -1419,7 +1420,7 @@ describe("cli user input handling", () => {
           sessionId: "session-1",
           summary: "Flow failed inside a batched sequence.",
           verdict: "failed",
-          executedSteps: [
+          executedSteps: boundedCollectionAllShown([
             {
               index: 1,
               kind: "sequence",
@@ -1445,7 +1446,7 @@ describe("cli user input handling", () => {
                 summary: "fixture.form.applyButton forced batched failure",
               },
             },
-          ],
+          ]),
           failedStep: {
             index: 1,
             kind: "sequence",
@@ -1466,10 +1467,10 @@ describe("cli user input handling", () => {
             },
           },
           retries: 0,
-          artifacts: [],
+          artifacts: boundedCollectionAllShown([]),
           finalSnapshotId: "@s2",
-          warnings: [],
-        } satisfies SessionFlowResult)),
+          warnings: boundedCollectionAllShown([]),
+        } satisfies BoundedFlowV2Result)),
       ),
     )
 
@@ -1511,7 +1512,7 @@ describe("cli user input handling", () => {
           sessionId: "session-1",
           summary: "Executed 1 flow step successfully.",
           verdict: "passed",
-          executedSteps: [
+          executedSteps: boundedCollectionAllShown([
             {
               index: 1,
               kind: "tap",
@@ -1533,13 +1534,13 @@ describe("cli user input handling", () => {
               },
               sequenceChildFailure: null,
             },
-          ],
+          ]),
           failedStep: null,
           retries: 0,
-          artifacts: [],
+          artifacts: boundedCollectionAllShown([]),
           finalSnapshotId: null,
-          warnings: [],
-        } satisfies SessionFlowResult)),
+          warnings: boundedCollectionAllShown([]),
+        } satisfies BoundedFlowV2Result)),
       ),
     )
 
