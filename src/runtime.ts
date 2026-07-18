@@ -29,7 +29,7 @@ const KernelProvided = ProbeKernelLive.pipe(
   Layer.provide(Layer.mergeAll(BaseServicesLive, SessionRegistryProvided, PerfServiceProvided)),
 )
 const InvestigationControllerProvided = InvestigationControllerLive.pipe(
-  Layer.provide(Layer.mergeAll(InvestigationStoreLive, DaemonClientProvided)),
+  Layer.provide(Layer.mergeAll(InvestigationStoreLive, DaemonClientProvided, ArtifactStoreLive)),
 )
 
 export const ProbeLayer = Layer.mergeAll(

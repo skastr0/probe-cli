@@ -7,7 +7,9 @@ import {
   decodeInvestigationRecipe,
   deriveComparisonVerdict,
   identifyRegressedMetrics,
+  mergeAndRankFindings,
   mergeInvestigationEvidenceReports,
+  overallFindingsConfidence,
   planInvestigation,
   validateInvestigationRecipe,
   validateInvestigationRecipeDomain,
@@ -22,8 +24,15 @@ import {
   type PerfEvidenceReportType,
 } from "../domain/investigation"
 import { EnvironmentError, SessionConflictError, UserInputError } from "../domain/errors"
+import { ArtifactStore } from "./ArtifactStore"
+import { bindBoundedCollection } from "./boundedCollections"
 import type { InvestigationExecutorDeps } from "./investigation/investigationExecutorDeps"
 import { InvestigationStore, type InvestigationState } from "./InvestigationStore"
+
+// AC: "Terminal JSON contains bounded ranked findings ..." -- how many
+// findings inline before the rest overflows to a persisted, drillable
+// artifact (`bindBoundedCollection`, services/boundedCollections.ts).
+const findingsInlineLimit = 20
 
 // PRB-099: the durable orchestrator behind `probe investigate`. Composes the
 // pure domain plan (domain/investigation.ts) with `InvestigationStore`
@@ -147,6 +156,7 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
     InvestigationController,
     Effect.gen(function* () {
       const store = yield* InvestigationStore
+      const artifactStore = yield* ArtifactStore
 
       const requireState = (investigationId: string) =>
         Effect.gen(function* () {
@@ -274,19 +284,36 @@ export const InvestigationControllerLayer = (deps: InvestigationExecutorDeps) =>
         }]
       }
 
-      const runReportStage = (state: InvestigationState) => {
-        const report = assembleInvestigationReport({
-          investigationId: state.investigationId,
-          recipeHash: state.recipeHash,
-          status: "completed",
-          repetitionFindings: state.capturedRepetitions.map((repetition) => repetition.evidenceReport.findings),
-          walls: buildComparisonWalls(state.comparisonResult),
-          comparison: state.comparisonResult,
-          repetitionReportKeys: state.capturedRepetitions.map((repetition) => repetition.traceArtifactKey),
-          generatedAt: deps.nowIso(),
+      const runReportStage = (state: InvestigationState) =>
+        Effect.gen(function* () {
+          const merged = mergeAndRankFindings(state.capturedRepetitions.map((repetition) => repetition.evidenceReport.findings))
+          // Real persisted-on-overflow drill handle (services/
+          // boundedCollections.ts's `bindBoundedCollection`, the same
+          // atomic-persist-before-summary contract every other bounded
+          // collection at the RPC/CLI boundary already uses) -- not a
+          // hardcoded `drill: null`, which would violate `BoundedCollection`'s
+          // own invariant the moment a run had more than
+          // `findingsInlineLimit` findings.
+          const findings = yield* bindBoundedCollection(artifactStore, {
+            sessionId: state.sessionId,
+            collectionLabel: `investigation-${state.investigationId}-findings`,
+            items: merged,
+            shownLimit: findingsInlineLimit,
+          })
+
+          const report = assembleInvestigationReport({
+            investigationId: state.investigationId,
+            recipeHash: state.recipeHash,
+            status: "completed",
+            findings,
+            confidence: overallFindingsConfidence(merged),
+            walls: buildComparisonWalls(state.comparisonResult),
+            comparison: state.comparisonResult,
+            repetitionReportKeys: state.capturedRepetitions.map((repetition) => repetition.traceArtifactKey),
+            generatedAt: deps.nowIso(),
+          })
+          return { report } satisfies Partial<InvestigationState>
         })
-        return Effect.succeed({ report } satisfies Partial<InvestigationState>)
-      }
 
       const runStageWork = (state: InvestigationState, stage: InvestigationStageName): Effect.Effect<Partial<InvestigationState>, unknown> => {
         const recipe = state.recipe as InvestigationRecipe

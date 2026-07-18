@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { boundedCollectionAllShown, sliceBoundedCollection } from "./bounded"
 import {
   assembleInvestigationReport,
   compareEvidenceReports as compareReports,
@@ -7,13 +8,25 @@ import {
   fnv1aHex,
   identifyRegressedMetrics,
   investigationRecipeHash,
+  mergeAndRankFindings,
   mergeInvestigationEvidenceReports,
+  overallFindingsConfidence,
   planInvestigation,
   validateInvestigationRecipe,
   validateInvestigationRecipeDomain,
   type InvestigationRecipe,
 } from "./investigation"
 import type { PerfEvidenceComparison, PerfEvidenceFinding, PerfEvidenceReport } from "./perf-evidence"
+
+// Pure test-only stand-in for `services/boundedCollections.ts#bindBoundedCollection`
+// (which needs `ArtifactStore` + an Effect) -- these domain-level tests only
+// assert total/shown/omitted, never `drill`, so a plain non-persisting bound
+// is enough here; `InvestigationController.test.ts` covers the real,
+// persisted-artifact drill handle end to end.
+const boundFindingsForTest = (findings: ReadonlyArray<PerfEvidenceFinding>, shownLimit: number) => {
+  const { shown, omitted } = sliceBoundedCollection(findings, shownLimit)
+  return omitted === 0 ? boundedCollectionAllShown(findings) : { total: findings.length, shown, omitted, drill: null }
+}
 
 // PRB-099: pure-domain tests for the `probe investigate` orbit's core --
 // recipe decode/validation, planning, recipe-digest determinism, the
@@ -258,11 +271,13 @@ describe("assembleInvestigationReport", () => {
   })
 
   test("diagnosis (no comparison) reports overallVerdict diagnosis and comparisonVerdict not-requested", () => {
+    const merged = mergeAndRankFindings([[finding("a", "high")]])
     const report = assembleInvestigationReport({
       investigationId: "inv-1",
       recipeHash: "hash-1",
       status: "completed",
-      repetitionFindings: [[finding("a", "high")]],
+      findings: boundFindingsForTest(merged, 20),
+      confidence: overallFindingsConfidence(merged),
       walls: [],
       comparison: null,
       repetitionReportKeys: ["rep-0"],
@@ -278,11 +293,13 @@ describe("assembleInvestigationReport", () => {
       makeReport({ appBuild: "1", cpuSamples: [1_000_000] }),
       makeReport({ appBuild: "2", cpuSamples: [2_000_000] }),
     )
+    const merged = mergeAndRankFindings([[finding("a", "high")]])
     const report = assembleInvestigationReport({
       investigationId: "inv-1",
       recipeHash: "hash-1",
       status: "completed",
-      repetitionFindings: [[finding("a", "high")]],
+      findings: boundFindingsForTest(merged, 20),
+      confidence: overallFindingsConfidence(merged),
       walls: [],
       comparison,
       repetitionReportKeys: ["rep-0"],
@@ -294,16 +311,17 @@ describe("assembleInvestigationReport", () => {
 
   test("bounds findings and reports the true total/omitted count", () => {
     const manyFindings = Array.from({ length: 30 }, (_, index) => finding(`f-${index}`, "low"))
+    const merged = mergeAndRankFindings([manyFindings])
     const report = assembleInvestigationReport({
       investigationId: "inv-1",
       recipeHash: "hash-1",
       status: "completed",
-      repetitionFindings: [manyFindings],
+      findings: boundFindingsForTest(merged, 10),
+      confidence: overallFindingsConfidence(merged),
       walls: [],
       comparison: null,
       repetitionReportKeys: [],
       generatedAt: "2026-01-01T00:00:00.000Z",
-      maxInlineFindings: 10,
     })
     expect(report.findings.total).toBe(30)
     expect(report.findings.shown.length).toBe(10)
@@ -311,11 +329,13 @@ describe("assembleInvestigationReport", () => {
   })
 
   test("overall confidence is the worst confidence across every finding", () => {
+    const merged = mergeAndRankFindings([[finding("a", "high"), finding("b", "low")]])
     const report = assembleInvestigationReport({
       investigationId: "inv-1",
       recipeHash: "hash-1",
       status: "completed",
-      repetitionFindings: [[finding("a", "high"), finding("b", "low")]],
+      findings: boundFindingsForTest(merged, 20),
+      confidence: overallFindingsConfidence(merged),
       walls: [],
       comparison: null,
       repetitionReportKeys: [],

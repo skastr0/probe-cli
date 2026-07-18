@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { boundedCollectionAllShown, BoundedCollectionSchema, sliceBoundedCollection, type BoundedCollection } from "./bounded"
+import { BoundedCollectionSchema, type BoundedCollection } from "./bounded"
 import { EvidencePolicyInputSchema, resolveEvidencePolicy, type EvidencePolicy, type EvidencePolicyInput } from "./evidence"
 import { isBatchSequencePlannedStep, isFastSinglePlannedStep, planFlowExecution } from "./flow-planner"
 import { decodeSessionFlowContract, type SessionFlowContract } from "./flow-v2"
@@ -490,7 +490,7 @@ export const InvestigationReport = Schema.Struct({
 })
 export type InvestigationReport = typeof InvestigationReport.Type
 
-const overallConfidence = (findings: ReadonlyArray<PerfEvidenceFindingType>): "high" | "medium" | "low" => {
+export const overallFindingsConfidence = (findings: ReadonlyArray<PerfEvidenceFindingType>): "high" | "medium" | "low" => {
   if (findings.length === 0) {
     return "low"
   }
@@ -509,43 +509,41 @@ const overallConfidence = (findings: ReadonlyArray<PerfEvidenceFindingType>): "h
 const findingRank: Record<PerfEvidenceFindingType["confidence"], number> = { high: 0, medium: 1, low: 2 }
 
 /**
+ * Pure merge + re-rank step, split out from bounding/persistence (which
+ * needs `ArtifactStore`, an Effect, and is the caller's job -- see
+ * `services/InvestigationController.ts`'s `runReportStage`, which calls
+ * this, then `bindBoundedCollection` (services/boundedCollections.ts) for
+ * the real, persisted-on-overflow `BoundedCollection`, then
+ * `assembleInvestigationReport` below with the already-bounded result).
+ * Splitting these three steps is what lets "typed drill refs" (AC) be a
+ * genuine persisted-artifact handle instead of a hardcoded `null`.
+ */
+export const mergeAndRankFindings = (
+  repetitionFindings: ReadonlyArray<ReadonlyArray<PerfEvidenceFindingType>>,
+): ReadonlyArray<PerfEvidenceFindingType> =>
+  repetitionFindings
+    .flat()
+    .sort((left, right) => findingRank[left.confidence] - findingRank[right.confidence] || left.id.localeCompare(right.id))
+
+/**
  * Assembles the bounded terminal report (AC: "Terminal JSON contains
  * bounded ranked findings, confidence, walls, comparison verdict, and typed
- * drill refs; bulk evidence stays artifacts"). `findings` across every
- * repetition are merged, re-ranked by confidence, and bounded to
- * `maxInlineFindings` -- overflow is the caller's job to persist as a drill
- * artifact (see services/InvestigationController.ts), this function only
- * decides the slice.
+ * drill refs; bulk evidence stays artifacts"). Takes an already-merged,
+ * already-bounded `findings` collection (see `mergeAndRankFindings` +
+ * `bindBoundedCollection` above) rather than computing it itself -- this
+ * function's only job is assembling the final envelope around it.
  */
 export const assembleInvestigationReport = (args: {
   readonly investigationId: string
   readonly recipeHash: string
   readonly status: InvestigationStatus
-  readonly repetitionFindings: ReadonlyArray<ReadonlyArray<PerfEvidenceFindingType>>
+  readonly findings: BoundedCollection<PerfEvidenceFindingType>
+  readonly confidence: "high" | "medium" | "low"
   readonly walls: ReadonlyArray<InvestigationWall>
   readonly comparison: PerfEvidenceComparisonType | null
   readonly repetitionReportKeys: ReadonlyArray<string>
   readonly generatedAt: string
-  readonly maxInlineFindings?: number
-  readonly boundFindings?: (
-    findings: ReadonlyArray<PerfEvidenceFindingType>,
-    maxInlineFindings: number,
-  ) => BoundedCollection<PerfEvidenceFindingType>
 }): InvestigationReport => {
-  const merged = args.repetitionFindings
-    .flat()
-    .sort((left, right) => findingRank[left.confidence] - findingRank[right.confidence] || left.id.localeCompare(right.id))
-
-  const maxInlineFindings = args.maxInlineFindings ?? 20
-  const bounded = args.boundFindings
-    ? args.boundFindings(merged, maxInlineFindings)
-    : (() => {
-        const { shown, omitted } = sliceBoundedCollection(merged, maxInlineFindings)
-        return omitted === 0
-          ? boundedCollectionAllShown(merged)
-          : { total: merged.length, shown, omitted, drill: null }
-      })()
-
   const comparisonVerdict: InvestigationComparisonVerdict = args.comparison
     ? deriveComparisonVerdict(args.comparison)
     : "not-requested"
@@ -555,8 +553,8 @@ export const assembleInvestigationReport = (args: {
     recipeHash: args.recipeHash,
     status: args.status,
     overallVerdict: args.comparison ? "before-after-proof" : "diagnosis",
-    confidence: overallConfidence(merged),
-    findings: bounded,
+    confidence: args.confidence,
+    findings: args.findings,
     walls: args.walls,
     comparison: args.comparison,
     comparisonVerdict,

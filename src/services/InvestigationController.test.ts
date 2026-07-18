@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Context, Effect, Layer, ManagedRuntime } from "effect"
 import type { PerfEvidenceReport } from "../domain/perf-evidence"
+import { ArtifactStoreLive } from "./ArtifactStore"
 import { InvestigationController, InvestigationControllerLayer } from "./InvestigationController"
 import { InvestigationStore, InvestigationStoreLive } from "./InvestigationStore"
 import type { InvestigationExecutorDeps } from "./investigation/investigationExecutorDeps"
@@ -124,7 +125,7 @@ const withController = async <T>(
 
   const layer = Layer.mergeAll(
     InvestigationStoreLive,
-    InvestigationControllerLayer(deps).pipe(Layer.provide(InvestigationStoreLive)),
+    InvestigationControllerLayer(deps).pipe(Layer.provide(Layer.mergeAll(InvestigationStoreLive, ArtifactStoreLive))),
   )
   const runtime = ManagedRuntime.make(layer)
 
@@ -157,6 +158,38 @@ describe("InvestigationController -- state, events, artifacts", () => {
       expect(inspection.report?.comparisonVerdict).toBe("not-requested")
       expect(inspection.report?.repetitionReportKeys).toEqual(["trace-0", "trace-1", "trace-2"])
       expect(inspection.report?.findings.total).toBe(3)
+    })
+  })
+
+  test("overflowing findings (>20 inline) persist a real, non-null typed drill handle", async () => {
+    const { deps, captureRepetitionRef } = makeFakeDeps()
+    const manyFindingsReport: PerfEvidenceReport = {
+      ...makeFakeReport(0, 1_000_000),
+      findings: Array.from({ length: 25 }, (_, index) => ({
+        id: `finding-${index}`,
+        kind: "observation" as const,
+        summary: `Observation ${index}.`,
+        windowLabel: "full-recording",
+        source: { schema: "time-sample", rowSelector: `row[${index}]` },
+        confidence: "low" as const,
+        basis: ["time-sample rows"],
+      })),
+    }
+    captureRepetitionRef.current = () => Effect.succeed({ evidenceReport: manyFindingsReport, traceArtifactKey: "trace-0" })
+
+    await withController(deps, async ({ controller }) => {
+      const inspection = await Effect.runPromise(controller.run({ recipeInput: { ...baseRecipe, repetitions: 1 } }))
+
+      expect(inspection.status).toBe("completed")
+      expect(inspection.report?.findings.total).toBe(25)
+      expect(inspection.report?.findings.shown.length).toBe(20)
+      expect(inspection.report?.findings.omitted).toBe(5)
+      // The whole point of this fix: overflow must be a real, resolvable
+      // artifact handle, never a `null` that would contradict
+      // `BoundedCollection`'s own "drill null means nothing was omitted"
+      // invariant (domain/bounded.ts).
+      expect(inspection.report?.findings.drill).not.toBeNull()
+      expect(inspection.report?.findings.drill?.artifactKey).toContain("findings-overflow")
     })
   })
 
@@ -337,7 +370,7 @@ describe("InvestigationController -- read/resume across a simulated process cras
       process.env.PROBE_ARTIFACT_ROOT = root
       const resumeLayer = Layer.mergeAll(
         InvestigationStoreLive,
-        InvestigationControllerLayer(resumed.deps).pipe(Layer.provide(InvestigationStoreLive)),
+        InvestigationControllerLayer(resumed.deps).pipe(Layer.provide(Layer.mergeAll(InvestigationStoreLive, ArtifactStoreLive))),
       )
       const resumeRuntime = ManagedRuntime.make(resumeLayer)
 
