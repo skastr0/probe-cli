@@ -175,7 +175,19 @@ export const AccessibilityServiceLive = Layer.effect(
       doctor: ({ sessionId }) =>
         Effect.gen(function* () {
           const session = yield* daemonClient.getSessionHealth({ sessionId })
-          const warnings = [...session.warnings.shown]
+          // PRB-094 review finding: `session.warnings` is bounded at the RPC
+          // boundary (session.warnings.shown = the first
+          // sessionHealthWarningsShownLimit), so a session with more
+          // warnings than that can no longer surface the rest through this
+          // doctor report inline. Rather than silently narrow what the
+          // report claims to cover, record the omission explicitly and
+          // point at the drill handle for the rest.
+          const warnings = [
+            ...session.warnings.shown,
+            ...(session.warnings.omitted > 0
+              ? [`${session.warnings.omitted} additional session warning(s) omitted -- drill ${session.warnings.drill?.artifactKey} for the complete list.`]
+              : []),
+          ]
           const checks: Array<AccessibilityDoctorCheck> = [buildLiveRunnerCheck(session)]
 
           let snapshotArtifact: AccessibilityDoctorReport["snapshotArtifact"] = null

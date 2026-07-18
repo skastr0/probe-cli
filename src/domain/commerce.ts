@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { FlowStepSchema } from "./action"
+import { BoundedCollectionSchema } from "./bounded"
 import { UnsupportedFlowContractError } from "./errors"
 import {
   BoundedFlowV2ResultSchema,
@@ -306,6 +307,21 @@ export const CommerceValidationReportSchema = Schema.Struct({
   reportArtifact: Schema.Union(ArtifactRecord, Schema.Null),
 })
 export type CommerceValidationReport = typeof CommerceValidationReportSchema.Type
+
+// PRB-094: `CommerceValidationReportSchema` above is `buildCommerceValidationReport`'s
+// pure-builder shape -- it stays a plain `Array<CommerceValidationStepResult>`
+// because that builder has no `ArtifactStore`/Effect context to persist an
+// overflow artifact through. `CommerceService.validate` (the one caller that
+// actually hands this report back to the CLI) binds `executedSteps` through
+// the same `bindBoundedCollection` step every other RPC/CLI-boundary
+// collection uses, against the report's own `sessionId` -- a many-step
+// commerce validation plan can't inline every step's details/warnings/flow
+// result unbounded any more than a 10k-step `session.run` flow can.
+export const BoundedCommerceValidationReportSchema = Schema.Struct({
+  ...CommerceValidationReportSchema.fields,
+  executedSteps: BoundedCollectionSchema(CommerceValidationStepResultSchema),
+})
+export type BoundedCommerceValidationReport = typeof BoundedCommerceValidationReportSchema.Type
 
 const normalizeEmbeddedFlowInput = (value: unknown): unknown => {
   // Checked here, ahead of schema validation: EmbeddedFlowInputSchema's
