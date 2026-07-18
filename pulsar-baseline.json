@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "baseline_sha": "d6eca69bf63cecf993f37a00be27bc24dea1d396",
+  "created_at": "2026-07-18T09:48:32.645Z",
+  "vector_id": "all-defaults",
+  "vector_source": "built-in defaults",
+  "vector_trust_boundary": "built-in-defaults",
+  "observer_config_hash": "004b7c435d06106c535aa498a701961711b5bccd157f37bceb4ec264090cb4e9",
+  "violations": {}
+}
