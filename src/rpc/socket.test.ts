@@ -490,6 +490,42 @@ describe("rpc socket behavior", () => {
     })
   })
 
+  test("delivers a terminal response larger than one flushed chunk without truncation (PRB-104)", async () => {
+    await withTempSocketRoot(async ({ socketPath, metadataPath }) => {
+      // Regression: the per-connection finalizer destroyed the socket immediately after
+      // socket.end(), discarding everything in the write buffer beyond the first flushed
+      // ~8KB chunk. Session open/health responses exceed that routinely.
+      const oversizedMarker = "x".repeat(64 * 1024)
+
+      const fiber = Effect.runFork(
+        serveRpc({
+          socketPath,
+          metadataPath,
+          onRequest: (request) =>
+            Effect.succeed(makeDaemonPingResponse(request, oversizedMarker)),
+          onMetadataWrite: async () => undefined,
+          onMetadataRemove: async () => undefined,
+        }),
+      )
+
+      try {
+        await waitForSocket(socketPath)
+
+        const buffer = await requestRawLine(socketPath, `${JSON.stringify(daemonPingRequest)}\n`)
+        expect(buffer.length).toBeGreaterThan(8_192)
+
+        const parsed = JSON.parse(buffer) as {
+          requestId: string
+          result: { socketPath: string }
+        }
+        expect(parsed.requestId).toBe(daemonPingRequest.requestId)
+        expect(parsed.result.socketPath).toHaveLength(oversizedMarker.length)
+      } finally {
+        await Effect.runPromise(Fiber.interrupt(fiber))
+      }
+    })
+  })
+
   test("decodes a request fragmented across arbitrary chunks exactly once, preserving progress-then-terminal ordering", async () => {
     await withTempSocketRoot(async ({ socketPath, metadataPath }) => {
       let requestCount = 0
