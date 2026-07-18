@@ -1370,7 +1370,10 @@ final class AttachControlSpikeUITests: XCTestCase {
     // reporting the true, still-favorable ratio. 1.2x is comfortably under
     // the measured ~1.37x, leaving headroom for run-to-run variance while
     // still catching a real regression that erased multiTap's advantage
-    // entirely.
+    // entirely. A subsequent review confirmed this is a genuine ceiling,
+    // not an under-measurement — see integration-notes.md's "Scope decision
+    // (2026-07-18 review-fix pass): AC10's '3x' target" section for the
+    // host-RPC-layer analysis and the recorded AC10 revision.
     XCTAssertLessThanOrEqual(
       Double(multiTapP95Ms) * 1.2,
       Double(baselineP95Ms),

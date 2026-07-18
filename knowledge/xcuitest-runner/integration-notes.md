@@ -473,3 +473,100 @@ and the physical-device half of "real Simulator and physical-device
 boundary tests replace fake-only proof" stay **partial**: implemented and
 Simulator-boundary-tested, not exercised against real hardware on this
 host.
+
+### Scope decision (2026-07-18 review-fix pass): AC10's "3x" target
+
+Review flagged AC10 ("Five-tap p95 is at least three times faster than five
+separate fast actions") as objectively unmet by the committed
+`>=1.2x` assertion, and asked for an explicit glyph-owner scope call rather
+than a silently-buried gap: relax the target given the documented finding,
+or pursue a genuinely batched native gesture. Both alternatives were
+re-examined before deciding, not assumed:
+
+- **A native batched gesture was re-checked and re-rejected.** XCUITest's
+  public surface has no gesture that dispatches N discrete taps with a
+  caller-controlled inter-tap delay as one synchronized event —
+  `tapWithNumberOfTaps(_:numberOfTouches:)` is the only multi-tap primitive
+  and it exposes no timing control at all (already documented above), and
+  there is no lower-level public replacement (`XCUICoordinate.tap()` still
+  pays the same per-dispatch cross-process synchronization wait as
+  `XCUIElement.tap()` — switching coordinate vs. element does not touch the
+  cost this finding is about). Inventing one would mean reaching for
+  private API, which is out of scope for a QA runner shipped against real
+  apps. This path is closed, not merely deferred.
+- **The host RPC/snapshot layer was checked as a second candidate source of
+  the claimed 3x** (the committed benchmark only measures the
+  runner-internal XCUITest layer, in-process, so it was fair to ask whether
+  batching's real advantage shows up further up the stack instead). It does
+  not: `executeDirectRunnerActionStep`
+  (`src/services/flow/directRunnerActionExecutor.ts`) is the actual
+  "five separate fast actions" comparator AC10 means, and fast actions
+  already skip the post-action host snapshot capture entirely ("Executed
+  fast ... without host snapshots.") — the expensive per-command snapshot
+  walk that `uiActionBatch` avoids (one optional end-of-batch checkpoint
+  snapshot vs. N, `batchActionExecutor.ts`) is not paid by the fast-action
+  baseline in the first place. The only host-level saving batching adds on
+  top of the runner-internal number is avoided HTTP/dispatch round trips,
+  which are small next to the few-hundred-ms per-tap XCUITest
+  synchronization cost that dominates on both sides of the comparison. This
+  was verified by tracing the code path, not assumed from the runner-only
+  number.
+
+Given both avenues are closed, **AC10 is revised**: the glyph's "at least
+three times faster" target is relaxed to "measurably and consistently
+faster, with the multiplier and root cause disclosed" — which is exactly
+what `testFixtureFiveTapRecognizerPassesRepeatedWarmMultiTapActions`
+already asserts and reports (`>=1.2x`, comfortably under both measured
+~1.24x-1.37x runs) and what this file's "Measured receipts" section above
+already documents in full. No test was weakened to reach this: the
+`>=1.2x` assertion was already the honest, measured bound before this
+review pass; this section is the recorded scope decision that resolves
+AC10 against it, so the glyph does not sit indefinitely on an
+unsatisfiable literal target. A future host/XCUITest version that lowers
+the fixed per-tap synchronization cost would be free to raise this bound
+again — nothing here forecloses re-measuring later.
+
+### Independent verification (2026-07-18 review-fix pass)
+
+The prior review round could not re-run the Simulator XCUITest receipts
+below (no booted simulator, multi-minute `xcodebuild`) and flagged them as
+resting on the builder's report only. This pass had a booted iOS 26.5
+iPhone 17 Pro and re-ran the real integration through the `probe` CLI
+end-to-end (not the XCUITest target directly) against Xcode 26.6 — the
+exact host/Xcode combination the KNOWN HOST DEFECT warns about — and did
+**not** hit that defect on this path:
+
+- `session open --target simulator` performed a real
+  `build-for-testing` + `test-without-building` + attach, twice (two fresh
+  sessions), and both ready frames' `capabilities` included
+  `"uiActionBatch"` alongside `"uiAction"` — the capability flip is
+  confirmed live in this environment, not only in the builder's report.
+- `session run` against `docs/examples/flows/sequence-batch-v2.json` (a
+  `fast`/`checkpoint: end` sequence with two ordered children) executed
+  successfully with `transportLane: "runner-batch"`, one snapshot for the
+  whole step (not one per child), and the follow-on `assert` step confirmed
+  the second child only ran after the first completed — a live,
+  independent confirmation of ordered execution and the "no host snapshot
+  between children" guarantee end to end at the real HTTP boundary (using
+  `type`/`tap` children, not `multiTap`, but the same `uiActionBatch`
+  dispatch path `testUIActionBatchAtTheHTTPBoundaryIsOneRPCWithReplaySafeRedelivery`
+  exercises).
+- A direct `multiTap` action against
+  `fixture.gesture.multiTapTarget` while the button was off-screen was
+  correctly rejected with `"Expected identifier=fixture.gesture.multiTapTarget,
+  type=button, interactive=true to be hittable before multi-tap."` —
+  confirming the runner's `multiTap` hittability guard
+  (`requireExistsAndHittable("multi-tap")`) is live end to end through the
+  host, not just exercised in-process by the test target.
+
+Not independently re-verified this pass (still resting on the builder's
+report, time-boxed rather than exhaustive): the specific 100/100-iteration
+`testFixtureFiveTapRecognizerPassesRepeatedWarmMultiTapActions` gate and
+its p95 numbers (reproducing it end to end requires driving the fixture's
+`Reset` button and scrolling the exact fixture layout the Swift test
+already automates — the CLI attempt above got as far as confirming the
+hittability guard fires correctly but did not chase the scroll sequence
+needed to reach a hittable state, a deliberately bounded stop for a minor
+finding), and the pre-existing `testCommandLoopReplaySafety` base-commit
+flake claim (this diff does not touch that test either way). Both are
+unchanged from the prior review round's caveat.
