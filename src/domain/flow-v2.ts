@@ -29,6 +29,7 @@ import {
   validateFlowStep,
   validateSessionAction,
 } from "./action"
+import { BoundedCollectionSchema } from "./bounded"
 import { EvidencePolicyInputSchema, EvidenceReportSchema } from "./evidence"
 import { ArtifactRecord, NullableString } from "./output"
 import { UnsupportedFlowContractError } from "./errors"
@@ -329,6 +330,20 @@ export const FlowSequenceStepSchema = Schema.Struct({
   // regardless of child count.
   evidencePolicy: Schema.optional(EvidencePolicyInputSchema),
   continueOnError: Schema.optional(Schema.Boolean),
+}).annotations({
+  // PRB-103: a stale caller still sending the pre-PRB-093 `checkpoint`
+  // field (see above) would otherwise decode silently -- Schema.Struct's
+  // default `onExcessProperty: "ignore"` drops unknown keys rather than
+  // rejecting them, so `checkpoint: "none"` would vanish and the step would
+  // silently fall back to the *default* evidence policy (success="end"),
+  // which is not what a caller asking for "none" meant. Consistent with
+  // PRB-082's rejection idiom (a superseded shape fails closed with a typed
+  // decode error instead of silently adapting through), `onExcessProperty:
+  // "error"` is scoped to just this one step kind -- the step shape that
+  // actually changed vocabulary -- rather than a project-wide strict-decode
+  // policy that would risk rejecting unrelated, still-tolerated extra
+  // fields elsewhere in the flow contract.
+  parseOptions: { onExcessProperty: "error" },
 })
 export type FlowSequenceStep = typeof FlowSequenceStepSchema.Type
 
@@ -420,6 +435,24 @@ export type SessionFlowContract = typeof SessionFlowContractSchema.Type
 
 export const SessionFlowResultSchema = FlowV2ResultSchema
 export type SessionFlowResult = typeof SessionFlowResultSchema.Type
+
+// PRB-094: the RPC/CLI-boundary contract for `session.run`. `FlowV2Result`
+// above stays the *internal* engine shape -- `SessionRegistry.runFlow` and
+// its tests still build and assert against a plain `executedSteps` array,
+// since a flow's own executor loop needs the full, ungrouped step list to
+// fold verdicts/retries/artifacts as it runs. Only the outermost RPC
+// response (built in `ProbeKernel.ts`, the one place a `FlowV2Result`
+// actually gets serialized to a caller) swaps `executedSteps`/`artifacts`/
+// `warnings` for their bounded-collection form, so a 10k-step flow's wire
+// response stays inside the generic 4 KiB / 100 line inline budget instead
+// of inlining every step.
+export const BoundedFlowV2ResultSchema = Schema.Struct({
+  ...FlowV2ResultSchema.fields,
+  executedSteps: BoundedCollectionSchema(FlowV2StepResultSchema),
+  artifacts: BoundedCollectionSchema(ArtifactRecord),
+  warnings: BoundedCollectionSchema(Schema.String),
+})
+export type BoundedFlowV2Result = typeof BoundedFlowV2ResultSchema.Type
 
 export const resolveFlowExecutionProfile = (
   flowExecution?: FlowExecutionProfile,

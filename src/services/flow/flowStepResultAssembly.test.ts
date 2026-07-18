@@ -3,7 +3,7 @@ import { Either } from "effect"
 import { EnvironmentError, SessionNotFoundError } from "../../domain/errors"
 import type { PlannedStep } from "../../domain/flow-planner"
 import type { ArtifactRecord } from "../../domain/output"
-import type { ActionExecutionOutcome } from "../SessionRegistry"
+import type { ActionExecutionOutcome } from "../sessionShared"
 import {
   assembleFlowResult,
   buildActionOutcomeStepResult,

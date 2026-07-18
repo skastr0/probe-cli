@@ -8,15 +8,15 @@ import {
   isCommerceExecutableStep,
   rollupCommerceVerdict,
   validateCommerceValidationPlan,
+  type BoundedCommerceValidationReport,
   type CommerceCheck,
   type CommerceDoctorReport,
   type CommerceProvider,
   type CommerceValidationMode,
   type CommerceValidationPlan,
-  type CommerceValidationReport,
   type CommerceValidationStepResult,
 } from "../domain/commerce"
-import type { SessionFlowResult } from "../domain/flow-v2"
+import type { BoundedFlowV2Result } from "../domain/flow-v2"
 import {
   ArtifactNotFoundError,
   ChildProcessError,
@@ -32,6 +32,7 @@ import {
 } from "../domain/errors"
 import type { ArtifactRecord } from "../domain/output"
 import { ArtifactStore } from "./ArtifactStore"
+import { bindBoundedCollection } from "./boundedCollections"
 import { DaemonClient } from "./DaemonClient"
 
 interface TextFileEntry {
@@ -80,6 +81,12 @@ const storeKitProductFieldNames = new Set(["productId", "productID", "productIde
 const revenueCatProductFieldNames = new Set(["productId", "productID", "productIdentifier", "storeProductId", "storeProductID", "appleProductId", "apple_product_id", "id"])
 const revenueCatEntitlementFieldNames = new Set(["entitlement", "entitlementId", "entitlementID", "entitlementIdentifier", "entitlements"])
 const ignoredWorkspaceDirectoryNames = new Set([".git", "node_modules", "Pods", "build", "coverage", "dist", ".next"])
+
+// PRB-094: matches `flowExecutedStepsShownLimit` (ProbeKernel.ts) -- how
+// many `executedSteps` entries a commerce validation report inlines before
+// the rest overflows to a persisted, drillable artifact (see
+// `bindBoundedCollection`, services/boundedCollections.ts).
+const commerceExecutedStepsShownLimit = 5
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null
@@ -541,10 +548,10 @@ const formatThrownError = (error: unknown): string =>
       ? error.message
       : String(error)
 
-const flowResultToStepVerdict = (flow: SessionFlowResult): CommerceValidationStepResult["verdict"] =>
+const flowResultToStepVerdict = (flow: BoundedFlowV2Result): CommerceValidationStepResult["verdict"] =>
   flow.verdict === "passed" ? "verified" : "blocked"
 
-const buildStepDetails = (flow: SessionFlowResult): Array<string> => [
+const buildStepDetails = (flow: BoundedFlowV2Result): Array<string> => [
   `flow verdict: ${flow.verdict}`,
   `flow retries: ${flow.retries}`,
   ...(flow.failedStep ? [`failed flow step ${flow.failedStep.index}: ${flow.failedStep.summary}`] : []),
@@ -628,7 +635,7 @@ export class CommerceService extends Context.Tag("@probe/CommerceService")<
       readonly mode: CommerceValidationMode
       readonly provider?: CommerceProvider | null
       readonly plan?: CommerceValidationPlan | null
-    }) => Effect.Effect<CommerceValidationReport, CommerceServiceError>
+    }) => Effect.Effect<BoundedCommerceValidationReport, CommerceServiceError>
   }
 >() {}
 
@@ -1459,7 +1466,19 @@ export const CommerceServiceLive = Layer.effect(
                 ...buildStepDetails(flowResult),
                 ...(provider === "revenuecat" ? buildRevenueCatStepNotes(step.kind) : []),
               ],
-              warnings: [...flowResult.warnings],
+              // PRB-094 review finding: `flowResult.warnings` is bounded at
+              // the RPC boundary, so a step whose underlying flow raised
+              // more warnings than the shown limit can no longer surface
+              // the rest through this step's own `warnings` array. Record
+              // the omission explicitly (with a pointer to the drill
+              // handle) instead of silently narrowing what this step
+              // reports.
+              warnings: [
+                ...flowResult.warnings.shown,
+                ...(flowResult.warnings.omitted > 0
+                  ? [`${flowResult.warnings.omitted} additional flow warning(s) omitted -- drill ${flowResult.warnings.drill?.artifactKey} for the complete list.`]
+                  : []),
+              ],
               flowResult,
             }
             executedSteps.push(stepResult)
@@ -1535,9 +1554,26 @@ export const CommerceServiceLive = Layer.effect(
           const stubCount = executedSteps.filter((step) => step.stub).length
           const verdictCounts = rollupCommerceVerdict(executedSteps.map((step) => step.verdict))
 
+          // PRB-094: bound the top-level `executedSteps` collection itself --
+          // each step's *embedded* `flowResult` was already bounded above,
+          // but a many-step plan (many stubbed/executed steps, each with its
+          // own `details`/`warnings`) can still blow the generic budget
+          // through sheer step count. `reportArtifact` above already holds
+          // the complete unbounded report for drilling, but this reuses the
+          // same canonical bounded-collection contract (total/shown/omitted/
+          // typed drill handle) every other RPC/CLI-boundary collection uses
+          // instead of only relying on the whole-report artifact.
+          const boundedExecutedSteps = yield* bindBoundedCollection(artifactStore, {
+            sessionId,
+            collectionLabel: "commerce-executed-steps",
+            items: finalReport.executedSteps,
+            shownLimit: commerceExecutedStepsShownLimit,
+          })
+
           return {
             ...finalReport,
             summary: `${finalReport.summary} Overall verdict: ${finalReport.verdict}. Raw step rollup: ${verdictCounts}.${stubCount > 0 ? ` Stubbed steps: ${stubCount}.` : ""}`,
+            executedSteps: boundedExecutedSteps,
           }
         }),
     })

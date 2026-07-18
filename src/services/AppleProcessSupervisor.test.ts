@@ -167,6 +167,44 @@ describe("AppleProcessSupervisor", () => {
     expect(processGroupMembers(pgid.pgid).length).toBe(0)
   })
 
+  test(
+    "grandchild fault test: a backgrounded job outliving the leader while holding stdout is signaled and cannot hang waitForClose",
+    async () => {
+      // PRB-101: `sh -c "echo leader-done; sleep 30 &"` never `wait`s on the
+      // background job it starts, so the tracked leader (the sh process)
+      // exits almost immediately while `sleep 30` -- still in the same
+      // process group, still holding the inherited write end of stdout --
+      // keeps running. Before this fix, Node's 'close' event (which needs
+      // every holder of the pipe to let go, not just the leader) never
+      // fired, and nothing else ever re-signaled the group once the tracked
+      // leader had already exited -- awaitExit hung forever. This test's own
+      // bounded timeout (well below the default bun test timeout) is the
+      // backstop if that regresses.
+      const outcome = await withSupervisor(
+        Effect.gen(function* () {
+          const supervisor = yield* AppleProcessSupervisor
+          const handle = yield* supervisor.spawnHandle({
+            command: "/bin/sh",
+            commandArgs: ["-c", "echo leader-done; sleep 30 &"],
+            gracePeriodMs: 150,
+          })
+
+          const result = yield* Effect.promise(() => handle.awaitExit)
+          // Give the forced KILL a moment to actually land before checking
+          // for survivors.
+          yield* Effect.sleep(Duration.millis(50))
+          const survivors = processGroupMembers(handle.pid)
+          return { result, survivors }
+        }),
+      )
+
+      expect(outcome.result.exitCode).toBe(0)
+      expect(outcome.result.stdout.trim()).toBe("leader-done")
+      expect(outcome.survivors.length).toBe(0)
+    },
+    5_000,
+  )
+
   test("daemon shutdown fault test: closing the supervisor's scope kills stragglers", async () => {
     let pid = -1
 

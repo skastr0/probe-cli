@@ -2,17 +2,18 @@ import { Effect, Schema } from "effect"
 import type { AccessibilityDoctorReport } from "../../domain/accessibility"
 import type { CommerceDoctorReport, CommerceProvider, CommerceValidationMode } from "../../domain/commerce"
 import type {
+  BoundedDiagnosticReport,
   DiagnosticCaptureKind,
   DiagnosticCaptureTarget,
-  DiagnosticReport,
-  KnownWall,
+  BoundedKnownWall,
 } from "../../domain/diagnostics"
 import type { SummaryArtifactResult } from "../../domain/output"
 import type { WorkspaceStatus } from "../../domain/workspace"
 import { AccessibilityService } from "../../services/AccessibilityService"
 import { CommerceService } from "../../services/CommerceService"
 import { DaemonClient } from "../../services/DaemonClient"
-import { ProbeKernel } from "../../services/ProbeKernel"
+import { ProbeKernel, workspaceDiagnosticsSessionId } from "../../services/ProbeKernel"
+import { boundCliEscapingError } from "../errorBounding"
 import { hasMachineJsonOutput, readOptionalJsonInput } from "../json"
 import { invalidOption, optionalOption, requireOption, unknownSubcommand } from "../options"
 
@@ -39,14 +40,25 @@ const decodeDoctorAccessibilityPayload = Schema.decodeUnknownSync(DoctorAccessib
 const decodeDoctorCommercePayload = Schema.decodeUnknownSync(DoctorCommercePayload)
 const decodeDoctorCapturePayload = Schema.decodeUnknownSync(DoctorCapturePayload)
 
-const formatDiagnostic = (diagnostic: DiagnosticReport): Array<string> => [
-  `- ${diagnostic.key} [${diagnostic.status}] ${diagnostic.summary}`,
-  ...diagnostic.details.map((detail) => `  - ${detail}`),
+// PRB-094: `details` is now a bounded collection (total/shown/omitted/drill,
+// domain/bounded.ts) -- mirrors the `session health`/`session run` text
+// formatters' "N of total, M omitted -- drill <key>" idiom (cli/commands/
+// session.ts) instead of assuming every detail line is present inline.
+const formatBoundedDetails = (details: BoundedDiagnosticReport["details"]): Array<string> => [
+  ...details.shown.map((detail) => `  - ${detail}`),
+  ...(details.omitted > 0
+    ? [`  - ${details.omitted} more omitted -- drill ${details.drill?.artifactKey}`]
+    : []),
 ]
 
-const formatKnownWall = (wall: KnownWall): Array<string> => [
+const formatDiagnostic = (diagnostic: BoundedDiagnosticReport): Array<string> => [
+  `- ${diagnostic.key} [${diagnostic.status}] ${diagnostic.summary}`,
+  ...formatBoundedDetails(diagnostic.details),
+]
+
+const formatKnownWall = (wall: BoundedKnownWall): Array<string> => [
   `- ${wall.key}: ${wall.summary}`,
-  ...wall.details.map((detail) => `  - ${detail}`),
+  ...formatBoundedDetails(wall.details),
 ]
 
 const formatWorkspaceStatus = (status: WorkspaceStatus): string => {
@@ -223,7 +235,9 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
         const sessionId = payload?.sessionId ?? (yield* requireOption(rest, "--session-id"))
         const asJson = hasMachineJsonOutput(rest)
         const accessibility = yield* AccessibilityService
-        const report = yield* accessibility.doctor({ sessionId })
+        const report = yield* accessibility.doctor({ sessionId }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(sessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatAccessibilityDoctorReport(report))
@@ -246,7 +260,9 @@ export const runDoctorCommand = (args: ReadonlyArray<string>) =>
           mode,
           provider,
           storekitConfigPath,
-        })
+        }).pipe(
+          Effect.catchAll((error) => boundCliEscapingError(workspaceDiagnosticsSessionId, error)),
+        )
 
         yield* Effect.sync(() => {
           console.log(asJson ? JSON.stringify(report, null, 2) : formatCommerceDoctorReport(report))

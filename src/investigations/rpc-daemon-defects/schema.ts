@@ -7,6 +7,11 @@ export const DefectCategory = Schema.Literal(
   "ambiguous-mutation-delivery",
   "artifact-race",
   "eager-export",
+  // PRB-094: whether the RPC-boundary bounded-collection contract
+  // (domain/bounded.ts, services/boundedCollections.ts) actually keeps a
+  // 10k-item normal result inside the generic 4 KiB / 100 line inline
+  // budget -- see scenarios/outputPolicyBounds.ts.
+  "output-policy-overflow",
 )
 export type DefectCategory = typeof DefectCategory.Type
 

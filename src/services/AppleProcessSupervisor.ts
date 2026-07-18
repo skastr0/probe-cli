@@ -223,8 +223,32 @@ const trySignalGroup = (pid: number, signal: NodeJS.Signals): void => {
 
 const hasExited = (child: ChildProcess): boolean => child.exitCode !== null || child.signalCode !== null
 
+/**
+ * Resolves once `child`'s stdio has fully closed -- but never hangs forever
+ * over it. A grandchild that inherited the write end of stdout/stderr (e.g.
+ * a job the tracked leader backgrounded and then exited without ever
+ * `wait`-ing on) can outlive the leader while still holding that pipe open:
+ * Node's 'close' event needs every holder of the pipe to let go, not just
+ * the direct child, so a naive close-only wait can hang indefinitely even
+ * though the tracked process itself is long gone -- and since this is the
+ * same wait every caller (runManaged, spawnHandleManaged, the acquireRelease
+ * finalizer) ultimately joins before it can do anything else, that hang
+ * previously meant the finalizer that would otherwise TERM/KILL the process
+ * group was never even reached.
+ *
+ * Once 'exit' fires without a prompt 'close', this re-signals the process
+ * group (still a valid target even after the original leader has exited, as
+ * long as any member survives -- `trySignalGroup`'s ESRCH fallback makes a
+ * fully-empty group a harmless no-op) through the same TERM -> grace -> KILL
+ * ladder used elsewhere, then gives the pipe one bounded window to actually
+ * close before giving up and resolving with the exit's own code/signal. The
+ * caller gets whatever output had already streamed in instead of the
+ * supervisor hanging forever over a pipe a surviving grandchild may never
+ * release on its own.
+ */
 const waitForClose = (
   child: ChildProcess,
+  gracePeriodMs: number = defaultGracePeriodMs,
 ): Effect.Effect<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }> =>
   Effect.async((resume) => {
     if (hasExited(child)) {
@@ -232,8 +256,46 @@ const waitForClose = (
       return
     }
 
-    child.once("close", (code, signal) => {
-      resume(Effect.succeed({ code, signal: signal as NodeJS.Signals | null }))
+    let settled = false
+    let killTimer: ReturnType<typeof setTimeout> | undefined
+    let forceTimer: ReturnType<typeof setTimeout> | undefined
+
+    const settle = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (killTimer !== undefined) {
+        clearTimeout(killTimer)
+      }
+      if (forceTimer !== undefined) {
+        clearTimeout(forceTimer)
+      }
+      resume(Effect.succeed({ code, signal }))
+    }
+
+    child.once("close", (code, signal) => settle(code, signal as NodeJS.Signals | null))
+
+    child.once("exit", (exitCode, exitSignal) => {
+      const pid = child.pid
+
+      if (pid === undefined) {
+        settle(exitCode, exitSignal as NodeJS.Signals | null)
+        return
+      }
+
+      trySignalGroup(pid, "SIGTERM")
+
+      killTimer = setTimeout(() => {
+        if (settled) {
+          return
+        }
+        trySignalGroup(pid, "SIGKILL")
+        forceTimer = setTimeout(
+          () => settle(exitCode, exitSignal as NodeJS.Signals | null),
+          gracePeriodMs,
+        )
+      }, gracePeriodMs)
     })
   })
 
@@ -249,13 +311,13 @@ const escalateIfRunning = (child: ChildProcess, gracePeriodMs: number): Effect.E
     trySignalGroup(pid, "SIGTERM")
 
     const timer = yield* Effect.fork(Effect.sleep(Duration.millis(gracePeriodMs)))
-    yield* waitForClose(child).pipe(Effect.raceFirst(Effect.fromFiber(timer)))
+    yield* waitForClose(child, gracePeriodMs).pipe(Effect.raceFirst(Effect.fromFiber(timer)))
 
     if (!hasExited(child)) {
       trySignalGroup(pid, "SIGKILL")
     }
 
-    yield* waitForClose(child)
+    yield* waitForClose(child, gracePeriodMs)
   })
 
 /**
@@ -282,7 +344,7 @@ const stopGracefully = (
     trySignalGroup(pid, signal)
 
     const timer = yield* Effect.fork(Effect.sleep(Duration.millis(gracePeriodMs)))
-    yield* waitForClose(child).pipe(Effect.raceFirst(Effect.fromFiber(timer)))
+    yield* waitForClose(child, gracePeriodMs).pipe(Effect.raceFirst(Effect.fromFiber(timer)))
 
     if (!hasExited(child)) {
       yield* escalateIfRunning(child, gracePeriodMs)
@@ -444,7 +506,7 @@ const runManaged = (
 
         attachSinks(child, spec, stdoutSink, stderrSink)
 
-        const closeResult = yield* waitForClose(child)
+        const closeResult = yield* waitForClose(child, gracePeriodMs)
         return closeResult
       }),
     )
@@ -534,7 +596,7 @@ const spawnHandleManaged = (
       if (!settled) {
         settled = Effect.runPromise(
           Effect.gen(function* () {
-            const closeResult = yield* waitForClose(child)
+            const closeResult = yield* waitForClose(child, gracePeriodMs)
             yield* deregisterChild(registry, pid)
             yield* stdoutSink.close()
             yield* stderrSink.close()

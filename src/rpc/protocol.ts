@@ -6,7 +6,7 @@ import {
   SessionRecordingExportResultSchema,
   SessionReplayResultSchema,
 } from "../domain/action"
-import { SessionFlowContractSchema, SessionFlowResultSchema } from "../domain/flow-v2"
+import { BoundedFlowV2ResultSchema, SessionFlowContractSchema } from "../domain/flow-v2"
 import { DebugCommandInput, DebugCommandResult } from "../domain/debug"
 import { DiagnosticCaptureKind, DiagnosticCaptureTarget } from "../domain/diagnostics"
 import { ProtocolMismatchError } from "../domain/errors"
@@ -24,16 +24,16 @@ import {
   SummaryArtifactResult,
 } from "../domain/output"
 import {
+  BoundedPerfAroundFlowResult,
   PerfAnalyzeResult,
   PerfAnalyzerName,
-  PerfAroundFlowResult,
   PerfExportResult,
   PerfRecordResult,
   PerfSignpostSummaryResult,
   PerfSummaryGroupBy,
   PerfTemplate,
 } from "../domain/perf"
-import { SessionHealth, SessionListEntry, SimulatorSessionMode } from "../domain/session"
+import { BoundedSessionHealthSchema, BoundedSessionListSchema, SimulatorSessionMode } from "../domain/session"
 import { SessionSnapshotResultSchema } from "../domain/snapshot"
 
 export const PROBE_PROTOCOL_VERSION = "probe-rpc/v1"
@@ -465,16 +465,19 @@ export const SessionOpenResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.open"),
-  result: SessionHealth,
+  result: BoundedSessionHealthSchema,
 })
 export type SessionOpenResponse = typeof SessionOpenResponse.Type
 
+// PRB-094 AC3 review finding (minor): `result` used to inline every active
+// session unbounded -- see `BoundedSessionListSchema` (domain/session.ts)
+// for why nothing in the daemon caps concurrent active sessions.
 export const SessionListResponse = Schema.Struct({
   kind: Schema.Literal("response"),
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.list"),
-  result: Schema.Array(SessionListEntry),
+  result: BoundedSessionListSchema,
 })
 export type SessionListResponse = typeof SessionListResponse.Type
 
@@ -483,7 +486,7 @@ export const SessionShowResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.show"),
-  result: SessionHealth,
+  result: BoundedSessionHealthSchema,
 })
 export type SessionShowResponse = typeof SessionShowResponse.Type
 
@@ -492,7 +495,7 @@ export const SessionHealthResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.health"),
-  result: SessionHealth,
+  result: BoundedSessionHealthSchema,
 })
 export type SessionHealthResponse = typeof SessionHealthResponse.Type
 
@@ -595,7 +598,7 @@ export const SessionRunResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("session.run"),
-  result: SessionFlowResultSchema,
+  result: BoundedFlowV2ResultSchema,
 })
 export type SessionRunResponse = typeof SessionRunResponse.Type
 
@@ -658,7 +661,7 @@ export const PerfAroundResponse = Schema.Struct({
   protocolVersion: Schema.Literal(PROBE_PROTOCOL_VERSION),
   requestId: Schema.String,
   method: Schema.Literal("perf.around"),
-  result: PerfAroundFlowResult,
+  result: BoundedPerfAroundFlowResult,
 })
 export type PerfAroundResponse = typeof PerfAroundResponse.Type
 
@@ -766,6 +769,11 @@ export const RpcFailure = Schema.Struct({
     exitCode: Schema.Union(Schema.Number, Schema.Null),
     sessionId: NullableString,
     artifactKey: NullableString,
+    // PRB-094 AC8: links the complete diagnostic artifact
+    // `bindErrorDetailsForWire` (services/boundedCollections.ts) persisted
+    // when `details` was too large to inline in full -- distinct from
+    // `artifactKey` above (an artifact lookup that failed).
+    diagnosticArtifactKey: NullableString,
     wall: Schema.Boolean,
   }),
 })

@@ -131,6 +131,63 @@ Legend:
 - **Observed:** Probe's own `AppleProcessSupervisor` timeout (`timeLimitMs + recordingOverheadMs` = 243,000 ms for this template) correctly killed the stalled process and surfaced a typed `command-timeout` `ChildProcessError` instead of hanging the daemon forever. The session's own `state` stayed `ready` afterward (PRB-096 AC 7: a profiler failure degrades only the trace lane, never the UI lane), and `probe session close` still tore the session down cleanly on the first try.
 - **Inference:** this run is genuine evidence the PRB-096 code path executes correctly against a real Simulator (lease acquisition, fresh pid-identity verification, `xctrace record` invocation, bounded timeout/kill, UI-lane isolation on failure) but is **not** evidence of a *successful* raw capture completing within budget on this host -- the gate this pack's PRB-096 glyph asked to prove ("disable runner HTTP while app lives, raw capture succeeds") stays partial pending a host/Xcode environment where `xctrace` itself finalizes promptly.
 
+### 7c. CoreSimulator reset bounded attempt (PRB-102, 2026-07-18)
+
+The glyph's HOST item authorized one bounded, non-destructive attempt at a
+user-level CoreSimulator reset (`xcrun simctl shutdown all`; `killall -9
+com.apple.CoreSimulator.CoreSimulatorService` -- no `sudo`, no reboot) to see
+whether it clears the finalize stall documented in 7b above, plus one
+bounded (max 10 min) 5s `xctrace record` on either side. Both receipts below
+are from this pass, same host, same day, `xcrun xctrace` under Xcode 26.6.
+
+- **Before receipt:** a fresh `xctrace record --template "Time Profiler"
+  --attach <live ProbeFixture pid> --time-limit 5s` against a simulator that
+  was already booted from earlier in this session printed only `Starting
+  recording ... Time limit: 5.0 s` and never progressed further. Killed after
+  a bounded ~100s wall-clock wait (well short of the historical
+  345-731s+ range this pack already documents, deliberately -- this was a
+  fresh confirmation the defect still reproduces today, not a full
+  re-measurement). CPU time for the `xctrace` process over that window: ~2s
+  out of ~100s wall -- the same near-zero-CPU-while-wall-clock-climbs
+  signature as every prior stall observation in this pack.
+- **Reset performed:** `xcrun simctl shutdown all` (stopped all 3 then-booted
+  simulators) followed immediately by `killall -9
+  com.apple.CoreSimulator.CoreSimulatorService`. The service restarts on
+  demand, as documented; no `sudo`, no reboot, no other destructive action.
+- **After receipt:** a freshly booted simulator (same device, cold-booted
+  post-reset) and a freshly relaunched `ProbeFixture` process. The very
+  first `xctrace record --attach <pid>` attempt immediately after boot
+  failed fast with `Cannot find process for provided pid` (exit 21) even
+  though the host's own `ps`/`launchctl list` confirmed that exact pid was
+  alive at that moment -- plausibly CoreSimulatorService's own device/process
+  index not yet warm immediately after a forced restart; not the finalize
+  stall this attempt was testing for. A second attempt against the same
+  (still live) pid a few seconds later did start recording, ran past the 5s
+  window, and then reproduced the identical finalize stall: `Starting
+  recording ... Time limit: 5.0 s` with no further output, near-zero CPU
+  time (`0:00.01`-`0:05.7` CPU across the whole run), killed at the
+  authorized ~10-minute bound (~573s wall-clock, from `2026-07-18T06:50:07Z`
+  to `2026-07-18T06:59:40Z`) still stuck in the same phase, never producing
+  a completed `.trace` bundle.
+- **Verdict: the CoreSimulator reset did not clear the stall.** Both the
+  before and after attempts reproduce the identical symptom (near-zero CPU,
+  no output past the "Starting recording" line, requires an external kill)
+  on this exact host/Xcode combination (26.6/17F113). This is consistent
+  with 7b's existing inference that the stall is `xctrace`-side host/Xcode
+  state, not something a CoreSimulator service restart reaches -- the
+  service was never a live suspect distinct from `xctrace`/Instruments
+  itself, and this pass confirms restarting it changes nothing observable.
+- **Remaining remediation is the human's, per the glyph's own bound:** the
+  next non-destructive lever this pack has not yet tried is a host reboot
+  (out of scope for an agent session) or an Xcode/Instruments
+  reinstall-and-first-launch pass (`xcodebuild -runFirstLaunch
+  -checkForNewerComponents`, itself unlikely to touch `xctrace`'s recording
+  finalize path specifically but the next reasonable non-reboot step). No
+  further code-side workaround is possible from Probe's side: this is the
+  same `AppleProcessSupervisor`-bounded-timeout-and-typed-failure path 7b
+  already validated as the correct *handling* of the stall, not a fix for
+  the stall itself.
+
 ### 8. Target-process lease, decoupled from XCUITest runner health (PRB-096, 2026-07-17)
 
 - **Observed:** `xctrace record --attach <pid> --device <deviceId>` only needs the target app's process id and device identifier -- it never talks to Probe's own XCUITest runner wrapper at all. The runner-coupled preflight (`getSessionHealth`'s `wrapperRunning`/`ready|degraded` gate), the runner keepalive fiber during the recording, and the post-record runner health refresh that used to wrap raw `perf record` were all Probe-side policy, not an xctrace requirement.
@@ -165,3 +222,10 @@ Legend:
   - `SIGTERM` to an in-flight `xctrace record --time-limit 30s` at the 3s mark: the process exited within ~1s of the signal (measured wall time from `kill` to `wait` returning: 10 ms for the signal to be delivered and acknowledged by the shell; the process itself was gone from `ps` within the next ~1s poll), leaving an empty `Trace1.run` directory under the target `--output` path and no surviving `xctrace`/`xcrun` process -- consistent with the "children + descendants gone within 2s" bound `AppleProcessSupervisor`'s TERM -> grace -> KILL ladder targets (this ad hoc measurement used a raw `kill -TERM`, not the supervisor itself, but xctrace exits promptly on SIGTERM on this host without needing the grace/KILL escalation at all).
   - Based on these numbers, record()'s new zero-export path (TOC export only, ~2.2s, plus sub-millisecond in-process bookkeeping) should land the p95 gate (terminal response within 5s of xctrace exit) comfortably.
 - **Blocked (this host, live daemon+simulator round trip):** attempting the full ten-pinned-30s-run p95 benchmark through the real daemon (`probe serve` + `probe session open --target simulator` + ten `probe perf record --time-limit 30s` calls) failed before a single recording started -- `session open` and even a plain `session health` on a freshly opened, `ready`-per-`session list` session both returned a client-side `rpc-client-transport-closed` error (the daemon-side socket closed mid-request) on two independent attempts (a stale daemon and a fully fresh `probe serve` + fresh session). This reproduced identically on a clean daemon, so it is not this glyph's session-state corruption. `ps` at the time of the second failure showed a **second, independent Tower worker actively building/running XCUITest against a separate booted Simulator device on the same host** (`PRB-092`'s worktree, `xcodebuild ... -scheme ProbeRunner ... test-without-building`) -- concurrent multi-agent Simulator/Xcode/CoreSimulator contention on a shared host is the most likely cause, not a code defect in `perf.record`'s session-open path (which this glyph's diff does not touch: `SessionRegistry.ts`, `SessionController.ts`, and `ios/` are unmodified by PRB-097). The p95 gate stays **partial**: the dominant cost component (TOC export) is directly measured above and comfortably clears the 5s budget, but the actual RPC round trip through the live daemon was not exercised end-to-end in this session.
+
+### 10. `perf.around`'s `notifyutil` startup gate timing out on a cold Instruments host state (PRB-099, 2026-07-18)
+
+- **Observed:** a live end-to-end `probe investigate run` (PRB-099) against a freshly booted Simulator (iPhone 17 Pro, iOS 26.4) with an already-`ready` session reached the "capture" stage (`perf.around`, `time-profiler` template, a single 500 ms `wait` as the measured flow) and failed in ~33s with `command-timeout` on `notifyutil -1 dev.probe.perf.<session>.<epoch>.<hex>` -- `liveStartRecording`'s (`PerfService.ts`) 30,000 ms wait for xctrace's own "recording started" Darwin notification never resolved.
+- **Observed:** at the moment of that timeout, `ps` showed Instruments' privileged XPC arbitration services (`com.apple.dt.instruments.dtarbiter`, `com.apple.dt.instruments.dtsecurity`, both root-owned, plus a `DTServiceHub` process) had just started on this host -- consistent with a cold-start cost (these persist once running) rather than a steady-state per-recording cost.
+- **Inference:** on a host where Instruments' XPC arbitration services have not yet been warmed up, the very first `xctrace record` invocation in a session may not post its startup notification within the current 30s `startupTimeoutMs` window, independent of the previously-documented post-recording finalization stall (§7b above, which is a *different* phase -- after the recording window closes, not before it opens). Not reproduced a second time in this session (budget-bounded to one live attempt per this glyph's honesty contract); flagged here as an open host-variance risk for `perf.around`/`perf.record`'s startup gate, not confirmed as a steady-state defect.
+- **Not falsified:** the durable investigation orchestration itself (PRB-099's `InvestigationController`) behaved exactly as designed against this real failure -- preflight succeeded, capture stage failed cleanly with a typed reason, status moved to `failed` (never silently retried/reopened), and both `probe investigate inspect` and `probe investigate events` read the persisted outcome correctly after the CLI process exited. The gate this observation leaves **partial** is the live xctrace capture itself, not the orchestration wrapping it -- see `src/services/InvestigationController.test.ts` for the fake-lane contract tests that cover the orchestration deterministically.

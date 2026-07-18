@@ -8,6 +8,7 @@ import { runExamplesCommand, runSchemaCommand } from "./discovery"
 import { runConfigCommand } from "./commands/config"
 import { runDrillCommand } from "./commands/drill"
 import { runCapabilitiesCommand, runDoctorCommand } from "./commands/doctor"
+import { runInvestigateCommand } from "./commands/investigate"
 import { runPerfCommand } from "./commands/perf"
 import { runServeCommand } from "./commands/serve"
 import { runSessionCommand } from "./commands/session"
@@ -55,6 +56,14 @@ Usage:
   probe perf around (--input-json <payload> | --session-id <id> --file <flow.json> --template ${perfTemplateChoiceText}) [--output-json|--json]
   probe perf summarize --session-id <id> --artifact <trace-key> --group-by signpost [--output-json|--json]
   probe drill (--input-json <payload> | --session-id <id> --artifact <key> [--xcresult summary|attachments [--attachment-id <id>] | --json-pointer <ptr> | --xpath <expr> | --lines <start:end> [--match <text>]] [--output auto|inline|artifact]) [--output-json|--json]
+  probe investigate validate (--input-json <recipe> | --file <recipe.json> | --stdin) [--output-json|--json]
+  probe investigate plan (--input-json <recipe> | --file <recipe.json> | --stdin) [--output-json|--json]
+  probe investigate run (--input-json <recipe|{recipe,resumeId}> | --file <recipe.json> | --stdin | --resume-id <id>) [--output-json|--json]
+  probe investigate inspect --investigation-id <id> [--output-json|--json]
+  probe investigate events --investigation-id <id> [--output-json|--json]
+  probe investigate wait --investigation-id <id> [--timeout-ms <ms>] [--output-json|--json]
+  probe investigate cancel --investigation-id <id> [--output-json|--json]
+  probe investigate compare --baseline-id <id> --candidate-id <id> [--output-json|--json]
 
 Notes:
   - serve runs the long-lived daemon over the local Unix socket
@@ -181,6 +190,11 @@ const runCli = (args: ReadonlyArray<string>) =>
 
       case "drill": {
         yield* runDrillCommand(rest)
+        return
+      }
+
+      case "investigate": {
+        yield* runInvestigateCommand(rest)
         return
       }
 

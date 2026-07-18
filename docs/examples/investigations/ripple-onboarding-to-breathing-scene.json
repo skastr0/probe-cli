@@ -1,0 +1,22 @@
+{
+  "target": {
+    "sessionId": "<real-device-session-id>"
+  },
+  "measuredFlow": {
+    "contract": "probe.session-flow/v2",
+    "steps": [
+      { "kind": "wait", "timeoutMs": 1500 },
+      { "kind": "wait", "timeoutMs": 1500 },
+      { "kind": "wait", "timeoutMs": 1500 },
+      { "kind": "wait", "timeoutMs": 3000 }
+    ]
+  },
+  "capture": {
+    "kind": "preset",
+    "template": "time-profiler"
+  },
+  "repetitions": 20,
+  "cooldown": {
+    "minIntervalMs": 5000
+  }
+}

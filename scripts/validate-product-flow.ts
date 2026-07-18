@@ -6,10 +6,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect } from "effect"
 import { formatProbeError, isProbeError } from "../src/domain/errors"
-import { decodeSessionFlowContract, type SessionFlowContract, type SessionFlowResult } from "../src/domain/flow-v2"
+import { decodeSessionFlowContract, type BoundedFlowV2Result, type SessionFlowContract } from "../src/domain/flow-v2"
 import type { PerfRecordResult } from "../src/domain/perf"
 import type { SessionAction } from "../src/domain/action"
-import type { SessionHealth, SimulatorSessionMode } from "../src/domain/session"
+import type { BoundedSessionHealth, SimulatorSessionMode } from "../src/domain/session"
 import type { SessionSnapshotResult, SnapshotPreviewItem, StoredSnapshotArtifact } from "../src/domain/snapshot"
 import { probeRuntime } from "../src/runtime"
 import { ArtifactStore } from "../src/services/ArtifactStore"
@@ -389,7 +389,7 @@ const daemonEvent = (stage: string, message: string) => {
   console.error(`[${stage}] ${message}`)
 }
 
-const openSession = async (options: Options): Promise<SessionHealth> => (
+const openSession = async (options: Options): Promise<BoundedSessionHealth> => (
   await probeRuntime.runPromise(
     Effect.gen(function* () {
       const client = yield* DaemonClient
@@ -405,7 +405,7 @@ const openSession = async (options: Options): Promise<SessionHealth> => (
   )
 )
 
-const getSessionHealth = async (sessionId: string): Promise<SessionHealth> => (
+const getSessionHealth = async (sessionId: string): Promise<BoundedSessionHealth> => (
   await probeRuntime.runPromise(
     Effect.gen(function* () {
       const client = yield* DaemonClient
@@ -558,8 +558,8 @@ const buildAction = async (options: Options, snapshot: SessionSnapshotResult): P
   }
 }
 
-const formatArtifacts = (health: SessionHealth): ReadonlyArray<string> =>
-  health.artifacts.map((artifact) => `- ${artifact.key}: ${artifact.absolutePath}`)
+const formatArtifacts = (health: BoundedSessionHealth): ReadonlyArray<string> =>
+  health.artifacts.shown.map((artifact) => `- ${artifact.key}: ${artifact.absolutePath}`)
 
 const tailText = (value: string, maxLines: number): string => {
   const lines = value.trim().split(/\r?\n/).filter((line) => line.length > 0)
@@ -671,14 +671,14 @@ const recordSkippedStep = (results: Array<StepResult>, name: string, detail: str
  * because flows that navigate (e.g. into the detail screen) would otherwise
  * leave stale UI state for the next example.
  */
-const runFlowExample = async (options: Options, flow: SessionFlowContract): Promise<SessionFlowResult> => {
+const runFlowExample = async (options: Options, flow: SessionFlowContract): Promise<BoundedFlowV2Result> => {
   const health = await openSession(options)
 
   if (health.state !== "ready") {
     throw new Error(`Session ${health.sessionId} opened in state ${health.state} while running a flow example.`)
   }
 
-  let result: SessionFlowResult
+  let result: BoundedFlowV2Result
 
   try {
     result = await probeRuntime.runPromise(
@@ -748,7 +748,7 @@ const runFlowExampleStep = async (
     const result = await runFlowExample(options, flow)
     return {
       value: result,
-      detail: `${result.executedSteps.length} step(s), verdict ${result.verdict}: ${result.summary}`,
+      detail: `${result.executedSteps.total} step(s), verdict ${result.verdict}: ${result.summary}`,
     }
   })
 }
@@ -800,7 +800,7 @@ const main = async () => {
 
       if (health.state !== "ready") {
         throw new Error(
-          `Session ${health.sessionId} opened in state ${health.state}; expected ready. Warnings: ${health.warnings.join(" | ") || "none"}`,
+          `Session ${health.sessionId} opened in state ${health.state}; expected ready. Warnings: ${health.warnings.shown.join(" | ") || "none"}`,
         )
       }
 
@@ -849,7 +849,7 @@ const main = async () => {
       artifactLines.splice(0, artifactLines.length, ...formatArtifacts(health))
       return {
         value: health,
-        detail: `${health.artifacts.length} artifacts currently registered`,
+        detail: `${health.artifacts.total} artifacts currently registered`,
       }
     })
 

@@ -3,6 +3,8 @@ import { AccessibilityServiceLive } from "./services/AccessibilityService"
 import { ArtifactStoreLive } from "./services/ArtifactStore"
 import { CommerceServiceLive } from "./services/CommerceService"
 import { DaemonClientLive } from "./services/DaemonClient"
+import { InvestigationControllerLive } from "./services/investigation/investigationControllerLive"
+import { InvestigationStoreLive } from "./services/InvestigationStore"
 import { LldbBridgeFactoryLive } from "./services/LldbBridge"
 import { OutputPolicyLive } from "./services/OutputPolicy"
 import { PerfServiceLive } from "./services/PerfService"
@@ -26,6 +28,9 @@ const CommerceServiceProvided = CommerceServiceLive.pipe(Layer.provide(Layer.mer
 const KernelProvided = ProbeKernelLive.pipe(
   Layer.provide(Layer.mergeAll(BaseServicesLive, SessionRegistryProvided, PerfServiceProvided)),
 )
+const InvestigationControllerProvided = InvestigationControllerLive.pipe(
+  Layer.provide(Layer.mergeAll(InvestigationStoreLive, DaemonClientProvided, ArtifactStoreLive)),
+)
 
 export const ProbeLayer = Layer.mergeAll(
   BaseServicesLive,
@@ -35,6 +40,8 @@ export const ProbeLayer = Layer.mergeAll(
   AccessibilityServiceProvided,
   CommerceServiceProvided,
   KernelProvided,
+  InvestigationStoreLive,
+  InvestigationControllerProvided,
 )
 
 const probeMemoMap = Effect.runSync(Layer.makeMemoMap)

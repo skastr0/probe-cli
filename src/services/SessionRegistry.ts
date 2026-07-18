@@ -98,7 +98,7 @@ import {
 } from "../domain/session"
 import { buildSessionSnapshotResult, buildSnapshotArtifact, decodeRunnerSnapshotPayload, type SessionSnapshotResult, type StoredSnapshotArtifact } from "../domain/snapshot"
 import { ArtifactStore, type DaemonSessionMetadata } from "./ArtifactStore"
-import { type LldbBridgeHandle, type LldbBridgeResponseFrame, LldbBridgeFactory } from "./LldbBridge"
+import { type LldbBridgeResponseFrame, LldbBridgeFactory } from "./LldbBridge"
 import { OutputPolicy } from "./OutputPolicy"
 import {
   buildRealDeviceInterruptionWarning,
@@ -114,7 +114,7 @@ import {
   type SessionControllerContext,
 } from "./SessionController"
 import { advertisedRunnerCapabilities, requireRunnerCapability } from "./runnerCapabilities"
-import { SimulatorHarness, type OpenedSimulatorSession, type RunnerCommandResult } from "./SimulatorHarness"
+import { SimulatorHarness, type OpenedSimulatorSession } from "./SimulatorHarness"
 import type { RunnerAction } from "./runnerProtocol"
 import {
   defaultVideoCaptureFps,
@@ -147,15 +147,51 @@ import {
   foldFlowStepOutcome,
 } from "./flow/flowStepResultAssembly"
 import { executeVerifiedActionStep } from "./flow/verifiedActionExecutor"
+// PRB-102: shared pure session-action utilities and the ActiveSessionRecord
+// type family live in their own module now, so this file and every
+// src/services/flow/* executor both import from there instead of
+// SessionRegistry.ts importing flow/* while flow/* imports back from
+// SessionRegistry.ts -- see sessionShared.ts's module doc for the full
+// before/after.
+import {
+  type ActionExecutionOutcome,
+  type ActiveSessionRecord,
+  attemptWithRetry,
+  buildActionResultMetadata,
+  dedupeStrings,
+  defaultMutationRetryPolicy,
+  defaultReadOnlyRetryPolicy,
+  describeVideoArtifactLabel,
+  emptyRetryAttemptMetadata,
+  type ExtendedSessionActionResult,
+  isRunnerBackedRecord,
+  isSimulatorRecord,
+  type RealDeviceActiveSessionRecord,
+  type RetryAttemptMetadata,
+  type RunnerBackedActiveSessionRecord,
+  sanitizeFileComponent,
+  selectorDriftContractWarning,
+  type SessionActionError,
+  type SimulatorActiveSessionRecord,
+  timestampForFile,
+  type VideoArtifactMode,
+  withOffscreenNextStep,
+} from "./sessionShared"
 
-const defaultSessionTtlMs = Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
-const ttlSweepIntervalMs = Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
 // PRB-083: bounded operation queue per SessionController. Comfortably above
 // any realistic in-flight command burst (batched UI actions, retries) so
 // legitimate traffic never trips queue saturation; a caller issuing more
 // than this many concurrent commands against one session gets a typed
 // session-busy error instead of unbounded memory growth.
 const sessionControllerQueueCapacity = Number(process.env.PROBE_SESSION_QUEUE_CAPACITY ?? 512)
+// PRB-101: `closedRecordsRef` (below) exists only so a repeat close call, a
+// late peekSessionHealth, or endTraceLease's best-effort mutate can still
+// find a session's terminal controller/health after closeSessionInternal has
+// removed it from the main sessionsRef table -- but nothing ever evicted an
+// entry from it, so a daemon that opens and closes many sessions over its
+// lifetime grows this side table without bound. Comfortably above any
+// realistic "repeat close arrives shortly after" or "late peek" race window.
+const closedSessionRecordCapacity = Number(process.env.PROBE_CLOSED_SESSION_RECORD_CAP ?? 200)
 const maxSessionLogCaptureSeconds = 30
 const defaultDebugCommandTimeoutMs = Number(process.env.PROBE_LLDB_COMMAND_TIMEOUT_MS ?? 60_000)
 const maxDebugFrameLimit = 200
@@ -163,7 +199,6 @@ const maxDebugEvalTimeoutMs = 30_000
 const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
 const defaultVideoDurationMs = 10_000
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
-export const selectorDriftContractWarning = "Selector drift recovery only helps while the semantic fallback stays unique on the runner; duplicate weak targets still need stronger accessibility identifiers or labels."
 const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
 const nonRecoverableSessionWarning =
   "Probe fails closed when the runner exits, the daemon restarts, or runner transport is lost. Close and reopen the session instead of expecting transparent recovery."
@@ -184,10 +219,6 @@ interface RunnerVideoCaptureManifest {
   readonly frameCount: number
   readonly framesDirectoryPath: string
 }
-
-// PRB-073: exported so the flow executors (src/services/flow/*) can type
-// their evidence-capture deps without re-declaring the mode union.
-export type VideoArtifactMode = "mp4" | "mov" | "frame-sequence"
 
 const parseDurationStringMs = (value: string): number | null => {
   const match = value.match(/^(\d+)(ms|s|m|h)$/)
@@ -375,60 +406,12 @@ const decodeRunnerVideoCaptureManifest = (
   }
 }
 
-export const timestampForFile = (): string => new Date().toISOString().replace(/[:.]/g, "-")
-
-export const sanitizeFileComponent = (value: string | null | undefined, fallback: string): string => {
-  const sanitized = (value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-
-  return sanitized.length > 0 ? sanitized : fallback
-}
-
-export const describeVideoArtifactLabel = (mode: VideoArtifactMode, options?: { readonly includeArtifact?: boolean }): string => {
-  const suffix = options?.includeArtifact === false ? "" : " artifact"
-
-  switch (mode) {
-    case "mp4":
-      return `MP4 video${suffix}`
-    case "mov":
-      return `QuickTime video${suffix}`
-    case "frame-sequence":
-      return `frame-sequence video${suffix}`
-  }
-}
-
-const isHittabilityFailure = (reason: string): boolean => /\bhittable\b|\boffscreen\b/i.test(reason)
-
-export const withOffscreenNextStep = (base: string, reason: string): string =>
-  isHittabilityFailure(reason)
-    ? `${base} If the target is offscreen, add an explicit scroll step first; Probe does not auto-scroll until the element becomes hittable.`
-    : base
-
 const buildReplayWarnings = (semanticFallbackCount: number): ReadonlyArray<string> => [
   semanticFallbackCount > 0
     ? `${semanticFallbackCount} replay steps recovered selector drift via semantic fallback. ${selectorDriftContractWarning}`
     : selectorDriftContractWarning,
   offscreenHittabilityWarning,
 ]
-
-export const dedupeStrings = (values: ReadonlyArray<string>): Array<string> => [...new Set(values)]
-
-export const defaultReadOnlyRetryPolicy: RetryPolicy = {
-  maxAttempts: 3,
-  backoffMs: 250,
-  refreshSnapshotBetweenAttempts: true,
-  retryOn: ["not-found", "not-hittable", "runner-timeout", "transient-transport", "assertion-failed"],
-}
-
-export const defaultMutationRetryPolicy: RetryPolicy = {
-  maxAttempts: 3,
-  backoffMs: 250,
-  refreshSnapshotBetweenAttempts: true,
-  retryOn: ["not-found", "not-hittable"],
-}
 
 const defaultAssertRetryPolicy: RetryPolicy = {
   maxAttempts: 1,
@@ -446,18 +429,6 @@ const defaultWaitRetryPolicy = (timeoutMs: number): RetryPolicy => ({
   retryOn: ["not-found", "assertion-failed"],
 })
 
-export type SessionActionError =
-  | SessionNotFoundError
-  | UserInputError
-  | UnsupportedCapabilityError
-  | EnvironmentError
-  | ChildProcessError
-
-export interface RetryAttemptMetadata {
-  readonly retryCount: number
-  readonly retryReasons: Array<string>
-}
-
 // PRB-093: named separately (not `typeof lastSnapshot`) to sidestep a real
 // TS inference cycle when a `let`-declared snapshot cache is read into a
 // same-named `const` inside the loop that reassigns it -- see the wait-poll
@@ -467,146 +438,6 @@ interface WaitPollSnapshot {
   readonly artifactRecord: ArtifactRecord
   readonly handledMs: number
 }
-
-export type ExtendedSessionActionResult = SessionActionResult & {
-  readonly handledMs?: number | null
-  // PRB-091: `handledMs` broken into the runner's uiAction phases —
-  // resolution/wait/interaction — plus generic response finalization.
-  // Populated by the fast direct-runner-action lane (the one lane whose
-  // response comes straight from a `uiAction` command); `null`/absent
-  // everywhere else, matching `RunnerCommandResult`'s same fields.
-  readonly resolutionMs?: number | null
-  readonly waitMs?: number | null
-  readonly interactionMs?: number | null
-  readonly finalizationMs?: number | null
-}
-
-type RetryAttemptOutcome<T, E extends SessionActionError> =
-  | {
-      readonly ok: true
-      readonly value: T
-      readonly retry: RetryAttemptMetadata
-    }
-  | {
-      readonly ok: false
-      readonly error: E
-      readonly retry: RetryAttemptMetadata
-    }
-
-export type ActionExecutionOutcome =
-  | {
-      readonly ok: true
-      readonly result: ExtendedSessionActionResult
-    }
-  | {
-      readonly ok: false
-      readonly error: SessionActionError
-      readonly retry: RetryAttemptMetadata
-      // PRB-093: every outcome reports its evidence, failure included -- a
-      // best-effort failure snapshot is real capture work and must not be
-      // silently discarded just because the mutation itself failed. See
-      // evidence.ts's module doc: failure evidence never replaces or masks
-      // the original failure, it only rides alongside it.
-      readonly evidence: EvidenceReport
-    }
-
-export const emptyRetryAttemptMetadata = (): RetryAttemptMetadata => ({
-  retryCount: 0,
-  retryReasons: [],
-})
-
-const classifyRetryableFailure = (error: SessionActionError): { readonly code: RetryReasonCode; readonly reason: string } | null => {
-  if (error instanceof EnvironmentError) {
-    switch (error.code) {
-      case "session-action-target-not-found":
-        return { code: "not-found", reason: error.reason }
-      case "session-assert-failed":
-        return { code: "assertion-failed", reason: error.reason }
-      case "session-action-failed":
-        return {
-          code: isHittabilityFailure(error.reason) ? "not-hittable" : "transient-transport",
-          reason: error.reason,
-        }
-      case "session-snapshot-failed":
-      case "session-snapshot-payload-missing":
-      case "session-snapshot-read":
-      case "session-snapshot-parse":
-      case "session-snapshot-write":
-      case "session-screenshot-failed":
-      case "session-screenshot-payload-missing":
-      case "session-screenshot-artifact-write":
-        return {
-          code: /timeout/i.test(error.reason) ? "runner-timeout" : "transient-transport",
-          reason: error.reason,
-        }
-      default:
-        if (error.code.startsWith("session-runner-")) {
-          return {
-            code: /timeout/i.test(error.reason) ? "runner-timeout" : "transient-transport",
-            reason: error.reason,
-          }
-        }
-
-        return null
-    }
-  }
-
-  if (error instanceof ChildProcessError) {
-    return {
-      code: /timeout/i.test(error.reason) ? "runner-timeout" : "transient-transport",
-      reason: error.reason,
-    }
-  }
-
-  return null
-}
-
-export const attemptWithRetry = <T, E extends SessionActionError>(args: {
-  readonly policy: RetryPolicy
-  readonly run: () => Effect.Effect<T, E>
-}) =>
-  Effect.gen(function* () {
-    const retryReasons: Array<string> = []
-    let attempt = 0
-
-    while (true) {
-      attempt += 1
-      const result = (yield* Effect.either(args.run())) as { _tag: "Right"; right: T } | { _tag: "Left"; left: E }
-
-      if (result._tag === "Right") {
-        return {
-          ok: true as const,
-          value: result.right,
-          retry: {
-            retryCount: attempt - 1,
-            retryReasons,
-          },
-        }
-      }
-
-      const retryable = classifyRetryableFailure(result.left)
-      const shouldRetry = retryable !== null
-        && args.policy.retryOn.includes(retryable.code)
-        && attempt < args.policy.maxAttempts
-
-      if (!shouldRetry) {
-        return {
-          ok: false as const,
-          error: result.left,
-          retry: {
-            retryCount: attempt - 1,
-            retryReasons,
-          },
-        }
-      }
-
-      retryReasons.push(`${retryable.code}: ${retryable.reason}`)
-
-      if (args.policy.backoffMs > 0) {
-        yield* Effect.sleep(args.policy.backoffMs)
-      }
-    }
-  })
 
 const runWithRetry = <T, E extends SessionActionError>(args: {
   readonly policy: RetryPolicy
@@ -701,64 +532,6 @@ const buildReplayArtifactSummary = (args: {
     ? `Replay report with ${args.stepCount} executed steps. ${selectorDriftContractWarning} ${offscreenHittabilityWarning}`
     : `Replay failure report for step ${args.failureStepIndex ?? "unknown"} after retry exhaustion. ${selectorDriftContractWarning} ${offscreenHittabilityWarning}`
 
-export interface BaseActiveSessionRecord {
-  kind: "simulator" | "device"
-  health: SessionHealth
-  baseWarnings: ReadonlyArray<string>
-  debuggerBridge: LldbBridgeHandle | null
-  snapshotState: {
-    latest: StoredSnapshotArtifact | null
-    nextSnapshotIndex: number
-    nextElementRefIndex: number
-  }
-  recording: {
-    steps: Array<RecordedSessionAction>
-  }
-  // PRB-083: the controller is the sole writer of `health` (reassigned as a
-  // whole object, never mutated in place) and the sole allocator of runner
-  // command sequence numbers. Every other field above stays a plain mutable
-  // property because nothing outside the controller's serialized execution
-  // ever writes it concurrently; see SessionController.ts for the invariant
-  // this buys.
-  readonly controller: SessionController
-}
-
-export interface SimulatorActiveSessionRecord extends BaseActiveSessionRecord {
-  kind: "simulator"
-  readonly sendRunnerCommand: (
-    sequence: number,
-    action: RunnerAction,
-    payload?: string,
-  ) => Promise<RunnerCommandResult>
-  /** PRB-089: this runner process's epoch, for indeterminate-outcome diagnostics. */
-  readonly runnerEpoch: string
-  readonly closeResources: () => Promise<void>
-  readonly isRunnerRunning: () => boolean
-  readonly waitForExit: Promise<{ readonly code: number | null; readonly signal: string | null }>
-}
-
-export interface RealDeviceActiveSessionRecord extends BaseActiveSessionRecord {
-  kind: "device"
-  integrationPoints: ReadonlyArray<string>
-  readonly sendRunnerCommand: ((
-    sequence: number,
-    action: RunnerAction,
-    payload?: string,
-  ) => Promise<RunnerCommandResult>) | null
-  /** PRB-089: this runner process's epoch, for indeterminate-outcome diagnostics. Null until a live runner has opened. */
-  readonly runnerEpoch: string | null
-  readonly refreshConnection: () => Promise<SessionConnectionDetails>
-  readonly closeResources: () => Promise<void>
-  readonly isRunnerRunning: () => boolean
-  readonly waitForExit: Promise<{ readonly code: number | null; readonly signal: string | null }> | null
-}
-
-export type ActiveSessionRecord = SimulatorActiveSessionRecord | RealDeviceActiveSessionRecord
-export type RunnerBackedActiveSessionRecord = SimulatorActiveSessionRecord | (RealDeviceActiveSessionRecord & {
-  readonly sendRunnerCommand: NonNullable<RealDeviceActiveSessionRecord["sendRunnerCommand"]>
-  readonly waitForExit: NonNullable<RealDeviceActiveSessionRecord["waitForExit"]>
-})
-
 interface OpeningSessionReservation {
   readonly sessionId: string
   readonly platform: "simulator" | "device"
@@ -786,7 +559,38 @@ interface DebugProcessSnapshot {
 }
 
 const nowIso = (): string => new Date().toISOString()
-const expiresAtIso = (): string => new Date(Date.now() + defaultSessionTtlMs).toISOString()
+// PRB-102: takes the session TTL as an explicit parameter instead of closing
+// over a module-level constant -- see `SessionRegistryConfig` and
+// `makeSessionRegistryLive` below for why. `SessionRegistryLive`'s own body
+// declares a zero-arg `expiresAtIso` local that closes over its
+// layer-instance-resolved TTL, so none of its many internal call sites need
+// to change.
+const expiresAtIsoFor = (sessionTtlMs: number): string => new Date(Date.now() + sessionTtlMs).toISOString()
+
+/**
+ * PRB-101: bounds `closedRecordsRef`'s growth. `Map` preserves insertion
+ * order, so the oldest-inserted entries -- the ones least likely to still be
+ * needed by a repeat close or a late peek -- are always the first evicted
+ * once the table exceeds `closedSessionRecordCapacity`.
+ */
+const withBoundedClosedRecords = (
+  records: Map<string, ActiveSessionRecord>,
+): Map<string, ActiveSessionRecord> => {
+  const overflow = records.size - closedSessionRecordCapacity
+
+  if (overflow <= 0) {
+    return records
+  }
+
+  const next = new Map(records)
+  const oldestKeys = [...next.keys()].slice(0, overflow)
+
+  for (const key of oldestKeys) {
+    next.delete(key)
+  }
+
+  return next
+}
 
 const makeSessionResources = (runner: SessionResourceState): SessionResourceStates => ({
   runner,
@@ -1298,14 +1102,8 @@ const composeWarnings = (
   extras: ReadonlyArray<string>,
 ): ReadonlyArray<string> => dedupeStrings([...record.baseWarnings, ...extras])
 
-export const isSimulatorRecord = (record: ActiveSessionRecord): record is SimulatorActiveSessionRecord =>
-  record.kind === "simulator"
-
 const isRealDeviceRecord = (record: ActiveSessionRecord): record is RealDeviceActiveSessionRecord =>
   record.kind === "device"
-
-export const isRunnerBackedRecord = (record: ActiveSessionRecord): record is RunnerBackedActiveSessionRecord =>
-  isSimulatorRecord(record) || record.sendRunnerCommand !== null
 
 // PRB-096: the target-process lease surface. `resources.trace` (already part
 // of the frozen `SessionResourceStates` contract in domain/session.ts) is the
@@ -1344,15 +1142,18 @@ export type TraceLeaseOutcome =
 
 // PRB-073: hoisted out of `SessionRegistryLive`'s Effect.gen body — this has
 // no dependency on any layer-scoped service (ArtifactStore, harnesses, …),
-// only on the module-level `nowIso`/`expiresAtIso`/`deriveSessionPhase`
-// helpers above, so it is safe as a plain top-level function. Exported so
-// the flow executors (src/services/flow/*) can call it as an explicit
-// dependency without closing over `SessionRegistryLive`'s internals.
-export const updateHealthCheck = (record: ActiveSessionRecord, command: string, ok: boolean) => {
+// only on the module-level `nowIso`/`expiresAtIsoFor`/`deriveSessionPhase`
+// helpers above, so it is safe as a plain top-level function.
+// PRB-102: takes `sessionTtlMs` explicitly (see `expiresAtIsoFor` above) --
+// `SessionRegistryLive`'s body shadows this with a 3-arg local `updateHealthCheck`
+// closing over its layer-instance-resolved TTL, so the flow executors (which
+// receive that 3-arg version through `FlowExecutorDeps.updateHealthCheck`)
+// and every internal call site keep the original 3-arg call shape.
+const updateHealthCheckWithTtl = (record: ActiveSessionRecord, command: string, ok: boolean, sessionTtlMs: number) => {
   const nextHealth: SessionHealth = {
     ...record.health,
     updatedAt: nowIso(),
-    expiresAt: expiresAtIso(),
+    expiresAt: expiresAtIsoFor(sessionTtlMs),
     healthCheck: {
       ...record.health.healthCheck,
       checkedAt: nowIso(),
@@ -1367,21 +1168,6 @@ export const updateHealthCheck = (record: ActiveSessionRecord, command: string, 
     state: deriveSessionPhase(nextHealth),
   }
 }
-
-// PRB-073: hoisted alongside `updateHealthCheck` for the same reason — pure,
-// no layer-scoped dependency.
-export const buildActionResultMetadata = (
-  retry: RetryAttemptMetadata,
-  verdict: SessionActionResult["verdict"] = null,
-  waitedMs: number | null = null,
-  polledCount: number | null = null,
-) => ({
-  retryCount: retry.retryCount,
-  retryReasons: retry.retryReasons,
-  verdict,
-  waitedMs,
-  polledCount,
-})
 
 export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
   SessionRegistry,
@@ -1558,7 +1344,35 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
   }
 >() {}
 
-export const SessionRegistryLive = Layer.scoped(
+/**
+ * PRB-102: `makeSessionRegistryLive`'s TTL/sweep inputs. Before this, the
+ * session TTL and sweep interval were `Number(process.env.PROBE_SESSION_TTL_MS
+ * ?? ...)`-style top-level `const`s -- resolved exactly once, at module load,
+ * before any test (or daemon startup script) had a chance to set the
+ * corresponding environment variable. A test mutating `process.env` after the
+ * module was already imported (the norm in a long-lived `bun test` process)
+ * had no effect at all, which made PRB-096 AC5's "an active trace lease
+ * exempts a session from TTL cleanup" gate impossible to exercise with a
+ * fast, deterministic TTL -- the sweeper would always run against whatever
+ * (usually 15-minute) default happened to be baked in at import time.
+ *
+ * Fixed by threading the TTL/sweep values through this optional config
+ * instead: `makeSessionRegistryLive(config)` resolves
+ * `config.sessionTtlMs ?? process.env.PROBE_SESSION_TTL_MS ?? default` (and
+ * the sweep-interval equivalent) once per constructed Layer, not once per
+ * process. Production wiring (`SessionRegistryLive` below) calls it with no
+ * config, so the environment-variable behavior is unchanged; a test that
+ * wants a bounded TTL sweep passes `{ sessionTtlMs, ttlSweepIntervalMs }`
+ * directly and never touches `process.env`.
+ */
+export interface SessionRegistryConfig {
+  /** Overrides `PROBE_SESSION_TTL_MS` (default 15 minutes) for this Layer instance only. */
+  readonly sessionTtlMs?: number
+  /** Overrides `PROBE_SESSION_SWEEP_INTERVAL_MS` (default 10s) for this Layer instance only. */
+  readonly ttlSweepIntervalMs?: number
+}
+
+export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => Layer.scoped(
   SessionRegistry,
   Effect.gen(function* () {
     const artifactStore = yield* ArtifactStore
@@ -1566,6 +1380,16 @@ export const SessionRegistryLive = Layer.scoped(
     const realDeviceHarness = yield* RealDeviceHarness
     const simulatorHarness = yield* SimulatorHarness
     const lldbBridgeFactory = yield* LldbBridgeFactory
+    const defaultSessionTtlMs = config.sessionTtlMs ?? Number(process.env.PROBE_SESSION_TTL_MS ?? 15 * 60 * 1000)
+    const ttlSweepIntervalMs = config.ttlSweepIntervalMs ?? Number(process.env.PROBE_SESSION_SWEEP_INTERVAL_MS ?? 10_000)
+    // Shadow the module-level TTL helpers with 0-/3-arg versions closing over
+    // this Layer instance's resolved TTL -- every existing internal
+    // `expiresAtIso()`/`updateHealthCheck(record, command, ok)` call site
+    // (and the `FlowExecutorDeps.updateHealthCheck` wiring below) keeps its
+    // original call shape unchanged.
+    const expiresAtIso = (): string => expiresAtIsoFor(defaultSessionTtlMs)
+    const updateHealthCheck = (record: ActiveSessionRecord, command: string, ok: boolean) =>
+      updateHealthCheckWithTtl(record, command, ok, defaultSessionTtlMs)
     const sessionsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
     // PRB-083 gate 10: `closeSessionInternal` removes a session from
     // `sessionsRef` once it is fully closed (so it stops counting as
@@ -1574,7 +1398,10 @@ export const SessionRegistryLive = Layer.scoped(
     // rather than SessionNotFoundError. This small side-table is what makes
     // that possible: it keeps just the closed record's controller (already
     // memoized/terminal) reachable by session id after removal from the
-    // main table.
+    // main table. PRB-101: bounded to `closedSessionRecordCapacity` entries
+    // (oldest-inserted evicted first, see `withBoundedClosedRecords`) so a
+    // daemon that opens and closes many sessions over its lifetime does not
+    // grow this table without bound.
     const closedRecordsRef = yield* Ref.make(new Map<string, ActiveSessionRecord>())
     const openingRef = yield* Ref.make<OpeningSessionReservation | null>(null)
     const openMutex = yield* Effect.makeSemaphore(1)
@@ -2311,6 +2138,28 @@ export const SessionRegistryLive = Layer.scoped(
             details: [],
           })
         }
+
+        // PRB-101: the isRunnerBackedRecord check above only proves a live
+        // runner transport is connected -- not that it advertises uiAction
+        // support. runFlow's fast lane (directRunnerActionExecutor.ts)
+        // already gates the same dispatch through requireRunnerCapability;
+        // the single-action path asks the same reusable gate before sending
+        // the same "uiAction" command, instead of trusting an old or
+        // partial runner binary to reject it on its own.
+        yield* requireRunnerCapability({
+          record,
+          isRunnerBacked: isRunnerBackedRecord,
+          advertised: (activeRecord) => advertisedRunnerCapabilities(activeRecord.health.runner),
+          capability: "uiAction",
+          capabilityTag: "session.action",
+          usageDescription: "session UI actions (tap, press, swipe, type, scroll)",
+          notRunnerBacked: {
+            code: "session-action-real-device-runner",
+            reason: "This session does not currently expose a live runner transport for UI actions.",
+            nextStep: "Inspect session health/artifacts, or reopen the session once the runner transport is live.",
+          },
+          missingCapabilityNextStep: "Open a session against a runner that reports uiAction capability before retrying this action.",
+        })
 
         const action = args.action
         const retryPolicy = action.retryPolicy ?? defaultMutationRetryPolicy
@@ -4164,7 +4013,7 @@ export const SessionRegistryLive = Layer.scoped(
           next.delete(sessionId)
           return next
         })
-        yield* Ref.update(closedRecordsRef, (current) => new Map(current).set(sessionId, record))
+        yield* Ref.update(closedRecordsRef, (current) => withBoundedClosedRecords(new Map(current).set(sessionId, record)))
         yield* syncDaemonMetadata
 
         return record.health
@@ -6651,3 +6500,5 @@ export const SessionRegistryLive = Layer.scoped(
     return registry
   }),
 )
+
+export const SessionRegistryLive = makeSessionRegistryLive()

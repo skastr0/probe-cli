@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { CapabilityReport } from "./capabilities"
-import { DiagnosticReport, KnownWall } from "./diagnostics"
+import { BoundedDiagnosticReport, BoundedKnownWall } from "./diagnostics"
 import { OutputThreshold } from "./output"
 
 export const DaemonStatusSummary = Schema.Struct({
@@ -20,8 +20,8 @@ export const WorkspaceStatus = Schema.Struct({
   commands: Schema.Array(Schema.String),
   daemon: DaemonStatusSummary,
   capabilities: Schema.Array(CapabilityReport),
-  diagnostics: Schema.Array(DiagnosticReport),
-  knownWalls: Schema.Array(KnownWall),
+  diagnostics: Schema.Array(BoundedDiagnosticReport),
+  knownWalls: Schema.Array(BoundedKnownWall),
   notes: Schema.Array(Schema.String),
 })
 export type WorkspaceStatus = typeof WorkspaceStatus.Type
