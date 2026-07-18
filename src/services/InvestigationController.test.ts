@@ -65,7 +65,6 @@ interface FakeDepsOptions {
 }
 
 const makeFakeDeps = (options: FakeDepsOptions = {}) => {
-  let idCounter = 0
   const capturedIndices: Array<number> = []
 
   const baseCaptureRepetition: InvestigationExecutorDeps["captureRepetition"] = ({ repetitionIndex }) =>
@@ -98,8 +97,6 @@ const makeFakeDeps = (options: FakeDepsOptions = {}) => {
 
   const deps: InvestigationExecutorDeps = {
     ...makeUnusedInvestigationExecutorDeps(),
-    nowIso: () => new Date().toISOString(),
-    newInvestigationId: () => `inv-${idCounter++}`,
     checkSessionReady: () => Effect.succeed({ state: "ready" }),
     reserveRecorder: ({ investigationId }) =>
       Effect.sync(() => {
