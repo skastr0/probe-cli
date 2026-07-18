@@ -108,6 +108,37 @@ Updated: 2026-04-10
   - https://developer.apple.com/documentation/xcode-release-notes/xcode-26_4-release-notes
   - Used for the Apple-documented `Import As Run…` workflow and `xctrace import --append-run` support.
 
+## PRB-098 thermal-channel research (2026-07-18)
+
+See `knowledge/xctrace-instruments/thermal-state-findings.md` for the full writeup. Sources
+added in that pass:
+
+- Local empirical captures on this host (Xcode 26.6, `xctrace version 16.0 (17F113)`,
+  macOS 26.4.1):
+  - `xcodebuild -version`, `xcrun xctrace version`, `sw_vers`
+  - `xcrun xctrace record --template "Time Profiler" --attach <local pid> --time-limit 3s
+    --no-prompt --output …` (host self-attach control, succeeded)
+  - `xcrun xctrace export --input … --toc` and `--xpath
+    '/trace-toc/run[@number="1"]/data/table[@schema="device-thermal-state-intervals"]'`
+  - `xcrun devicectl device info details --device …` (physical device, unreachable)
+  - `xcrun xctrace record --device … --template "System Trace" --all-processes|--attach …`
+    against a booted Simulator (hung in this sandbox; killed)
+  - `xcrun simctl help`, `xcrun devicectl --help`, `xcrun devicectl device --help` (no
+    thermal/condition-simulation subcommand on this toolchain)
+  - Durable artifacts: `fixture-host-selftrace.toc.xml`,
+    `fixture-host-selftrace.device-thermal-state-intervals.xml`
+- Apple-hosted archived power-efficiency guide (macOS-focused, `NSProcessInfoThermalState`
+  four levels and per-level guidance):
+  - https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/RespondToThermalStateChanges.html
+- Secondary/community source corroborating the GUI-only Device Conditions invocation path
+  (used at lower confidence than the Apple-hosted page above):
+  - https://bleepingswift.com/blog/simulating-device-conditions-in-xcode
+- A WebSearch-tool synthesized answer claiming Apple Developer Forums thread 700733 documents
+  `device-thermal-state-intervals` columns was checked directly against that thread via
+  `WebFetch` and found **unsupported** — the thread contains zero thermal-related content.
+  Treat WebSearch's own prose summaries as unverified until checked against the underlying
+  page; this pack cites only what `WebFetch`/local commands actually returned.
+
 ## Source quality notes
 
 - Installed `xctrace` help, `list` output, and the local man page are treated as the primary source for the **current machine’s exact command surface**.

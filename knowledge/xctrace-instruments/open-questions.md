@@ -14,6 +14,10 @@ Updated: 2026-04-10
 2. **How reliable is `xctrace record --attach` for already-running iOS simulator and real-device app processes?**
    - The command surface supports attach by pid or name.
    - Forum evidence shows some attach / record combinations can hang or destabilize collection, especially with `CPU Counters`.
+   - **Partially answered (2026-07-18, PRB-098):** in a headless/windowless CLI sandbox, `xctrace record` against a *Simulator or paired iOS device* target (`--all-processes` or `--attach <pid>`) hung past its `--time-limit` in every attempt and had to be killed; a host-Mac self-attach control recording with the same flags completed normally in seconds. See `knowledge/xctrace-instruments/thermal-state-findings.md` §4. This looks like an environment/session-establishment limitation of that sandbox, not a general `xctrace` defect — unvalidated on a normal interactive desktop session.
+
+9. **Is there a CLI-scriptable way to induce or simulate device thermal state for reproducible testing?**
+   - **Answered (2026-07-18, PRB-098):** No. Xcode's Device Conditions thermal simulation is GUI-only (Devices and Simulators window). `xcrun simctl help`, `xcrun devicectl --help`, and `xcrun devicectl device --help` expose no thermal/condition-simulation subcommand on Xcode 26.6. See `knowledge/xctrace-instruments/thermal-state-findings.md` §3.
 
 3. **What is the exact schema/query Probe should use for full call-stack export on current Xcode versions?**
    - Apple Help documents compressed vs extended backtrace display.
