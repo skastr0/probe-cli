@@ -1252,6 +1252,7 @@ export class SessionRegistry extends Context.Tag("@probe/SessionRegistry")<
     readonly openDeviceSession: (params: {
       readonly bundleId: string
       readonly deviceId: string | null
+      readonly signingTeamId: string | null
       readonly projectRoot: string
       readonly emitProgress: (stage: string, message: string) => void
     }) => Effect.Effect<
@@ -3828,7 +3829,7 @@ export const SessionRegistryLive = Layer.scoped(
             .map((record) => toSessionListEntry(record.health))
             .sort((left, right) => left.openedAt.localeCompare(right.openedAt))
         }),
-      openDeviceSession: ({ bundleId, deviceId, projectRoot, emitProgress }) =>
+      openDeviceSession: ({ bundleId, deviceId, signingTeamId, projectRoot, emitProgress }) =>
         Effect.gen(function* () {
           const reservation = yield* reserveOpeningSession({
             platform: "device",
@@ -3875,8 +3876,19 @@ export const SessionRegistryLive = Layer.scoped(
                   logsDirectory: layout.logsDirectory,
                   bundleId,
                   requestedDeviceId: deviceId,
+                  signingTeamId,
                 })
 
+                emitProgress(
+                  "runner-cache",
+                  opened.runnerBuildCache.status
+                    ? `Signed runner build ${opened.runnerBuildCache.status} (key ${opened.runnerBuildCache.key ?? "unknown"})${
+                        opened.runnerBuildCache.invalidationReason
+                          ? ` -- invalidated: ${opened.runnerBuildCache.invalidationReason}`
+                          : ""
+                      }.`
+                    : "No signing team resolved; the runner build cache was not evaluated.",
+                )
                 emitProgress("runner.ready", "Real-device runner attached and acknowledged the initial ping.")
 
                 return yield* Effect.gen(function* () {
@@ -4074,6 +4086,7 @@ export const SessionRegistryLive = Layer.scoped(
                       connectionStatus: opened.connection.status,
                       lastCheckedAt: opened.connection.checkedAt,
                       capabilities: [...opened.capabilities],
+                      runnerBuildCache: opened.runnerBuildCache,
                       note:
                         "The real-device runner is live over HTTP POST command ingress with stdout-JSONL mixed-log observation for readiness and diagnostics.",
                     },

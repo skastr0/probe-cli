@@ -217,6 +217,14 @@ describe("commerce domain", () => {
           connectionStatus: "connected",
           lastCheckedAt: "2026-04-14T00:00:00.000Z",
           note: "ok",
+          runnerBuildCache: {
+            status: "hit",
+            key: "cache-key-1",
+            invalidationReason: null,
+            signingIdentity: "Apple Development: Test (ABCDE12345)",
+            profileIdentity: "profile-uuid-1",
+            profileExpiresAt: "2026-12-31T00:00:00.000Z",
+          },
         },
       }),
     })

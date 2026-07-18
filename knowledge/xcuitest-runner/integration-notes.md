@@ -71,6 +71,7 @@ Updated: 2026-04-09
 - Prefer a build/execute split for runner startup:
   - build the runner bundle with `build-for-testing`
   - start sessions with `test-without-building`
+  - PRB-095 (2026-07-17): for real-device sessions, the `build-for-testing` half is now content-addressed and cached (`RunnerBuildCache`) rather than re-run on every open -- see `knowledge/devicectl-device-signing/integration-notes.md`'s "PRB-095: signing precedence + signed runner build cache" section for the cache key, revalidation, and measured hit/miss/coalescing behavior. Simulator sessions still use the simpler project-root-reference cache in `SimulatorHarness.ensureSimulatorRunnerPrepared`.
 - Do not rely on teardown for essential state flushes. A crash can skip teardown entirely.
 - Do not rely on XCTest attachments as Probe’s primary artifact transport. They are test-result artifacts and are deleted on success by default unless explicitly retained.
 - For stable Probe refs, prefer accessibility identifiers first, then type/label/value/frame context as fallback.
