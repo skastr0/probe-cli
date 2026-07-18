@@ -259,6 +259,36 @@ crash after dispatch cannot produce success" case.
   the same file-read path and failed the same way. The new eviction step
   therefore stayed unexercised live in this pass — real-boundary coverage
   for `#6`/`#11` is code-reviewed and typechecked only, not yet Simulator-run.
+- **Working third injection path found (2026-07-18, PRB-092 review-fix
+  pass).** Both bypasses above still fail on this exact host
+  (Xcode 26.6/17F113): a fresh attempt reproduced the same raw-file ENOENT
+  (`testUIActionBatchAtTheHTTPBoundaryIsOneRPCWithReplaySafeRedelivery` run
+  directly via `-project`/`-scheme` against a freshly-written
+  `/tmp/probe-runner-bootstrap/<udid>.json`). What *did* work: editing the
+  `.xctestrun` file `build-for-testing` already generates — not the
+  `TEST_RUNNER_` command-line override, which never reaches it — and adding
+  `PROBE_BOOTSTRAP_JSON` directly to `ProbeRunnerUITests.EnvironmentVariables`
+  in that plist, then invoking `xcodebuild test-without-building -xctestrun
+  <path>` (in place of `-project`/`-scheme`). Two pitfalls to avoid when
+  writing that key: (1) `/usr/libexec/PlistBuddy -c "Add ... string
+  \"<json>\""` mangles embedded double quotes and silently corrupts the JSON
+  (`JSONDecoder` then fails with "isn't in the correct format") — write the
+  plist with Python's `plistlib` (load, mutate the dict, dump) instead; (2)
+  the env-var branch of `resolveLifecycleControlDirectory` decodes into the
+  same `LifecycleBootstrapConfig` as the file-based branches, so the payload
+  needs every required field the shell-script bootstrap writers omit —
+  `targetBundleId` in particular is not written by
+  `validate-lifecycle.sh`'s `write_bootstrap_json` (it predates PRB-092's
+  arbitrary-target-app support) — and, for this specific test,
+  `ingressTransport` must be `"http-post"`, not the file-mailbox scripts'
+  `"file-mailbox"`, or `validateLifecycleBootstrapConfig` rejects it. With
+  both fixed, `testUIActionBatchAtTheHTTPBoundaryIsOneRPCWithReplaySafeRedelivery`
+  ran and passed end to end (see
+  `knowledge/xcuitest-runner/integration-notes.md`'s "PRB-092" section for
+  the receipt). This does not retroactively prove the still-unexercised
+  `testCommandLoopReplaySafety` eviction step above ran — that step was not
+  re-attempted in this pass — but it is a genuine, reproducible third
+  bootstrap-injection path for any future spike blocked the same way.
 
 ## Historical evidence (superseded)
 

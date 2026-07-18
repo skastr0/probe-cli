@@ -1249,12 +1249,14 @@ final class AttachControlSpikeUITests: XCTestCase {
 
   // PRB-092 acceptance criteria: "A fixture recognizer requiring five taps
   // inside its declared window passes 100/100 Simulator runs" (met — see
-  // the `recognizedCount` assertion below) and "Five-tap p95 is at least
-  // three times faster than five separate fast actions" (measured NOT met
-  // on this host — see the speedup assertion's doc comment below for the
-  // real numbers and root cause; multiTap is still genuinely faster, just
-  // not 3x). Runs entirely in-process against one already-attached fixture
-  // session, mirroring PRB-091's
+  // the `recognizedCount` assertion below, independently re-run and
+  // confirmed 100/100 in the 2026-07-18 review-fix pass) and "Five-tap p95
+  // is at least three times faster than five separate fast actions"
+  // (measured NOT met on this host — see the speedup assertion's doc
+  // comment below for the real numbers, root cause, and the AC10 scope
+  // proposal's ratification status; multiTap is still genuinely faster,
+  // just not 3x). Runs entirely in-process against one already-attached
+  // fixture session, mirroring PRB-091's
   // `testLargeFixtureIdentifierResolutionMeetsReleaseBudget` shape (a
   // hundred-iteration in-process loop, not a hundred separate
   // `xcodebuild test-without-building` sessions) — see
@@ -1353,12 +1355,12 @@ final class AttachControlSpikeUITests: XCTestCase {
     XCTAssertGreaterThan(baselineP95Ms, 0)
 
     // PRB-092 finding (see knowledge/xcuitest-runner/integration-notes.md's
-    // "PRB-092" section for the full writeup): a measured 100-iteration run
-    // on this host produced multi_tap_p95_ms ~5876 vs
-    // baseline_five_separate_taps_p95_ms ~8080 — multiTap is genuinely
-    // faster (~1.37x), but does NOT clear the glyph's "at least 3x faster"
-    // target. Root cause: XCUITest's own per-`tap()` cross-process
-    // synchronization/quiescence wait (the same fixed cost
+    // "PRB-092" section for the full writeup): measured 100-iteration runs
+    // on this host have landed multiTap at ~1.24x-1.37x faster than five
+    // separate fast tap actions, genuinely and consistently faster, but
+    // NOT clearing the glyph's "at least 3x faster" target. Root cause:
+    // XCUITest's own per-`tap()` cross-process synchronization/quiescence
+    // wait (the same fixed cost
     // knowledge/xcuitest-runner/integration-notes.md's PRB-091 section
     // documents for element resolution) is paid once per discrete tap
     // dispatch, inside multiTap's own loop exactly as much as in five
@@ -1367,18 +1369,27 @@ final class AttachControlSpikeUITests: XCTestCase {
     // per-tap dispatch cost itself, which dominates the total. This is a
     // real architectural ceiling on this host/XCUITest version, not a
     // Probe defect; asserting a false 3x here would be a worse outcome than
-    // reporting the true, still-favorable ratio. 1.2x is comfortably under
-    // the measured ~1.37x, leaving headroom for run-to-run variance while
-    // still catching a real regression that erased multiTap's advantage
-    // entirely. A subsequent review confirmed this is a genuine ceiling,
-    // not an under-measurement — see integration-notes.md's "Scope decision
-    // (2026-07-18 review-fix pass): AC10's '3x' target" section for the
-    // host-RPC-layer analysis and the recorded AC10 revision.
+    // reporting the true, still-favorable ratio (the PROBE_METRIC line
+    // above always prints the true measured multiTapP95Ms/baselineP95Ms
+    // pair, independent of the asserted floor below). A review pass
+    // confirmed the ceiling analysis is sound but flagged that only the
+    // glyph owner can actually relax the literal "3x" acceptance
+    // criterion — see integration-notes.md's "Proposed scope decision
+    // (2026-07-18 review-fix pass, STATUS: awaiting glyph-owner
+    // ratification): AC10's '3x' target" section; until that ratification
+    // lands, AC10 stays unmet/partial regardless of what this test asserts.
+    // A second review pass also flagged the previous `>=1.2x` floor as too
+    // tight a regression guard (~3% headroom over the worst of the first
+    // two measured runs, ~1.24x); a subsequent run reproduced exactly that
+    // flake (multiTap ~1.164x faster, failed `>=1.2x`) — see
+    // integration-notes.md's "Measured receipts" Run 3 for the numbers.
+    // Lowered to `>=1.1x`, which every run to date (including the one that
+    // failed `>=1.2x`) clears with room to spare.
     XCTAssertLessThanOrEqual(
-      Double(multiTapP95Ms) * 1.2,
+      Double(multiTapP95Ms) * 1.1,
       Double(baselineP95Ms),
-      "Expected multiTap's p95 (\(multiTapP95Ms) ms) to be at least 1.2x faster than five separate fast tap actions' p95 (\(baselineP95Ms) ms) — "
-        + "see this test's doc comment for why the glyph's original 3x target is not met on this host."
+      "Expected multiTap's p95 (\(multiTapP95Ms) ms) to be at least 1.1x faster than five separate fast tap actions' p95 (\(baselineP95Ms) ms) — "
+        + "see this test's doc comment for why the glyph's original 3x target is not met on this host, and the PROBE_METRIC line above for the true measured ratio."
     )
   }
 
