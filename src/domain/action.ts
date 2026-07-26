@@ -586,6 +586,15 @@ export const SessionActionResultSchema = Schema.Struct({
   verdict: Schema.Union(ActionVerdict, Schema.Null),
   waitedMs: NullableNumber,
   polledCount: NullableNumber,
+  // PRB-091/092 timing truth: total + phase breakdown from the runner's
+  // uiAction response. Omitted/null for non-runner actions and older runners.
+  // `hostRttMs` is host-measured transport time around the runner HTTP call.
+  handledMs: Schema.optional(NullableNumber),
+  resolutionMs: Schema.optional(NullableNumber),
+  waitMs: Schema.optional(NullableNumber),
+  interactionMs: Schema.optional(NullableNumber),
+  finalizationMs: Schema.optional(NullableNumber),
+  hostRttMs: Schema.optional(NullableNumber),
   // PRB-093: the canonical evidence report -- requested policy, actual
   // captures (each tagged with why it happened), and their total cost.
   // Populated for every action result, including read-only/explicit-capture
