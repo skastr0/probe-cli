@@ -2311,7 +2311,16 @@ final class AttachControlSpikeUITests: XCTestCase {
           controlDirectoryURL: controlDirectoryURL
         )
         let finalizationStartedAt = Date()
-        let statusLabelText = Self.genericResponseStatusLabel(app: app)
+        // Hot path: uiAction / uiActionBatch are agent fly commands. Reading
+        // app.label here was ~200ms of pure finalization tax on real devices
+        // (measured 2026-07-26) and is not needed for action success/failure.
+        // Keep the generic status label only for slower diagnostic commands.
+        let statusLabelText: String
+        if command.action == "uiAction" || command.action == "uiActionBatch" {
+          statusLabelText = "<status-skipped>"
+        } else {
+          statusLabelText = Self.genericResponseStatusLabel(app: app)
+        }
         response = LifecycleResponseFrame(
           action: command.action,
           // PRB-092: `result.ok` is true for every action except a
