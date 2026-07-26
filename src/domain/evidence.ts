@@ -52,8 +52,23 @@ export type EvidencePolicy = typeof EvidencePolicySchema.Type
 // The default mutation policy (acceptance criterion #2): success=end,
 // failure=snapshot. This is what every mutation-capable lane falls back to
 // when a caller omits `evidencePolicy` entirely.
+//
+// Do not flip this to success=none. Investigate plans, verified flows, replay,
+// and PRB-093 tests treat omit→end as the domain contract. Agent-facing CLI
+// surfaces inject `defaultAgentMutationEvidencePolicy` when the caller omits
+// a policy on the fly path (see session action / actions[]).
 export const defaultMutationEvidencePolicy: EvidencePolicy = {
   success: "end",
+  failure: "snapshot",
+}
+
+/**
+ * Sparse default for agent multi-step navigation: zero discretionary success
+ * snapshots, still capture on failure. Used only by CLI agent fly paths —
+ * never by `resolveEvidencePolicy`, investigate, or verified flows.
+ */
+export const defaultAgentMutationEvidencePolicy: EvidencePolicy = {
+  success: "none",
   failure: "snapshot",
 }
 
