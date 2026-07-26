@@ -156,3 +156,24 @@ Scroll requires a **target** (the element you gesture on), a **direction**, and
   outside any scrollable container — snapshot frames help.
 - **Device fixture looks old**: close the session and reopen (Probe reinstalls
   `dev.probe.fixture` from the session’s build products).
+
+## Agent CLI fly path notes
+
+- **`session action` with `actions: [...]`** is the preferred multi-mutation CLI
+  shape. Probe wraps the array as one `probe.session-flow/v2` `sequence` with
+  `execution: "fast"` and **injects sparse evidence automatically**
+  (`evidencePolicy: { success: "none", failure: "snapshot" }`) so the runner can
+  batch without host snapshots between children. Prefer this over N separate
+  `session action` calls.
+- **Export a session recording as a durable flow** for CI re-run:
+
+  ```bash
+  probe session recording export --session-id <id> --format flow-v2
+  ```
+
+  Prefer semantic identifiers while recording so the export is stable across
+  snapshot renumbering.
+- **Nav + perf compose** (fixture golden): fill `target.sessionId` in
+  [`docs/examples/investigations/fixture-form-apply-time-profiler.json`](../investigations/fixture-form-apply-time-profiler.json)
+  and run `probe investigate validate|plan|run --file …`. See
+  [`docs/examples/investigations/README.md`](../investigations/README.md).

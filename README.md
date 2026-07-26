@@ -94,6 +94,29 @@ bun run probe -- serve
 bun run probe -- session open --output-json
 ```
 
+## Agent loop
+
+Probe is built so an agent can walk an iOS app end-to-end with Apple-native proof
+and export the path as durable tests.
+
+1. `probe serve` once; keep one long-lived session (`probe session open`).
+2. Navigate with sparse evidence: prefer `session action` with `actions: [...]`
+   (auto-batches as a fast sequence with `evidencePolicy.success: "none"`),
+   `multiTap` for multi-tap gestures, and identifier selectors from a snapshot
+   only when the screen is unknown.
+3. Prove with purpose: verified asserts, `session run` flows, Instruments via
+   `probe investigate`, then `probe drill` on artifacts.
+4. Export: record actions, export as flow-v2 when you want CI re-run.
+
+Playbooks:
+
+- Navigation fly path — `docs/examples/flows/agent-navigation.md`
+- Flow examples — `docs/examples/flows/README.md`
+- Investigate recipes (fixture form-apply + time-profiler golden) —
+  `docs/examples/investigations/README.md` and
+  `docs/examples/investigations/fixture-form-apply-time-profiler.json`
+- Usability bar — `knowledge/agent-loop-usability-bar.md`
+
 ## Release Plan
 
 The release lane is:
@@ -307,7 +330,7 @@ probe session action \
 
 **Supported action kinds:** `tap`, `multiTap`, `press`, `swipe`, `type`, `scroll`, `wait`, `assert`, `screenshot`, `video`
 
-See `actions-reference.md` for full schemas: selectors (ref / semantic / point / absence), assertion expectations, retry policy, and the recording contract.
+See `docs/examples/flows/agent-navigation.md` and `docs/examples/flows/README.md` for selector strategy, batching, evidence policy, and worked action/flow shapes. Discover full payload contracts via `probe schema list/show --output-json`.
 
 ### 5. Multi-Step Flows (`session run`)
 
@@ -462,7 +485,7 @@ probe session result attachments --session-id <id> --output-json
 
 ## Element Selection Strategy
 
-Probe supports four selector kinds (see `actions-reference.md`):
+Probe supports four selector kinds (see `docs/examples/flows/agent-navigation.md`):
 
 - **`ref`** — fast, per-snapshot, optional semantic fallback
 - **`semantic`** — durable across UI changes, can be ambiguous
@@ -528,10 +551,11 @@ The script starts `probe serve`, opens a session, sends a ping, captures a snaps
 
 ## Supporting References
 
-- `actions-reference.md` — full action and selector schemas, `wait` conditions, assertion expectations, retry policy, recording/replay contracts
 - `docs/examples/flows/README.md` — `probe.session-flow/v2` examples, fast/verified trade-offs, and batching patterns
-- `recipes.md` — end-to-end QA recipes (login, form validation, commerce, accessibility, perf-around-flow, etc.)
-- `troubleshooting.md` — session won't open, stale refs, log sources unavailable, daemon socket conflicts, perf walls
+- `docs/examples/flows/agent-navigation.md` — agent fly path: identifiers, sequence, multiTap, sparse evidence
+- `docs/examples/investigations/README.md` — `probe investigate` recipes (fixture golden + real-app placeholder)
+- `knowledge/agent-loop-usability-bar.md` — minimum usability bar for the agent E2E loop
+- `knowledge/` — research packs for Apple/Xcode seams (xctrace, xcuitest-runner, commerce, etc.)
 - `V2-DIRECTION.md` — product vision and roadmap for the validation and observability workbench
 
 ---

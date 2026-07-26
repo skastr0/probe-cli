@@ -13,6 +13,8 @@ probe session run --session-id <id> --file docs/examples/flows/<example>.json --
 - `mixed-mode-v2.json` — verified evidence steps mixed with fast mutations
 - `sequence-batch-v2.json` — explicit runner-batched `sequence` step with an `evidencePolicy: { success: "end" }` post-batch capture (requires the `uiActionBatch` runner capability, which the production Swift runner implements — see below)
 
+Agent CLI `session action` with `actions[]` defaults to sparse evidence (`success: "none"`) for the fly path; this `sequence-batch-v2.json` example intentionally uses `success: "end"` so a post-batch snapshot proves final state after the batch.
+
 `probe.session-flow/v2` is the single canonical flow contract. `probe.session-flow/v1` was removed; old v1 input now fails with a typed `unsupported-flow-contract` error that names the migration step (re-tag `contract` as `probe.session-flow/v2` — step shapes are unchanged).
 
 ## Validation (PRB-071)
