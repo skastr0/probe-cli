@@ -628,6 +628,65 @@ describe("action domain", () => {
     expect(action.target.type).toBe("button")
   })
 
+  test("accepts agent-friendly scroll amount aliases and defaults steps to 1", () => {
+    const withAmount = decodeSessionAction({
+      kind: "scroll",
+      target: {
+        kind: "semantic",
+        identifier: "fixture.form.sectionLabel",
+        label: null,
+        value: null,
+        placeholder: null,
+        type: null,
+        section: null,
+        interactive: false,
+      },
+      direction: "down",
+      amount: "medium",
+    })
+    if (withAmount.kind !== "scroll") {
+      throw new Error(`Expected scroll, received ${withAmount.kind}`)
+    }
+    expect(withAmount.steps).toBe(3)
+
+    const defaultSteps = decodeSessionAction({
+      kind: "scroll",
+      target: {
+        kind: "semantic",
+        identifier: "fixture.form.sectionLabel",
+        label: null,
+        value: null,
+        placeholder: null,
+        type: null,
+        section: null,
+        interactive: false,
+      },
+      direction: "down",
+    })
+    if (defaultSteps.kind !== "scroll") {
+      throw new Error(`Expected scroll, received ${defaultSteps.kind}`)
+    }
+    expect(defaultSteps.steps).toBe(1)
+  })
+
+  test("compact action schema errors do not dump the full Effect union", () => {
+    expect(() =>
+      decodeSessionAction({
+        kind: "scroll",
+        direction: "down",
+      }),
+    ).toThrow(/Invalid scroll action/)
+
+    try {
+      decodeSessionAction({ kind: "scroll", direction: "down" })
+      throw new Error("expected decode to throw")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      expect(message.length).toBeLessThan(500)
+      expect(message).not.toContain("readonly kind: \"tap\"")
+    }
+  })
+
   test("decodes point and absence selectors from json payloads", () => {
     const pointAction = decodeSessionAction({
       kind: "tap",

@@ -1685,8 +1685,20 @@ const normalizeSessionActionInput = (value: unknown): unknown => {
     || record.kind === "type"
     || record.kind === "scroll"
   ) {
+    // Agent ergonomics: accept `amount` as a synonym for scroll `steps`, and
+    // default steps to 1 when only direction+target are provided. Agents often
+    // invent `{ kind:"scroll", direction:"down", amount:"medium" }` and die on
+    // a multi-KB Schema dump.
+    const scrollSteps = record.kind === "scroll"
+      ? (record.steps
+        ?? (typeof record.amount === "number" ? record.amount : null)
+        ?? (record.amount === "small" ? 1 : record.amount === "medium" ? 3 : record.amount === "large" ? 6 : null)
+        ?? 1)
+      : record.steps
+
     return {
       ...record,
+      ...(record.kind === "scroll" ? { steps: scrollSteps } : {}),
       target: normalizeActionSelectorInput(record.target ?? record.selector),
     }
   }
@@ -1717,6 +1729,39 @@ const normalizeSessionActionInput = (value: unknown): unknown => {
   return value
 }
 
-export const decodeSessionAction = (value: unknown): SessionAction =>
-  Schema.decodeUnknownSync(SessionActionSchema)(normalizeSessionActionInput(value))
+const compactActionSchemaError = (error: unknown, value: unknown): Error => {
+  const kind = typeof value === "object" && value !== null && "kind" in value
+    ? String((value as { kind?: unknown }).kind)
+    : "unknown"
+  const message = error instanceof Error ? error.message : String(error)
+  // Effect Schema dumps the entire union; agents cannot parse that. Keep a short
+  // recipe for the most common navigation action.
+  if (kind === "scroll" || message.includes('"kind": "scroll"') || message.includes("kind: \"scroll\"")) {
+    return new Error(
+      `Invalid scroll action. Required shape: { "kind":"scroll", "target":{ "kind":"semantic", "identifier":"<scrollable or anchor id>", "label":null, "value":null, "placeholder":null, "type":null, "section":null, "interactive":true }, "direction":"up"|"down"|"left"|"right", "steps": <positive int> }. Optional: amount "small"|"medium"|"large" maps to steps 1|3|6.`,
+    )
+  }
+  if (kind === "multiTap" || message.includes("multiTap")) {
+    return new Error(
+      `Invalid multiTap action. Required shape: { "kind":"multiTap", "target":{ "kind":"semantic", "identifier":"<id>", "label":null, "value":null, "placeholder":null, "type":null, "section":null, "interactive":true }, "tapCount": 2..20, "interTapDelayMs": 0..500 }.`,
+    )
+  }
+  if (kind === "tap" || message.includes('"kind": "tap"')) {
+    return new Error(
+      `Invalid tap action. Required shape: { "kind":"tap", "target":{ "kind":"semantic", "identifier":"<id>", "label":null, "value":null, "placeholder":null, "type":null, "section":null, "interactive":true } }.`,
+    )
+  }
+  // Fall back to a truncated schema message rather than multi-KB Effect output.
+  const compact = message.length > 400 ? `${message.slice(0, 400)}…` : message
+  return new Error(`Invalid session action (kind=${kind}): ${compact}`)
+}
+
+export const decodeSessionAction = (value: unknown): SessionAction => {
+  const normalized = normalizeSessionActionInput(value)
+  try {
+    return Schema.decodeUnknownSync(SessionActionSchema)(normalized)
+  } catch (error) {
+    throw compactActionSchemaError(error, normalized)
+  }
+}
 export const decodeActionRecordingScript = Schema.decodeUnknownSync(ActionRecordingScriptSchema)
