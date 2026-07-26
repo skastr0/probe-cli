@@ -2008,11 +2008,27 @@ export const ProbeKernelLive = Layer.effect(
           const alreadyRunning = yield* artifactStore.isDaemonRunning()
 
           if (alreadyRunning) {
+            // Best-effort metadata for a concrete stop recipe. Corrupt/missing
+            // metadata must not change the fail-closed ownership outcome.
+            const metadata = yield* artifactStore.readDaemonMetadata().pipe(
+              Effect.catchAll(() => Effect.succeed(null as Record<string, unknown> | null)),
+            )
+            const processId =
+              metadata && typeof metadata.processId === "number" ? metadata.processId : null
+            const details =
+              processId !== null
+                ? [`processId: ${processId}`, `socket: ${socketPath}`]
+                : []
+            const nextStep =
+              processId !== null
+                ? `Reuse the existing daemon (pid ${processId} at ${socketPath}), or stop it with \`kill ${processId}\` after confirming via \`probe doctor --output-json\`.`
+                : "Reuse the existing daemon, or identify its pid via `probe doctor --output-json` and stop it with `kill <pid>` before starting a new one."
+
             return yield* new EnvironmentError({
               code: "daemon-already-running",
               reason: `A Probe daemon is already listening at ${socketPath}.`,
-              nextStep: "Reuse the existing daemon or stop it before starting a new one.",
-              details: [],
+              nextStep,
+              details,
             })
           }
 

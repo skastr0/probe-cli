@@ -336,11 +336,21 @@ describe("ProbeKernel", () => {
             getDaemonSocketPath: () => Effect.succeed(join(root, "probe.sock")),
             getDaemonMetadataPath: () => Effect.succeed(join(root, "daemon.json")),
             // The single-daemon ownership check must run and fail closed
-            // before any of these are ever touched - dying proves the guard
+            // before ensure/write/listen are touched - dying proves the guard
             // actually runs first rather than merely happening to fail later.
+            // readDaemonMetadata is intentionally live: already-running errors
+            // enrich nextStep/details from daemon metadata when available.
             ensureDaemonDirectories: () => Effect.die("second writer must fail closed before ensureDaemonDirectories"),
             isDaemonRunning: () => Effect.succeed(true),
-            readDaemonMetadata: () => Effect.die("unused readDaemonMetadata"),
+            readDaemonMetadata: () =>
+              Effect.succeed({
+                processId: 4242,
+                socketPath: join(root, "probe.sock"),
+                protocolVersion: "test",
+                startedAt: new Date(0).toISOString(),
+                activeSessions: 0,
+                sessions: [],
+              }),
             createSessionLayout: () => Effect.die("unused createSessionLayout"),
             removeSessionLayout: () => Effect.void,
             readSessionManifest: () => Effect.die("unused readSessionManifest"),
@@ -382,6 +392,11 @@ describe("ProbeKernel", () => {
         expect(Either.isLeft(result)).toBe(true)
         if (Either.isLeft(result)) {
           expect(result.left.code).toBe("daemon-already-running")
+          expect(result.left.details).toContain("processId: 4242")
+          expect(result.left.details.some((detail: string) => detail.startsWith("socket:"))).toBe(true)
+          expect(result.left.nextStep).toContain("4242")
+          expect(result.left.nextStep).toContain("kill 4242")
+          expect(result.left.nextStep).toContain("probe doctor --output-json")
         }
       } finally {
         await runtime.dispose()
