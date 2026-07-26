@@ -17,14 +17,19 @@ The loop is usable when an agent can, without ceremony:
 2. **Navigate with sparse evidence by default** on fly paths:
    - CLI `session action` with `actions: [...]` → one fast `sequence` with
      `evidencePolicy.success: "none"` (no host snapshots between mutations).
+   - Single CLI mutations that omit `evidencePolicy` also inject sparse defaults.
    - Explicit `sequence` / `multiTap` for multi-step and multi-tap gestures.
 3. **Snapshot only when lost** (`session snapshot`), then prefer semantic
-   identifiers — not labels, ordinals, or points.
-4. **Fail closed on recovery**: typed errors name the next step; re-snapshot
+   identifiers from `agentView.interactive` — not labels, ordinals, or points.
+   Full tree stays in the artifact; drill when needed.
+4. **Optional post-mutation `uiDelta`** when evidence already captured a post
+   snapshot (`success: end|around`) — compact diff + slim interactive, no
+   second AX capture. Sparse fly path leaves `uiDelta` null by design.
+5. **Fail closed on recovery**: typed errors name the next step; re-snapshot
    after `target-not-found`; reopen when the fixture is stale.
-5. **Compose nav + perf** via `probe investigate` recipes (measured flow under a
+6. **Compose nav + perf** via `probe investigate` recipes (measured flow under a
    preset Instruments capture).
-6. **Keep golden flows schema-valid in CI**: every file under
+7. **Keep golden flows schema-valid in CI**: every file under
    `docs/examples/flows/` and `docs/examples/investigations/` is
    glob-discovered and domain-validated in tests.
 
@@ -39,6 +44,8 @@ lanes; fly paths stay sparse until proof is requested.
 | `sequence` | Runner-batched fast mutations (`uiActionBatch`) |
 | `evidencePolicy` | `success: none \| end \| around`, `failure: none \| snapshot` |
 | `multiTap` | One resolve, N taps, no host snapshots between taps |
+| `agentView` | Always-on slim interactive targets on snapshot results |
+| `uiDelta` | Compact post-mutation diff when a post snapshot was already taken |
 | `doctor` / `validate` / `drill` | Preflight → execute → inspect evidence |
 | `investigate` | Recipe: setup?/warmup?/measuredFlow + capture + repetitions + cooldown |
 
