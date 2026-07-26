@@ -1611,6 +1611,25 @@ export const buildDirectRunnerUiActionPayload = (
   selector: ActionSelector,
 ): RunnerUiActionPayload => buildRunnerUiActionPayloadWithLocator(action, buildDirectRunnerLocator(selector))
 
+/**
+ * Selectors the runner can resolve without a host snapshot pre-pass.
+ * Point is coordinate-native; semantic/ref-with-fallback are identifier-first
+ * on-device queries. Host snapshot resolution is only required for pure refs
+ * (no fallback) and for host-side assert/wait matching.
+ */
+export const isDirectRunnerResolvableSelector = (selector: ActionSelector): boolean => {
+  switch (selector.kind) {
+    case "point":
+      return true
+    case "semantic":
+      return true
+    case "ref":
+      return selector.fallback !== null
+    case "absence":
+      return false
+  }
+}
+
 export const flowStepToSessionAction = (step: FlowSessionActionStep): SessionAction => {
   switch (step.kind) {
     case "tap":

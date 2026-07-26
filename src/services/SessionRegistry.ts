@@ -8,6 +8,7 @@ import {
   buildRecordedSessionAction,
   buildDirectRunnerUiActionPayload,
   buildRunnerUiActionPayload,
+  isDirectRunnerResolvableSelector,
   describeActionSelector,
   describeRecordedActionTarget,
   describeSnapshotNode,
@@ -2163,21 +2164,16 @@ export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => L
 
         const action = args.action
         const retryPolicy = action.retryPolicy ?? defaultMutationRetryPolicy
-        // PRB-093: the canonical evidence policy replaces the old implicit
-        // "always capture pre, always capture post" behavior. `wantsPre`
-        // covers two independent reasons a pre-mutation snapshot might be
-        // needed: resolving a ref/semantic target at all (mandatory,
-        // regardless of policy), or "around" explicitly requesting
-        // pre-mutation evidence even for a point target that needs no
-        // resolution. Only "around" ever forces a *fresh* pre, ignoring the
-        // session's cached latest snapshot -- "end" and "none" trust that
-        // cache for resolution (the previous action's own post capture, or
-        // an explicit snapshot command) rather than paying for a redundant
-        // fresh capture before every mutation. See evidence.ts's module doc.
+        // PRB-093 + agent fly path: pre-mutation host snapshots are no longer
+        // mandatory for every semantic selector. Point/semantic/ref-with-fallback
+        // targets resolve on the runner (same as runFlow's fast lane). Host
+        // snapshot resolution remains for pure refs without fallback, and
+        // "around" still forces a fresh pre capture for evidence only.
         const policy = resolveEvidencePolicy(action.evidencePolicy)
         const successPlan = planSuccessEvidence(policy.success)
-        const requiresResolution = action.target.kind !== "point"
-        const wantsPre = requiresResolution || successPlan.forcedFreshPre
+        const directRunnerResolvable = isDirectRunnerResolvableSelector(action.target)
+        const requiresHostResolution = !directRunnerResolvable
+        const wantsPre = requiresHostResolution || successPlan.forcedFreshPre
         const evidenceCaptures: Array<EvidenceCapture> = []
         let cachedPreSnapshot: StoredSnapshotArtifact | null = wantsPre && !successPlan.forcedFreshPre
           ? record.snapshotState.latest
@@ -2219,33 +2215,66 @@ export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => L
                 cachedPreSnapshot = preSnapshot.artifact
               }
 
-              const resolution = resolveActionSelectorInSnapshot(preSnapshot?.artifact ?? null, action.target)
+              let runnerPayload: string
+              // null means direct-runner path (no host snapshot match)
+              let resolvedTarget: import("../domain/action").ResolvedActionTarget | null = null
 
-              if (resolution.outcome !== "matched") {
-                return yield* new EnvironmentError({
-                  code: "session-action-target-not-found",
-                  reason: resolution.reason,
-                  nextStep: "Capture a fresh snapshot, refine the selector, and retry the action.",
-                  details: [],
+              if (directRunnerResolvable) {
+                // Agent fly path: no host AX match required. Runner auto-scrolls
+                // and resolves identifier-first / point locators on-device.
+                const payload = yield* Effect.try({
+                  try: () => buildDirectRunnerUiActionPayload(action, action.target),
+                  catch: (error) =>
+                    new EnvironmentError({
+                      code: "session-action-target-not-found",
+                      reason: error instanceof Error ? error.message : String(error),
+                      nextStep: "Use a semantic identifier, point selector, or ref with a semantic fallback.",
+                      details: [],
+                    }),
                 })
-              }
+                runnerPayload = JSON.stringify(payload)
+                if (action.target.kind === "point") {
+                  resolvedTarget = {
+                    kind: "point",
+                    x: action.target.x,
+                    y: action.target.y,
+                    resolvedBy: "point",
+                  }
+                }
+              } else {
+                const resolution = resolveActionSelectorInSnapshot(preSnapshot?.artifact ?? null, action.target)
 
-              const resolvedTarget = resolution.target!
+                if (resolution.outcome !== "matched") {
+                  return yield* new EnvironmentError({
+                    code: "session-action-target-not-found",
+                    reason: resolution.reason,
+                    nextStep: "Capture a fresh snapshot, refine the selector, and retry the action.",
+                    details: [],
+                  })
+                }
 
-              if (resolvedTarget.kind === "absence") {
-                return yield* new EnvironmentError({
-                  code: "session-action-target-not-found",
-                  reason: "Absence selectors can only be used with assert actions.",
-                  nextStep: "Use a ref, semantic, or point selector for runner UI actions, or move the absence check into an assert.",
-                  details: [],
-                })
+                const matched = resolution.target!
+
+                if (matched.kind === "absence") {
+                  return yield* new EnvironmentError({
+                    code: "session-action-target-not-found",
+                    reason: "Absence selectors can only be used with assert actions.",
+                    nextStep: "Use a ref, semantic, or point selector for runner UI actions, or move the absence check into an assert.",
+                    details: [],
+                  })
+                }
+
+                runnerPayload = JSON.stringify(
+                  buildRunnerUiActionPayload(action, matched, preSnapshot?.artifact ?? null),
+                )
+                resolvedTarget = matched
               }
 
               const response = yield* sendRunnerCommand(
                 args.sessionId,
                 record,
                 "uiAction",
-                JSON.stringify(buildRunnerUiActionPayload(action, resolvedTarget, preSnapshot?.artifact ?? null)),
+                runnerPayload,
               )
 
               if (!response.ok) {
@@ -2331,30 +2360,33 @@ export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => L
           ? `; captured ${actionResult.value.postSnapshot.artifact.snapshotId}`
           : ""
 
-        const summary = actionResult.value.resolvedTarget.kind === "snapshot"
-          ? actionResult.value.resolvedTarget.resolvedBy === "semantic"
-              && action.target.kind === "ref"
-              && action.target.fallback !== null
-            ? `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)} after semantic selector-drift recovery${captureNote}.`
-            : `Executed ${action.kind} on ${describeSnapshotNode(actionResult.value.resolvedTarget.node)}${captureNote}.`
-          : `Executed ${action.kind} at point(${actionResult.value.resolvedTarget.x}, ${actionResult.value.resolvedTarget.y}) in interaction-root coordinates${captureNote}.`
+        const resolved = actionResult.value.resolvedTarget
+        const summary = resolved === null
+          ? `Executed ${action.kind} via runner-direct selector ${describeActionSelector(action.target)}${captureNote}.`
+          : resolved.kind === "snapshot"
+            ? resolved.resolvedBy === "semantic"
+                && action.target.kind === "ref"
+                && action.target.fallback !== null
+              ? `Executed ${action.kind} on ${describeSnapshotNode(resolved.node)} after semantic selector-drift recovery${captureNote}.`
+              : `Executed ${action.kind} on ${describeSnapshotNode(resolved.node)}${captureNote}.`
+            : `Executed ${action.kind} at point(${resolved.x}, ${resolved.y}) in interaction-root coordinates${captureNote}.`
 
         return {
           ok: true,
           result: {
             summary,
             action: args.action.kind,
-            matchedRef: actionResult.value.resolvedTarget.kind === "snapshot" ? actionResult.value.resolvedTarget.ref : null,
-            resolvedBy: actionResult.value.resolvedTarget.resolvedBy,
+            matchedRef: resolved?.kind === "snapshot" ? resolved.ref : null,
+            resolvedBy: resolved?.resolvedBy ?? (action.target.kind === "point" ? "point" : "semantic"),
             statusLabel,
             latestSnapshotId,
-              artifact: null,
-              recordingLength: record.recording.steps.length,
-              handledMs: actionResult.value.handledMs,
-              evidence: buildEvidenceReport(policy, evidenceCaptures),
-              ...buildActionResultMetadata(actionResult.retry),
-            } satisfies ExtendedSessionActionResult,
-          } satisfies ActionExecutionOutcome
+            artifact: null,
+            recordingLength: record.recording.steps.length,
+            handledMs: actionResult.value.handledMs,
+            evidence: buildEvidenceReport(policy, evidenceCaptures),
+            ...buildActionResultMetadata(actionResult.retry),
+          } satisfies ExtendedSessionActionResult,
+        } satisfies ActionExecutionOutcome
       })
 
     const validateLogRequest = (args: {
