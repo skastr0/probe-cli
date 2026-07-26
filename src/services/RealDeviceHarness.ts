@@ -2615,6 +2615,43 @@ export const RealDeviceHarnessLive = Layer.succeed(
               })
             }
 
+            // Probe's fixture is built in this preflight (and may be cache-hit). Session open
+            // used to only *check* that some copy of the bundle id existed on-device, so agents
+            // could attach to a stale fixture that lacked newer controls (multiTap, etc.).
+            // Mirror SimulatorHarness build-and-install: when the target is Probe's fixture,
+            // always install the just-built/cached .app before launch.
+            if (args.bundleId === "dev.probe.fixture") {
+              const installLogPath = join(liveLogsDirectory, "devicectl-device-install-app.log")
+              const installResult = await runRealDeviceHostCommand({
+                command: "/usr/bin/xcrun",
+                commandArgs: [
+                  "devicectl",
+                  "device",
+                  "install",
+                  "app",
+                  "--device",
+                  preflight.device.identifier,
+                  preflight.targetAppPath,
+                ],
+              })
+              await writeCommandLog(installLogPath, installResult)
+
+              if (installResult.exitCode !== 0) {
+                throw new EnvironmentError({
+                  code: "target-app-install-failed",
+                  reason:
+                    `Probe could not install the fixture app built for this session onto ${preflight.device.name} (${preflight.device.identifier}).`,
+                  nextStep:
+                    "Confirm the device is unlocked, trusted, and in Developer Mode, then retry the session open.",
+                  details: [
+                    formatCommandFailure("xcrun devicectl device install app", installResult),
+                    `app: ${preflight.targetAppPath}`,
+                    `install log: ${installLogPath}`,
+                  ],
+                })
+              }
+            }
+
             const launchResult = await runRealDeviceHostCommand({
               command: "/usr/bin/xcrun",
               commandArgs: [
