@@ -41,7 +41,7 @@ const isHittabilityFailure = (reason: string): boolean => /\bhittable\b|\boffscr
 
 export const withOffscreenNextStep = (base: string, reason: string): string =>
   isHittabilityFailure(reason)
-    ? `${base} If the target is offscreen, add an explicit scroll step first; Probe does not auto-scroll until the element becomes hittable.`
+    ? `${base} The runner already tried bounded auto-scroll until hittable; if this still fails, capture a snapshot to confirm the identifier exists and is not covered/disabled, or use an explicit scroll step on a scrollView/list.`
     : base
 
 export const defaultReadOnlyRetryPolicy: RetryPolicy = {

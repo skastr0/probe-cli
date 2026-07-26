@@ -199,7 +199,7 @@ const maxDebugEvalTimeoutMs = 30_000
 const defaultReplayAttemptLimit = Number(process.env.PROBE_REPLAY_ATTEMPTS ?? 3)
 const defaultVideoDurationMs = 10_000
 const tarExecutable = process.env.PROBE_TAR_PATH ?? "/usr/bin/tar"
-const offscreenHittabilityWarning = "Offscreen targets must already be hittable for tap/press/type; Probe does not auto-scroll until an element becomes visible."
+const offscreenHittabilityWarning = "Offscreen targets: the runner auto-scrolls until hittable (bounded); if interaction still fails, the element may be missing, covered, or disabled — re-snapshot and refine the selector."
 const nonRecoverableSessionWarning =
   "Probe fails closed when the runner exits, the daemon restarts, or runner transport is lost. Close and reopen the session instead of expecting transparent recovery."
 const daemonOwnedCleanupWarning =

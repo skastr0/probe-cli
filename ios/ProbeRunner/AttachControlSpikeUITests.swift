@@ -3840,6 +3840,17 @@ final class AttachControlSpikeUITests: XCTestCase {
     func requireExistsAndHittable(_ waitDescription: String) throws -> Int {
       let waitStartedAt = Date()
       try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before \(waitDescription).")
+      // Agent-facing default: if the element exists but is off-screen (common for
+      // long fixture/product screens), scroll until hittable instead of failing
+      // and forcing the host/CLI to invent an explicit scroll recipe. Bounded in
+      // both directions so a prior scroll position cannot leave Form/Mode
+      // controls permanently stranded below the fold.
+      if !target.isHittable {
+        scrollUntilHittable(target, app: app, swipeUp: true, maxAttempts: 8)
+      }
+      if !target.isHittable {
+        scrollUntilHittable(target, app: app, swipeUp: false, maxAttempts: 8)
+      }
       try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before \(waitDescription).")
       return milliseconds(since: waitStartedAt)
     }
