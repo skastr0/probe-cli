@@ -82,7 +82,10 @@ const SessionScopedPayload = Schema.Struct({
 
 const SessionActionPayload = Schema.Struct({
   sessionId: Schema.optional(Schema.String),
-  action: Schema.Unknown,
+  action: Schema.optional(Schema.Unknown),
+  // Agent fly path: one RPC-shaped batch of runner-backed mutations without
+  // writing a full flow document. Converted to a fast v2 sequence on the host.
+  actions: Schema.optional(Schema.Array(Schema.Unknown)),
 })
 
 const SessionRunPayload = Schema.Struct({
@@ -112,17 +115,32 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null
 
 const decodeSessionActionPayload = (value: unknown) => {
-  if (isRecord(value) && "action" in value) {
+  if (isRecord(value) && ("action" in value || "actions" in value)) {
     const payload = decodeSessionActionPayloadEnvelope(value)
+    if (payload.actions !== undefined && payload.actions.length > 0) {
+      if (payload.action !== undefined) {
+        throw new Error("Provide either action or actions, not both.")
+      }
+      return {
+        sessionId: payload.sessionId ?? null,
+        action: null as ReturnType<typeof decodeSessionAction> | null,
+        actions: payload.actions.map((entry) => decodeSessionAction(entry)),
+      }
+    }
+    if (payload.action === undefined) {
+      throw new Error("session action payload requires action or a non-empty actions array.")
+    }
     return {
       sessionId: payload.sessionId ?? null,
       action: decodeSessionAction(payload.action),
+      actions: null as ReturnType<typeof decodeSessionAction>[] | null,
     }
   }
 
   return {
     sessionId: null,
     action: decodeSessionAction(value),
+    actions: null as ReturnType<typeof decodeSessionAction>[] | null,
   }
 }
 
@@ -555,6 +573,7 @@ const parseActionInvocation = (args: ReadonlyArray<string>) =>
     return {
       sessionId: payload.sessionId,
       action: payload.action,
+      actions: payload.actions,
       outputAsJson: hasMachineJsonOutput(args),
     }
   })
@@ -849,6 +868,66 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
         const parsed = yield* parseActionInvocation(rest)
         const sessionId = parsed.sessionId ?? (yield* requireOption(rest, "--session-id"))
         const client = yield* DaemonClient
+
+        // Agent fly path: `actions: [...]` becomes one fast sequence flow so the
+        // runner can batch mutations in a single uiActionBatch instead of N
+        // host RPCs with optional host snapshots between each.
+        if (parsed.actions !== null && parsed.actions.length > 0) {
+          const sequenceActions = []
+          for (const action of parsed.actions) {
+            if (
+              action.kind !== "tap"
+              && action.kind !== "multiTap"
+              && action.kind !== "press"
+              && action.kind !== "swipe"
+              && action.kind !== "type"
+              && action.kind !== "scroll"
+              && action.kind !== "wait"
+            ) {
+              return yield* new UserInputError({
+                code: "session-action-batch-invalid",
+                reason: `actions[] only supports runner-backed mutation kinds; received ${action.kind}.`,
+                nextStep: "Use tap/multiTap/press/swipe/type/scroll/wait children, or call session run with a full flow.",
+                details: [],
+              })
+            }
+            sequenceActions.push(action)
+          }
+
+          // Build as plain JSON then let the flow decoder normalize/validate
+          // sequence child shapes (SessionAction vs FlowSequenceAction differ
+          // slightly on wait variants).
+          const flow = decodeSessionFlowContract({
+            contract: "probe.session-flow/v2",
+            steps: [
+              {
+                kind: "sequence",
+                execution: "fast",
+                evidencePolicy: { success: "none", failure: "snapshot" },
+                actions: sequenceActions,
+              },
+            ],
+          })
+          const result = yield* client.runSessionFlow({
+            sessionId,
+            flow,
+            onEvent: eventPrinter(!parsed.outputAsJson),
+          })
+          yield* Effect.sync(() => {
+            console.log(parsed.outputAsJson ? JSON.stringify(result, null, 2) : formatFlowResult(result))
+          })
+          return
+        }
+
+        if (parsed.action === null) {
+          return yield* new UserInputError({
+            code: "session-action-missing",
+            reason: "session action payload requires action or a non-empty actions array.",
+            nextStep: "Pass { sessionId, action } or { sessionId, actions: [...] }.",
+            details: [],
+          })
+        }
+
         const result = yield* client.performSessionAction({
           sessionId,
           action: parsed.action,
