@@ -15,7 +15,9 @@ probe session open --target device --team-id <TEAM> --output-json
 
 1. **Snapshot once** when you do not know what is on screen:
    `probe session snapshot --session-id <id> --output-json`
-2. Prefer **semantic identifiers** from the snapshot (`fixture.form.applyButton`),
+   Read **`agentView.interactive`** first (slim `{ref,type,identifier,label}`, ≤50).
+   Full tree is in the artifact only — drill if you need depth.
+2. Prefer **semantic identifiers** from `agentView` / the snapshot (`fixture.form.applyButton`),
    not labels, ordinals, or points.
 3. **Tap / type / multiTap by identifier.** The runner auto-scrolls until the
    target is hittable (bounded). You usually do **not** need a separate scroll.
