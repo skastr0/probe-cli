@@ -1657,7 +1657,44 @@ describe("cli user input handling", () => {
         target: {
           kind: "ref",
         },
+        // CLI agent fly path injects sparse evidence when omitted.
+        evidencePolicy: { success: "none", failure: "snapshot" },
       },
+    })
+  })
+
+  test("session action preserves explicit evidencePolicy end on mutations", async () => {
+    const captured = { current: null as CapturedActionParams | null }
+
+    await Effect.runPromise(
+      Effect.either(
+        runSessionCommand([
+          "action",
+          "--input-json",
+          JSON.stringify({
+            sessionId: "session-1",
+            action: {
+              kind: "tap",
+              target: {
+                kind: "ref",
+                ref: "@e5",
+                fallback: null,
+              },
+              evidencePolicy: { success: "end", failure: "snapshot" },
+            },
+          }),
+          "--output-json",
+        ]).pipe(
+          Effect.provideService(DaemonClient, buildCapturedActionClient((params) => {
+            captured.current = params
+          })),
+        ),
+      ),
+    )
+
+    expect(captured.current?.action).toMatchObject({
+      kind: "tap",
+      evidencePolicy: { success: "end", failure: "snapshot" },
     })
   })
 

@@ -2,10 +2,13 @@ import { Effect, Schema } from "effect"
 import {
   decodeActionRecordingScript,
   decodeSessionAction,
+  type SessionAction,
   type SessionActionResult,
   type SessionRecordingExportResult,
   type SessionReplayResult,
 } from "../../domain/action"
+import { defaultAgentMutationEvidencePolicy } from "../../domain/evidence"
+import { recordingScriptToFlowV2, RecordingToFlowError } from "../../domain/recordingToFlow"
 import { UserInputError } from "../../domain/errors"
 import {
   decodeSessionFlowContract,
@@ -342,6 +345,29 @@ const formatRecordingExport = (result: SessionRecordingExportResult): string => 
     `steps: ${result.stepCount}`,
     `artifact: ${result.artifact.absolutePath}`,
   ].join("\n")
+}
+
+/** CLI agent fly default: mutations omit → sparse evidence (not domain end). */
+const applyAgentSparseEvidenceDefault = (action: SessionAction): SessionAction => {
+  if (
+    action.kind !== "tap"
+    && action.kind !== "multiTap"
+    && action.kind !== "press"
+    && action.kind !== "swipe"
+    && action.kind !== "type"
+    && action.kind !== "scroll"
+  ) {
+    return action
+  }
+
+  if (action.evidencePolicy !== undefined) {
+    return action
+  }
+
+  return {
+    ...action,
+    evidencePolicy: defaultAgentMutationEvidencePolicy,
+  }
 }
 
 const formatReplayResult = (result: SessionReplayResult): string => {
@@ -896,14 +922,15 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
 
           // Build as plain JSON then let the flow decoder normalize/validate
           // sequence child shapes (SessionAction vs FlowSequenceAction differ
-          // slightly on wait variants).
+          // slightly on wait variants). Sparse evidence is the agent default
+          // (defaultAgentMutationEvidencePolicy) — not domain omit→end.
           const flow = decodeSessionFlowContract({
             contract: "probe.session-flow/v2",
             steps: [
               {
                 kind: "sequence",
                 execution: "fast",
-                evidencePolicy: { success: "none", failure: "snapshot" },
+                evidencePolicy: defaultAgentMutationEvidencePolicy,
                 actions: sequenceActions,
               },
             ],
@@ -928,9 +955,15 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
           })
         }
 
+        // CLI agent fly path: when the caller omits evidencePolicy on a
+        // mutation, inject the sparse agent default so each tap does not pay
+        // a host AX post-snapshot. Explicit end/around still pass through.
+        // Domain resolveEvidencePolicy and investigate/verified paths keep
+        // omit→end (PRB-093).
+        const action = applyAgentSparseEvidenceDefault(parsed.action)
         const result = yield* client.performSessionAction({
           sessionId,
-          action: parsed.action,
+          action,
           onEvent: eventPrinter(!parsed.outputAsJson),
         })
 
@@ -948,6 +981,16 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
           case "export": {
             const sessionId = yield* requireOption(recordingRest, "--session-id")
             const label = yield* optionalOption(recordingRest, "--label")
+            const format = (yield* optionalOption(recordingRest, "--format")) ?? "script"
+            if (format !== "script" && format !== "flow-v2") {
+              return yield* new UserInputError({
+                code: "session-recording-export-format-invalid",
+                reason: `Unknown recording export format "${format}".`,
+                nextStep: "Use --format script (default, probe.action-recording/script-v1) or --format flow-v2 (probe.session-flow/v2 for session run).",
+                details: [],
+              })
+            }
+
             const client = yield* DaemonClient
             const result = yield* client.exportSessionRecording({
               sessionId,
@@ -955,8 +998,59 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
               onEvent: eventPrinter(!recordingAsJson),
             })
 
+            if (format === "script") {
+              yield* Effect.sync(() => {
+                console.log(recordingAsJson ? JSON.stringify(result, null, 2) : formatRecordingExport(result))
+              })
+              return
+            }
+
+            // flow-v2: convert the exported script-v1 artifact into a durable
+            // session-flow contract agents can re-run via `session run --file`.
+            const flowExport = yield* Effect.tryPromise({
+              try: async () => {
+                const { readFile, writeFile } = await import("node:fs/promises")
+                const raw = JSON.parse(await readFile(result.artifact.absolutePath, "utf8")) as unknown
+                const script = decodeActionRecordingScript(raw)
+                const flow = recordingScriptToFlowV2(script)
+                const siblingPath = result.artifact.absolutePath.replace(/\.json$/i, ".flow-v2.json")
+                const outPath = siblingPath === result.artifact.absolutePath
+                  ? `${result.artifact.absolutePath}.flow-v2.json`
+                  : siblingPath
+                await writeFile(outPath, `${JSON.stringify(flow, null, 2)}\n`, "utf8")
+                return {
+                  summary: `Exported ${result.stepCount} recorded actions as session-flow/v2 to ${outPath}.`,
+                  scriptArtifact: result.artifact,
+                  flowPath: outPath,
+                  stepCount: result.stepCount,
+                  flow,
+                }
+              },
+              catch: (error) => {
+                if (error instanceof RecordingToFlowError) {
+                  return new UserInputError({
+                    code: "session-recording-flow-export-failed",
+                    reason: error.reason,
+                    nextStep: error.nextStep,
+                    details: error.stepIndex === undefined ? [] : [`stepIndex: ${error.stepIndex}`],
+                  })
+                }
+                return new UserInputError({
+                  code: "session-recording-flow-export-failed",
+                  reason: error instanceof Error ? error.message : String(error),
+                  nextStep: "Export with --format script, inspect the recording, then retry flow-v2 conversion.",
+                  details: [],
+                })
+              },
+            })
+
             yield* Effect.sync(() => {
-              console.log(recordingAsJson ? JSON.stringify(result, null, 2) : formatRecordingExport(result))
+              console.log(recordingAsJson ? JSON.stringify(flowExport, null, 2) : [
+                flowExport.summary,
+                `steps: ${flowExport.stepCount}`,
+                `script artifact: ${flowExport.scriptArtifact.absolutePath}`,
+                `flow: ${flowExport.flowPath}`,
+              ].join("\n"))
             })
             return
           }
