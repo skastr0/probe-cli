@@ -345,38 +345,55 @@ const toAgentViewItem = (item: SnapshotPreviewItem): SnapshotAgentViewItem => ({
 
 /** Always-on slim interactive list for agents (PRB-117). */
 export const buildSnapshotAgentView = (artifact: StoredSnapshotArtifact): SnapshotAgentView => {
-  const all = artifact.renderings.interactive.nodes
+  const rendering = artifact.renderings?.interactive
+  const all = rendering?.nodes ?? []
+  const total = rendering?.totalNodes ?? all.length
   const shown = all.slice(0, snapshotInteractivePreviewLimit).map(toAgentViewItem)
   return {
-    statusLabel: artifact.statusLabel,
+    statusLabel: artifact.statusLabel ?? null,
     interactive: shown,
-    interactiveTotal: artifact.renderings.interactive.totalNodes,
-    omittedInteractiveCount: Math.max(artifact.renderings.interactive.totalNodes - shown.length, 0),
+    interactiveTotal: total,
+    omittedInteractiveCount: Math.max(total - shown.length, 0),
   }
 }
+
+const emptyDiffSummary = {
+  added: 0,
+  removed: 0,
+  updated: 0,
+  remapped: 0,
+  stale: 0,
+} as const
 
 /**
  * Project a compact post-mutation delta from an already-captured artifact
  * (PRB-116). Call only when a post/failure snapshot was taken this action.
+ * Defensive against partial test doubles that omit renderings/diff.
  */
 export const buildActionUiDelta = (artifact: StoredSnapshotArtifact): ActionUiDelta => {
-  const interactiveSource = artifact.renderings.interactive.nodes
+  const rendering = artifact.renderings?.interactive
+  const interactiveSource = rendering?.nodes ?? []
   const interactive = interactiveSource
     .slice(0, actionUiDeltaInteractiveLimit)
     .map(toAgentViewItem)
+  const diff = artifact.diff
+  const summary = diff?.summary ?? emptyDiffSummary
+  const highlights = diff?.highlights ?? []
+  const staleRefs = diff?.staleRefs ?? []
+  const remappedRefs = diff?.remappedRefs ?? []
 
   return {
     snapshotId: artifact.snapshotId,
-    previousSnapshotId: artifact.previousSnapshotId,
-    kind: artifact.diff.kind,
-    summary: artifact.diff.summary,
-    highlightLines: artifact.diff.highlights
+    previousSnapshotId: artifact.previousSnapshotId ?? null,
+    kind: diff?.kind ?? "initial",
+    summary,
+    highlightLines: highlights
       .slice(0, actionUiDeltaHighlightLimit)
       .map((highlight) => highlight.description),
-    staleRefs: [...artifact.diff.staleRefs],
-    remappedRefs: artifact.diff.remappedRefs.slice(0, actionUiDeltaRemapLimit),
+    staleRefs: [...staleRefs],
+    remappedRefs: remappedRefs.slice(0, actionUiDeltaRemapLimit),
     interactive,
-    interactiveTotal: artifact.renderings.interactive.totalNodes,
+    interactiveTotal: rendering?.totalNodes ?? interactiveSource.length,
   }
 }
 
