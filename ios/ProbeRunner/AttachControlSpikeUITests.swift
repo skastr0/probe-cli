@@ -1028,6 +1028,31 @@ final class AttachControlSpikeUITests: XCTestCase {
     }
   }
 
+  /// Best-effort keyboard dismiss so follow-up taps/multiTaps are not covered.
+  /// Prefer the standard "Done" accessory, then a short typeText of newline.
+  @MainActor
+  private func dismissKeyboardIfPresent(app: XCUIApplication) {
+    let keyboards = app.keyboards
+    guard keyboards.count > 0, keyboards.element(boundBy: 0).exists else {
+      return
+    }
+
+    let done = app.buttons["Done"]
+    if done.exists, done.isHittable {
+      done.tap()
+      return
+    }
+
+    let returnKey = app.keyboards.buttons["return"]
+    if returnKey.exists, returnKey.isHittable {
+      returnKey.tap()
+      return
+    }
+
+    // Last resort: type a newline into the first responder via the app.
+    app.typeText("\n")
+  }
+
   @MainActor
   private func scrollToMultiTapButton(app: XCUIApplication) -> XCUIElement {
     let multiTapButton = app.buttons["fixture.gesture.multiTapTarget"]
@@ -3813,6 +3838,7 @@ final class AttachControlSpikeUITests: XCTestCase {
         if let text = action.text, !text.isEmpty {
           app.typeText(text)
         }
+        dismissKeyboardIfPresent(app: app)
         return pointOutcome("typed into \(targetDescription)", interactionStartedAt: interactionStartedAt)
 
       case "scroll":
@@ -3839,17 +3865,23 @@ final class AttachControlSpikeUITests: XCTestCase {
 
     func requireExistsAndHittable(_ waitDescription: String) throws -> Int {
       let waitStartedAt = Date()
-      try requireActionCondition(target.waitForExistence(timeout: interactionTimeout), "Expected \(targetDescription) to exist before \(waitDescription).")
-      // Agent-facing default: if the element exists but is off-screen (common for
-      // long fixture/product screens), scroll until hittable instead of failing
-      // and forcing the host/CLI to invent an explicit scroll recipe. Bounded in
-      // both directions so a prior scroll position cannot leave Form/Mode
-      // controls permanently stranded below the fold.
+      // Fast probe first (250ms): identifiers that are already in the tree
+      // should resolve immediately. Only pay the full interactionTimeout when
+      // the element is genuinely absent from the current AX snapshot.
+      if !target.waitForExistence(timeout: 0.25) {
+        try requireActionCondition(
+          target.waitForExistence(timeout: interactionTimeout),
+          "Expected \(targetDescription) to exist before \(waitDescription)."
+        )
+      }
+      // Agent-facing default: if the element exists but is off-screen, scroll
+      // until hittable instead of failing. Bounded both directions; fewer
+      // attempts than the original thrash-prone 8+8 — agents fly, not thrash.
       if !target.isHittable {
-        scrollUntilHittable(target, app: app, swipeUp: true, maxAttempts: 8)
+        scrollUntilHittable(target, app: app, swipeUp: true, maxAttempts: 5)
       }
       if !target.isHittable {
-        scrollUntilHittable(target, app: app, swipeUp: false, maxAttempts: 8)
+        scrollUntilHittable(target, app: app, swipeUp: false, maxAttempts: 5)
       }
       try requireActionCondition(target.isHittable, "Expected \(targetDescription) to be hittable before \(waitDescription).")
       return milliseconds(since: waitStartedAt)
@@ -3918,6 +3950,9 @@ final class AttachControlSpikeUITests: XCTestCase {
       if let text = action.text, !text.isEmpty {
         target.typeText(text)
       }
+      // Dismiss the keyboard so the next agent action is not blocked by a
+      // covering input accessory (major thrash source on real devices).
+      dismissKeyboardIfPresent(app: app)
       return RunnerUIActionOutcome(summary: "typed into \(targetDescription)", resolutionMs: resolutionMs, waitMs: waitMs, interactionMs: milliseconds(since: interactionStartedAt))
 
     case "scroll":
