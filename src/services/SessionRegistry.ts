@@ -5979,7 +5979,29 @@ export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => L
               }
 
               if (step.kind === "wait") {
-                lastFailure = "Wait replay steps are not supported in replay yet. Re-run the wait before replay, or remove it from the recording."
+                // Duration waits are pure host sleep (agent settle gaps).
+                // Selector waits (match/text/absence) stay out of this slice —
+                // export those as flow-v2 and re-run via session run instead.
+                if (step.condition !== "duration") {
+                  lastFailure = `Replay wait condition "${step.condition}" is not supported yet. Export with --format flow-v2 and use session run, or re-record with condition duration.`
+                  continue
+                }
+
+                yield* Effect.sleep(step.timeoutMs)
+                if (attempt > 1) {
+                  retriedStepCount += 1
+                }
+                reports.push(buildReplayStepReport({
+                  index: index + 1,
+                  kind: step.kind,
+                  attempts: attempt,
+                  resolvedBy: "none",
+                  matchedRef: null,
+                  artifact: null,
+                  summary: `Waited ${step.timeoutMs}ms (duration) during replay.`,
+                  evidence: emptyEvidenceReport(replayEvidencePolicy),
+                }))
+                succeeded = true
                 continue
               }
 
