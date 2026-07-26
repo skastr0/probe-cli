@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import { EvidencePolicyInputSchema, EvidenceReportSchema } from "./evidence"
 import { ArtifactRecord, NullableString, OutputMode } from "./output"
+import { ActionUiDeltaSchema } from "./snapshot"
 import type { SnapshotFrame, SnapshotNodeState, StoredSnapshotArtifact, StoredSnapshotNode } from "./snapshot"
 
 const NullableBoolean = Schema.Union(Schema.Boolean, Schema.Null)
@@ -601,6 +602,10 @@ export const SessionActionResultSchema = Schema.Struct({
   // actions (screenshot/video/assert/wait), which always report a fixed
   // "explicit"/"resolution"-only shape unaffected by evidence policy.
   evidence: EvidenceReportSchema,
+  // PRB-116: compact post-mutation UI delta projected from an already-captured
+  // snapshot (policy-post / failure). Omitted/null on sparse success=none paths
+  // that took no post snapshot — agent must snapshot-when-lost.
+  uiDelta: Schema.optional(Schema.Union(ActionUiDeltaSchema, Schema.Null)),
 })
 export type SessionActionResult = typeof SessionActionResultSchema.Type
 

@@ -107,6 +107,44 @@ export const SnapshotPreviewSchema = Schema.Struct({
 })
 export type SnapshotPreview = typeof SnapshotPreviewSchema.Type
 
+/**
+ * Always-on agent planning surface (PRB-117). Slim interactive targets so
+ * cold agents never need to open the full tree artifact when lost. Independent
+ * of outputMode/preview budget — cap at snapshotInteractivePreviewLimit.
+ */
+export const SnapshotAgentViewItemSchema = Schema.Struct({
+  ref: Schema.String,
+  type: Schema.String,
+  identifier: NullableString,
+  label: NullableString,
+})
+export type SnapshotAgentViewItem = typeof SnapshotAgentViewItemSchema.Type
+
+export const SnapshotAgentViewSchema = Schema.Struct({
+  statusLabel: NullableString,
+  interactive: Schema.Array(SnapshotAgentViewItemSchema),
+  interactiveTotal: Schema.Number,
+  omittedInteractiveCount: Schema.Number,
+})
+export type SnapshotAgentView = typeof SnapshotAgentViewSchema.Type
+
+/**
+ * Compact post-mutation UI delta for action results (PRB-116). Projected from
+ * an already-captured StoredSnapshotArtifact — no second AX capture.
+ */
+export const ActionUiDeltaSchema = Schema.Struct({
+  snapshotId: Schema.String,
+  previousSnapshotId: NullableString,
+  kind: SnapshotDiffKind,
+  summary: SnapshotDiffSummarySchema,
+  highlightLines: Schema.Array(Schema.String),
+  staleRefs: Schema.Array(Schema.String),
+  remappedRefs: Schema.Array(SnapshotRemappedRefSchema),
+  interactive: Schema.Array(SnapshotAgentViewItemSchema),
+  interactiveTotal: Schema.Number,
+})
+export type ActionUiDelta = typeof ActionUiDeltaSchema.Type
+
 export const SessionSnapshotResultSchema = Schema.Struct({
   snapshotId: Schema.String,
   capturedAt: Schema.String,
@@ -115,6 +153,8 @@ export const SessionSnapshotResultSchema = Schema.Struct({
   summary: Schema.String,
   artifact: ArtifactRecord,
   preview: Schema.Union(SnapshotPreviewSchema, Schema.Null),
+  /** Always populated (PRB-117): slim interactive targets for agent planning. */
+  agentView: SnapshotAgentViewSchema,
   metrics: SnapshotMetricsSchema,
   diff: SnapshotDiffSchema,
   warnings: Schema.Array(Schema.String),
@@ -286,9 +326,59 @@ export const snapshotPreviewThreshold: OutputThreshold = {
 // Heuristic from the simulator-only large AX tree spike against generated ProbeFixture profiles.
 export const snapshotInteractivePreviewLimit = 50
 export const snapshotCollapsedPreviewLimit = 55
+/** Cap remapped refs on action uiDelta so the wire stays token-cheap. */
+export const actionUiDeltaRemapLimit = 8
+/** Cap highlight lines on action uiDelta. */
+export const actionUiDeltaHighlightLimit = 12
+/** Cap interactive targets on action uiDelta (smaller than snapshot agentView). */
+export const actionUiDeltaInteractiveLimit = 12
 
 const staleRefListLimit = 20
 const snapshotDiffHighlightLimit = 12
+
+const toAgentViewItem = (item: SnapshotPreviewItem): SnapshotAgentViewItem => ({
+  ref: item.ref,
+  type: item.type,
+  identifier: item.identifier,
+  label: item.label,
+})
+
+/** Always-on slim interactive list for agents (PRB-117). */
+export const buildSnapshotAgentView = (artifact: StoredSnapshotArtifact): SnapshotAgentView => {
+  const all = artifact.renderings.interactive.nodes
+  const shown = all.slice(0, snapshotInteractivePreviewLimit).map(toAgentViewItem)
+  return {
+    statusLabel: artifact.statusLabel,
+    interactive: shown,
+    interactiveTotal: artifact.renderings.interactive.totalNodes,
+    omittedInteractiveCount: Math.max(artifact.renderings.interactive.totalNodes - shown.length, 0),
+  }
+}
+
+/**
+ * Project a compact post-mutation delta from an already-captured artifact
+ * (PRB-116). Call only when a post/failure snapshot was taken this action.
+ */
+export const buildActionUiDelta = (artifact: StoredSnapshotArtifact): ActionUiDelta => {
+  const interactiveSource = artifact.renderings.interactive.nodes
+  const interactive = interactiveSource
+    .slice(0, actionUiDeltaInteractiveLimit)
+    .map(toAgentViewItem)
+
+  return {
+    snapshotId: artifact.snapshotId,
+    previousSnapshotId: artifact.previousSnapshotId,
+    kind: artifact.diff.kind,
+    summary: artifact.diff.summary,
+    highlightLines: artifact.diff.highlights
+      .slice(0, actionUiDeltaHighlightLimit)
+      .map((highlight) => highlight.description),
+    staleRefs: [...artifact.diff.staleRefs],
+    remappedRefs: artifact.diff.remappedRefs.slice(0, actionUiDeltaRemapLimit),
+    interactive,
+    interactiveTotal: artifact.renderings.interactive.totalNodes,
+  }
+}
 
 const frameKey = (frame: SnapshotFrame | null): string => {
   if (frame === null) {
@@ -1037,15 +1127,18 @@ export const buildSessionSnapshotResult = (args: {
     return "partial ref stability"
   })()
 
+  const agentView = buildSnapshotAgentView(args.artifact)
+
   return {
     snapshotId: args.artifact.snapshotId,
     capturedAt: args.artifact.capturedAt,
     previousSnapshotId: args.artifact.previousSnapshotId,
     statusLabel: args.artifact.statusLabel,
     summary:
-      `Captured ${args.artifact.snapshotId} with ${args.artifact.metrics.nodeCount} nodes (${args.artifact.metrics.interactiveNodeCount} interactive); ${diffSummary}; ${refStabilitySummary}; ${previewSummary}.`,
+      `Captured ${args.artifact.snapshotId} with ${args.artifact.metrics.nodeCount} nodes (${args.artifact.metrics.interactiveNodeCount} interactive); ${diffSummary}; ${refStabilitySummary}; ${previewSummary}; agentView ${agentView.interactive.length}/${agentView.interactiveTotal} interactive.`,
     artifact: args.artifactRecord,
     preview,
+    agentView,
     metrics: args.artifact.metrics,
     diff: args.artifact.diff,
     warnings: [...args.artifact.warnings],

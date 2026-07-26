@@ -29,6 +29,7 @@ import {
   type ActiveSessionRecord,
   type ExtendedSessionActionResult,
 } from "../sessionShared"
+import { buildActionUiDelta, type StoredSnapshotArtifact } from "../../domain/snapshot"
 import { classifyFastFailureCode } from "./flowStepResultAssembly"
 import type { FlowExecutorDeps } from "./flowExecutorDeps"
 
@@ -204,10 +205,12 @@ export const executeDirectRunnerActionStep = (args: {
     yield* deps.persistHealth(sessionId, record.health)
     yield* deps.syncDaemonMetadata
 
+    let postSnapshotArtifact: StoredSnapshotArtifact | null = null
     if (successPlan.needsPost) {
       const postCapture = yield* Effect.either(deps.captureSnapshotArtifactInternal(sessionId, record))
 
       if (postCapture._tag === "Right") {
+        postSnapshotArtifact = postCapture.right.artifact
         evidenceCaptures.push({
           reason: "policy-post",
           phase: "post",
@@ -245,6 +248,7 @@ export const executeDirectRunnerActionStep = (args: {
         interactionMs: actionResult.value.response.interactionMs ?? null,
         finalizationMs: actionResult.value.response.finalizationMs ?? null,
         evidence: buildEvidenceReport(policy, evidenceCaptures),
+        uiDelta: postSnapshotArtifact !== null ? buildActionUiDelta(postSnapshotArtifact) : null,
         ...buildActionResultMetadata(actionResult.retry),
       } satisfies ExtendedSessionActionResult,
     } satisfies ActionExecutionOutcome

@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { buildSessionSnapshotResult, buildSnapshotArtifact, type RunnerSnapshotNode } from "./snapshot"
+import {
+  buildActionUiDelta,
+  buildSessionSnapshotResult,
+  buildSnapshotArtifact,
+  type RunnerSnapshotNode,
+} from "./snapshot"
 
 const node = (overrides: Partial<RunnerSnapshotNode> = {}): RunnerSnapshotNode => ({
   type: "other",
@@ -158,6 +163,48 @@ describe("snapshot domain", () => {
 
     expect(result.preview?.kind).toBe("interactive")
     expect(result.preview?.nodes.length).toBe(1)
+    expect(result.agentView.interactiveTotal).toBe(1)
+    expect(result.agentView.interactive).toEqual([
+      {
+        ref: expect.stringMatching(/^@e/),
+        type: "button",
+        identifier: "fixture.form.applyButton",
+        label: "Apply Input",
+      },
+    ])
+    expect(result.agentView.omittedInteractiveCount).toBe(0)
+  })
+
+  test("agentView always lists interactive targets even when preview is collapsed or null path", () => {
+    const largeInteractiveChildren = Array.from({ length: 60 }, (_, index) =>
+      node({
+        type: "button",
+        identifier: `fixture.button.${index}`,
+        label: `Button ${index}`,
+        interactive: true,
+      }),
+    )
+    const built = buildSnapshotArtifact({
+      previous: null,
+      nextSnapshotIndex: 1,
+      nextElementRefIndex: 1,
+      raw: rawSnapshot(
+        node({
+          type: "application",
+          children: largeInteractiveChildren,
+        }),
+      ),
+    })
+    const result = buildSessionSnapshotResult({
+      artifact: built.artifact,
+      artifactRecord,
+      outputMode: "auto",
+    })
+
+    expect(result.agentView.interactiveTotal).toBe(60)
+    expect(result.agentView.interactive.length).toBe(50)
+    expect(result.agentView.omittedInteractiveCount).toBe(10)
+    expect(result.agentView.interactive[0]?.identifier).toBe("fixture.button.0")
   })
 
   test("falls back to a collapsed preview when the interactive surface is large", () => {
@@ -361,5 +408,57 @@ describe("snapshot domain", () => {
       outputMode: "inline",
     })
     expect(result.summary).toContain("weakly remapped")
+  })
+
+  test("buildActionUiDelta projects compact highlights and interactive slice", () => {
+    const first = buildSnapshotArtifact({
+      previous: null,
+      nextSnapshotIndex: 1,
+      nextElementRefIndex: 1,
+      raw: rawSnapshot(
+        node({
+          type: "application",
+          children: [
+            node({
+              type: "button",
+              identifier: "fixture.form.applyButton",
+              label: "Apply Input",
+              interactive: true,
+            }),
+          ],
+        }),
+      ),
+    })
+    const second = buildSnapshotArtifact({
+      previous: first.artifact,
+      nextSnapshotIndex: first.nextSnapshotIndex,
+      nextElementRefIndex: first.nextElementRefIndex,
+      raw: rawSnapshot(
+        node({
+          type: "application",
+          children: [
+            node({
+              type: "button",
+              identifier: "fixture.form.applyButton",
+              label: "Apply Input",
+              interactive: true,
+            }),
+            node({
+              type: "button",
+              identifier: "fixture.form.clearButton",
+              label: "Clear",
+              interactive: true,
+            }),
+          ],
+        }),
+      ),
+    })
+
+    const delta = buildActionUiDelta(second.artifact)
+    expect(delta.snapshotId).toBe(second.artifact.snapshotId)
+    expect(delta.previousSnapshotId).toBe(first.artifact.snapshotId)
+    expect(delta.interactiveTotal).toBeGreaterThanOrEqual(1)
+    expect(delta.interactive.length).toBeGreaterThan(0)
+    expect(delta.summary.added + delta.summary.updated + delta.summary.remapped).toBeGreaterThanOrEqual(0)
   })
 })

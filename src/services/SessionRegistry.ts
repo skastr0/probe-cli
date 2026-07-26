@@ -97,7 +97,7 @@ import {
   type SessionResourceStates,
   type SimulatorSessionMode,
 } from "../domain/session"
-import { buildSessionSnapshotResult, buildSnapshotArtifact, decodeRunnerSnapshotPayload, type SessionSnapshotResult, type StoredSnapshotArtifact } from "../domain/snapshot"
+import { buildActionUiDelta, buildSessionSnapshotResult, buildSnapshotArtifact, decodeRunnerSnapshotPayload, type SessionSnapshotResult, type StoredSnapshotArtifact } from "../domain/snapshot"
 import { ArtifactStore, type DaemonSessionMetadata } from "./ArtifactStore"
 import { type LldbBridgeResponseFrame, LldbBridgeFactory } from "./LldbBridge"
 import { OutputPolicy } from "./OutputPolicy"
@@ -2364,6 +2364,11 @@ export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => L
         const captureNote = actionResult.value.postSnapshot !== null
           ? `; captured ${actionResult.value.postSnapshot.artifact.snapshotId}`
           : ""
+        // PRB-116: free compact delta only when this action already paid for a
+        // post snapshot (success=end/around). Sparse success=none stays null.
+        const uiDelta = actionResult.value.postSnapshot !== null
+          ? buildActionUiDelta(actionResult.value.postSnapshot.artifact)
+          : null
 
         const resolved = actionResult.value.resolvedTarget
         const summary = resolved === null
@@ -2394,6 +2399,7 @@ export const makeSessionRegistryLive = (config: SessionRegistryConfig = {}) => L
             finalizationMs: actionResult.value.finalizationMs ?? null,
             hostRttMs: actionResult.value.hostRttMs ?? null,
             evidence: buildEvidenceReport(policy, evidenceCaptures),
+            uiDelta,
             ...buildActionResultMetadata(actionResult.retry),
           } satisfies ExtendedSessionActionResult,
         } satisfies ActionExecutionOutcome

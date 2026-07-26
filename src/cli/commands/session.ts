@@ -292,6 +292,10 @@ const eventPrinter = (enabled: boolean) =>
 const formatSnapshot = (result: SessionSnapshotResult): string => {
   const warningLines = result.warnings.map((warning) => `- ${warning}`)
   const highlightLines = result.diff.highlights.map((highlight) => `- ${highlight.description}`)
+  const agentLines = result.agentView.interactive.map(
+    (item) =>
+      `- ${item.ref} ${item.type}${item.identifier ? ` id=${item.identifier}` : ""}${item.label ? ` "${item.label}"` : ""}`,
+  )
   const previewLines = result.preview
     ? [
         `preview: ${result.preview.kind} (${result.preview.nodes.length}/${result.preview.totalNodes})`,
@@ -303,6 +307,7 @@ const formatSnapshot = (result: SessionSnapshotResult): string => {
     result.summary,
     `snapshot id: ${result.snapshotId}`,
     `captured at: ${result.capturedAt}`,
+    `status: ${result.statusLabel ?? "n/a"}`,
     `artifact: ${result.artifact.absolutePath}`,
     `retries: ${result.retryCount}`,
     `retry reasons: ${result.retryReasons.length > 0 ? result.retryReasons.join(" | ") : "none"}`,
@@ -311,6 +316,13 @@ const formatSnapshot = (result: SessionSnapshotResult): string => {
     `weak identity nodes: ${result.metrics.weakIdentityNodeCount}`,
     `diff: ${result.diff.kind}`,
     `diff counts: +${result.diff.summary.added} / -${result.diff.summary.removed} / ~${result.diff.summary.updated} / remapped ${result.diff.summary.remapped}`,
+    `agentView interactive: ${result.agentView.interactive.length}/${result.agentView.interactiveTotal}`
+      + (result.agentView.omittedInteractiveCount > 0
+        ? ` (omitted ${result.agentView.omittedInteractiveCount})`
+        : ""),
+    "",
+    "agent interactive:",
+    ...(agentLines.length > 0 ? agentLines : ["- none"]),
     "",
     "highlights:",
     ...(highlightLines.length > 0 ? highlightLines : ["- none"]),
@@ -323,6 +335,15 @@ const formatSnapshot = (result: SessionSnapshotResult): string => {
 }
 
 const formatActionResult = (result: SessionActionResult): string => {
+  const delta = result.uiDelta ?? null
+  const deltaLines = delta === null
+    ? ["uiDelta: none (sparse path or no post snapshot — snapshot when lost)"]
+    : [
+        `uiDelta: ${delta.kind} +${delta.summary.added}/-${delta.summary.removed}/~${delta.summary.updated} remapped ${delta.summary.remapped}`,
+        `uiDelta interactive: ${delta.interactive.length}/${delta.interactiveTotal}`,
+        ...delta.highlightLines.slice(0, 5).map((line) => `- ${line}`),
+      ]
+
   return [
     result.summary,
     `action: ${result.action}`,
@@ -336,6 +357,7 @@ const formatActionResult = (result: SessionActionResult): string => {
     `retry reasons: ${result.retryReasons.length > 0 ? result.retryReasons.join(" | ") : "none"}`,
     `waited ms: ${result.waitedMs ?? "n/a"}`,
     `polls: ${result.polledCount ?? "n/a"}`,
+    ...deltaLines,
   ].join("\n")
 }
 
