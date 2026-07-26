@@ -176,7 +176,7 @@ Real publishing, tags, GitHub Releases, Homebrew formula pushes, npm setup, and 
 |---------|---------|
 | `probe session action (--input-json <payload> \| --session-id <id> --file <action.json>)` | Perform a single UI action |
 | `probe session run (--input-json <payload> \| --session-id <id> (--file <flow.json> \| --stdin))` | Run a multi-step flow (`probe.session-flow/v2`) |
-| `probe session recording export --session-id <id> [--label <name>]` | Export recorded actions as a replay script |
+| `probe session recording export --session-id <id> [--label <name>] [--format script\|flow-v2]` | Export recorded actions as script-v1, or convert to durable session-flow/v2 (requires semantic selectors) |
 | `probe session replay (--input-json <payload> \| --session-id <id> --file <recording.json>)` | Replay a recording with retries + semantic fallback |
 | `probe session result summary (--input-json <payload> \| --session-id <id>)` | Aggregate session result summary artifact |
 | `probe session result attachments (--input-json <payload> \| --session-id <id>)` | List artifacts attached to the session result |

@@ -88,8 +88,8 @@ describe("recordingScriptToFlowV2", () => {
     }
   })
 
-  test("uses preferredRef as a ref selector when fallback is null", () => {
-    const flow = recordingScriptToFlowV2(baseScript([
+  test("rejects preferredRef-only steps (not CI-stable for fast export)", () => {
+    expect(() => recordingScriptToFlowV2(baseScript([
       {
         kind: "tap",
         target: {
@@ -98,11 +98,25 @@ describe("recordingScriptToFlowV2", () => {
           description: "orphan ref",
         },
       },
-    ]))
-    const step = flow.steps[0]
-    expect(step?.kind).toBe("tap")
-    if (step?.kind === "tap") {
-      expect(step.target).toEqual({ kind: "ref", ref: "@e99", fallback: null })
+    ]))).toThrow(RecordingToFlowError)
+
+    try {
+      recordingScriptToFlowV2(baseScript([
+        {
+          kind: "tap",
+          target: {
+            preferredRef: "@e99",
+            fallback: null,
+            description: "orphan ref",
+          },
+        },
+      ]))
+    } catch (error) {
+      expect(error).toBeInstanceOf(RecordingToFlowError)
+      if (error instanceof RecordingToFlowError) {
+        expect(error.reason).toContain("preferredRef")
+        expect(error.nextStep).toContain("semantic")
+      }
     }
   })
 
@@ -114,5 +128,16 @@ describe("recordingScriptToFlowV2", () => {
         target: { preferredRef: null, fallback: null, description: "broken" },
       },
     ]))).toThrow(RecordingToFlowError)
+  })
+
+  test("stamps defaultAgentMutationEvidencePolicy on fast mutations", () => {
+    const flow = recordingScriptToFlowV2(baseScript([
+      { kind: "tap", target: semanticFallback },
+    ]))
+    const step = flow.steps[0]
+    if (step?.kind === "tap") {
+      expect(step.evidencePolicy).toEqual({ success: "none", failure: "snapshot" })
+      expect(step.execution).toBe("fast")
+    }
   })
 })

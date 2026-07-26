@@ -4,6 +4,11 @@
  *
  * Prefer semantic/point fallbacks over ephemeral preferredRef ids when both
  * exist — refs die when the next snapshot renumbers the tree.
+ *
+ * CI stability gate: mutation/assert targets must be runner-resolvable without
+ * a host snapshot (semantic, point, or ref+semantic/point fallback). Bare
+ * preferredRef-only steps fail closed at export rather than stamp
+ * execution:fast and blow up later on session run.
  */
 import type {
   ActionRecordingScript,
@@ -12,6 +17,7 @@ import type {
   RecordedActionTarget,
   RecordedSessionAction,
 } from "./action"
+import { defaultAgentMutationEvidencePolicy } from "./evidence"
 import type { SessionFlowContract } from "./flow-v2"
 
 export class RecordingToFlowError extends Error {
@@ -27,22 +33,43 @@ export class RecordingToFlowError extends Error {
   }
 }
 
+/** Selectors that fast/sequence lanes can resolve without a host AX tree. */
+const isCiStableSelector = (selector: ActionSelector): boolean => {
+  if (selector.kind === "semantic" || selector.kind === "point") {
+    return true
+  }
+  if (selector.kind === "ref") {
+    const fallback = selector.fallback
+    return fallback !== null && (fallback.kind === "semantic" || fallback.kind === "point")
+  }
+  return false
+}
+
 const selectorFromRecordedTarget = (
   target: RecordedActionTarget,
   stepIndex: number,
 ): ActionSelector => {
-  // Stable selectors first: semantic / point / ref fallback shapes survive
-  // snapshot renumbering better than a bare preferredRef alone.
+  // Stable selectors first: semantic / point survive snapshot renumbering.
   if (target.fallback !== null) {
-    return target.fallback
+    if (!isCiStableSelector(target.fallback) && target.fallback.kind === "ref") {
+      // Nested bare ref is as unstable as preferredRef-only.
+      throw new RecordingToFlowError(
+        `Recorded step ${stepIndex + 1} fallback is a bare ref without a semantic/point nested fallback.`,
+        "Re-record with a semantic identifier (or point) before exporting as flow-v2 for CI.",
+        stepIndex,
+      )
+    }
+    if (isCiStableSelector(target.fallback)) {
+      return target.fallback
+    }
   }
 
   if (target.preferredRef !== null && target.preferredRef.length > 0) {
-    return {
-      kind: "ref",
-      ref: target.preferredRef,
-      fallback: null,
-    }
+    throw new RecordingToFlowError(
+      `Recorded step ${stepIndex + 1} only has preferredRef "${target.preferredRef}" — not CI-stable for fast session-flow export.`,
+      "Re-record using semantic identifiers (snapshot → identifier), then export --format flow-v2. Or export --format script and session replay while the tree still matches.",
+      stepIndex,
+    )
   }
 
   throw new RecordingToFlowError(
@@ -150,7 +177,8 @@ const recordedStepToFlowStep = (
 
 /**
  * Pure conversion. Throws `RecordingToFlowError` on steps that cannot become
- * a flow (empty script, missing selectors). Does not mutate the script.
+ * a CI-stable flow (empty script, missing/unstable selectors). Does not mutate
+ * the script.
  */
 export const recordingScriptToFlowV2 = (
   script: ActionRecordingScript,
@@ -164,8 +192,9 @@ export const recordingScriptToFlowV2 = (
 
   const steps = script.steps.map((step, index) => recordedStepToFlowStep(step, index))
 
-  // Agent-friendly default: fast mutations with sparse evidence; callers who
-  // need post-step proof should insert an assert or set evidencePolicy end.
+  // Agent-friendly default: fast mutations with sparse evidence (same constant
+  // as CLI fly paths). Callers who need post-step proof insert assert or set
+  // evidencePolicy end on the flow.
   return {
     contract: "probe.session-flow/v2",
     steps: steps.map((step) => {
@@ -180,7 +209,7 @@ export const recordingScriptToFlowV2 = (
         return {
           ...step,
           execution: "fast" as const,
-          evidencePolicy: { success: "none" as const, failure: "snapshot" as const },
+          evidencePolicy: defaultAgentMutationEvidencePolicy,
         }
       }
       return step

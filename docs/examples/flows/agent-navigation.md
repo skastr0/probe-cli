@@ -165,14 +165,23 @@ Scroll requires a **target** (the element you gesture on), a **direction**, and
   (`evidencePolicy: { success: "none", failure: "snapshot" }`) so the runner can
   batch without host snapshots between children. Prefer this over N separate
   `session action` calls.
+- **Single `session action` mutations** that omit `evidencePolicy` also get the
+  same sparse CLI inject. Explicit `end`/`around` still pass through. This is
+  **CLI-only** — raw RPC `session.action` and hand-written `session run` flows
+  still resolve omit→`success:end` (domain PRB-093 / investigate default).
 - **Export a session recording as a durable flow** for CI re-run:
 
   ```bash
   probe session recording export --session-id <id> --format flow-v2
   ```
 
-  Prefer semantic identifiers while recording so the export is stable across
-  snapshot renumbering.
+  Prefer semantic identifiers while recording. Export **fails closed** if a step
+  only has an ephemeral `preferredRef` (no semantic/point fallback) — re-record
+  with identifiers, or use `--format script` + `session replay`. On convert
+  failure the script-v1 artifact is already written; the error names its path.
+- **Replay wait honesty:** `session replay` supports **duration** waits only.
+  Selector waits (`match`/`text`/`absence`) should be expressed in a flow-v2
+  file and re-run via `session run`, not script replay.
 - **Nav + perf compose** (fixture golden): fill `target.sessionId` in
   [`docs/examples/investigations/fixture-form-apply-time-profiler.json`](../investigations/fixture-form-apply-time-profiler.json)
   and run `probe investigate validate|plan|run --file …`. See

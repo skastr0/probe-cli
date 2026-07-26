@@ -45,7 +45,7 @@ Usage:
   probe session snapshot --session-id <id> [--output auto|inline|artifact] [--output-json|--json]
   probe session run (--input-json <payload> | --session-id <id> (--file <flow.json> | --stdin)) [--output-json|--json]
   probe session action (--input-json <payload> | --session-id <id> --file <action.json>) [--output-json|--json]
-  probe session recording export --session-id <id> [--label <name>] [--output-json|--json]
+  probe session recording export --session-id <id> [--label <name>] [--format script|flow-v2] [--output-json|--json]
   probe session replay (--input-json <payload> | --session-id <id> --file <recording.json>) [--output-json|--json]
   probe session result summary (--input-json <payload> | --session-id <id>) [--output-json|--json]
   probe session result attachments (--input-json <payload> | --session-id <id>) [--output-json|--json]

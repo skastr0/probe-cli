@@ -1027,19 +1027,24 @@ export const runSessionCommand = (args: ReadonlyArray<string>, deps?: SessionCom
                 }
               },
               catch: (error) => {
+                // Script artifact was already written by session.recording.export
+                // before conversion — always name it so partial success is honest.
+                const scriptPathDetail = `script artifact (already written): ${result.artifact.absolutePath}`
                 if (error instanceof RecordingToFlowError) {
                   return new UserInputError({
                     code: "session-recording-flow-export-failed",
                     reason: error.reason,
-                    nextStep: error.nextStep,
-                    details: error.stepIndex === undefined ? [] : [`stepIndex: ${error.stepIndex}`],
+                    nextStep: `${error.nextStep} The script-v1 artifact is already at ${result.artifact.absolutePath}; fix selectors and re-export, or use session replay on the script.`,
+                    details: error.stepIndex === undefined
+                      ? [scriptPathDetail]
+                      : [scriptPathDetail, `stepIndex: ${error.stepIndex}`],
                   })
                 }
                 return new UserInputError({
                   code: "session-recording-flow-export-failed",
                   reason: error instanceof Error ? error.message : String(error),
-                  nextStep: "Export with --format script, inspect the recording, then retry flow-v2 conversion.",
-                  details: [],
+                  nextStep: `Script-v1 is already at ${result.artifact.absolutePath}. Inspect it, fix selectors, then retry --format flow-v2 (or use session replay on the script).`,
+                  details: [scriptPathDetail],
                 })
               },
             })

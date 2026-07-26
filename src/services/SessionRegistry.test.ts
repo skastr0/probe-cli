@@ -5115,7 +5115,7 @@ describe("SessionRegistry", () => {
         expect(report.steps[1]?.attempts).toBe(3)
         expect(report.steps[1]?.outcome).toBe("retry-succeeded")
         expect(report.steps[1]?.summary).toContain("retry succeeded")
-        expect(report.warnings.some((warning) => warning.includes("Offscreen targets must already be hittable"))).toBe(true)
+        expect(report.warnings.some((warning) => warning.includes("Offscreen targets: the runner auto-scrolls until hittable"))).toBe(true)
         // PRB-093 review finding: 3 attempts on the same step must still
         // report exactly one post capture, not one per attempt -- retries
         // reuse the already-cached resolution snapshot and only the
@@ -5273,7 +5273,7 @@ describe("SessionRegistry", () => {
         expect(report.failure?.attempts).toBe(3)
         expect(report.failure?.reason).toContain("retry exhausted")
         expect(report.failure?.reason).toContain("hittable")
-        expect(report.warnings.some((warning) => warning.includes("Offscreen targets must already be hittable"))).toBe(true)
+        expect(report.warnings.some((warning) => warning.includes("Offscreen targets: the runner auto-scrolls until hittable"))).toBe(true)
         // PRB-093 review finding: an exhausted-retries step still took a
         // real (bootstrap) resolution capture on its first attempt -- that
         // capture work must survive into the failed step's evidence rather
