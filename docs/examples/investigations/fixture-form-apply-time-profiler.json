@@ -1,0 +1,53 @@
+{
+  "target": {
+    "sessionId": "<session-id>"
+  },
+  "measuredFlow": {
+    "contract": "probe.session-flow/v2",
+    "steps": [
+      {
+        "kind": "sequence",
+        "execution": "fast",
+        "evidencePolicy": { "success": "none" },
+        "actions": [
+          {
+            "kind": "type",
+            "target": {
+              "kind": "semantic",
+              "identifier": "fixture.form.input",
+              "label": null,
+              "value": null,
+              "placeholder": null,
+              "type": "textField",
+              "section": null,
+              "interactive": true
+            },
+            "text": "delta",
+            "replace": true
+          },
+          {
+            "kind": "tap",
+            "target": {
+              "kind": "semantic",
+              "identifier": "fixture.form.applyButton",
+              "label": null,
+              "value": null,
+              "placeholder": null,
+              "type": "button",
+              "section": null,
+              "interactive": true
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "capture": {
+    "kind": "preset",
+    "template": "time-profiler"
+  },
+  "repetitions": 1,
+  "cooldown": {
+    "minIntervalMs": 1000
+  }
+}
