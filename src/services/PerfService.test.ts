@@ -1878,7 +1878,7 @@ describe("PerfService analyzeTrace", () => {
       ])
       // Empty counter tables omitted (0 rows); surface-rate + gpu/driver/encoder kept.
       expect(result.artifacts.exports.length).toBeGreaterThanOrEqual(4)
-      expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
+      expect(result.summary.metrics.find((metric) => metric.label === "Display surface FPS")?.value).toContain("fps")
       expect(result.summary.metrics.find((metric) => metric.label === "FPS source")?.value).toBe("displayed-surfaces-per-second")
       expect(result.summary.metrics.find((metric) => metric.label === "Per-encoder summary")?.value).toContain("command buffer")
       expect(result.summary.metrics.find((metric) => metric.label === "GPU counters")?.value).toBe("none exported")

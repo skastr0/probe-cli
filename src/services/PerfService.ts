@@ -65,10 +65,10 @@ const customTemplateExtension = ".tracetemplate"
 
 // How a schema export reacts when the stream budget is hit mid-export.
 // - fail: typed EnvironmentError (explicit `perf export`)
-// - skip: drop this schema and continue (optional analyze schemas)
-// - truncate: keep the prefix already written, analyze it, diagnose honestly
-//   (required analyze schemas — so record→analyze never dies on density alone)
-type ExportBudgetPolicy = "fail" | "skip" | "truncate"
+// - skip: drop this schema and continue
+// - truncate: keep prefix; if salvage fails, fail (required analyze schemas)
+// - truncate-or-skip: keep prefix; if salvage fails, skip (optional analyze schemas)
+type ExportBudgetPolicy = "fail" | "skip" | "truncate" | "truncate-or-skip"
 
 const formatTimeLimitMs = (value: number): string => {
   if (value % 60_000 === 0) {
@@ -657,7 +657,8 @@ const countExportRowsInFile = async (path: string): Promise<number> => {
  * leading `<schema>` block and complete row pairs — trailing close tags are
  * optional — so this is enough to keep analysis honest under agent budgets.
  */
-const clampExportFileToBudget = async (args: {
+/** @internal exported for unit tests — clamps a partial xctrace XML export to budget. */
+export const clampExportFileToBudget = async (args: {
   readonly outputPath: string
   readonly maxBytes: number
 }): Promise<{ readonly bytesWritten: number; readonly rowCount: number; readonly truncated: boolean } | null> => {
@@ -2492,7 +2493,10 @@ export const createPerfService = (dependencies: {
               }),
           })
 
-          const truncatedFromCache = cached.right.summary.includes("truncated prefix")
+          // Durable flag: label suffix, not English summary wording.
+          const truncatedFromCache =
+            cached.right.label.endsWith("-export-truncated")
+            || cached.right.summary.includes("truncated prefix")
 
           return {
             kind: "exported",
@@ -2513,8 +2517,9 @@ export const createPerfService = (dependencies: {
         `Exporting ${schema} rows (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}, policy ${budgetPolicy}).`,
       )
 
-      const fileBudgetPolicy: Exclude<ExportBudgetPolicy, "skip"> =
-        budgetPolicy === "truncate" ? "truncate" : "fail"
+      const wantsTruncate = budgetPolicy === "truncate" || budgetPolicy === "truncate-or-skip"
+      const fileBudgetPolicy: Exclude<ExportBudgetPolicy, "skip" | "truncate-or-skip"> =
+        wantsTruncate ? "truncate" : "fail"
 
       const exportOutcome = yield* Effect.tryPromise({
         try: async (signal) => {
@@ -2537,7 +2542,7 @@ export const createPerfService = (dependencies: {
                 return { kind: "skipped-budget" as const, error }
               }
 
-              if (budgetPolicy === "truncate") {
+              if (wantsTruncate) {
                 const partial = await tryKeepPartialExport({
                   outputPath: exportPath,
                   budgetError: error,
@@ -2546,6 +2551,11 @@ export const createPerfService = (dependencies: {
                 })
                 if (partial) {
                   return { kind: "exported" as const, result: partial }
+                }
+                // Optional tables must not kill the whole analyze when salvage fails.
+                if (budgetPolicy === "truncate-or-skip") {
+                  await cleanupOutputFile(exportPath)
+                  return { kind: "skipped-budget" as const, error }
                 }
               }
             }
@@ -2601,7 +2611,7 @@ export const createPerfService = (dependencies: {
 
           if (!clamped) {
             yield* Effect.promise(() => cleanupOutputFile(exportPath))
-            if (budgetPolicy === "skip") {
+            if (budgetPolicy === "skip" || budgetPolicy === "truncate-or-skip") {
               emitProgress(
                 "perf.export",
                 `Skipping optional ${schema} export after it exceeded the ${formatBytes(parseBudgetBytes)} parse limit with no salvageable rows.`,
@@ -2649,7 +2659,7 @@ export const createPerfService = (dependencies: {
         createArtifactRecord({
           artifactRoot,
           key: cacheKey,
-          label: `${schema}-export`,
+          label: exportResult.truncated ? `${schema}-export-truncated` : `${schema}-export`,
           kind: "xml",
           absolutePath: exportPath,
           summary: exportResult.truncated
@@ -2766,10 +2776,9 @@ export const createPerfService = (dependencies: {
           continue
         }
 
-        // Required schemas always truncate under budget. Optional schemas also
-        // truncate when any complete rows were written — skip only if the export
-        // produced nothing salvageable (so encoder/driver heat is not lost on
-        // dense Metal scenes).
+        // Required: truncate under budget (fail only if salvage yields nothing).
+        // Optional: truncate when possible; skip on unsalvageable overrun so a
+        // fat encoder/counter table cannot kill metal analyze after GPU intervals land.
         const outcome = yield* exportSchemaWithCache({
           sessionId,
           artifactRoot: context.artifactRoot,
@@ -2779,7 +2788,7 @@ export const createPerfService = (dependencies: {
           budget: exportSpec.budget,
           xctraceVersion: context.xctraceVersion,
           emitProgress,
-          budgetPolicy: "truncate",
+          budgetPolicy: exportSpec.required === true ? "truncate" : "truncate-or-skip",
         })
 
         if (outcome.kind === "skipped-budget") {
