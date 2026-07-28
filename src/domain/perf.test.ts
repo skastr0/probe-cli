@@ -20,7 +20,7 @@ const timeProfilerXml = `<?xml version="1.0"?>
       <col><mnemonic>cp-user-callstack</mnemonic></col>
       <col><mnemonic>sample-type</mnemonic></col>
     </schema>
-    <row><sample-time id="1" fmt="00:00.100.000">100000000</sample-time><thread id="2" fmt="Main Thread 0x1 (ProbeFixture, pid: 111)"><tid id="3">1</tid></thread><sentinel/><thread-state id="4" fmt="Blocked">Blocked</thread-state><kperf-bt id="5" fmt="PC:0x1, 4 frames">1</kperf-bt><time-sample-kind id="6" fmt="Stackshot">3</time-sample-kind></row>
+    <row><sample-time id="1" fmt="00:00.100.000">100000000</sample-time><thread id="2" fmt="Main Thread 0x1 (ProbeFixture, pid: 111)"><tid id="3">1</tid></thread><sentinel/><thread-state id="4" fmt="Blocked">Blocked</thread-state><kperf-bt id="5" fmt="PC:0x1010fcb70, 4 frames"><text-address id="50" fmt="0x1010fcb70">4312779632</text-address></kperf-bt><time-sample-kind id="6" fmt="Stackshot">3</time-sample-kind></row>
     <row><sample-time ref="1"/><thread ref="2"/><core id="7" fmt="CPU 3">3</core><thread-state ref="4"/><kperf-bt ref="5"/><time-sample-kind ref="6"/></row>
   </node>
 </trace-query-result>`
@@ -157,12 +157,19 @@ describe("perf analysis", () => {
     expect(defaultPerfTimeLimitForTemplate("logging")).toBe("3s")
   })
 
-  test("time profiler analysis flags blocked-heavy traces and preserves walls", () => {
+  test("time profiler analysis flags blocked-heavy traces and attributes leaf callstack PCs", () => {
     const result = analyzeTimeProfilerTable(parsePerfTableExport(timeProfilerXml))
 
     expect(result.summary.headline).toContain("Collected 2 CPU samples")
+    expect(result.summary.headline).toContain("hottest leaf")
+    expect(result.summary.metrics.find((metric) => metric.label === "Top leaf PCs")?.value).toContain("0x")
+    expect(result.summary.metrics.find((metric) => metric.label === "Main thread share")?.value).toBe("100.0%")
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "time-profiler-mostly-blocked")).toBe(true)
-    expect(result.diagnoses.some((diagnosis) => diagnosis.wall)).toBe(true)
+    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "time-profiler-top-leaves")).toBe(true)
+    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "time-profiler-main-thread-heavy")).toBe(true)
+    // Full symbol names still need atos/dSYM — note, not a hard capture wall.
+    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "time-profiler-symbolication-note")).toBe(true)
+    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "time-profiler-callstack-wall")).toBe(false)
   })
 
   test("system trace analysis filters rows to the target pid", () => {

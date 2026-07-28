@@ -268,10 +268,45 @@ const readStructuredRaw = (tagName: string, inner: string): string | null => {
         ?? inner.match(/<tid[^>]*>([^<]+)<\/tid>/)?.[1]?.trim()
         ?? null
       )
+    case "kperf-bt": {
+      // Prefer the leaf PC from nested <text-address>, then the full PC chain.
+      // These are unsymbolicated addresses — still agent-actionable as hot-leaf ids.
+      const leaf = inner.match(/<text-address\b[^>]*>([^<]+)<\/text-address>/)?.[1]?.trim()
+      if (leaf) {
+        return leaf
+      }
+      const chain = inner.match(/<text-addresses\b[^>]*>([^<]+)<\/text-addresses>/)?.[1]?.trim()
+      return chain && chain.length > 0 ? chain.split(/\s+/)[0] ?? null : null
+    }
     default:
       return null
   }
 }
+
+/** Normalize a leaf callstack identity from either raw PC or Instruments fmt text. */
+const leafCallstackIdentity = (row: PerfRow, mnemonic: string): string | null => {
+  const raw = readRaw(row, mnemonic)
+  if (raw && /^\d+$/.test(raw)) {
+    const asHex = `0x${BigInt(raw).toString(16)}`
+    return asHex
+  }
+  if (raw && /^0x[0-9a-fA-F]+$/i.test(raw)) {
+    return raw.toLowerCase()
+  }
+  const display = readDisplay(row, mnemonic)
+  if (!display) {
+    return null
+  }
+  const pcMatch = display.match(/PC:(0x[0-9a-fA-F]+)/i)
+  if (pcMatch?.[1]) {
+    return pcMatch[1].toLowerCase()
+  }
+  // Fall back to the full display when Instruments already symbolicated something useful.
+  const compact = display.trim()
+  return compact.length > 0 ? compact : null
+}
+
+const isMainThreadLabel = (thread: string): boolean => /main\s*thread/i.test(thread)
 
 const buildCell = (
   tagName: string,
@@ -612,6 +647,28 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
   const topCore = countBy(cores)[0] ?? null
   const diagnoses: Array<PerfDiagnosis> = []
 
+  // Prefer user stacks; fall back to kernel when user column is absent/sentinel.
+  const hasUserStackMnemonic = table.mnemonics.includes("cp-user-callstack")
+  const hasKernelStackMnemonic = table.mnemonics.includes("cp-kernel-callstack")
+  const leafStacks = table.rows
+    .map((row) => {
+      if (hasUserStackMnemonic) {
+        const user = leafCallstackIdentity(row, "cp-user-callstack")
+        if (user) {
+          return user
+        }
+      }
+      if (hasKernelStackMnemonic) {
+        return leafCallstackIdentity(row, "cp-kernel-callstack")
+      }
+      return null
+    })
+    .filter((value): value is string => value !== null)
+  const topLeaves = countBy(leafStacks).slice(0, 5)
+  const topThreads = countBy(threads).slice(0, 5)
+  const mainThreadSamples = threads.filter(isMainThreadLabel).length
+  const mainThreadShare = sampleCount > 0 ? mainThreadSamples / sampleCount : 0
+
   if (sampleCount === 0) {
     diagnoses.push(
       warningDiagnosis(
@@ -645,20 +702,72 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
     )
   }
 
-  diagnoses.push(
-    wallDiagnosis(
-      "time-profiler-callstack-wall",
-      "Probe keeps the raw sample exports, but full reconstructed call stacks are not yet a stable supported contract.",
-      ["Inspect the saved .trace bundle when you need richer stack reconstruction than the current XML contract provides."],
-    ),
-  )
+  if (topLeaves.length > 0) {
+    diagnoses.push(
+      infoDiagnosis(
+        "time-profiler-top-leaves",
+        `Top leaf callstack PCs: ${topLeaves.map(([leaf, count]) => `${leaf} (${count})`).join(", ")}.`,
+        [
+          "These are unsymbolicated program counters from cp-user-callstack (or kernel fallback).",
+          "Symbolicate with atos/dsymutil against the matching app binary for function names, or open the .trace in Instruments.",
+          "Leaf PC heat is still enough to diff before/after and spot regressions.",
+        ],
+      ),
+    )
+  }
+
+  if (sampleCount > 0 && mainThreadShare >= 0.4) {
+    diagnoses.push(
+      warningDiagnosis(
+        "time-profiler-main-thread-heavy",
+        `Main thread carried ${formatRatio(mainThreadShare)} of exported samples (${mainThreadSamples} of ${sampleCount}).`,
+        [
+          "High main-thread sample share often means UI/jank risk — move work off Main Thread or reduce per-frame main work.",
+          topLeaves[0] ? `Hottest leaf PC overall: ${topLeaves[0][0]} (${topLeaves[0][1]} samples).` : "No leaf PC extracted from callstack columns.",
+        ],
+      ),
+    )
+  }
+
+  if (leafStacks.length === 0 && sampleCount > 0) {
+    diagnoses.push(
+      wallDiagnosis(
+        "time-profiler-callstack-wall",
+        "Time Profiler samples exported, but no user/kernel callstack cells were present to attribute leaf PCs.",
+        [
+          "Confirm the TOC advertises cp-user-callstack / cp-kernel-callstack and that the export was not truncated before stack columns.",
+          "Open the raw .trace in Instruments if stacks are visible there but missing from the XML export.",
+        ],
+      ),
+    )
+  } else if (leafStacks.length > 0) {
+    diagnoses.push(
+      infoDiagnosis(
+        "time-profiler-symbolication-note",
+        "Leaf callstack PCs are interpreted; human-readable symbol names still need binary symbolication.",
+        [
+          "Probe does not yet run atos against the target .app/dSYM automatically.",
+          "Pass the matching binary to atos, or open the .trace in Instruments for symbolicated heavy stacks.",
+        ],
+      ),
+    )
+  }
+
+  const topLeafSummary = topLeaves.length === 0
+    ? "none"
+    : topLeaves.map(([leaf, count]) => `${leaf}×${count}`).join(", ")
+  const topThreadSummary = topThreads.length === 0
+    ? "none"
+    : topThreads.map(([thread, count]) => `${thread.split(" (")[0] ?? thread}×${count}`).join(", ")
 
   return {
     summary: {
       headline:
         sampleCount === 0
           ? "No Time Profiler samples were exported."
-          : `Collected ${sampleCount} CPU samples across ${uniqueCount(threads)} threads.`,
+          : topLeaves[0]
+            ? `Collected ${sampleCount} CPU samples across ${uniqueCount(threads)} threads; hottest leaf ${topLeaves[0][0]} (${topLeaves[0][1]} samples).`
+            : `Collected ${sampleCount} CPU samples across ${uniqueCount(threads)} threads.`,
       metrics: [
         { label: "Samples", value: String(sampleCount) },
         { label: "Threads", value: String(uniqueCount(threads)) },
@@ -666,6 +775,10 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
         { label: "States", value: summarizeCounts(states) },
         { label: "Sample kinds", value: summarizeCounts(sampleKinds) },
         { label: "Sample window", value: formatNanoseconds(windowNs) },
+        { label: "Main thread share", value: sampleCount === 0 ? "n/a" : formatRatio(mainThreadShare) },
+        { label: "Top leaf PCs", value: topLeafSummary },
+        { label: "Top threads", value: topThreadSummary },
+        { label: "Stacks attributed", value: String(leafStacks.length) },
       ],
     },
     diagnoses,
@@ -824,13 +937,50 @@ interface MetalEncoderAggregate {
   readonly averageDuration: number
 }
 
-const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): {
+const isAppRenderGpuChannel = (channel: string | null): boolean => {
+  if (!channel) {
+    return false
+  }
+  // Prefer channels that describe app render work. Numeric / empty / compositor-ish
+  // labels are excluded so frame spans are less likely to mix system intervals.
+  const normalized = channel.trim().toLowerCase()
+  if (normalized.length === 0) {
+    return false
+  }
+  if (/^\d+$/.test(normalized)) {
+    return false
+  }
+  if (normalized.includes("compositor") || normalized.includes("backboard") || normalized.includes("springboard")) {
+    return false
+  }
+  return (
+    normalized.includes("fragment")
+    || normalized.includes("vertex")
+    || normalized.includes("compute")
+    || normalized.includes("render")
+    || normalized.includes("tile")
+  )
+}
+
+const buildMetalFrameEstimates = (
+  rows: ReadonlyArray<PerfRow>,
+  options?: { readonly appRenderChannelsOnly?: boolean },
+): {
   readonly estimates: ReadonlyArray<MetalFrameEstimate>
   readonly reliable: boolean
+  readonly channelFilter: "all" | "app-render"
 } => {
   const frames = new Map<string, { minStart: number; maxEnd: number }>()
+  const appRenderChannelsOnly = options?.appRenderChannelsOnly === true
 
   for (const row of rows) {
+    if (appRenderChannelsOnly) {
+      const channel = readDisplay(row, "channel-name") ?? readRaw(row, "channel-name")
+      if (!isAppRenderGpuChannel(channel)) {
+        continue
+      }
+    }
+
     const frameId = readDisplay(row, "frame-number") ?? readRaw(row, "frame-number")
     const start = readNumber(row, "start")
     const duration = readNumber(row, "duration")
@@ -859,7 +1009,11 @@ const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): {
     .sort((left, right) => left.frameId.localeCompare(right.frameId, undefined, { numeric: true }))
 
   if (estimates.length === 0) {
-    return { estimates, reliable: true }
+    return {
+      estimates,
+      reliable: true,
+      channelFilter: appRenderChannelsOnly ? "app-render" : "all",
+    }
   }
 
   const averageFrameDuration = estimates.reduce((total, frame) => total + frame.duration, 0) / estimates.length
@@ -867,7 +1021,54 @@ const buildMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>): {
 
   const reliable = averageFrameDuration < unreliableFrameAverageNs && !hasExtremeOutlier
 
-  return { estimates, reliable }
+  return {
+    estimates,
+    reliable,
+    channelFilter: appRenderChannelsOnly ? "app-render" : "all",
+  }
+}
+
+const pickBestMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>) => {
+  const appRender = buildMetalFrameEstimates(rows, { appRenderChannelsOnly: true })
+  if (appRender.estimates.length > 0 && appRender.reliable) {
+    return appRender
+  }
+
+  const allChannels = buildMetalFrameEstimates(rows, { appRenderChannelsOnly: false })
+  if (allChannels.estimates.length > 0 && allChannels.reliable) {
+    return allChannels
+  }
+
+  // Prefer the denser unreliable set for diagnostics (still withheld for FPS).
+  if (appRender.estimates.length >= allChannels.estimates.length && appRender.estimates.length > 0) {
+    return appRender
+  }
+  return allChannels
+}
+
+const buildMetalGpuCounterSummary = (table: ParsedPerfTable | undefined) => {
+  if (!table || table.rows.length === 0) {
+    return null
+  }
+
+  // GPU counter exports vary by template; stay mnemonic-flexible.
+  const counterNames = table.rows
+    .map((row) =>
+      readLabel(row, ["counter-name", "name", "metric", "label", "gpu-counter-name"])
+      ?? readDisplay(row, "counter-name")
+      ?? readDisplay(row, "name"),
+    )
+    .filter((value): value is string => value !== null)
+  const values = table.rows
+    .map((row) => readNumber(row, "value") ?? readNumber(row, "counter-value") ?? readNumber(row, "duration"))
+    .filter((value): value is number => value !== null)
+
+  return {
+    rowCount: table.rows.length,
+    counterNames: summarizeCounts(counterNames),
+    averageValue: averageOf(values),
+    maxValue: values.length === 0 ? null : Math.max(...values),
+  }
 }
 
 const buildMetalEncoderAggregates = (table: ParsedPerfTable | undefined): ReadonlyArray<MetalEncoderAggregate> => {
@@ -969,6 +1170,7 @@ export const analyzeMetalSystemTraceTables = (args: {
   readonly gpuIntervalsTable: ParsedPerfTable
   readonly driverEventTable?: ParsedPerfTable
   readonly encoderListTable?: ParsedPerfTable
+  readonly gpuCounterTable?: ParsedPerfTable
 }): {
   readonly summary: PerfSummary
   readonly diagnoses: ReadonlyArray<PerfDiagnosis>
@@ -988,7 +1190,12 @@ export const analyzeMetalSystemTraceTables = (args: {
   const maxLatency = latencies.length === 0 ? null : Math.max(...latencies)
   const averageDuration = averageOf(durations)
   const averageLatency = averageOf(latencies)
-  const { estimates: frameEstimates, reliable: frameEstimatesReliable } = buildMetalFrameEstimates(rows)
+  const {
+    estimates: frameEstimates,
+    reliable: frameEstimatesReliable,
+    channelFilter: frameChannelFilter,
+  } = pickBestMetalFrameEstimates(rows)
+  const gpuCounterSummary = buildMetalGpuCounterSummary(args.gpuCounterTable)
   const frameDurations = frameEstimates.map((frame) => frame.duration)
   const averageFrameDuration = averageOf(frameDurations)
   const maxFrameDuration = frameDurations.length === 0 ? null : Math.max(...frameDurations)
@@ -1031,10 +1238,37 @@ export const analyzeMetalSystemTraceTables = (args: {
         "metal-fps-withheld",
         "Frame-rate estimation was withheld because the GPU interval export showed unreliable frame grouping.",
         [
+          `Channel filter used: ${frameChannelFilter}.`,
           `Average exported frame span: ${formatNanoseconds(averageFrameDuration)}.`,
           `Max exported frame span: ${formatNanoseconds(maxFrameDuration)}.`,
           "This typically happens when the GPU interval table mixes target-app and compositor/system intervals under the same frame IDs, producing inflated frame spans.",
           "Per-interval GPU timing and encoder breakdown remain trustworthy. The encoder export is usually the more reliable attribution seam.",
+        ],
+      ),
+    )
+  } else if (frameEstimatesReliable && frameEstimates.length > 0 && frameChannelFilter === "app-render") {
+    diagnoses.push(
+      infoDiagnosis(
+        "metal-fps-app-render-channels",
+        "Estimated FPS from Fragment/Vertex/Compute/Render channel intervals only (compositor-ish channels excluded).",
+        [
+          `${frameEstimates.length} frames contributed to the estimate.`,
+          `Average frame span: ${formatNanoseconds(averageFrameDuration)}.`,
+        ],
+      ),
+    )
+  }
+
+  if (gpuCounterSummary) {
+    diagnoses.push(
+      infoDiagnosis(
+        "metal-gpu-counters-present",
+        `GPU counter export present (${gpuCounterSummary.rowCount} rows).`,
+        [
+          `Counters: ${gpuCounterSummary.counterNames}.`,
+          gpuCounterSummary.averageValue !== null
+            ? `Average numeric value: ${gpuCounterSummary.averageValue}.`
+            : "No numeric counter values decoded from the export mnemonics Probe understands.",
         ],
       ),
     )
@@ -1086,15 +1320,20 @@ export const analyzeMetalSystemTraceTables = (args: {
     )
   }
 
-  diagnoses.push(
-    wallDiagnosis(
-      "metal-gpu-counters-required",
-      "Probe can summarize GPU intervals, driver events, and encoder timing from Metal traces, but per-shader GPU cycle attribution still requires GPU Counters with a pre-configured custom template.",
-      topEncoder
-        ? [`Top encoder in this export: ${topEncoder.label} (${formatNanoseconds(topEncoder.averageDuration)} avg).`]
-        : ["This recording did not export encoder rows, so Probe cannot isolate individual encoder hotspots from the current trace alone."],
-    ),
-  )
+  if (!gpuCounterSummary) {
+    diagnoses.push(
+      wallDiagnosis(
+        "metal-gpu-counters-required",
+        "Per-shader GPU cycle attribution needs a counter-enabled template (e.g. custom Metal System Trace with Metal Counters, or `Ripple Scene Profiler.tracetemplate`).",
+        [
+          topEncoder
+            ? `Top encoder in this export: ${topEncoder.label} (${formatNanoseconds(topEncoder.averageDuration)} avg).`
+            : "This recording did not export encoder rows, so Probe cannot isolate individual encoder hotspots from the current trace alone.",
+          "Record with --custom-template pointing at a counters-enabled .tracetemplate, then re-run analyze; Probe will summarize gpu-counter-* rows when present.",
+        ],
+      ),
+    )
+  }
 
   return {
     summary: {
@@ -1121,6 +1360,7 @@ export const analyzeMetalSystemTraceTables = (args: {
         { label: "Avg CPU→GPU latency", value: formatNanoseconds(averageLatency) },
         { label: "Max CPU→GPU latency", value: formatNanoseconds(maxLatency) },
         { label: "Estimated FPS", value: estimatedFpsText },
+        { label: "FPS channel filter", value: frameChannelFilter },
         { label: "Frames over 60 FPS budget", value: frameEstimates.length === 0 ? "n/a" : frameEstimatesReliable ? `${framesOverBudget}/${frameEstimates.length}` : "withheld" },
         { label: "Avg frame span", value: formatNanoseconds(averageFrameDuration) },
         { label: "Max frame span", value: formatNanoseconds(maxFrameDuration) },
@@ -1128,6 +1368,12 @@ export const analyzeMetalSystemTraceTables = (args: {
         { label: "Driver event types", value: summarizeCounts(driverSummary.eventTypes) },
         { label: "Avg driver event duration", value: formatNanoseconds(driverSummary.averageDuration) },
         { label: "Per-encoder summary", value: summarizeEncoderAggregates(encoderAggregates) },
+        {
+          label: "GPU counters",
+          value: gpuCounterSummary
+            ? `${gpuCounterSummary.rowCount} rows; ${gpuCounterSummary.counterNames}`
+            : "none exported",
+        },
       ],
     },
     diagnoses,
