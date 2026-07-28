@@ -744,10 +744,10 @@ export const analyzeTimeProfilerTable = (table: ParsedPerfTable): {
     diagnoses.push(
       infoDiagnosis(
         "time-profiler-symbolication-note",
-        "Leaf callstack PCs are interpreted; human-readable symbol names still need binary symbolication.",
+        "Leaf callstack PCs are interpreted; symbol names require atos + matching binary/dSYM.",
         [
-          "Probe does not yet run atos against the target .app/dSYM automatically.",
-          "Pass the matching binary to atos, or open the .trace in Instruments for symbolicated heavy stacks.",
+          "Set PROBE_PERF_BINARY or PROBE_ATOS_BINARY to the target .app executable or dSYM before `probe perf analyze` to best-effort symbolicate top leaves.",
+          "Without that env, agents should treat leaf PCs as stable heat ids for before/after diffs, or open the .trace in Instruments.",
         ],
       ),
     )
@@ -1009,9 +1009,10 @@ const buildMetalFrameEstimates = (
     .sort((left, right) => left.frameId.localeCompare(right.frameId, undefined, { numeric: true }))
 
   if (estimates.length === 0) {
+    // No frame identity → never invent FPS from raw interval durations.
     return {
       estimates,
-      reliable: true,
+      reliable: false,
       channelFilter: appRenderChannelsOnly ? "app-render" : "all",
     }
   }
@@ -1389,27 +1390,31 @@ export const analyzeMetalSystemTraceTables = (args: {
   // GPU-interval frame spans when that export is present and non-empty.
   const displayFpsAvailable = displaySurfaceRate !== null && displaySurfaceRate.sampleCount > 0
     && displaySurfaceRate.averageFps !== null
-  // FPS estimation from GPU intervals: only when frame grouping is reliable.
-  // Unreliable grouping produces fabricated frame rates from mixed-process/compositor noise.
-  const estimatedFrameDuration = frameEstimatesReliable
-    ? (averageFrameDuration ?? averageDuration)
-    : averageDuration
-  const intervalAverageFps = frameEstimatesReliable && estimatedFrameDuration !== null && estimatedFrameDuration > 0
-    ? 1_000_000_000 / estimatedFrameDuration
-    : null
-  const averageFps = displayFpsAvailable ? displaySurfaceRate.averageFps : intervalAverageFps
-  const framesOverBudget = frameEstimatesReliable
+  // GPU frame-span FPS: only when frame-ids exist AND grouping is reliable.
+  // Never invent FPS from average interval duration (work time ≠ present rate).
+  const gpuFrameSpanFps =
+    frameEstimatesReliable
+    && frameEstimates.length > 0
+    && averageFrameDuration !== null
+    && averageFrameDuration > 0
+      ? 1_000_000_000 / averageFrameDuration
+      : null
+  const framesOverBudget = frameEstimatesReliable && frameEstimates.length > 0
     ? frameDurations.filter((duration) => duration > sixtyFpsFrameBudgetNs).length
     : 0
-  const estimatedFpsText = displayFpsAvailable
-    ? formatFramesPerSecond(averageFps)
-    : frameEstimatesReliable
-      ? formatFramesPerSecond(averageFps)
+  const displayFpsText = displayFpsAvailable
+    ? formatFramesPerSecond(displaySurfaceRate.averageFps)
+    : "none exported"
+  const gpuFrameSpanFpsText = gpuFrameSpanFps !== null
+    ? formatFramesPerSecond(gpuFrameSpanFps)
+    : frameEstimates.length === 0
+      ? "withheld (no frame ids)"
       : "withheld (unreliable grouping)"
+  // Headline prefers display rate, then reliable GPU span — never a fake number.
   const frameBudgetSummary = displayFpsAvailable
     ? displaySurfaceRate.summaryLine
-    : frameEstimatesReliable && frameEstimates.length > 0
-      ? `${formatFramesPerSecond(averageFps)} average; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}`
+    : gpuFrameSpanFps !== null && frameEstimates.length > 0
+      ? `${formatFramesPerSecond(gpuFrameSpanFps)} GPU frame-span avg; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)} 60Hz reference`
       : null
 
   if (rows.length === 0) {
@@ -1430,40 +1435,54 @@ export const analyzeMetalSystemTraceTables = (args: {
         [
           "Source schema: displayed-surfaces-per-second (surface swaps per second).",
           displaySurfaceRate.bucketsUnder60 > 0
-            ? `${displaySurfaceRate.bucketsUnder60} of ${displaySurfaceRate.sampleCount} one-second buckets were under 60 swaps.`
-            : "All one-second buckets met or exceeded 60 surface swaps.",
-          "This is display presentation rate, not GPU frame-interval reconstruction.",
+            ? `${displaySurfaceRate.bucketsUnder60} of ${displaySurfaceRate.sampleCount} one-second buckets were under a 60Hz reference (${displaySurfaceRate.bucketsUnder60}/${displaySurfaceRate.sampleCount}).`
+            : "All one-second buckets met or exceeded a 60Hz reference rate.",
+          "This is display presentation rate, not GPU frame-interval reconstruction. Not a measured vsync period (ProMotion may run higher).",
         ],
       ),
     )
     if (displaySurfaceRate.bucketsUnder60 > 0) {
       diagnoses.push(
         warningDiagnosis(
-          "metal-display-under-60",
-          `Display surface rate dropped under 60 in ${displaySurfaceRate.bucketsUnder60} second(s) (min ${displaySurfaceRate.minFps?.toFixed(0) ?? "n/a"}).`,
-          ["Investigate encoder/blit heat and main-thread sample share alongside this window."],
+          "metal-display-under-60hz-reference",
+          `Display surface rate dropped under a 60Hz reference in ${displaySurfaceRate.bucketsUnder60} second(s) (min ${displaySurfaceRate.minFps?.toFixed(0) ?? "n/a"}).`,
+          [
+            "Reference threshold is 60 swaps/s — not the device's measured refresh rate.",
+            "Investigate encoder/blit heat and main-thread sample share alongside this window.",
+          ],
         ),
       )
     }
-  } else if (!frameEstimatesReliable && frameEstimates.length > 0) {
+  } else if (frameEstimates.length === 0) {
     diagnoses.push(
       warningDiagnosis(
         "metal-fps-withheld",
-        "Frame-rate estimation was withheld because the GPU interval export showed unreliable frame grouping and no display surface-rate samples were available.",
+        "GPU frame-span FPS withheld: no frame-number identity in the GPU interval export, and no display surface-rate samples were available.",
+        [
+          "Probe does not invent FPS from average GPU interval duration (work time ≠ present rate).",
+          "Per-interval GPU timing and encoder breakdown remain trustworthy.",
+        ],
+      ),
+    )
+  } else if (!frameEstimatesReliable) {
+    diagnoses.push(
+      warningDiagnosis(
+        "metal-fps-withheld",
+        "GPU frame-span FPS withheld because frame grouping looked unreliable, and no display surface-rate samples were available.",
         [
           `Channel filter used: ${frameChannelFilter}.`,
           `Average exported frame span: ${formatNanoseconds(averageFrameDuration)}.`,
           `Max exported frame span: ${formatNanoseconds(maxFrameDuration)}.`,
-          "This typically happens when the GPU interval table mixes target-app and compositor/system intervals under the same frame IDs, producing inflated frame spans.",
-          "Per-interval GPU timing and encoder breakdown remain trustworthy. The encoder export is usually the more reliable attribution seam.",
+          "This typically happens when the GPU interval table mixes target-app and compositor/system intervals under the same frame IDs.",
+          "Per-interval GPU timing and encoder breakdown remain trustworthy.",
         ],
       ),
     )
-  } else if (frameEstimatesReliable && frameEstimates.length > 0 && frameChannelFilter === "app-render") {
+  } else if (frameChannelFilter === "app-render") {
     diagnoses.push(
       infoDiagnosis(
         "metal-fps-app-render-channels",
-        "Estimated FPS from Fragment/Vertex/Compute/Render channel intervals only (compositor-ish channels excluded).",
+        "GPU frame-span FPS estimated from Fragment/Vertex/Compute/Render channel intervals only (compositor-ish channels excluded).",
         [
           `${frameEstimates.length} frames contributed to the estimate.`,
           `Average frame span: ${formatNanoseconds(averageFrameDuration)}.`,
@@ -1494,8 +1513,8 @@ export const analyzeMetalSystemTraceTables = (args: {
     diagnoses.push(
       warningDiagnosis(
         "metal-frame-budget-duration",
-        "At least one exported GPU interval exceeded a 60 FPS frame budget.",
-        [`Max GPU duration: ${formatNanoseconds(maxDuration)}.`],
+        "At least one exported GPU interval exceeded a 60Hz reference frame budget (16.67 ms).",
+        [`Max GPU duration: ${formatNanoseconds(maxDuration)}.`, "Reference only — not measured display refresh."],
       ),
     )
   }
@@ -1504,8 +1523,8 @@ export const analyzeMetalSystemTraceTables = (args: {
     diagnoses.push(
       warningDiagnosis(
         "metal-frame-budget-latency",
-        "CPU-to-GPU start latency exceeded a 60 FPS frame budget.",
-        [`Max CPU→GPU latency: ${formatNanoseconds(maxLatency)}.`],
+        "CPU-to-GPU start latency exceeded a 60Hz reference frame budget (16.67 ms).",
+        [`Max CPU→GPU latency: ${formatNanoseconds(maxLatency)}.`, "Reference only — not measured display refresh."],
       ),
     )
   }
@@ -1514,10 +1533,11 @@ export const analyzeMetalSystemTraceTables = (args: {
     diagnoses.push(
       warningDiagnosis(
         "metal-frame-budget-fps",
-        "Estimated GPU frame spans missed a 60 FPS budget.",
+        "Estimated GPU frame spans missed a 60Hz reference budget (16.67 ms).",
         [
           `${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}.`,
-          `Estimated average frame rate: ${formatFramesPerSecond(averageFps)}.`,
+          `GPU frame-span average: ${formatFramesPerSecond(gpuFrameSpanFps)}.`,
+          "Uses GPU interval frame grouping only — never display surface rate.",
         ],
       ),
     )
@@ -1537,15 +1557,17 @@ export const analyzeMetalSystemTraceTables = (args: {
   }
 
   if (!gpuCounterSummary) {
+    // Capture/config gap, not a permanent Probe capability wall — re-record can recover.
     diagnoses.push(
-      wallDiagnosis(
-        "metal-gpu-counters-required",
-        "Per-shader GPU cycle attribution needs a counter-enabled template (e.g. custom Metal System Trace with Metal Counters, or `Ripple Scene Profiler.tracetemplate`).",
+      warningDiagnosis(
+        "metal-gpu-counters-missing",
+        "No GPU counter rows in this export — per-shader cycle attribution unavailable for this capture.",
         [
           topEncoder
             ? `Top encoder in this export: ${topEncoder.label} (${formatNanoseconds(topEncoder.averageDuration)} avg).`
-            : "This recording did not export encoder rows, so Probe cannot isolate individual encoder hotspots from the current trace alone.",
-          "Record with --custom-template pointing at a counters-enabled .tracetemplate, then re-run analyze; Probe will summarize gpu-counter-* rows when present.",
+            : "Encoder timing may still be available from metal-application-encoders-list when that export succeeds.",
+          "Re-record with a counters-enabled template (e.g. templates/instruments/Ripple Scene Profiler.tracetemplate) after Instruments Recording Options → GPU Counter Set is non-null.",
+          "Encoder/interval timing above remains valid without counters.",
         ],
       ),
     )
@@ -1575,11 +1597,12 @@ export const analyzeMetalSystemTraceTables = (args: {
         { label: "Max duration", value: formatNanoseconds(maxDuration) },
         { label: "Avg CPU→GPU latency", value: formatNanoseconds(averageLatency) },
         { label: "Max CPU→GPU latency", value: formatNanoseconds(maxLatency) },
-        { label: "Estimated FPS", value: estimatedFpsText },
-        { label: "FPS source", value: displayFpsAvailable ? "displayed-surfaces-per-second" : frameEstimatesReliable ? `gpu-intervals(${frameChannelFilter})` : "withheld" },
+        { label: "Display surface FPS", value: displayFpsText },
+        { label: "GPU frame-span FPS", value: gpuFrameSpanFpsText },
+        { label: "FPS source", value: displayFpsAvailable ? "displayed-surfaces-per-second" : gpuFrameSpanFps !== null ? `gpu-intervals(${frameChannelFilter})` : "withheld" },
         { label: "FPS channel filter", value: frameChannelFilter },
         { label: "Display surface rate", value: displaySurfaceRate?.summaryLine ?? "none exported" },
-        { label: "Frames over 60 FPS budget", value: frameEstimates.length === 0 ? "n/a" : frameEstimatesReliable ? `${framesOverBudget}/${frameEstimates.length}` : "withheld" },
+        { label: "Frames over 60Hz reference", value: frameEstimates.length === 0 ? "n/a" : frameEstimatesReliable ? `${framesOverBudget}/${frameEstimates.length}` : "withheld" },
         { label: "Avg frame span", value: formatNanoseconds(averageFrameDuration) },
         { label: "Max frame span", value: formatNanoseconds(maxFrameDuration) },
         { label: "Driver events", value: String(driverSummary.eventCount) },

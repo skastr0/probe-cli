@@ -18,8 +18,11 @@ probe perf record --session-id $SID --template metal-system-trace --time-limit 1
 probe perf analyze --session-id $SID --artifact <metal-trace-key> --analyzer metal-system-trace
 ```
 
-Analyze prefers `displayed-surfaces-per-second` for FPS. GPU frame-span FPS is
-only claimed when interval grouping is reliable.
+Analyze exposes separate metrics:
+- **Display surface FPS** from `displayed-surfaces-per-second` (preferred for present rate)
+- **GPU frame-span FPS** only when frame-ids exist and grouping is reliable
+
+Never invents FPS from average GPU interval duration.
 
 ### Time Profiler + leaf heat
 

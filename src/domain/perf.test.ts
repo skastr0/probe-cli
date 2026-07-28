@@ -251,10 +251,10 @@ describe("perf analysis", () => {
     const result = analyzeMetalSystemTraceTable(parsePerfTableExport(metalXml))
 
     expect(result.summary.headline).toContain("Observed 1 Metal GPU intervals")
-    expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toBe("50.0 fps")
+    expect(result.summary.metrics.find((metric) => metric.label === "GPU frame-span FPS")?.value).toBe("50.0 fps")
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-frame-budget-duration")).toBe(true)
     expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-frame-budget-latency")).toBe(true)
-    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-gpu-counters-required")).toBe(true)
+    expect(result.diagnoses.some((diagnosis) => diagnosis.code === "metal-gpu-counters-missing")).toBe(true)
   })
 
   test("summarizes signpost intervals by interval name", () => {

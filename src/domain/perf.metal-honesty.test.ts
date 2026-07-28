@@ -144,8 +144,9 @@ describe("metal FPS honesty", () => {
       encoderListTable: parsePerfTableExport(buildEncoderListXml(rippleLikeEncoderRows)),
     })
 
-    expect(metricValue(result, "Estimated FPS")).toBe("withheld (unreliable grouping)")
-    expect(metricValue(result, "Frames over 60 FPS budget")).toBe("withheld")
+    expect(metricValue(result, "GPU frame-span FPS")).toBe("withheld (unreliable grouping)")
+    expect(metricValue(result, "Display surface FPS")).toBe("none exported")
+    expect(metricValue(result, "Frames over 60Hz reference")).toBe("withheld")
     expect(diagnosisByCode(result, "metal-fps-withheld")).toBeDefined()
     expect(diagnosisByCode(result, "metal-encoder-breakdown")).toBeDefined()
     expect(diagnosisByCode(result, "metal-frame-budget-duration")).toBeUndefined()
@@ -162,7 +163,7 @@ describe("metal FPS honesty", () => {
     expect(result.summary.headline).toContain("FPS withheld")
     expect(result.summary.headline).toContain("Render Command 0")
     expect(diagnosisByCode(result, "metal-encoder-breakdown")).toBeDefined()
-    expect(diagnosisByCode(result, "metal-gpu-counters-required")?.wall).toBe(true)
+    expect(diagnosisByCode(result, "metal-gpu-counters-missing")?.wall).toBe(false)
   })
 
   test("withholds FPS headline when no encoder table is present and grouping is unreliable", () => {
@@ -172,8 +173,8 @@ describe("metal FPS honesty", () => {
 
     expect(result.summary.headline).toContain("FPS withheld")
     expect(result.summary.headline).not.toContain("dominated")
-    expect(metricValue(result, "Estimated FPS")).toBe("withheld (unreliable grouping)")
-    expect(metricValue(result, "Frames over 60 FPS budget")).toBe("withheld")
+    expect(metricValue(result, "GPU frame-span FPS")).toBe("withheld (unreliable grouping)")
+    expect(metricValue(result, "Frames over 60Hz reference")).toBe("withheld")
     expect(diagnosisByCode(result, "metal-fps-withheld")).toBeDefined()
     expect(diagnosisByCode(result, "metal-encoder-breakdown")).toBeUndefined()
   })
@@ -183,19 +184,44 @@ describe("metal FPS honesty", () => {
       gpuIntervalsTable: parsePerfTableExport(buildGpuIntervalsXml(wellBehavedGpuRows)),
     })
 
-    expect(metricValue(result, "Estimated FPS")).toBe("60.6 fps")
-    expect(metricValue(result, "Estimated FPS")).not.toContain("withheld")
+    expect(metricValue(result, "GPU frame-span FPS")).toBe("60.6 fps")
+    expect(metricValue(result, "GPU frame-span FPS")).not.toContain("withheld")
     expect(diagnosisByCode(result, "metal-fps-withheld")).toBeUndefined()
     expect(diagnosisByCode(result, "metal-frame-budget-fps")).toBeDefined()
   })
 
-  test("reports n/a FPS for empty GPU intervals", () => {
+  test("display surface FPS rescues withheld GPU grouping", () => {
+    const displayXml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node>
+    <schema name="displayed-surfaces-per-second">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>count</mnemonic></col>
+    </schema>
+    <row><start-time>0</start-time><duration>1000000000</duration><uint32>58</uint32></row>
+    <row><start-time>1000000000</start-time><duration>1000000000</duration><uint32>60</uint32></row>
+  </node>
+</trace-query-result>`
+    const result = analyzeMetalSystemTraceTables({
+      gpuIntervalsTable: parsePerfTableExport(buildGpuIntervalsXml(rippleLikeGpuRows)),
+      displayedSurfacesTable: parsePerfTableExport(displayXml),
+    })
+
+    expect(metricValue(result, "Display surface FPS")).toBe("59.0 fps")
+    expect(metricValue(result, "GPU frame-span FPS")).toBe("withheld (unreliable grouping)")
+    expect(metricValue(result, "FPS source")).toBe("displayed-surfaces-per-second")
+    expect(result.summary.headline).toContain("59.0 fps")
+    expect(diagnosisByCode(result, "metal-display-surface-fps")).toBeDefined()
+  })
+
+  test("reports withheld FPS for empty GPU intervals without inventing a rate", () => {
     const result = analyzeMetalSystemTraceTables({
       gpuIntervalsTable: parsePerfTableExport(buildGpuIntervalsXml([])),
     })
 
-    expect(metricValue(result, "Estimated FPS")).toBe("n/a")
+    expect(metricValue(result, "GPU frame-span FPS")).toBe("withheld (no frame ids)")
     expect(diagnosisByCode(result, "metal-no-rows")).toBeDefined()
-    expect(diagnosisByCode(result, "metal-fps-withheld")).toBeUndefined()
+    expect(diagnosisByCode(result, "metal-fps-withheld")).toBeDefined()
   })
 })
