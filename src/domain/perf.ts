@@ -1046,28 +1046,68 @@ const pickBestMetalFrameEstimates = (rows: ReadonlyArray<PerfRow>) => {
   return allChannels
 }
 
+const classifyGpuCounterTheme = (name: string): "limiters" | "occupancy" | "bandwidth" | "other" => {
+  const n = name.toLowerCase()
+  if (/limiter|utilization|alu|fs\b|vs\b|cs\b|fragment|vertex|compute/.test(n)) {
+    return "limiters"
+  }
+  if (/occupancy|thread.?occup/.test(n)) {
+    return "occupancy"
+  }
+  if (/bandwidth|bytes|memory|gmem|dram|cache/.test(n)) {
+    return "bandwidth"
+  }
+  return "other"
+}
+
 const buildMetalGpuCounterSummary = (table: ParsedPerfTable | undefined) => {
   if (!table || table.rows.length === 0) {
     return null
   }
 
   // GPU counter exports vary by template; stay mnemonic-flexible.
-  const counterNames = table.rows
-    .map((row) =>
+  const namedValues: Array<{ name: string; value: number | null }> = table.rows.map((row) => {
+    const name =
       readLabel(row, ["counter-name", "name", "metric", "label", "gpu-counter-name"])
       ?? readDisplay(row, "counter-name")
-      ?? readDisplay(row, "name"),
-    )
-    .filter((value): value is string => value !== null)
-  const values = table.rows
-    .map((row) => readNumber(row, "value") ?? readNumber(row, "counter-value") ?? readNumber(row, "duration"))
-    .filter((value): value is number => value !== null)
+      ?? readDisplay(row, "name")
+      ?? "unknown"
+    const value = readNumber(row, "value") ?? readNumber(row, "counter-value") ?? readNumber(row, "duration")
+    return { name, value }
+  })
+
+  const counterNames = namedValues.map((entry) => entry.name)
+  const values = namedValues.map((entry) => entry.value).filter((value): value is number => value !== null)
+  const themeCounts = { limiters: 0, occupancy: 0, bandwidth: 0, other: 0 }
+  for (const entry of namedValues) {
+    themeCounts[classifyGpuCounterTheme(entry.name)] += 1
+  }
+
+  const hotByName = new Map<string, { total: number; count: number }>()
+  for (const entry of namedValues) {
+    if (entry.value === null) {
+      continue
+    }
+    const existing = hotByName.get(entry.name)
+    if (existing) {
+      existing.total += entry.value
+      existing.count += 1
+    } else {
+      hotByName.set(entry.name, { total: entry.value, count: 1 })
+    }
+  }
+  const topHot = [...hotByName.entries()]
+    .map(([name, agg]) => ({ name, average: agg.total / agg.count }))
+    .sort((a, b) => b.average - a.average)
+    .slice(0, 5)
 
   return {
     rowCount: table.rows.length,
     counterNames: summarizeCounts(counterNames),
     averageValue: averageOf(values),
     maxValue: values.length === 0 ? null : Math.max(...values),
+    themes: themeCounts,
+    topHot,
   }
 }
 
@@ -1433,15 +1473,18 @@ export const analyzeMetalSystemTraceTables = (args: {
   }
 
   if (gpuCounterSummary) {
+    const themeLine = `limiters=${gpuCounterSummary.themes.limiters}, occupancy=${gpuCounterSummary.themes.occupancy}, bandwidth=${gpuCounterSummary.themes.bandwidth}, other=${gpuCounterSummary.themes.other}`
+    const hotLine = gpuCounterSummary.topHot.length === 0
+      ? "No numeric counter values decoded."
+      : `Hottest counters: ${gpuCounterSummary.topHot.map((c) => `${c.name} (avg ${c.average.toFixed(2)})`).join(", ")}.`
     diagnoses.push(
       infoDiagnosis(
         "metal-gpu-counters-present",
         `GPU counter export present (${gpuCounterSummary.rowCount} rows).`,
         [
           `Counters: ${gpuCounterSummary.counterNames}.`,
-          gpuCounterSummary.averageValue !== null
-            ? `Average numeric value: ${gpuCounterSummary.averageValue}.`
-            : "No numeric counter values decoded from the export mnemonics Probe understands.",
+          `Themes: ${themeLine}.`,
+          hotLine,
         ],
       ),
     )
@@ -1513,17 +1556,17 @@ export const analyzeMetalSystemTraceTables = (args: {
       headline:
         rows.length === 0
           ? "No Metal GPU intervals were exported."
-          : topEncoder && frameBudgetSummary
+          : frameBudgetSummary && topEncoder
             ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}; ${topEncoder.label} dominated the encoder timing.`
+            : frameBudgetSummary
+              ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}.`
             : topEncoder && !frameEstimatesReliable && frameEstimates.length > 0
-              ? `Observed ${rows.length} Metal GPU intervals (FPS withheld — unreliable frame grouping); ${topEncoder.label} dominated the encoder timing.`
+              ? `Observed ${rows.length} Metal GPU intervals (GPU frame-span FPS withheld); ${topEncoder.label} dominated the encoder timing.`
               : !topEncoder && !frameEstimatesReliable && frameEstimates.length > 0
-                ? `Observed ${rows.length} Metal GPU intervals (FPS withheld — unreliable frame grouping) across ${uniqueCount(channels)} channels.`
+                ? `Observed ${rows.length} Metal GPU intervals (GPU frame-span FPS withheld) across ${uniqueCount(channels)} channels.`
                 : topEncoder
                   ? `Observed ${rows.length} Metal GPU intervals; ${topEncoder.label} dominated the encoder timing.`
-                  : frameBudgetSummary
-                    ? `Observed ${rows.length} Metal GPU intervals; ${frameBudgetSummary}.`
-                    : `Observed ${rows.length} Metal GPU intervals across ${uniqueCount(channels)} channels.`,
+                  : `Observed ${rows.length} Metal GPU intervals across ${uniqueCount(channels)} channels.`,
       metrics: [
         { label: "GPU intervals", value: String(rows.length) },
         { label: "Channels", value: summarizeCounts(channels) },
@@ -1548,6 +1591,12 @@ export const analyzeMetalSystemTraceTables = (args: {
           value: gpuCounterSummary
             ? `${gpuCounterSummary.rowCount} rows; ${gpuCounterSummary.counterNames}`
             : "none exported",
+        },
+        {
+          label: "GPU counter themes",
+          value: gpuCounterSummary
+            ? `limiters=${gpuCounterSummary.themes.limiters} occupancy=${gpuCounterSummary.themes.occupancy} bandwidth=${gpuCounterSummary.themes.bandwidth}`
+            : "n/a",
         },
       ],
     },
