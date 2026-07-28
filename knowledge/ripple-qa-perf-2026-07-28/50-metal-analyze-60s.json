@@ -1,0 +1,173 @@
+{
+  "sessionId": "07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "artifactKey": "2026-07-28T05-49-19-569Z-metal-system-trace-trace",
+  "analyzer": "metal-system-trace",
+  "analyzedAt": "2026-07-28T06:31:38.684Z",
+  "xctraceVersion": "xctrace version 16.0 (17F113)",
+  "summary": {
+    "headline": "Observed 17174 Metal GPU intervals (FPS withheld — unreliable frame grouping) across 6 channels.",
+    "metrics": [
+      {
+        "label": "GPU intervals",
+        "value": "17174"
+      },
+      {
+        "label": "Channels",
+        "value": "0 (8423), Fragment (4915), Vertex (2690)"
+      },
+      {
+        "label": "States",
+        "value": "Active (7676)"
+      },
+      {
+        "label": "Avg duration",
+        "value": "177.28 µs"
+      },
+      {
+        "label": "Max duration",
+        "value": "8.56 ms"
+      },
+      {
+        "label": "Avg CPU→GPU latency",
+        "value": "1.93 ms"
+      },
+      {
+        "label": "Max CPU→GPU latency",
+        "value": "10.76 ms"
+      },
+      {
+        "label": "Estimated FPS",
+        "value": "withheld (unreliable grouping)"
+      },
+      {
+        "label": "FPS channel filter",
+        "value": "all"
+      },
+      {
+        "label": "Frames over 60 FPS budget",
+        "value": "withheld"
+      },
+      {
+        "label": "Avg frame span",
+        "value": "14.13 ms"
+      },
+      {
+        "label": "Max frame span",
+        "value": "3.74 s"
+      },
+      {
+        "label": "Driver events",
+        "value": "0"
+      },
+      {
+        "label": "Driver event types",
+        "value": "none"
+      },
+      {
+        "label": "Avg driver event duration",
+        "value": "n/a"
+      },
+      {
+        "label": "Per-encoder summary",
+        "value": "none"
+      },
+      {
+        "label": "GPU counters",
+        "value": "none exported"
+      }
+    ]
+  },
+  "diagnoses": [
+    {
+      "code": "perf-export-truncated",
+      "severity": "warning",
+      "summary": "Analysis used a budget-capped prefix of metal-gpu-intervals (17174 rows, 16.0 MiB).",
+      "details": [
+        "Budget: 50000 rows / 16.0 MiB.",
+        "Metrics describe the exported prefix only, not necessarily the full recording window.",
+        "Re-record with a shorter --time-limit for full-window coverage under budget, or open the .trace in Instruments for the full capture."
+      ],
+      "wall": false
+    },
+    {
+      "code": "metal-fps-withheld",
+      "severity": "warning",
+      "summary": "Frame-rate estimation was withheld because the GPU interval export showed unreliable frame grouping.",
+      "details": [
+        "Channel filter used: all.",
+        "Average exported frame span: 14.13 ms.",
+        "Max exported frame span: 3.74 s.",
+        "This typically happens when the GPU interval table mixes target-app and compositor/system intervals under the same frame IDs, producing inflated frame spans.",
+        "Per-interval GPU timing and encoder breakdown remain trustworthy. The encoder export is usually the more reliable attribution seam."
+      ],
+      "wall": false
+    },
+    {
+      "code": "metal-gpu-counters-required",
+      "severity": "info",
+      "summary": "Per-shader GPU cycle attribution needs a counter-enabled template (e.g. custom Metal System Trace with Metal Counters, or `Ripple Scene Profiler.tracetemplate`).",
+      "details": [
+        "This recording did not export encoder rows, so Probe cannot isolate individual encoder hotspots from the current trace alone.",
+        "Record with --custom-template pointing at a counters-enabled .tracetemplate, then re-run analyze; Probe will summarize gpu-counter-* rows when present."
+      ],
+      "wall": true
+    }
+  ],
+  "artifacts": {
+    "trace": {
+      "key": "2026-07-28T05-49-19-569Z-metal-system-trace-trace",
+      "label": "metal-system-trace-trace",
+      "kind": "directory",
+      "summary": "Metal System Trace raw .trace bundle.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-49-19-569Z-metal-system-trace.trace",
+      "relativePath": "traces/2026-07-28T05-49-19-569Z-metal-system-trace.trace",
+      "external": false,
+      "createdAt": "2026-07-28T06:31:13.287Z"
+    },
+    "toc": {
+      "key": "2026-07-28T05-49-19-569Z-metal-system-trace-toc",
+      "label": "metal-system-trace-toc",
+      "kind": "xml",
+      "summary": "Metal System Trace TOC export.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-49-19-569Z-metal-system-trace.toc.xml",
+      "relativePath": "traces/2026-07-28T05-49-19-569Z-metal-system-trace.toc.xml",
+      "external": false,
+      "createdAt": "2026-07-28T06:31:13.287Z"
+    },
+    "exports": [
+      {
+        "key": "export-metal-gpu-intervals-9a2dc5786cea537f94a1",
+        "label": "metal-gpu-intervals-export",
+        "kind": "xml",
+        "summary": "metal-gpu-intervals export truncated prefix (17174 rows, 16.0 MiB).",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/export-metal-gpu-intervals-9a2dc5786cea537f94a1.xml",
+        "relativePath": "traces/export-metal-gpu-intervals-9a2dc5786cea537f94a1.xml",
+        "sizeBytes": 16776335,
+        "external": false,
+        "createdAt": "2026-07-28T06:31:20.158Z"
+      },
+      {
+        "key": "export-gpu-counter-value-bfff5f45646ba08c3c1e",
+        "label": "gpu-counter-value-export",
+        "kind": "xml",
+        "summary": "gpu-counter-value export (0 rows, 872 B).",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/export-gpu-counter-value-bfff5f45646ba08c3c1e.xml",
+        "relativePath": "traces/export-gpu-counter-value-bfff5f45646ba08c3c1e.xml",
+        "sizeBytes": 872,
+        "external": false,
+        "createdAt": "2026-07-28T06:31:34.325Z"
+      },
+      {
+        "key": "export-metal-gpu-counter-intervals-6028b626bb1f0852d126",
+        "label": "metal-gpu-counter-intervals-export",
+        "kind": "xml",
+        "summary": "metal-gpu-counter-intervals export (0 rows, 1.5 KiB).",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/export-metal-gpu-counter-intervals-6028b626bb1f0852d126.xml",
+        "relativePath": "traces/export-metal-gpu-counter-intervals-6028b626bb1f0852d126.xml",
+        "sizeBytes": 1538,
+        "external": false,
+        "createdAt": "2026-07-28T06:31:38.456Z"
+      }
+    ]
+  }
+}

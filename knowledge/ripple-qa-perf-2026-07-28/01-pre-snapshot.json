@@ -1,0 +1,140 @@
+{
+  "snapshotId": "@s9",
+  "capturedAt": "2026-07-28T05:43:15.584Z",
+  "previousSnapshotId": "@s8",
+  "statusLabel": "Ripple",
+  "summary": "Captured @s9 with 36 nodes (3 interactive); 25 added, 25 removed, 0 updated (stable); 36 nodes have weak identity; refs may drift; inline interactive preview includes 3 nodes; agentView 3/3 interactive.",
+  "artifact": {
+    "key": "snapshot-s9",
+    "label": "snapshot-@s9",
+    "kind": "json",
+    "summary": "Stable snapshot @s9 with 36 nodes and 3 interactive nodes.",
+    "absolutePath": "/Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7/snapshots/2026-07-28T05-43-15-777Z-s9.json",
+    "relativePath": "snapshots/2026-07-28T05-43-15-777Z-s9.json",
+    "sizeBytes": 60596,
+    "external": false,
+    "createdAt": "2026-07-28T05:43:15.778Z"
+  },
+  "preview": {
+    "kind": "interactive",
+    "totalNodes": 3,
+    "omittedNodes": 0,
+    "nodes": [
+      {
+        "ref": "@e80",
+        "depth": 23,
+        "type": "button",
+        "identifier": null,
+        "label": "View progress and heatmap",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e41",
+        "depth": 23,
+        "type": "button",
+        "identifier": null,
+        "label": "Open settings",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e83",
+        "depth": 23,
+        "type": "button",
+        "identifier": null,
+        "label": "Begin Dusk session",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      }
+    ]
+  },
+  "agentView": {
+    "statusLabel": "Ripple",
+    "interactive": [
+      {
+        "ref": "@e80",
+        "type": "button",
+        "identifier": null,
+        "label": "View progress and heatmap"
+      },
+      {
+        "ref": "@e41",
+        "type": "button",
+        "identifier": null,
+        "label": "Open settings"
+      },
+      {
+        "ref": "@e83",
+        "type": "button",
+        "identifier": null,
+        "label": "Begin Dusk session"
+      }
+    ],
+    "interactiveTotal": 3,
+    "omittedInteractiveCount": 0
+  },
+  "metrics": {
+    "rawNodeCount": 72,
+    "nodeCount": 36,
+    "interactiveNodeCount": 3,
+    "maxDepth": 24,
+    "weakIdentityNodeCount": 36,
+    "preservedRefCount": 11,
+    "newRefCount": 25,
+    "remappedRefCount": 0,
+    "staleRefCount": 25
+  },
+  "diff": {
+    "kind": "changed",
+    "previousSnapshotId": "@s8",
+    "summary": {
+      "added": 25,
+      "removed": 25,
+      "updated": 0,
+      "remapped": 0,
+      "stale": 25
+    },
+    "highlights": [],
+    "staleRefs": [
+      "@e215",
+      "@e216",
+      "@e217",
+      "@e218",
+      "@e219",
+      "@e220",
+      "@e221",
+      "@e222",
+      "@e223",
+      "@e224",
+      "@e225",
+      "@e226",
+      "@e227",
+      "@e228",
+      "@e229",
+      "@e230",
+      "@e231",
+      "@e232",
+      "@e233",
+      "@e234"
+    ],
+    "remappedRefs": []
+  },
+  "warnings": [
+    "36 nodes lack accessibility identifiers and rely on weak identity matching (label/value/frame/structure); their refs may be less durable across dynamic updates."
+  ],
+  "retryCount": 0,
+  "retryReasons": []
+}

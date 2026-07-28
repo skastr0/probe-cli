@@ -1,0 +1,279 @@
+{
+  "snapshotId": "@s1",
+  "capturedAt": "2026-07-28T05:44:00.590Z",
+  "previousSnapshotId": null,
+  "statusLabel": "Ripple",
+  "summary": "Captured @s1 with 57 nodes (8 interactive); initial snapshot; 57 nodes have weak identity; refs may drift; inline interactive preview includes 8 nodes; agentView 8/8 interactive.",
+  "artifact": {
+    "key": "snapshot-s1",
+    "label": "snapshot-@s1",
+    "kind": "json",
+    "summary": "Stable snapshot @s1 with 57 nodes and 8 interactive nodes.",
+    "absolutePath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/snapshots/2026-07-28T05-44-00-812Z-s1.json",
+    "relativePath": "snapshots/2026-07-28T05-44-00-812Z-s1.json",
+    "sizeBytes": 103303,
+    "external": false,
+    "createdAt": "2026-07-28T05:44:00.813Z"
+  },
+  "preview": {
+    "kind": "interactive",
+    "totalNodes": 8,
+    "omittedNodes": 0,
+    "nodes": [
+      {
+        "ref": "@e40",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "BEST VALUE, Yearly, 7 days free, then R$\u00a0299,90/year, R$\u00a024.99, /month",
+        "value": null,
+        "placeholder": null,
+        "state": {
+          "disabled": null,
+          "selected": true,
+          "focused": null
+        },
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e41",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "Monthly, 7 days free, then R$\u00a039,90/month, R$\u00a039,90, /month",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e42",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "Begin My Free Week",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e47",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "Restore purchases",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e48",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "Terms",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e49",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "Privacy",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e50",
+        "depth": 18,
+        "type": "button",
+        "identifier": null,
+        "label": "Support",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      },
+      {
+        "ref": "@e55",
+        "depth": 14,
+        "type": "button",
+        "identifier": null,
+        "label": "Close paywall",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      }
+    ]
+  },
+  "agentView": {
+    "statusLabel": "Ripple",
+    "interactive": [
+      {
+        "ref": "@e40",
+        "type": "button",
+        "identifier": null,
+        "label": "BEST VALUE, Yearly, 7 days free, then R$\u00a0299,90/year, R$\u00a024.99, /month"
+      },
+      {
+        "ref": "@e41",
+        "type": "button",
+        "identifier": null,
+        "label": "Monthly, 7 days free, then R$\u00a039,90/month, R$\u00a039,90, /month"
+      },
+      {
+        "ref": "@e42",
+        "type": "button",
+        "identifier": null,
+        "label": "Begin My Free Week"
+      },
+      {
+        "ref": "@e47",
+        "type": "button",
+        "identifier": null,
+        "label": "Restore purchases"
+      },
+      {
+        "ref": "@e48",
+        "type": "button",
+        "identifier": null,
+        "label": "Terms"
+      },
+      {
+        "ref": "@e49",
+        "type": "button",
+        "identifier": null,
+        "label": "Privacy"
+      },
+      {
+        "ref": "@e50",
+        "type": "button",
+        "identifier": null,
+        "label": "Support"
+      },
+      {
+        "ref": "@e55",
+        "type": "button",
+        "identifier": null,
+        "label": "Close paywall"
+      }
+    ],
+    "interactiveTotal": 8,
+    "omittedInteractiveCount": 0
+  },
+  "metrics": {
+    "rawNodeCount": 114,
+    "nodeCount": 57,
+    "interactiveNodeCount": 8,
+    "maxDepth": 19,
+    "weakIdentityNodeCount": 57,
+    "preservedRefCount": 0,
+    "newRefCount": 57,
+    "remappedRefCount": 0,
+    "staleRefCount": 0
+  },
+  "diff": {
+    "kind": "initial",
+    "previousSnapshotId": null,
+    "summary": {
+      "added": 57,
+      "removed": 0,
+      "updated": 0,
+      "remapped": 0,
+      "stale": 0
+    },
+    "highlights": [
+      {
+        "kind": "added",
+        "ref": "@e40",
+        "description": "Added \"BEST VALUE, Yearly, 7 days free, then R$\u00a0299,90/year, R$\u00a024.99, /month\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e41",
+        "description": "Added \"Monthly, 7 days free, then R$\u00a039,90/month, R$\u00a039,90, /month\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e42",
+        "description": "Added \"Begin My Free Week\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e47",
+        "description": "Added \"Restore purchases\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e48",
+        "description": "Added \"Terms\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e49",
+        "description": "Added \"Privacy\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e50",
+        "description": "Added \"Support\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e55",
+        "description": "Added \"Close paywall\" (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e51",
+        "description": "Added \"Horizontal scroll bar, 1 page\" (other)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e53",
+        "description": "Added \"Horizontal scroll bar, 1 page\" (other)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e1",
+        "description": "Added \"Ripple\" (application)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e23",
+        "description": "Added \"Ripple\" (staticText)."
+      }
+    ],
+    "staleRefs": [],
+    "remappedRefs": []
+  },
+  "warnings": [
+    "57 nodes lack accessibility identifiers and rely on weak identity matching (label/value/frame/structure); their refs may be less durable across dynamic updates."
+  ],
+  "retryCount": 0,
+  "retryReasons": []
+}

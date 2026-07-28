@@ -1,0 +1,27 @@
+{
+  "ok": false,
+  "command": "perf record 07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "error": {
+    "type": "UnsupportedCapabilityError",
+    "message": "The local xctrace installation does not expose the Hangs template required for Hangs.",
+    "details": {
+      "code": "perf-template-unavailable",
+      "category": "unsupported",
+      "reason": "The local xctrace installation does not expose the Hangs template required for Hangs.",
+      "nextStep": "Run `xcrun xctrace list templates`, then choose a supported template or update Xcode.",
+      "details": [],
+      "capability": "perf.record.template.hangs",
+      "contract": null,
+      "expectedVersion": null,
+      "receivedVersion": null,
+      "command": null,
+      "exitCode": null,
+      "sessionId": null,
+      "artifactKey": null,
+      "diagnosticArtifactKey": null,
+      "wall": false,
+      "next_step": "Run `xcrun xctrace list templates`, then choose a supported template or update Xcode.",
+      "retryable": false
+    }
+  }
+}

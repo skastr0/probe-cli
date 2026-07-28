@@ -1,0 +1,313 @@
+{
+  "sessionId": "07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "template": "metal-system-trace",
+  "templateName": "Metal System Trace",
+  "timeLimit": "60s",
+  "recordedAt": "2026-07-28T05:52:38.714Z",
+  "xctraceVersion": "xctrace version 16.0 (17F113)",
+  "session": {
+    "state": "ready",
+    "healthCheck": {
+      "checkedAt": "2026-07-28T05:49:18.129Z",
+      "wrapperRunning": true,
+      "pingRttMs": 127,
+      "lastCommand": "snapshot",
+      "lastOk": true
+    }
+  },
+  "summary": {
+    "headline": "Recorded Metal System Trace in 60s; the TOC advertises 82 schema(s). Call `probe perf analyze` for built-in diagnostics or `probe perf export` for a specific schema.",
+    "metrics": [
+      {
+        "label": "Schemas discovered",
+        "value": "82"
+      },
+      {
+        "label": "Run number",
+        "value": "1"
+      }
+    ]
+  },
+  "diagnoses": [
+    {
+      "code": "perf-target-identity-verified",
+      "severity": "info",
+      "summary": "Target process 1654 identity verified via devicectl-processes immediately before recording (no XCUITest runner ping performed).",
+      "details": [
+        "{\"executable\":\"file:///private/var/containers/Bundle/Application/84E39C97-78D9-43AE-81F6-A98A70502F29/Ripple.app/Ripple\",\"processIdentifier\":1654}"
+      ],
+      "wall": false
+    }
+  ],
+  "schemas": [
+    {
+      "schema": "ca-client-buffer-wait-interval"
+    },
+    {
+      "schema": "ca-client-present-request"
+    },
+    {
+      "schema": "ca-client-presented-handler"
+    },
+    {
+      "schema": "device-display-info"
+    },
+    {
+      "schema": "device-gpu-info"
+    },
+    {
+      "schema": "device-thermal-state-intervals"
+    },
+    {
+      "schema": "display-compositor-events-interval"
+    },
+    {
+      "schema": "display-compositor-interval"
+    },
+    {
+      "schema": "display-events-interval"
+    },
+    {
+      "schema": "display-surface-queue"
+    },
+    {
+      "schema": "display-surface-swap"
+    },
+    {
+      "schema": "display-vsyncs-interval"
+    },
+    {
+      "schema": "displayed-surfaces-interval"
+    },
+    {
+      "schema": "displayed-surfaces-per-second"
+    },
+    {
+      "schema": "dyld-library-load"
+    },
+    {
+      "schema": "gpu-aps-stream"
+    },
+    {
+      "schema": "gpu-counter-info"
+    },
+    {
+      "schema": "gpu-counter-value"
+    },
+    {
+      "schema": "gpu-performance-device-state-intervals"
+    },
+    {
+      "schema": "gpu-performance-state-info"
+    },
+    {
+      "schema": "gpu-performance-state-intervals"
+    },
+    {
+      "schema": "gpu-shader-profiler-interval"
+    },
+    {
+      "schema": "gpu-shader-profiler-sample"
+    },
+    {
+      "schema": "graphics-compiler-activity-intervals"
+    },
+    {
+      "schema": "graphics-compiler-spill-events"
+    },
+    {
+      "schema": "hang-risks"
+    },
+    {
+      "schema": "kdebug"
+    },
+    {
+      "schema": "kdebug-strings"
+    },
+    {
+      "schema": "life-cycle-period"
+    },
+    {
+      "schema": "metal-application-command-buffer-submissions"
+    },
+    {
+      "schema": "metal-application-encoders-list"
+    },
+    {
+      "schema": "metal-application-event-interval"
+    },
+    {
+      "schema": "metal-application-intervals"
+    },
+    {
+      "schema": "metal-ar-events"
+    },
+    {
+      "schema": "metal-command-buffer-completed"
+    },
+    {
+      "schema": "metal-command-buffer-error"
+    },
+    {
+      "schema": "metal-command-buffer-frame-assignment"
+    },
+    {
+      "schema": "metal-command-buffer-to-accelerator-id"
+    },
+    {
+      "schema": "metal-current-allocated-size"
+    },
+    {
+      "schema": "metal-driver-event-intervals"
+    },
+    {
+      "schema": "metal-driver-event-per-thread-intervals"
+    },
+    {
+      "schema": "metal-driver-intervals"
+    },
+    {
+      "schema": "metal-gpu-counter-intervals"
+    },
+    {
+      "schema": "metal-gpu-counter-profile"
+    },
+    {
+      "schema": "metal-gpu-execution-points"
+    },
+    {
+      "schema": "metal-gpu-info"
+    },
+    {
+      "schema": "metal-gpu-intervals"
+    },
+    {
+      "schema": "metal-gpu-state-intervals"
+    },
+    {
+      "schema": "metal-gpu-submission-to-command-buffer-id"
+    },
+    {
+      "schema": "metal-io-surface-access"
+    },
+    {
+      "schema": "metal-kernel-resource-allocations"
+    },
+    {
+      "schema": "metal-known-compositor-process"
+    },
+    {
+      "schema": "metal-object-dependency-chain-app"
+    },
+    {
+      "schema": "metal-object-dependency-chain-display"
+    },
+    {
+      "schema": "metal-object-dependency-chain-driver"
+    },
+    {
+      "schema": "metal-object-dependency-chain-gpu"
+    },
+    {
+      "schema": "metal-object-label"
+    },
+    {
+      "schema": "metal-residency-set-interval"
+    },
+    {
+      "schema": "metal-residency-set-resource-event"
+    },
+    {
+      "schema": "metal-residency-set-usage-event"
+    },
+    {
+      "schema": "metal-resource-allocations"
+    },
+    {
+      "schema": "metal-shader-profiler-intervals"
+    },
+    {
+      "schema": "metal-shader-profiler-shader-list"
+    },
+    {
+      "schema": "metal-visual-highlight-chain-app"
+    },
+    {
+      "schema": "metal-visual-highlight-chain-display"
+    },
+    {
+      "schema": "metal-visual-highlight-chain-driver"
+    },
+    {
+      "schema": "metal-visual-highlight-chain-gpu"
+    },
+    {
+      "schema": "metal-wired-sysmem-level-interval"
+    },
+    {
+      "schema": "mps-hw-intervals"
+    },
+    {
+      "schema": "os-log"
+    },
+    {
+      "schema": "os-signpost"
+    },
+    {
+      "schema": "os-signpost-arg"
+    },
+    {
+      "schema": "potential-hangs"
+    },
+    {
+      "schema": "process-info"
+    },
+    {
+      "schema": "runloop-events"
+    },
+    {
+      "schema": "thread-info"
+    },
+    {
+      "schema": "tick"
+    },
+    {
+      "schema": "time-info"
+    },
+    {
+      "schema": "time-profile"
+    },
+    {
+      "schema": "time-sample"
+    },
+    {
+      "schema": "visual-chain"
+    },
+    {
+      "schema": "visual-connection"
+    }
+  ],
+  "artifacts": {
+    "trace": {
+      "key": "2026-07-28T05-49-19-569Z-metal-system-trace-trace",
+      "label": "metal-system-trace-trace",
+      "kind": "directory",
+      "summary": "Metal System Trace raw .trace bundle.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-49-19-569Z-metal-system-trace.trace",
+      "relativePath": "traces/2026-07-28T05-49-19-569Z-metal-system-trace.trace",
+      "external": false,
+      "createdAt": "2026-07-28T05:52:33.587Z"
+    },
+    "toc": {
+      "key": "2026-07-28T05-49-19-569Z-metal-system-trace-toc",
+      "label": "metal-system-trace-toc",
+      "kind": "xml",
+      "summary": "Metal System Trace TOC export.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-49-19-569Z-metal-system-trace.toc.xml",
+      "relativePath": "traces/2026-07-28T05-49-19-569Z-metal-system-trace.toc.xml",
+      "sizeBytes": 21165,
+      "external": false,
+      "createdAt": "2026-07-28T05:52:38.713Z"
+    }
+  }
+}

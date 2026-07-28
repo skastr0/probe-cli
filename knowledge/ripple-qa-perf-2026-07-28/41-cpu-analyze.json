@@ -1,0 +1,30 @@
+{
+  "ok": false,
+  "command": "perf analyze 07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "error": {
+    "type": "EnvironmentError",
+    "message": "time-sample export for time-sample exceeded Probe's current 4.0 MiB budget.",
+    "details": {
+      "code": "perf-export-size-budget",
+      "category": "environment",
+      "reason": "time-sample export for time-sample exceeded Probe's current 4.0 MiB budget.",
+      "nextStep": "Reduce --time-limit, prefer a narrower recording window, or inspect the saved .trace and TOC artifacts directly.",
+      "retryable": true,
+      "details": [
+        "schema: time-sample",
+        "observed: 4.0 MiB"
+      ],
+      "capability": null,
+      "contract": null,
+      "expectedVersion": null,
+      "receivedVersion": null,
+      "command": null,
+      "exitCode": null,
+      "sessionId": null,
+      "artifactKey": null,
+      "diagnosticArtifactKey": null,
+      "wall": false,
+      "next_step": "Reduce --time-limit, prefer a narrower recording window, or inspect the saved .trace and TOC artifacts directly."
+    }
+  }
+}

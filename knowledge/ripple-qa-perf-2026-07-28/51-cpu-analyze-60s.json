@@ -1,0 +1,121 @@
+{
+  "sessionId": "07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "artifactKey": "2026-07-28T05-52-40-123Z-time-profiler-trace",
+  "analyzer": "time-profiler",
+  "analyzedAt": "2026-07-28T06:31:42.546Z",
+  "xctraceVersion": "xctrace version 16.0 (17F113)",
+  "summary": {
+    "headline": "Collected 36400 CPU samples across 18 threads; hottest leaf 0x1e51f8df8 (997 samples).",
+    "metrics": [
+      {
+        "label": "Samples",
+        "value": "36400"
+      },
+      {
+        "label": "Threads",
+        "value": "18"
+      },
+      {
+        "label": "Observed cores",
+        "value": "6"
+      },
+      {
+        "label": "States",
+        "value": "Running (36366), Blocked (34)"
+      },
+      {
+        "label": "Sample kinds",
+        "value": "Timer Fired (36362), Stackshot (38)"
+      },
+      {
+        "label": "Sample window",
+        "value": "60.82 s"
+      },
+      {
+        "label": "Main thread share",
+        "value": "23.5%"
+      },
+      {
+        "label": "Top leaf PCs",
+        "value": "0x1e51f8df8×997, 0x1027b02ec×781, 0x1fb0888b8×746, 0x1027b0214×690, 0x1b07ca950×689"
+      },
+      {
+        "label": "Top threads",
+        "value": "Main Thread×8550, Ripple×5182, Ripple×5024, Ripple×4909, Ripple×4430"
+      },
+      {
+        "label": "Stacks attributed",
+        "value": "36120"
+      }
+    ]
+  },
+  "diagnoses": [
+    {
+      "code": "perf-export-truncated",
+      "severity": "warning",
+      "summary": "Analysis used a budget-capped prefix of time-sample (36400 rows, 12.0 MiB).",
+      "details": [
+        "Budget: 50000 rows / 12.0 MiB.",
+        "Metrics describe the exported prefix only, not necessarily the full recording window.",
+        "Re-record with a shorter --time-limit for full-window coverage under budget, or open the .trace in Instruments for the full capture."
+      ],
+      "wall": false
+    },
+    {
+      "code": "time-profiler-top-leaves",
+      "severity": "info",
+      "summary": "Top leaf callstack PCs: 0x1e51f8df8 (997), 0x1027b02ec (781), 0x1fb0888b8 (746), 0x1027b0214 (690), 0x1b07ca950 (689).",
+      "details": [
+        "These are unsymbolicated program counters from cp-user-callstack (or kernel fallback).",
+        "Symbolicate with atos/dsymutil against the matching app binary for function names, or open the .trace in Instruments.",
+        "Leaf PC heat is still enough to diff before/after and spot regressions."
+      ],
+      "wall": false
+    },
+    {
+      "code": "time-profiler-symbolication-note",
+      "severity": "info",
+      "summary": "Leaf callstack PCs are interpreted; human-readable symbol names still need binary symbolication.",
+      "details": [
+        "Probe does not yet run atos against the target .app/dSYM automatically.",
+        "Pass the matching binary to atos, or open the .trace in Instruments for symbolicated heavy stacks."
+      ],
+      "wall": false
+    }
+  ],
+  "artifacts": {
+    "trace": {
+      "key": "2026-07-28T05-52-40-123Z-time-profiler-trace",
+      "label": "time-profiler-trace",
+      "kind": "directory",
+      "summary": "Time Profiler raw .trace bundle.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-52-40-123Z-time-profiler.trace",
+      "relativePath": "traces/2026-07-28T05-52-40-123Z-time-profiler.trace",
+      "external": false,
+      "createdAt": "2026-07-28T06:31:13.287Z"
+    },
+    "toc": {
+      "key": "2026-07-28T05-52-40-123Z-time-profiler-toc",
+      "label": "time-profiler-toc",
+      "kind": "xml",
+      "summary": "Time Profiler TOC export.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-52-40-123Z-time-profiler.toc.xml",
+      "relativePath": "traces/2026-07-28T05-52-40-123Z-time-profiler.toc.xml",
+      "external": false,
+      "createdAt": "2026-07-28T06:31:13.287Z"
+    },
+    "exports": [
+      {
+        "key": "export-time-sample-2f9ad7fc0ecfa5b3f128",
+        "label": "time-sample-export",
+        "kind": "xml",
+        "summary": "time-sample export truncated prefix (36400 rows, 12.0 MiB).",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/export-time-sample-2f9ad7fc0ecfa5b3f128.xml",
+        "relativePath": "traces/export-time-sample-2f9ad7fc0ecfa5b3f128.xml",
+        "sizeBytes": 12582776,
+        "external": false,
+        "createdAt": "2026-07-28T06:31:41.974Z"
+      }
+    ]
+  }
+}

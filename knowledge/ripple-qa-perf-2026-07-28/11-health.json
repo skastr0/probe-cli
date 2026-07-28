@@ -1,0 +1,222 @@
+{
+  "sessionId": "518158ce-4edd-40f5-8859-16a66d99dd8c",
+  "state": "ready",
+  "openedAt": "2026-07-28T05:43:53.598Z",
+  "updatedAt": "2026-07-28T05:44:00.243Z",
+  "expiresAt": "2026-07-28T05:59:00.243Z",
+  "artifactRoot": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c",
+  "target": {
+    "platform": "device",
+    "bundleId": "com.skastr0.ripple",
+    "deviceId": "00008110-0006293936C0401E",
+    "deviceName": "iPhone (2)",
+    "runtime": null
+  },
+  "connection": {
+    "status": "connected",
+    "checkedAt": "2026-07-28T05:44:00.086Z",
+    "summary": "CoreDevice can currently see iPhone (2) (00008110-0006293936C0401E).",
+    "details": [
+      "device runtime: unknown"
+    ]
+  },
+  "resources": {
+    "runner": "ready",
+    "debugger": "not-requested",
+    "logs": "not-requested",
+    "trace": "not-requested"
+  },
+  "capabilities": [
+    {
+      "area": "simulator",
+      "status": "unsupported",
+      "summary": "This session targets a real device, so simulator-only boot/install helpers are not part of its contract.",
+      "details": [
+        "Retry on a simulator target if you need simulator log capture or fixture build/install helpers."
+      ]
+    },
+    {
+      "area": "real-device",
+      "status": "supported",
+      "summary": "Probe opened a live real-device runner session through explicit devicectl, signing, and XCUITest transport validation.",
+      "details": [
+        "device runtime: unknown",
+        "xcrun devicectl list preferredDDI --json-output <path>",
+        "xcrun devicectl list devices --json-output <path>",
+        "xcrun devicectl device info ddiServices --device 00008110-0006293936C0401E --json-output <path>",
+        "xcrun devicectl device info apps --device 00008110-0006293936C0401E --bundle-id com.skastr0.ripple --json-output <path>",
+        "xcrun devicectl device process launch --device 00008110-0006293936C0401E --terminate-existing com.skastr0.ripple --json-output <path>",
+        "xcodebuild build-for-testing -destination generic/platform=iOS -allowProvisioningUpdates -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM=4452968868",
+        "xcodebuild test-without-building -destination platform=iOS,id=<udid> DEVELOPMENT_TEAM=4452968868"
+      ]
+    },
+    {
+      "area": "runner",
+      "status": "supported",
+      "summary": "The real-device runner is live over a device-specific bootstrap-manifest + HTTP POST + stdout-ready transport.",
+      "details": [
+        "Command ingress uses the runner-local HTTP listener reported in the ready frame.",
+        "Ready-state events are still parsed from stdout JSONL frames embedded in the mixed xcodebuild/XCTest log stream.",
+        "Runner feature flags such as uiAction and uiActionBatch are reported under session health runner details."
+      ]
+    },
+    {
+      "area": "perf",
+      "status": "supported",
+      "summary": "Perf recording can attach xctrace to the live real-device target pid exposed by the runner session.",
+      "details": [
+        "Real-device xctrace recording still depends on the live runner pid and connected-device availability."
+      ]
+    },
+    {
+      "area": "logs",
+      "status": "degraded",
+      "summary": "Real-device sessions expose build + runner boundary artifacts, but there is no long-lived device unified-log collector yet.",
+      "details": [
+        "You can inspect the saved xcodebuild-session, wrapper stderr, stdout-event, and preflight artifacts through session logs or artifact drill.",
+        "Real-device live unified logging remains an explicit later seam."
+      ]
+    },
+    {
+      "area": "debug",
+      "status": "unsupported",
+      "summary": "Device-session LLDB attach is still outside the verified contract for this slice.",
+      "details": [
+        "The only verified persistent debugger path today is the external host-process bridge."
+      ]
+    }
+  ],
+  "warnings": {
+    "total": 4,
+    "shown": [
+      "Real-device runner control uses the honest XCUITest boundary seam for device sessions: bootstrap manifest plus HTTP POST ingress plus stdout-framed mixed-log ready egress.",
+      "Device reconnects are surfaced explicitly in session health; Probe does not claim transparent recovery of real-device runner state.",
+      "runner build cache hit (key 94a65926235b551cf8b8d6c7).",
+      "Session cleanup is daemon-owned; close/session shutdown tears down the runner wrapper process group and removes the bootstrap manifest."
+    ],
+    "omitted": 0,
+    "drill": null
+  },
+  "artifacts": {
+    "total": 17,
+    "shown": [
+      {
+        "key": "session-manifest",
+        "label": "session-manifest",
+        "kind": "json",
+        "summary": "Latest persisted session state snapshot.",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/meta/session-manifest.json",
+        "relativePath": "meta/session-manifest.json",
+        "sizeBytes": 341,
+        "external": false,
+        "createdAt": "2026-07-28T05:43:53.601Z"
+      },
+      {
+        "key": "device-preflight-report",
+        "label": "device-preflight-report",
+        "kind": "json",
+        "summary": "Real-device preflight summary including DDI, device discovery, and signing checks.",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/meta/real-device-preflight.json",
+        "relativePath": "meta/real-device-preflight.json",
+        "sizeBytes": 2692,
+        "external": false,
+        "createdAt": "2026-07-28T05:43:59.786Z"
+      },
+      {
+        "key": "preferred-ddi",
+        "label": "preferred-ddi",
+        "kind": "json",
+        "summary": "Raw devicectl preferred DDI JSON captured during real-device preflight.",
+        "absolutePath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/meta/preferred-ddi.json",
+        "relativePath": "meta/preferred-ddi.json",
+        "sizeBytes": 7234,
+        "external": false,
+        "createdAt": "2026-07-28T05:43:59.786Z"
+      }
+    ],
+    "omitted": 14,
+    "drill": {
+      "contractVersion": 1,
+      "sessionId": "518158ce-4edd-40f5-8859-16a66d99dd8c",
+      "artifactKey": "derived-2026-07-28T05-44-00-245Z-session-artifacts-overflow.json",
+      "query": {
+        "kind": "collection",
+        "offset": 0,
+        "limit": 200
+      }
+    }
+  },
+  "transport": {
+    "kind": "real-device-live",
+    "contract": "probe.runner.transport/hybrid-v1",
+    "bootstrapSource": "device-bootstrap-manifest",
+    "bootstrapPath": "env:PROBE_BOOTSTRAP_JSON",
+    "sessionIdentifier": "518158ce-4edd-40f5-8859-16a66d99dd8c",
+    "commandIngress": "http-post",
+    "eventEgress": "stdout-jsonl-mixed-log",
+    "stdinProbeStatus": "not-required-http",
+    "note": "The current real-device slice uses a device bootstrap manifest plus runner-local HTTP ingress, while stdout remains the canonical ready-frame observation seam and diagnostics stream."
+  },
+  "runner": {
+    "kind": "real-device-live",
+    "wrapperProcessId": 88310,
+    "testProcessId": 1650,
+    "targetProcessId": 1648,
+    "attachLatencyMs": 0,
+    "runtimeControlDirectory": "/private/var/mobile/Containers/Data/Application/CE5C92BC-3590-4F34-ADA0-EC70614B2921/tmp/probe-runtime-518158ce-4edd-40f5-8859-16a66d99dd8c",
+    "observerControlDirectory": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/runner/observer-control",
+    "logPath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/logs/device-live/xcodebuild-session.log",
+    "buildLogPath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/logs/device-preflight/xcodebuild-build-for-testing-device.log",
+    "stdoutEventsPath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/runner/stdout-events.ndjson",
+    "resultBundlePath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/runner/ProbeRunnerTransportBoundary.xcresult",
+    "wrapperStderrPath": "/Users/guilhermecastro/.probe/sessions/518158ce-4edd-40f5-8859-16a66d99dd8c/logs/device-live/runner-wrapper.stderr.log",
+    "stdinProbeStatus": "not-required-http",
+    "connectionStatus": "connected",
+    "lastCheckedAt": "2026-07-28T05:44:00.086Z",
+    "note": "The real-device runner is live over HTTP POST command ingress with stdout-JSONL mixed-log observation for readiness and diagnostics.",
+    "capabilities": [
+      "uiAction",
+      "uiActionBatch"
+    ],
+    "runnerBuildCache": {
+      "status": "hit",
+      "key": "94a65926235b551cf8b8d6c7",
+      "invalidationReason": null,
+      "signingIdentity": "Apple Development: Guilherme Silva (3WQ8B23QHR)",
+      "profileIdentity": "c8ee2a40-192e-433d-9d81-8793ec251ba1",
+      "profileExpiresAt": "2027-04-14T18:33:55.000Z"
+    }
+  },
+  "healthCheck": {
+    "checkedAt": "2026-07-28T05:44:00.243Z",
+    "wrapperRunning": true,
+    "pingRttMs": 157,
+    "lastCommand": "ping",
+    "lastOk": true
+  },
+  "debugger": {
+    "attachState": "not-attached",
+    "targetScope": null,
+    "bridgePid": null,
+    "bridgeStartedAt": null,
+    "bridgeExitedAt": null,
+    "pythonExecutable": null,
+    "lldbPythonPath": null,
+    "lldbVersion": null,
+    "attachedPid": null,
+    "processState": null,
+    "stopId": null,
+    "stopReason": null,
+    "stopDescription": null,
+    "lastCommand": null,
+    "lastCommandOk": null,
+    "lastUpdatedAt": null,
+    "frameLogArtifactKey": null,
+    "stderrArtifactKey": null
+  },
+  "coordination": {
+    "runnerActionsBlocked": false,
+    "runnerActionPolicy": "normal",
+    "reason": null
+  }
+}

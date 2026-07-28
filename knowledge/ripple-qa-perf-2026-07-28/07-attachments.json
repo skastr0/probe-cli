@@ -1,0 +1,29 @@
+{
+  "ok": false,
+  "command": "session result attachments",
+  "error": {
+    "type": "ChildProcessError",
+    "message": "Error: Failed to create a new result bundle reader, underlying error: Info.plist at /Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7/runner/ProbeRunnerTransportBoundary.xcresult/Info.plist does not exist, the result bundle might be corrupted or the provided path is not a result bundle | Usage: xcresulttool <subcommand> |   See 'xcresulttool --help' for more information.",
+    "details": {
+      "code": "xcresult-attachments-export",
+      "category": "child-process",
+      "reason": "Error: Failed to create a new result bundle reader, underlying error: Info.plist at /Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7/runner/ProbeRunnerTransportBoundary.xcresult/Info.plist does not exist, the result bundle might be corrupted or the provided path is not a result bundle | Usage: xcresulttool <subcommand> |   See 'xcresulttool --help' for more information.",
+      "nextStep": "Inspect the result bundle attachments and retry the drill request.",
+      "retryable": true,
+      "details": [
+        "Error: Failed to create a new result bundle reader, underlying error: Info.plist at /Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7/runner/ProbeRunnerTransportBoundary.xcresult/Info.plist does not exist, the result bundle might be corrupted or the provided path is not a result bundle | Usage: xcresulttool <subcommand> |   See 'xcresulttool --help' for more information."
+      ],
+      "capability": null,
+      "contract": null,
+      "expectedVersion": null,
+      "receivedVersion": null,
+      "command": "/usr/bin/xcrun xcresulttool export attachments --path /Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7/runner/ProbeRunnerTransportBoundary.xcresult --output-path /var/folders/f5/yx3b1gkj4fz_8wc5mjk3pl180000gn/T/probe-xcresult-attachments-74kBMR",
+      "exitCode": 64,
+      "sessionId": null,
+      "artifactKey": null,
+      "diagnosticArtifactKey": null,
+      "wall": false,
+      "next_step": "Inspect the result bundle attachments and retry the drill request."
+    }
+  }
+}

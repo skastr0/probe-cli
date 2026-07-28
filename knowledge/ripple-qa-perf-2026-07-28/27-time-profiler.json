@@ -1,0 +1,136 @@
+{
+  "sessionId": "07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "template": "time-profiler",
+  "templateName": "Time Profiler",
+  "timeLimit": "60s",
+  "recordedAt": "2026-07-28T05:48:40.281Z",
+  "xctraceVersion": "xctrace version 16.0 (17F113)",
+  "session": {
+    "state": "ready",
+    "healthCheck": {
+      "checkedAt": "2026-07-28T05:45:40.692Z",
+      "wrapperRunning": true,
+      "pingRttMs": 124,
+      "lastCommand": "ping",
+      "lastOk": true
+    }
+  },
+  "summary": {
+    "headline": "Recorded Time Profiler in 60s; the TOC advertises 23 schema(s). Call `probe perf analyze` for built-in diagnostics or `probe perf export` for a specific schema.",
+    "metrics": [
+      {
+        "label": "Schemas discovered",
+        "value": "23"
+      },
+      {
+        "label": "Run number",
+        "value": "1"
+      }
+    ]
+  },
+  "diagnoses": [
+    {
+      "code": "perf-target-identity-verified",
+      "severity": "info",
+      "summary": "Target process 1654 identity verified via devicectl-processes immediately before recording (no XCUITest runner ping performed).",
+      "details": [
+        "{\"executable\":\"file:///private/var/containers/Bundle/Application/84E39C97-78D9-43AE-81F6-A98A70502F29/Ripple.app/Ripple\",\"processIdentifier\":1654}"
+      ],
+      "wall": false
+    }
+  ],
+  "schemas": [
+    {
+      "schema": "device-thermal-state-intervals"
+    },
+    {
+      "schema": "dyld-library-load"
+    },
+    {
+      "schema": "gcd-perf-event"
+    },
+    {
+      "schema": "global-poi-layout"
+    },
+    {
+      "schema": "global-roi-layout"
+    },
+    {
+      "schema": "hang-risks"
+    },
+    {
+      "schema": "kdebug"
+    },
+    {
+      "schema": "kdebug-signpost"
+    },
+    {
+      "schema": "kdebug-strings"
+    },
+    {
+      "schema": "life-cycle-period"
+    },
+    {
+      "schema": "os-log"
+    },
+    {
+      "schema": "os-log-arg"
+    },
+    {
+      "schema": "os-signpost"
+    },
+    {
+      "schema": "os-signpost-arg"
+    },
+    {
+      "schema": "potential-hangs"
+    },
+    {
+      "schema": "process-info"
+    },
+    {
+      "schema": "region-of-interest"
+    },
+    {
+      "schema": "roi-metadata"
+    },
+    {
+      "schema": "runloop-events"
+    },
+    {
+      "schema": "thread-info"
+    },
+    {
+      "schema": "tick"
+    },
+    {
+      "schema": "time-profile"
+    },
+    {
+      "schema": "time-sample"
+    }
+  ],
+  "artifacts": {
+    "trace": {
+      "key": "2026-07-28T05-47-29-423Z-time-profiler-trace",
+      "label": "time-profiler-trace",
+      "kind": "directory",
+      "summary": "Time Profiler raw .trace bundle.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-47-29-423Z-time-profiler.trace",
+      "relativePath": "traces/2026-07-28T05-47-29-423Z-time-profiler.trace",
+      "external": false,
+      "createdAt": "2026-07-28T05:48:38.329Z"
+    },
+    "toc": {
+      "key": "2026-07-28T05-47-29-423Z-time-profiler-toc",
+      "label": "time-profiler-toc",
+      "kind": "xml",
+      "summary": "Time Profiler TOC export.",
+      "absolutePath": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-47-29-423Z-time-profiler.toc.xml",
+      "relativePath": "traces/2026-07-28T05-47-29-423Z-time-profiler.toc.xml",
+      "sizeBytes": 8531,
+      "external": false,
+      "createdAt": "2026-07-28T05:48:40.275Z"
+    }
+  }
+}

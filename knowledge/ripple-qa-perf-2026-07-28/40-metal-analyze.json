@@ -1,0 +1,22 @@
+{
+  "code": "perf-export-size-budget",
+  "category": "environment",
+  "reason": "metal-gpu-intervals export for metal-gpu-intervals exceeded Probe's current 8.0 MiB budget.",
+  "nextStep": "Reduce --time-limit, prefer a narrower recording window, or inspect the saved .trace and TOC artifacts directly.",
+  "retryable": true,
+  "details": [
+    "schema: metal-gpu-intervals",
+    "observed: 8.0 MiB"
+  ],
+  "capability": null,
+  "contract": null,
+  "expectedVersion": null,
+  "receivedVersion": null,
+  "command": null,
+  "exitCode": null,
+  "sessionId": null,
+  "artifactKey": null,
+  "diagnosticArtifactKey": null,
+  "wall": false,
+  "next_step": "Reduce --time-limit, prefer a narrower recording window, or inspect the saved .trace and TOC artifacts directly."
+}

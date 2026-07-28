@@ -1,0 +1,30 @@
+{
+  "summary": "Executed tap via runner-direct selector label=\"Begin Dusk session\", type=button.",
+  "action": "tap",
+  "matchedRef": null,
+  "resolvedBy": "semantic",
+  "statusLabel": "Ripple",
+  "latestSnapshotId": "@s9",
+  "artifact": null,
+  "recordingLength": 2,
+  "retryCount": 0,
+  "retryReasons": [],
+  "verdict": null,
+  "waitedMs": null,
+  "polledCount": null,
+  "handledMs": 1521,
+  "resolutionMs": 216,
+  "waitMs": 556,
+  "interactionMs": 747,
+  "finalizationMs": 0,
+  "hostRttMs": 1531,
+  "evidence": {
+    "requested": {
+      "success": "none",
+      "failure": "snapshot"
+    },
+    "captures": [],
+    "evidenceMs": 0
+  },
+  "uiDelta": null
+}

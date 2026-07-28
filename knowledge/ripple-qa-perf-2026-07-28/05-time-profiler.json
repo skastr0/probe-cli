@@ -1,0 +1,27 @@
+{
+  "ok": false,
+  "command": "perf record 5d146809-1643-4af1-9436-dc47073aa8d7",
+  "error": {
+    "type": "EnvironmentError",
+    "message": "Target process 1641 on device 00008110-0006293936C0401E could not be verified alive immediately before recording. devicectl reported no running process with pid 1641 on device 00008110-0006293936C0401E.",
+    "details": {
+      "code": "perf-target-process-not-found",
+      "category": "environment",
+      "reason": "Target process 1641 on device 00008110-0006293936C0401E could not be verified alive immediately before recording. devicectl reported no running process with pid 1641 on device 00008110-0006293936C0401E.",
+      "nextStep": "The target app may have exited, crashed, or its pid may have been reused by an unrelated process. Reopen the session and retry the profiling command.",
+      "retryable": true,
+      "details": [],
+      "capability": null,
+      "contract": null,
+      "expectedVersion": null,
+      "receivedVersion": null,
+      "command": null,
+      "exitCode": null,
+      "sessionId": null,
+      "artifactKey": null,
+      "diagnosticArtifactKey": null,
+      "wall": false,
+      "next_step": "The target app may have exited, crashed, or its pid may have been reused by an unrelated process. Reopen the session and retry the profiling command."
+    }
+  }
+}

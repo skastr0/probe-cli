@@ -1,0 +1,35 @@
+{
+  "kind": "changed",
+  "previousSnapshotId": "@s6",
+  "summary": {
+    "added": 23,
+    "removed": 23,
+    "updated": 0,
+    "remapped": 0,
+    "stale": 23
+  },
+  "highlights": [],
+  "staleRefs": [
+    "@e144",
+    "@e145",
+    "@e146",
+    "@e147",
+    "@e148",
+    "@e150",
+    "@e151",
+    "@e152",
+    "@e153",
+    "@e154",
+    "@e155",
+    "@e156",
+    "@e157",
+    "@e158",
+    "@e159",
+    "@e160",
+    "@e161",
+    "@e162",
+    "@e163",
+    "@e171"
+  ],
+  "remappedRefs": []
+}

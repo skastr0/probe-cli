@@ -1,0 +1,30 @@
+{
+  "summary": "Executed tap via runner-direct selector label=\"Start free trial for Dusk\", type=button.",
+  "action": "tap",
+  "matchedRef": null,
+  "resolvedBy": "semantic",
+  "statusLabel": "Ripple",
+  "latestSnapshotId": "@s2",
+  "artifact": null,
+  "recordingLength": 2,
+  "retryCount": 0,
+  "retryReasons": [],
+  "verdict": null,
+  "waitedMs": null,
+  "polledCount": null,
+  "handledMs": 6868,
+  "resolutionMs": 247,
+  "waitMs": 5872,
+  "interactionMs": 747,
+  "finalizationMs": 0,
+  "hostRttMs": 6886,
+  "evidence": {
+    "requested": {
+      "success": "none",
+      "failure": "snapshot"
+    },
+    "captures": [],
+    "evidenceMs": 0
+  },
+  "uiDelta": null
+}

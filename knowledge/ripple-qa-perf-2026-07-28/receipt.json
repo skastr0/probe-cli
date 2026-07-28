@@ -1,0 +1,39 @@
+{
+  "sid": "5d146809-1643-4af1-9436-dc47073aa8d7",
+  "startedAt": "2026-07-28T05:43:15Z",
+  "steps": [
+    {
+      "pre_labels": [
+        "View progress and heatmap",
+        "Open settings",
+        "Begin Dusk session"
+      ]
+    },
+    {
+      "begin_tap": "Executed tap via runner-direct selector label=\"Begin Dusk session\", type=button.",
+      "ok": true
+    },
+    {
+      "mid_status": "Ripple",
+      "mid_labels": [
+        "Stop Dusk session"
+      ]
+    },
+    {
+      "metal": {
+        "rc": 1,
+        "elapsed_s": 0.517549991607666,
+        "summary": null
+      }
+    },
+    {
+      "time_profiler": {
+        "rc": 1,
+        "elapsed_s": 0.5637052059173584,
+        "summary": null
+      }
+    }
+  ],
+  "finishedAt": "2026-07-28T05:43:23Z",
+  "artifactRoot": "/Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7"
+}

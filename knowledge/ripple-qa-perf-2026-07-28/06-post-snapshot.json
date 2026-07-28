@@ -1,0 +1,129 @@
+{
+  "snapshotId": "@s11",
+  "capturedAt": "2026-07-28T05:43:22.370Z",
+  "previousSnapshotId": "@s10",
+  "statusLabel": "Ripple",
+  "summary": "Captured @s11 with 34 nodes (1 interactive); 29 added, 29 removed, 1 updated (1 refs weakly remapped); 1 weakly remapped; consider adding accessibility identifiers; inline interactive preview includes 1 nodes; agentView 1/1 interactive.",
+  "artifact": {
+    "key": "snapshot-s11",
+    "label": "snapshot-@s11",
+    "kind": "json",
+    "summary": "Stable snapshot @s11 with 34 nodes and 1 interactive nodes.",
+    "absolutePath": "/Users/guilhermecastro/.probe/sessions/5d146809-1643-4af1-9436-dc47073aa8d7/snapshots/2026-07-28T05-43-22-517Z-s11.json",
+    "relativePath": "snapshots/2026-07-28T05-43-22-517Z-s11.json",
+    "sizeBytes": 55632,
+    "external": false,
+    "createdAt": "2026-07-28T05:43:22.518Z"
+  },
+  "preview": {
+    "kind": "interactive",
+    "totalNodes": 1,
+    "omittedNodes": 0,
+    "nodes": [
+      {
+        "ref": "@e289",
+        "depth": 21,
+        "type": "button",
+        "identifier": null,
+        "label": "Stop Dusk session",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Ripple",
+        "childCount": null
+      }
+    ]
+  },
+  "agentView": {
+    "statusLabel": "Ripple",
+    "interactive": [
+      {
+        "ref": "@e289",
+        "type": "button",
+        "identifier": null,
+        "label": "Stop Dusk session"
+      }
+    ],
+    "interactiveTotal": 1,
+    "omittedInteractiveCount": 0
+  },
+  "metrics": {
+    "rawNodeCount": 68,
+    "nodeCount": 34,
+    "interactiveNodeCount": 1,
+    "maxDepth": 23,
+    "weakIdentityNodeCount": 34,
+    "preservedRefCount": 4,
+    "newRefCount": 29,
+    "remappedRefCount": 1,
+    "staleRefCount": 29
+  },
+  "diff": {
+    "kind": "changed",
+    "previousSnapshotId": "@s10",
+    "summary": {
+      "added": 29,
+      "removed": 29,
+      "updated": 1,
+      "remapped": 1,
+      "stale": 29
+    },
+    "highlights": [
+      {
+        "kind": "added",
+        "ref": "@e318",
+        "description": "Added \"4:55\" (staticText)."
+      },
+      {
+        "kind": "removed",
+        "ref": "@e288",
+        "description": "Removed \"4:57\" (staticText)."
+      },
+      {
+        "kind": "updated",
+        "ref": "@e23",
+        "description": "Updated \"4:55\" (staticText): label, frame."
+      },
+      {
+        "kind": "remapped",
+        "ref": "@e23",
+        "description": "@e23 was remapped to \"4:55\" (staticText) using weak structural matching."
+      }
+    ],
+    "staleRefs": [
+      "@e265",
+      "@e266",
+      "@e267",
+      "@e268",
+      "@e269",
+      "@e63",
+      "@e270",
+      "@e271",
+      "@e272",
+      "@e273",
+      "@e274",
+      "@e275",
+      "@e276",
+      "@e277",
+      "@e278",
+      "@e279",
+      "@e280",
+      "@e281",
+      "@e282",
+      "@e283"
+    ],
+    "remappedRefs": [
+      {
+        "ref": "@e23",
+        "description": "@e23 was remapped to \"4:55\" (staticText) using weak structural matching."
+      }
+    ]
+  },
+  "warnings": [
+    "34 nodes lack accessibility identifiers and rely on weak identity matching (label/value/frame/structure); their refs may be less durable across dynamic updates.",
+    "1 refs were remapped with weak structural matching; add stable accessibility identifiers to make these nodes durable."
+  ],
+  "retryCount": 0,
+  "retryReasons": []
+}

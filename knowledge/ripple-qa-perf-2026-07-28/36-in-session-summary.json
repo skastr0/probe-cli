@@ -1,0 +1,63 @@
+{
+  "sid": "07afc2e8-3509-4dd2-9667-e92fc0f02ad2",
+  "play": "Executed tap via runner-direct selector label=\"Begin Dusk session\", type=button.",
+  "breathing_labels": [
+    "Stop Dusk session"
+  ],
+  "in_session": true,
+  "metal": {
+    "ok": true,
+    "summary": {
+      "headline": "Recorded Metal System Trace in 60s; the TOC advertises 82 schema(s). Call `probe perf analyze` for built-in diagnostics or `probe perf export` for a specific schema.",
+      "metrics": [
+        {
+          "label": "Schemas discovered",
+          "value": "82"
+        },
+        {
+          "label": "Run number",
+          "value": "1"
+        }
+      ]
+    },
+    "paths": {
+      "trace": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-49-19-569Z-metal-system-trace.trace",
+      "toc": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-49-19-569Z-metal-system-trace.toc.xml"
+    }
+  },
+  "cpu": {
+    "ok": true,
+    "summary": {
+      "headline": "Recorded Time Profiler in 60s; the TOC advertises 23 schema(s). Call `probe perf analyze` for built-in diagnostics or `probe perf export` for a specific schema.",
+      "metrics": [
+        {
+          "label": "Schemas discovered",
+          "value": "23"
+        },
+        {
+          "label": "Run number",
+          "value": "1"
+        }
+      ]
+    },
+    "paths": {
+      "trace": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-52-40-123Z-time-profiler.trace",
+      "toc": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-52-40-123Z-time-profiler.toc.xml"
+    }
+  },
+  "hangs": {
+    "ok": false,
+    "summary": null,
+    "paths": {}
+  },
+  "earlier_home_screen_traces": {
+    "metal": {
+      "trace": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-45-42-142Z-metal-system-trace.trace",
+      "toc": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-45-42-142Z-metal-system-trace.toc.xml"
+    },
+    "cpu": {
+      "trace": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-47-29-423Z-time-profiler.trace",
+      "toc": "/Users/guilhermecastro/.probe/sessions/07afc2e8-3509-4dd2-9667-e92fc0f02ad2/traces/2026-07-28T05-47-29-423Z-time-profiler.toc.xml"
+    }
+  }
+}
