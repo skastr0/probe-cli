@@ -1,0 +1,572 @@
+{
+  "snapshotId": "@s1",
+  "capturedAt": "2026-07-28T05:03:08.534Z",
+  "previousSnapshotId": null,
+  "statusLabel": "ProbeFixture",
+  "summary": "Captured @s1 with 102 nodes (23 interactive); initial snapshot; 65 nodes have weak identity; refs may drift; inline interactive preview includes 23 nodes; agentView 23/23 interactive.",
+  "artifact": {
+    "key": "snapshot-s1",
+    "label": "snapshot-@s1",
+    "kind": "json",
+    "summary": "Stable snapshot @s1 with 102 nodes and 23 interactive nodes.",
+    "absolutePath": "/Users/guilhermecastro/.probe/sessions/e90a7244-9932-49e2-bf97-45260a9f3d04/snapshots/2026-07-28T05-03-08-866Z-s1.json",
+    "relativePath": "snapshots/2026-07-28T05-03-08-866Z-s1.json",
+    "sizeBytes": 155232,
+    "external": false,
+    "createdAt": "2026-07-28T05:03:08.866Z"
+  },
+  "preview": {
+    "kind": "interactive",
+    "totalNodes": 23,
+    "omittedNodes": 0,
+    "nodes": [
+      {
+        "ref": "@e8",
+        "depth": 6,
+        "type": "button",
+        "identifier": null,
+        "label": "Reset",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "Probe Fixture",
+        "childCount": null
+      },
+      {
+        "ref": "@e18",
+        "depth": 10,
+        "type": "segmentedControl",
+        "identifier": "fixture.snapshot.profile.control",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e19",
+        "depth": 11,
+        "type": "button",
+        "identifier": null,
+        "label": "Base",
+        "value": null,
+        "placeholder": null,
+        "state": {
+          "disabled": null,
+          "selected": true,
+          "focused": null
+        },
+        "interactive": true,
+        "section": "fixture.snapshot.profile.control",
+        "childCount": null
+      },
+      {
+        "ref": "@e20",
+        "depth": 11,
+        "type": "button",
+        "identifier": null,
+        "label": "Medium",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.snapshot.profile.control",
+        "childCount": null
+      },
+      {
+        "ref": "@e21",
+        "depth": 11,
+        "type": "button",
+        "identifier": null,
+        "label": "Large",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.snapshot.profile.control",
+        "childCount": null
+      },
+      {
+        "ref": "@e27",
+        "depth": 11,
+        "type": "textField",
+        "identifier": "fixture.form.input",
+        "label": null,
+        "value": null,
+        "placeholder": "Type fixture input",
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e28",
+        "depth": 11,
+        "type": "button",
+        "identifier": "fixture.form.applyButton",
+        "label": "Apply Input",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e31",
+        "depth": 10,
+        "type": "segmentedControl",
+        "identifier": "fixture.mode.segmentedControl",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e32",
+        "depth": 11,
+        "type": "button",
+        "identifier": null,
+        "label": "Idle",
+        "value": null,
+        "placeholder": null,
+        "state": {
+          "disabled": null,
+          "selected": true,
+          "focused": null
+        },
+        "interactive": true,
+        "section": "fixture.mode.segmentedControl",
+        "childCount": null
+      },
+      {
+        "ref": "@e33",
+        "depth": 11,
+        "type": "button",
+        "identifier": null,
+        "label": "Edit",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.mode.segmentedControl",
+        "childCount": null
+      },
+      {
+        "ref": "@e34",
+        "depth": 11,
+        "type": "button",
+        "identifier": null,
+        "label": "Review",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.mode.segmentedControl",
+        "childCount": null
+      },
+      {
+        "ref": "@e37",
+        "depth": 11,
+        "type": "switch",
+        "identifier": "fixture.state.toggle",
+        "label": null,
+        "value": "1",
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e40",
+        "depth": 11,
+        "type": "cell",
+        "identifier": "fixture.list.item.0",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.list.table",
+        "childCount": null
+      },
+      {
+        "ref": "@e46",
+        "depth": 11,
+        "type": "cell",
+        "identifier": "fixture.list.item.1",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.list.table",
+        "childCount": null
+      },
+      {
+        "ref": "@e52",
+        "depth": 11,
+        "type": "cell",
+        "identifier": "fixture.list.item.2",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.list.table",
+        "childCount": null
+      },
+      {
+        "ref": "@e58",
+        "depth": 11,
+        "type": "cell",
+        "identifier": "fixture.list.item.3",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.list.table",
+        "childCount": null
+      },
+      {
+        "ref": "@e69",
+        "depth": 10,
+        "type": "button",
+        "identifier": "fixture.navigation.detailButton",
+        "label": "Open Detail",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e72",
+        "depth": 10,
+        "type": "button",
+        "identifier": "fixture.problem.disabledButton",
+        "label": "Disabled Control",
+        "value": null,
+        "placeholder": null,
+        "state": {
+          "disabled": true,
+          "selected": null,
+          "focused": null
+        },
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e76",
+        "depth": 10,
+        "type": "button",
+        "identifier": "fixture.problem.offscreenButton",
+        "label": "Tap Offscreen Action",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e79",
+        "depth": 11,
+        "type": "button",
+        "identifier": "fixture.problem.sectionCollision.innerButton",
+        "label": "Collision Target",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.problem.sectionCollision.container",
+        "childCount": null
+      },
+      {
+        "ref": "@e83",
+        "depth": 10,
+        "type": "button",
+        "identifier": "fixture.gesture.multiTapTarget",
+        "label": "Multi-tap Target",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e87",
+        "depth": 10,
+        "type": "textView",
+        "identifier": "fixture.logs.textView",
+        "label": null,
+        "value": "[02:03:03] fixture reset",
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.root.view",
+        "childCount": null
+      },
+      {
+        "ref": "@e88",
+        "depth": 11,
+        "type": "textView",
+        "identifier": null,
+        "label": "[02:03:03] fixture reset",
+        "value": null,
+        "placeholder": null,
+        "state": null,
+        "interactive": true,
+        "section": "fixture.logs.textView",
+        "childCount": null
+      }
+    ]
+  },
+  "agentView": {
+    "statusLabel": "ProbeFixture",
+    "interactive": [
+      {
+        "ref": "@e8",
+        "type": "button",
+        "identifier": null,
+        "label": "Reset"
+      },
+      {
+        "ref": "@e18",
+        "type": "segmentedControl",
+        "identifier": "fixture.snapshot.profile.control",
+        "label": null
+      },
+      {
+        "ref": "@e19",
+        "type": "button",
+        "identifier": null,
+        "label": "Base"
+      },
+      {
+        "ref": "@e20",
+        "type": "button",
+        "identifier": null,
+        "label": "Medium"
+      },
+      {
+        "ref": "@e21",
+        "type": "button",
+        "identifier": null,
+        "label": "Large"
+      },
+      {
+        "ref": "@e27",
+        "type": "textField",
+        "identifier": "fixture.form.input",
+        "label": null
+      },
+      {
+        "ref": "@e28",
+        "type": "button",
+        "identifier": "fixture.form.applyButton",
+        "label": "Apply Input"
+      },
+      {
+        "ref": "@e31",
+        "type": "segmentedControl",
+        "identifier": "fixture.mode.segmentedControl",
+        "label": null
+      },
+      {
+        "ref": "@e32",
+        "type": "button",
+        "identifier": null,
+        "label": "Idle"
+      },
+      {
+        "ref": "@e33",
+        "type": "button",
+        "identifier": null,
+        "label": "Edit"
+      },
+      {
+        "ref": "@e34",
+        "type": "button",
+        "identifier": null,
+        "label": "Review"
+      },
+      {
+        "ref": "@e37",
+        "type": "switch",
+        "identifier": "fixture.state.toggle",
+        "label": null
+      },
+      {
+        "ref": "@e40",
+        "type": "cell",
+        "identifier": "fixture.list.item.0",
+        "label": null
+      },
+      {
+        "ref": "@e46",
+        "type": "cell",
+        "identifier": "fixture.list.item.1",
+        "label": null
+      },
+      {
+        "ref": "@e52",
+        "type": "cell",
+        "identifier": "fixture.list.item.2",
+        "label": null
+      },
+      {
+        "ref": "@e58",
+        "type": "cell",
+        "identifier": "fixture.list.item.3",
+        "label": null
+      },
+      {
+        "ref": "@e69",
+        "type": "button",
+        "identifier": "fixture.navigation.detailButton",
+        "label": "Open Detail"
+      },
+      {
+        "ref": "@e72",
+        "type": "button",
+        "identifier": "fixture.problem.disabledButton",
+        "label": "Disabled Control"
+      },
+      {
+        "ref": "@e76",
+        "type": "button",
+        "identifier": "fixture.problem.offscreenButton",
+        "label": "Tap Offscreen Action"
+      },
+      {
+        "ref": "@e79",
+        "type": "button",
+        "identifier": "fixture.problem.sectionCollision.innerButton",
+        "label": "Collision Target"
+      },
+      {
+        "ref": "@e83",
+        "type": "button",
+        "identifier": "fixture.gesture.multiTapTarget",
+        "label": "Multi-tap Target"
+      },
+      {
+        "ref": "@e87",
+        "type": "textView",
+        "identifier": "fixture.logs.textView",
+        "label": null
+      },
+      {
+        "ref": "@e88",
+        "type": "textView",
+        "identifier": null,
+        "label": "[02:03:03] fixture reset"
+      }
+    ],
+    "interactiveTotal": 23,
+    "omittedInteractiveCount": 0
+  },
+  "metrics": {
+    "rawNodeCount": 204,
+    "nodeCount": 102,
+    "interactiveNodeCount": 23,
+    "maxDepth": 13,
+    "weakIdentityNodeCount": 65,
+    "preservedRefCount": 0,
+    "newRefCount": 102,
+    "remappedRefCount": 0,
+    "staleRefCount": 0
+  },
+  "diff": {
+    "kind": "initial",
+    "previousSnapshotId": null,
+    "summary": {
+      "added": 102,
+      "removed": 0,
+      "updated": 0,
+      "remapped": 0,
+      "stale": 0
+    },
+    "highlights": [
+      {
+        "kind": "added",
+        "ref": "@e28",
+        "description": "Added fixture.form.applyButton (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e69",
+        "description": "Added fixture.navigation.detailButton (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e72",
+        "description": "Added fixture.problem.disabledButton (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e76",
+        "description": "Added fixture.problem.offscreenButton (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e79",
+        "description": "Added fixture.problem.sectionCollision.innerButton (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e83",
+        "description": "Added fixture.gesture.multiTapTarget (button)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e37",
+        "description": "Added fixture.state.toggle (switch)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e87",
+        "description": "Added fixture.logs.textView (textView)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e18",
+        "description": "Added fixture.snapshot.profile.control (segmentedControl)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e27",
+        "description": "Added fixture.form.input (textField)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e31",
+        "description": "Added fixture.mode.segmentedControl (segmentedControl)."
+      },
+      {
+        "kind": "added",
+        "ref": "@e40",
+        "description": "Added fixture.list.item.0 (cell)."
+      }
+    ],
+    "staleRefs": [],
+    "remappedRefs": []
+  },
+  "warnings": [
+    "65 nodes lack accessibility identifiers and rely on weak identity matching (label/value/frame/structure); their refs may be less durable across dynamic updates."
+  ],
+  "retryCount": 0,
+  "retryReasons": []
+}

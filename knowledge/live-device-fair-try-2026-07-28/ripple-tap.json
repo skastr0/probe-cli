@@ -1,0 +1,30 @@
+{
+  "summary": "Executed tap via runner-direct selector @e42 (label=\"Begin My Free Week\", type=button).",
+  "action": "tap",
+  "matchedRef": null,
+  "resolvedBy": "semantic",
+  "statusLabel": "Ripple",
+  "latestSnapshotId": "@s1",
+  "artifact": null,
+  "recordingLength": 1,
+  "retryCount": 0,
+  "retryReasons": [],
+  "verdict": null,
+  "waitedMs": null,
+  "polledCount": null,
+  "handledMs": 1400,
+  "resolutionMs": 329,
+  "waitMs": 635,
+  "interactionMs": 435,
+  "finalizationMs": 0,
+  "hostRttMs": 1411,
+  "evidence": {
+    "requested": {
+      "success": "none",
+      "failure": "snapshot"
+    },
+    "captures": [],
+    "evidenceMs": 0
+  },
+  "uiDelta": null
+}

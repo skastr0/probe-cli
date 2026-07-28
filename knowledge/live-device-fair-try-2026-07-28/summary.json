@@ -1,0 +1,238 @@
+{
+  "startedAt": "2026-07-28T05:03:00.275Z",
+  "deviceId": "9FE1EE68-650B-590A-B131-48E1575FBE5A",
+  "teamId": "4452968868",
+  "phases": {
+    "fixture": {
+      "ok": true,
+      "sessionId": "e90a7244-9932-49e2-bf97-45260a9f3d04",
+      "agentViewShown": 23,
+      "agentViewTotal": 23,
+      "batchVerdict": "passed",
+      "multiTap": {
+        "summary": "Executed multiTap via runner-direct selector identifier=fixture.gesture.multiTapTarget.",
+        "handledMs": 10534,
+        "interactionMs": 3513,
+        "evidence": {
+          "requested": {
+            "success": "none",
+            "failure": "snapshot"
+          },
+          "captures": [],
+          "evidenceMs": 0
+        },
+        "uiDelta": null
+      },
+      "multiTapEndUiDelta": {
+        "snapshotId": "@s2",
+        "previousSnapshotId": "@s1",
+        "kind": "changed",
+        "summary": {
+          "added": 23,
+          "removed": 10,
+          "updated": 77,
+          "remapped": 42,
+          "stale": 10
+        },
+        "highlightLines": [
+          "Added \"[02:03:12] input applied -> live-device-wave\" (textView).",
+          "Added \"[02:03:14] input applied -> live-device-wave\" (textView).",
+          "Added \"[02:03:22] multi-tap target tapped (1/5 within window)\" (textView).",
+          "Added \"[02:03:23] multi-tap target tapped (2/5 within window)\" (textView).",
+          "Added \"[02:03:24] multi-tap target tapped (3/5 within window)\" (textView).",
+          "Added \"[02:03:24] multi-tap target tapped (4/5 within window)\" (textView).",
+          "Added \"[02:03:25] multi-tap target recognized five taps (run 1)\" (textView).",
+          "Added \"[02:03:27] multi-tap target tapped (1/5 within window)\" (textView).",
+          "Added \"[02:03:28] multi-tap target tapped (2/5 within window)\" (textView).",
+          "Added \"[02:03:29] multi-tap target tapped (3/5 within window)\" (textView).",
+          "Updated fixture.form.applyButton (button): frame.",
+          "Updated fixture.navigation.detailButton (button): frame."
+        ],
+        "staleRefs": [
+          "@e1",
+          "@e3",
+          "@e4",
+          "@e9",
+          "@e10",
+          "@e90",
+          "@e94",
+          "@e96",
+          "@e98",
+          "@e100"
+        ],
+        "remappedRefs": [
+          {
+            "ref": "@e13",
+            "description": "@e13 was remapped to unnamed other using weak structural matching."
+          },
+          {
+            "ref": "@e19",
+            "description": "@e19 was remapped to \"Base\" (button) using weak structural matching."
+          },
+          {
+            "ref": "@e20",
+            "description": "@e20 was remapped to \"Medium\" (button) using weak structural matching."
+          },
+          {
+            "ref": "@e21",
+            "description": "@e21 was remapped to \"Large\" (button) using weak structural matching."
+          },
+          {
+            "ref": "@e26",
+            "description": "@e26 was remapped to unnamed other using weak structural matching."
+          },
+          {
+            "ref": "@e29",
+            "description": "@e29 was remapped to \"Apply Input\" (staticText) using weak structural matching."
+          },
+          {
+            "ref": "@e32",
+            "description": "@e32 was remapped to \"Idle\" (button) using weak structural matching."
+          },
+          {
+            "ref": "@e33",
+            "description": "@e33 was remapped to \"Edit\" (button) using weak structural matching."
+          }
+        ],
+        "interactive": [
+          {
+            "ref": "@e8",
+            "type": "button",
+            "identifier": null,
+            "label": "Reset"
+          },
+          {
+            "ref": "@e18",
+            "type": "segmentedControl",
+            "identifier": "fixture.snapshot.profile.control",
+            "label": null
+          },
+          {
+            "ref": "@e19",
+            "type": "button",
+            "identifier": null,
+            "label": "Base"
+          },
+          {
+            "ref": "@e20",
+            "type": "button",
+            "identifier": null,
+            "label": "Medium"
+          },
+          {
+            "ref": "@e21",
+            "type": "button",
+            "identifier": null,
+            "label": "Large"
+          },
+          {
+            "ref": "@e27",
+            "type": "textField",
+            "identifier": "fixture.form.input",
+            "label": null
+          },
+          {
+            "ref": "@e28",
+            "type": "button",
+            "identifier": "fixture.form.applyButton",
+            "label": "Apply Input"
+          },
+          {
+            "ref": "@e31",
+            "type": "segmentedControl",
+            "identifier": "fixture.mode.segmentedControl",
+            "label": null
+          },
+          {
+            "ref": "@e32",
+            "type": "button",
+            "identifier": null,
+            "label": "Idle"
+          },
+          {
+            "ref": "@e33",
+            "type": "button",
+            "identifier": null,
+            "label": "Edit"
+          },
+          {
+            "ref": "@e34",
+            "type": "button",
+            "identifier": null,
+            "label": "Review"
+          },
+          {
+            "ref": "@e37",
+            "type": "switch",
+            "identifier": "fixture.state.toggle",
+            "label": null
+          }
+        ],
+        "interactiveTotal": 33
+      },
+      "exportOk": true,
+      "exportSummary": "Exported 2 recorded actions as session-flow/v2 to /Users/guilhermecastro/.probe/sessions/e90a7244-9932-49e2-bf97-45260a9f3d04/recordings/2026-07-28T05-03-30-379Z-fixture-live-fly.flow-v2.json.",
+      "flowRunVerdict": "passed"
+    },
+    "ripple": {
+      "ok": true,
+      "sessionId": "28aca3de-7c75-49ff-a557-43a673f4342c",
+      "statusLabel": "Ripple",
+      "agentViewShown": 8,
+      "agentViewTotal": 8,
+      "sampleInteractive": [
+        {
+          "ref": "@e40",
+          "type": "button",
+          "identifier": null,
+          "label": "BEST VALUE, Yearly, 7 days free, then R$ 299,90/year, R$ 24.99, /month"
+        },
+        {
+          "ref": "@e41",
+          "type": "button",
+          "identifier": null,
+          "label": "Monthly, 7 days free, then R$ 39,90/month, R$ 39,90, /month"
+        },
+        {
+          "ref": "@e42",
+          "type": "button",
+          "identifier": null,
+          "label": "Begin My Free Week"
+        },
+        {
+          "ref": "@e47",
+          "type": "button",
+          "identifier": null,
+          "label": "Restore purchases"
+        },
+        {
+          "ref": "@e48",
+          "type": "button",
+          "identifier": null,
+          "label": "Terms"
+        },
+        {
+          "ref": "@e49",
+          "type": "button",
+          "identifier": null,
+          "label": "Privacy"
+        },
+        {
+          "ref": "@e50",
+          "type": "button",
+          "identifier": null,
+          "label": "Support"
+        },
+        {
+          "ref": "@e55",
+          "type": "button",
+          "identifier": null,
+          "label": "Close paywall"
+        }
+      ],
+      "bestEffortTap": true,
+      "tapSummary": "Executed tap via runner-direct selector @e42 (label=\"Begin My Free Week\", type=button)."
+    }
+  },
+  "finishedAt": "2026-07-28T05:03:48.009Z"
+}

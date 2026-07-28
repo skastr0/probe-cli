@@ -1,0 +1,77 @@
+{
+  "contract": "probe.session-flow/report-v2",
+  "executedAt": "2026-07-28T05:03:38.935Z",
+  "sessionId": "e90a7244-9932-49e2-bf97-45260a9f3d04",
+  "summary": "Executed 2 flow step(s) successfully with 0 retries.",
+  "verdict": "passed",
+  "executedSteps": {
+    "total": 2,
+    "shown": [
+      {
+        "index": 1,
+        "kind": "multiTap",
+        "summary": "Executed fast multiTap on identifier=fixture.gesture.multiTapTarget without host snapshots.",
+        "verdict": "passed",
+        "matchedRef": null,
+        "latestSnapshotId": "@s2",
+        "retryCount": 0,
+        "retryReasons": [],
+        "artifacts": [],
+        "executionProfile": "fast",
+        "transportLane": "runner-single",
+        "handledMs": 4857,
+        "warnings": [],
+        "evidence": {
+          "requested": {
+            "success": "none",
+            "failure": "snapshot"
+          },
+          "captures": [],
+          "evidenceMs": 0
+        },
+        "sequenceChildFailure": null
+      },
+      {
+        "index": 2,
+        "kind": "multiTap",
+        "summary": "Executed fast multiTap on identifier=fixture.gesture.multiTapTarget without host snapshots.",
+        "verdict": "passed",
+        "matchedRef": null,
+        "latestSnapshotId": "@s2",
+        "retryCount": 0,
+        "retryReasons": [],
+        "artifacts": [],
+        "executionProfile": "fast",
+        "transportLane": "runner-single",
+        "handledMs": 3423,
+        "warnings": [],
+        "evidence": {
+          "requested": {
+            "success": "none",
+            "failure": "snapshot"
+          },
+          "captures": [],
+          "evidenceMs": 0
+        },
+        "sequenceChildFailure": null
+      }
+    ],
+    "omitted": 0,
+    "drill": null
+  },
+  "failedStep": null,
+  "retries": 0,
+  "artifacts": {
+    "total": 0,
+    "shown": [],
+    "omitted": 0,
+    "drill": null
+  },
+  "finalSnapshotId": "@s2",
+  "warnings": {
+    "total": 0,
+    "shown": [],
+    "omitted": 0,
+    "drill": null
+  }
+}

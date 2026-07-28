@@ -1,0 +1,183 @@
+{
+  "summary": "Executed multiTap via runner-direct selector identifier=fixture.gesture.multiTapTarget; captured @s2.",
+  "action": "multiTap",
+  "matchedRef": null,
+  "resolvedBy": "semantic",
+  "statusLabel": "ProbeFixture",
+  "latestSnapshotId": "@s2",
+  "artifact": null,
+  "recordingLength": 2,
+  "retryCount": 0,
+  "retryReasons": [],
+  "verdict": null,
+  "waitedMs": null,
+  "polledCount": null,
+  "handledMs": 3341,
+  "resolutionMs": 512,
+  "waitMs": 773,
+  "interactionMs": 2053,
+  "finalizationMs": 0,
+  "hostRttMs": 3353,
+  "evidence": {
+    "requested": {
+      "success": "end",
+      "failure": "snapshot"
+    },
+    "captures": [
+      {
+        "reason": "policy-post",
+        "phase": "post",
+        "snapshotId": "@s2",
+        "ms": 529
+      }
+    ],
+    "evidenceMs": 529
+  },
+  "uiDelta": {
+    "snapshotId": "@s2",
+    "previousSnapshotId": "@s1",
+    "kind": "changed",
+    "summary": {
+      "added": 23,
+      "removed": 10,
+      "updated": 77,
+      "remapped": 42,
+      "stale": 10
+    },
+    "highlightLines": [
+      "Added \"[02:03:12] input applied -> live-device-wave\" (textView).",
+      "Added \"[02:03:14] input applied -> live-device-wave\" (textView).",
+      "Added \"[02:03:22] multi-tap target tapped (1/5 within window)\" (textView).",
+      "Added \"[02:03:23] multi-tap target tapped (2/5 within window)\" (textView).",
+      "Added \"[02:03:24] multi-tap target tapped (3/5 within window)\" (textView).",
+      "Added \"[02:03:24] multi-tap target tapped (4/5 within window)\" (textView).",
+      "Added \"[02:03:25] multi-tap target recognized five taps (run 1)\" (textView).",
+      "Added \"[02:03:27] multi-tap target tapped (1/5 within window)\" (textView).",
+      "Added \"[02:03:28] multi-tap target tapped (2/5 within window)\" (textView).",
+      "Added \"[02:03:29] multi-tap target tapped (3/5 within window)\" (textView).",
+      "Updated fixture.form.applyButton (button): frame.",
+      "Updated fixture.navigation.detailButton (button): frame."
+    ],
+    "staleRefs": [
+      "@e1",
+      "@e3",
+      "@e4",
+      "@e9",
+      "@e10",
+      "@e90",
+      "@e94",
+      "@e96",
+      "@e98",
+      "@e100"
+    ],
+    "remappedRefs": [
+      {
+        "ref": "@e13",
+        "description": "@e13 was remapped to unnamed other using weak structural matching."
+      },
+      {
+        "ref": "@e19",
+        "description": "@e19 was remapped to \"Base\" (button) using weak structural matching."
+      },
+      {
+        "ref": "@e20",
+        "description": "@e20 was remapped to \"Medium\" (button) using weak structural matching."
+      },
+      {
+        "ref": "@e21",
+        "description": "@e21 was remapped to \"Large\" (button) using weak structural matching."
+      },
+      {
+        "ref": "@e26",
+        "description": "@e26 was remapped to unnamed other using weak structural matching."
+      },
+      {
+        "ref": "@e29",
+        "description": "@e29 was remapped to \"Apply Input\" (staticText) using weak structural matching."
+      },
+      {
+        "ref": "@e32",
+        "description": "@e32 was remapped to \"Idle\" (button) using weak structural matching."
+      },
+      {
+        "ref": "@e33",
+        "description": "@e33 was remapped to \"Edit\" (button) using weak structural matching."
+      }
+    ],
+    "interactive": [
+      {
+        "ref": "@e8",
+        "type": "button",
+        "identifier": null,
+        "label": "Reset"
+      },
+      {
+        "ref": "@e18",
+        "type": "segmentedControl",
+        "identifier": "fixture.snapshot.profile.control",
+        "label": null
+      },
+      {
+        "ref": "@e19",
+        "type": "button",
+        "identifier": null,
+        "label": "Base"
+      },
+      {
+        "ref": "@e20",
+        "type": "button",
+        "identifier": null,
+        "label": "Medium"
+      },
+      {
+        "ref": "@e21",
+        "type": "button",
+        "identifier": null,
+        "label": "Large"
+      },
+      {
+        "ref": "@e27",
+        "type": "textField",
+        "identifier": "fixture.form.input",
+        "label": null
+      },
+      {
+        "ref": "@e28",
+        "type": "button",
+        "identifier": "fixture.form.applyButton",
+        "label": "Apply Input"
+      },
+      {
+        "ref": "@e31",
+        "type": "segmentedControl",
+        "identifier": "fixture.mode.segmentedControl",
+        "label": null
+      },
+      {
+        "ref": "@e32",
+        "type": "button",
+        "identifier": null,
+        "label": "Idle"
+      },
+      {
+        "ref": "@e33",
+        "type": "button",
+        "identifier": null,
+        "label": "Edit"
+      },
+      {
+        "ref": "@e34",
+        "type": "button",
+        "identifier": null,
+        "label": "Review"
+      },
+      {
+        "ref": "@e37",
+        "type": "switch",
+        "identifier": "fixture.state.toggle",
+        "label": null
+      }
+    ],
+    "interactiveTotal": 33
+  }
+}

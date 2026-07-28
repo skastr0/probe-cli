@@ -1,0 +1,30 @@
+{
+  "summary": "Executed multiTap via runner-direct selector identifier=fixture.gesture.multiTapTarget.",
+  "action": "multiTap",
+  "matchedRef": null,
+  "resolvedBy": "semantic",
+  "statusLabel": "ProbeFixture",
+  "latestSnapshotId": "@s1",
+  "artifact": null,
+  "recordingLength": 1,
+  "retryCount": 0,
+  "retryReasons": [],
+  "verdict": null,
+  "waitedMs": null,
+  "polledCount": null,
+  "handledMs": 10534,
+  "resolutionMs": 478,
+  "waitMs": 6540,
+  "interactionMs": 3513,
+  "finalizationMs": 0,
+  "hostRttMs": 10550,
+  "evidence": {
+    "requested": {
+      "success": "none",
+      "failure": "snapshot"
+    },
+    "captures": [],
+    "evidenceMs": 0
+  },
+  "uiDelta": null
+}

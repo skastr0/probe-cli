@@ -1,0 +1,53 @@
+{
+  "contract": "probe.session-flow/report-v2",
+  "executedAt": "2026-07-28T05:03:15.159Z",
+  "sessionId": "e90a7244-9932-49e2-bf97-45260a9f3d04",
+  "summary": "Executed 1 flow step(s) successfully with 0 retries.",
+  "verdict": "passed",
+  "executedSteps": {
+    "total": 1,
+    "shown": [
+      {
+        "index": 1,
+        "kind": "sequence",
+        "summary": "Executed fast sequence step with 2 child action(s) through the runner batch lane without host evidence captures.",
+        "verdict": "passed",
+        "matchedRef": null,
+        "latestSnapshotId": "@s1",
+        "retryCount": 0,
+        "retryReasons": [],
+        "artifacts": [],
+        "executionProfile": "fast",
+        "transportLane": "runner-batch",
+        "handledMs": 6040,
+        "warnings": [],
+        "evidence": {
+          "requested": {
+            "success": "none",
+            "failure": "snapshot"
+          },
+          "captures": [],
+          "evidenceMs": 0
+        },
+        "sequenceChildFailure": null
+      }
+    ],
+    "omitted": 0,
+    "drill": null
+  },
+  "failedStep": null,
+  "retries": 0,
+  "artifacts": {
+    "total": 0,
+    "shown": [],
+    "omitted": 0,
+    "drill": null
+  },
+  "finalSnapshotId": "@s1",
+  "warnings": {
+    "total": 0,
+    "shown": [],
+    "omitted": 0,
+    "drill": null
+  }
+}

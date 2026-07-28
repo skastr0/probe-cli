@@ -1,0 +1,61 @@
+{
+  "summary": "Exported 2 recorded actions as session-flow/v2 to /Users/guilhermecastro/.probe/sessions/e90a7244-9932-49e2-bf97-45260a9f3d04/recordings/2026-07-28T05-03-30-379Z-fixture-live-fly.flow-v2.json.",
+  "scriptArtifact": {
+    "key": "recording-2026-07-28T05-03-30-379Z-fixture-live-fly",
+    "label": "fixture-live-fly",
+    "kind": "json",
+    "summary": "Recorded action script with 2 steps.",
+    "absolutePath": "/Users/guilhermecastro/.probe/sessions/e90a7244-9932-49e2-bf97-45260a9f3d04/recordings/2026-07-28T05-03-30-379Z-fixture-live-fly.json",
+    "relativePath": "recordings/2026-07-28T05-03-30-379Z-fixture-live-fly.json",
+    "sizeBytes": 1194,
+    "external": false,
+    "createdAt": "2026-07-28T05:03:30.380Z"
+  },
+  "flowPath": "/Users/guilhermecastro/.probe/sessions/e90a7244-9932-49e2-bf97-45260a9f3d04/recordings/2026-07-28T05-03-30-379Z-fixture-live-fly.flow-v2.json",
+  "stepCount": 2,
+  "flow": {
+    "contract": "probe.session-flow/v2",
+    "steps": [
+      {
+        "kind": "multiTap",
+        "target": {
+          "kind": "semantic",
+          "identifier": "fixture.gesture.multiTapTarget",
+          "label": null,
+          "value": null,
+          "placeholder": null,
+          "type": null,
+          "section": null,
+          "interactive": true
+        },
+        "tapCount": 5,
+        "interTapDelayMs": 40,
+        "execution": "fast",
+        "evidencePolicy": {
+          "success": "none",
+          "failure": "snapshot"
+        }
+      },
+      {
+        "kind": "multiTap",
+        "target": {
+          "kind": "semantic",
+          "identifier": "fixture.gesture.multiTapTarget",
+          "label": null,
+          "value": null,
+          "placeholder": null,
+          "type": null,
+          "section": null,
+          "interactive": true
+        },
+        "tapCount": 3,
+        "interTapDelayMs": 40,
+        "execution": "fast",
+        "evidencePolicy": {
+          "success": "none",
+          "failure": "snapshot"
+        }
+      }
+    ]
+  }
+}
