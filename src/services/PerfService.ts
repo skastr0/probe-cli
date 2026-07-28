@@ -20,6 +20,8 @@ import {
   analyzeSystemTraceTables,
   analyzeSwiftConcurrencyTables,
   analyzeTimeProfilerTable,
+  applyCallstackSymbols,
+  leafPcsFromTimeProfilerSummary,
   parsePerfTableExport,
   type CustomTemplateRef,
   type PerfAnalyzerName,
@@ -41,6 +43,7 @@ import {
 import { ArtifactStore } from "./ArtifactStore"
 import { SessionRegistry, type TraceLeaseHandle, type TraceLeaseOutcome } from "./SessionRegistry"
 import { verifyTargetProcessIdentity } from "./TargetProcessIdentity"
+import { resolveAtosBinaryPath, symbolicateAddressesWithAtos } from "./AtosSymbolicate"
 
 const nowIso = (): string => new Date().toISOString()
 
@@ -240,6 +243,13 @@ const templateSpecs: Record<PerfTemplate, AnalyzableTemplateSpec> = {
         maxBytes: 8 * mib,
         maxRows: 25_000,
       },
+    }, {
+      // Display presentation rate — tiny table, preferred FPS source.
+      schema: "displayed-surfaces-per-second",
+      budget: {
+        maxBytes: 1 * mib,
+        maxRows: 4_000,
+      },
     }],
     maxRecordingTimeLimitMs: 120_000,
     analyze: (tables) => analyzeMetalSystemTraceTables({
@@ -247,6 +257,7 @@ const templateSpecs: Record<PerfTemplate, AnalyzableTemplateSpec> = {
       driverEventTable: tables["metal-driver-event-intervals"],
       encoderListTable: tables["metal-application-encoders-list"],
       gpuCounterTable: tables["gpu-counter-value"] ?? tables["metal-gpu-counter-intervals"],
+      displayedSurfacesTable: tables["displayed-surfaces-per-second"],
     }),
   },
   hangs: {
@@ -2837,7 +2848,7 @@ export const createPerfService = (dependencies: {
         })
       }
 
-      const analysis = yield* Effect.try({
+      let analysis = yield* Effect.try({
         try: () => spec.analyze(parsedTables, context.targetProcessId ?? -1),
         catch: (error) =>
           new EnvironmentError({
@@ -2847,6 +2858,43 @@ export const createPerfService = (dependencies: {
             details: spec.exportSchemas.map((exportSpec) => exportSpec.schema),
           }),
       })
+
+      // Optional atos enrichment for time-profiler leaf PCs when the operator
+      // exports PROBE_PERF_BINARY / PROBE_ATOS_BINARY to the matching .app or dSYM.
+      if (analyzer === "time-profiler") {
+        const binaryPath = resolveAtosBinaryPath()
+        const leafPcs = leafPcsFromTimeProfilerSummary(analysis.summary)
+        if (binaryPath && leafPcs.length > 0) {
+          emitProgress("perf.analyze", `Symbolicating ${leafPcs.length} leaf PC(s) with atos against ${binaryPath}.`)
+          const symbols = yield* Effect.tryPromise({
+            try: () =>
+              symbolicateAddressesWithAtos({
+                binaryPath,
+                addresses: leafPcs,
+              }),
+            catch: (error) =>
+              new EnvironmentError({
+                code: "perf-atos-symbolicate",
+                reason: error instanceof Error ? error.message : String(error),
+                nextStep:
+                  "Set PROBE_PERF_BINARY to the target .app executable or dSYM, or omit it to keep raw leaf PCs.",
+                details: [binaryPath],
+              }),
+          }).pipe(
+            Effect.catchAll((error) => {
+              // Symbolication is best-effort — never fail the whole analyze.
+              emitProgress(
+                "perf.analyze",
+                `atos symbolication skipped: ${error instanceof EnvironmentError ? error.reason : String(error)}`,
+              )
+              return Effect.succeed(new Map<string, string>())
+            }),
+          )
+          if (symbols.size > 0) {
+            analysis = applyCallstackSymbols(analysis, symbols)
+          }
+        }
+      }
 
       return {
         sessionId,

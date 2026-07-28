@@ -2,9 +2,12 @@ import { describe, expect, test } from "bun:test"
 import {
   analyzeSignpostIntervalTable,
   defaultPerfTimeLimitForTemplate,
+  analyzeDisplayedSurfacesPerSecond,
   analyzeMetalSystemTraceTable,
   analyzeSystemTraceTables,
   analyzeTimeProfilerTable,
+  applyCallstackSymbols,
+  leafPcsFromTimeProfilerSummary,
   parsePerfTableExport,
   summarizeSignpostIntervalsTable,
 } from "./perf"
@@ -155,6 +158,37 @@ describe("perf analysis", () => {
 
   test("uses the default short time limit for logging traces", () => {
     expect(defaultPerfTimeLimitForTemplate("logging")).toBe("3s")
+  })
+
+  test("displayed-surfaces-per-second yields honest display FPS", () => {
+    const xml = `<?xml version="1.0"?>
+<trace-query-result>
+  <node>
+    <schema name="displayed-surfaces-per-second">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>count</mnemonic></col>
+    </schema>
+    <row><start-time>0</start-time><duration>1000000000</duration><uint32 fmt="57">57</uint32></row>
+    <row><start-time>1000000000</start-time><duration>1000000000</duration><uint32 fmt="60">60</uint32></row>
+    <row><start-time>2000000000</start-time><duration>1000000000</duration><uint32 fmt="42">42</uint32></row>
+  </node>
+</trace-query-result>`
+    const rate = analyzeDisplayedSurfacesPerSecond(parsePerfTableExport(xml))
+    expect(rate.sampleCount).toBe(3)
+    expect(rate.averageFps).toBeCloseTo(53, 0)
+    expect(rate.minFps).toBe(42)
+    expect(rate.maxFps).toBe(60)
+    expect(rate.bucketsUnder60).toBe(2)
+  })
+
+  test("applyCallstackSymbols rewrites top leaf metrics", () => {
+    const base = analyzeTimeProfilerTable(parsePerfTableExport(timeProfilerXml))
+    const leaf = leafPcsFromTimeProfilerSummary(base.summary)[0]
+    expect(leaf).toBeDefined()
+    const enriched = applyCallstackSymbols(base, new Map([[leaf!, "Ripple`hotFunction"]]))
+    expect(enriched.summary.metrics.find((m) => m.label === "Top leaf PCs")?.value).toContain("Ripple`hotFunction")
+    expect(enriched.diagnoses.some((d) => d.code === "time-profiler-symbols-applied")).toBe(true)
   })
 
   test("time profiler analysis flags blocked-heavy traces and attributes leaf callstack PCs", () => {

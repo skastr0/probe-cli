@@ -1166,11 +1166,149 @@ const buildMetalDriverSummary = (table: ParsedPerfTable | undefined) => {
   }
 }
 
+/**
+ * Display-level FPS from `displayed-surfaces-per-second` (surface swaps per
+ * second buckets). Prefer this over GPU-interval frame grouping when present —
+ * it is what the display path actually presented, not a reconstructed GPU span.
+ */
+export const analyzeDisplayedSurfacesPerSecond = (table: ParsedPerfTable): {
+  readonly averageFps: number | null
+  readonly minFps: number | null
+  readonly maxFps: number | null
+  readonly sampleCount: number
+  readonly bucketsUnder60: number
+  readonly summaryLine: string
+} => {
+  assertSchemaContract({
+    table,
+    schema: "displayed-surfaces-per-second",
+    requiredMnemonics: ["start", "duration", "count"],
+  })
+
+  const counts = table.rows
+    .map((row) => readNumber(row, "count"))
+    .filter((value): value is number => value !== null && Number.isFinite(value) && value >= 0)
+
+  if (counts.length === 0) {
+    return {
+      averageFps: null,
+      minFps: null,
+      maxFps: null,
+      sampleCount: 0,
+      bucketsUnder60: 0,
+      summaryLine: "no display surface-rate samples",
+    }
+  }
+
+  const averageFps = counts.reduce((a, b) => a + b, 0) / counts.length
+  const minFps = Math.min(...counts)
+  const maxFps = Math.max(...counts)
+  const bucketsUnder60 = counts.filter((c) => c < 60).length
+
+  return {
+    averageFps,
+    minFps,
+    maxFps,
+    sampleCount: counts.length,
+    bucketsUnder60,
+    summaryLine: `${averageFps.toFixed(1)} fps avg (min ${minFps.toFixed(0)}, max ${maxFps.toFixed(0)}) over ${counts.length}s of surface swaps`,
+  }
+}
+
+/** Apply atos (or other) symbol names onto an existing time-profiler analysis result. */
+export const applyCallstackSymbols = (
+  analysis: {
+    readonly summary: PerfSummary
+    readonly diagnoses: ReadonlyArray<PerfDiagnosis>
+  },
+  symbols: ReadonlyMap<string, string>,
+): {
+  readonly summary: PerfSummary
+  readonly diagnoses: ReadonlyArray<PerfDiagnosis>
+} => {
+  if (symbols.size === 0) {
+    return analysis
+  }
+
+  const rewriteLeaf = (leaf: string): string => {
+    const symbol = symbols.get(leaf.toLowerCase()) ?? symbols.get(leaf)
+    return symbol ? `${leaf} ${symbol}` : leaf
+  }
+
+  const metrics = analysis.summary.metrics.map((metric) => {
+    if (metric.label !== "Top leaf PCs") {
+      return metric
+    }
+    // Shape: "0xabc×12, 0xdef×8"
+    const rewritten = metric.value
+      .split(", ")
+      .map((part) => {
+        const match = part.match(/^(0x[0-9a-fA-F]+)(×\d+)$/)
+        if (!match) {
+          return part
+        }
+        return `${rewriteLeaf(match[1]!)}${match[2]}`
+      })
+      .join(", ")
+    return { ...metric, value: rewritten }
+  })
+
+  const symbolLines = [...symbols.entries()]
+    .slice(0, 8)
+    .map(([pc, name]) => `${pc} → ${name}`)
+
+  const diagnoses: PerfDiagnosis[] = [
+    infoDiagnosis(
+      "time-profiler-symbols-applied",
+      `Symbolicated ${symbols.size} leaf PC(s) via atos.`,
+      symbolLines.length > 0 ? symbolLines : ["No symbol lines produced."],
+    ),
+    ...analysis.diagnoses.map((diagnosis) => {
+      if (diagnosis.code !== "time-profiler-top-leaves") {
+        return diagnosis
+      }
+      return {
+        ...diagnosis,
+        summary: diagnosis.summary.replace(/0x[0-9a-fA-F]+/g, (pc) => {
+          const symbol = symbols.get(pc.toLowerCase()) ?? symbols.get(pc)
+          return symbol ? `${pc} (${symbol})` : pc
+        }),
+      }
+    }),
+  ]
+
+  const headline = analysis.summary.headline.replace(/0x[0-9a-fA-F]+/g, (pc) => {
+    const symbol = symbols.get(pc.toLowerCase()) ?? symbols.get(pc)
+    return symbol ? `${pc}(${symbol})` : pc
+  })
+
+  return {
+    summary: {
+      headline,
+      metrics,
+    },
+    diagnoses,
+  }
+}
+
+/** Extract ordered unique leaf PCs from a time-profiler Top leaf PCs metric. */
+export const leafPcsFromTimeProfilerSummary = (summary: PerfSummary): ReadonlyArray<string> => {
+  const metric = summary.metrics.find((entry) => entry.label === "Top leaf PCs")
+  if (!metric || metric.value === "none") {
+    return []
+  }
+  return metric.value
+    .split(", ")
+    .map((part) => part.match(/^(0x[0-9a-fA-F]+)/)?.[1]?.toLowerCase())
+    .filter((value): value is string => value !== undefined)
+}
+
 export const analyzeMetalSystemTraceTables = (args: {
   readonly gpuIntervalsTable: ParsedPerfTable
   readonly driverEventTable?: ParsedPerfTable
   readonly encoderListTable?: ParsedPerfTable
   readonly gpuCounterTable?: ParsedPerfTable
+  readonly displayedSurfacesTable?: ParsedPerfTable
 }): {
   readonly summary: PerfSummary
   readonly diagnoses: ReadonlyArray<PerfDiagnosis>
@@ -1196,6 +1334,9 @@ export const analyzeMetalSystemTraceTables = (args: {
     channelFilter: frameChannelFilter,
   } = pickBestMetalFrameEstimates(rows)
   const gpuCounterSummary = buildMetalGpuCounterSummary(args.gpuCounterTable)
+  const displaySurfaceRate = args.displayedSurfacesTable
+    ? analyzeDisplayedSurfacesPerSecond(args.displayedSurfacesTable)
+    : null
   const frameDurations = frameEstimates.map((frame) => frame.duration)
   const averageFrameDuration = averageOf(frameDurations)
   const maxFrameDuration = frameDurations.length === 0 ? null : Math.max(...frameDurations)
@@ -1204,23 +1345,32 @@ export const analyzeMetalSystemTraceTables = (args: {
   const driverSummary = buildMetalDriverSummary(args.driverEventTable)
   const diagnoses: Array<PerfDiagnosis> = []
 
-  // FPS estimation: only compute and display when frame grouping is reliable.
+  // Prefer display surface-rate (what actually hit the screen) over reconstructed
+  // GPU-interval frame spans when that export is present and non-empty.
+  const displayFpsAvailable = displaySurfaceRate !== null && displaySurfaceRate.sampleCount > 0
+    && displaySurfaceRate.averageFps !== null
+  // FPS estimation from GPU intervals: only when frame grouping is reliable.
   // Unreliable grouping produces fabricated frame rates from mixed-process/compositor noise.
   const estimatedFrameDuration = frameEstimatesReliable
     ? (averageFrameDuration ?? averageDuration)
     : averageDuration
-  const averageFps = frameEstimatesReliable && estimatedFrameDuration !== null && estimatedFrameDuration > 0
+  const intervalAverageFps = frameEstimatesReliable && estimatedFrameDuration !== null && estimatedFrameDuration > 0
     ? 1_000_000_000 / estimatedFrameDuration
     : null
+  const averageFps = displayFpsAvailable ? displaySurfaceRate.averageFps : intervalAverageFps
   const framesOverBudget = frameEstimatesReliable
     ? frameDurations.filter((duration) => duration > sixtyFpsFrameBudgetNs).length
     : 0
-  const estimatedFpsText = frameEstimatesReliable
+  const estimatedFpsText = displayFpsAvailable
     ? formatFramesPerSecond(averageFps)
-    : "withheld (unreliable grouping)"
-  const frameBudgetSummary = frameEstimatesReliable && frameEstimates.length > 0
-    ? `${formatFramesPerSecond(averageFps)} average; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}`
-    : null
+    : frameEstimatesReliable
+      ? formatFramesPerSecond(averageFps)
+      : "withheld (unreliable grouping)"
+  const frameBudgetSummary = displayFpsAvailable
+    ? displaySurfaceRate.summaryLine
+    : frameEstimatesReliable && frameEstimates.length > 0
+      ? `${formatFramesPerSecond(averageFps)} average; ${framesOverBudget} of ${frameEstimates.length} frames exceeded ${formatNanoseconds(sixtyFpsFrameBudgetNs)}`
+      : null
 
   if (rows.length === 0) {
     diagnoses.push(
@@ -1232,11 +1382,34 @@ export const analyzeMetalSystemTraceTables = (args: {
     )
   }
 
-  if (!frameEstimatesReliable && frameEstimates.length > 0) {
+  if (displayFpsAvailable) {
+    diagnoses.push(
+      infoDiagnosis(
+        "metal-display-surface-fps",
+        `Display surface rate: ${displaySurfaceRate.summaryLine}.`,
+        [
+          "Source schema: displayed-surfaces-per-second (surface swaps per second).",
+          displaySurfaceRate.bucketsUnder60 > 0
+            ? `${displaySurfaceRate.bucketsUnder60} of ${displaySurfaceRate.sampleCount} one-second buckets were under 60 swaps.`
+            : "All one-second buckets met or exceeded 60 surface swaps.",
+          "This is display presentation rate, not GPU frame-interval reconstruction.",
+        ],
+      ),
+    )
+    if (displaySurfaceRate.bucketsUnder60 > 0) {
+      diagnoses.push(
+        warningDiagnosis(
+          "metal-display-under-60",
+          `Display surface rate dropped under 60 in ${displaySurfaceRate.bucketsUnder60} second(s) (min ${displaySurfaceRate.minFps?.toFixed(0) ?? "n/a"}).`,
+          ["Investigate encoder/blit heat and main-thread sample share alongside this window."],
+        ),
+      )
+    }
+  } else if (!frameEstimatesReliable && frameEstimates.length > 0) {
     diagnoses.push(
       warningDiagnosis(
         "metal-fps-withheld",
-        "Frame-rate estimation was withheld because the GPU interval export showed unreliable frame grouping.",
+        "Frame-rate estimation was withheld because the GPU interval export showed unreliable frame grouping and no display surface-rate samples were available.",
         [
           `Channel filter used: ${frameChannelFilter}.`,
           `Average exported frame span: ${formatNanoseconds(averageFrameDuration)}.`,
@@ -1360,7 +1533,9 @@ export const analyzeMetalSystemTraceTables = (args: {
         { label: "Avg CPU→GPU latency", value: formatNanoseconds(averageLatency) },
         { label: "Max CPU→GPU latency", value: formatNanoseconds(maxLatency) },
         { label: "Estimated FPS", value: estimatedFpsText },
+        { label: "FPS source", value: displayFpsAvailable ? "displayed-surfaces-per-second" : frameEstimatesReliable ? `gpu-intervals(${frameChannelFilter})` : "withheld" },
         { label: "FPS channel filter", value: frameChannelFilter },
+        { label: "Display surface rate", value: displaySurfaceRate?.summaryLine ?? "none exported" },
         { label: "Frames over 60 FPS budget", value: frameEstimates.length === 0 ? "n/a" : frameEstimatesReliable ? `${framesOverBudget}/${frameEstimates.length}` : "withheld" },
         { label: "Avg frame span", value: formatNanoseconds(averageFrameDuration) },
         { label: "Max frame span", value: formatNanoseconds(maxFrameDuration) },

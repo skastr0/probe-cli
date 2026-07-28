@@ -1839,6 +1839,18 @@ describe("PerfService analyzeTrace", () => {
           "metal-application-encoders-list": metalEncoderListXml,
           "gpu-counter-value": emptyCounterXml("gpu-counter-value"),
           "metal-gpu-counter-intervals": emptyCounterXml("metal-gpu-counter-intervals"),
+          "displayed-surfaces-per-second": `<?xml version="1.0"?>
+<trace-query-result>
+  <node>
+    <schema name="displayed-surfaces-per-second">
+      <col><mnemonic>start</mnemonic></col>
+      <col><mnemonic>duration</mnemonic></col>
+      <col><mnemonic>count</mnemonic></col>
+    </schema>
+    <row><start-time>0</start-time><duration>1000000000</duration><uint32 fmt="58">58</uint32></row>
+    <row><start-time>1000000000</start-time><duration>1000000000</duration><uint32 fmt="60">60</uint32></row>
+  </node>
+</trace-query-result>`,
         },
       })
       const perfService = createPerfService({
@@ -1862,13 +1874,15 @@ describe("PerfService analyzeTrace", () => {
         { schema: "metal-application-encoders-list", maxBytes: 24 * mib, maxRows: 50_000 },
         { schema: "gpu-counter-value", maxBytes: 8 * mib, maxRows: 50_000 },
         { schema: "metal-gpu-counter-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
+        { schema: "displayed-surfaces-per-second", maxBytes: 1 * mib, maxRows: 4_000 },
       ])
-      // Empty counter tables are attempted (budgets recorded) but omitted from
-      // artifacts when they contribute zero rows.
-      expect(result.artifacts.exports).toHaveLength(3)
+      // Empty counter tables omitted (0 rows); surface-rate + gpu/driver/encoder kept.
+      expect(result.artifacts.exports.length).toBeGreaterThanOrEqual(4)
       expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
+      expect(result.summary.metrics.find((metric) => metric.label === "FPS source")?.value).toBe("displayed-surfaces-per-second")
       expect(result.summary.metrics.find((metric) => metric.label === "Per-encoder summary")?.value).toContain("command buffer")
       expect(result.summary.metrics.find((metric) => metric.label === "GPU counters")?.value).toBe("none exported")
+      expect(result.diagnoses.some((d) => d.code === "metal-display-surface-fps")).toBe(true)
     })
   })
 
