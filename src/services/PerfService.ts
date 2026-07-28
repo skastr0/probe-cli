@@ -1,5 +1,5 @@
 import { constants, createWriteStream, statSync } from "node:fs"
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, open as openFile, readFile, rm, writeFile } from "node:fs/promises"
 import { createHash } from "node:crypto"
 import { basename, dirname, join, relative } from "node:path"
 import { pipeline } from "node:stream/promises"
@@ -53,8 +53,19 @@ const runnerKeepaliveIntervalMs = 10_000
 const maxPerfTimeLimitMs = 5 * 60_000
 const recordingStartupTimeoutMs = 30_000
 const mib = 1024 * 1024
-const maxExportFileSizeBytes = 8 * mib
+// Parse cap for a single schema export after it lands on disk. Sized to fit
+// dense ~60s Time Profiler / Metal encoder tables while still bounding agent
+// memory. Metal GPU interval tables for a full shader minute can be 100+ MiB;
+// those stay under the per-schema stream budget and are truncated instead.
+const maxExportFileSizeBytes = 32 * mib
 const customTemplateExtension = ".tracetemplate"
+
+// How a schema export reacts when the stream budget is hit mid-export.
+// - fail: typed EnvironmentError (explicit `perf export`)
+// - skip: drop this schema and continue (optional analyze schemas)
+// - truncate: keep the prefix already written, analyze it, diagnose honestly
+//   (required analyze schemas — so record→analyze never dies on density alone)
+type ExportBudgetPolicy = "fail" | "skip" | "truncate"
 
 const formatTimeLimitMs = (value: number): string => {
   if (value % 60_000 === 0) {
@@ -83,12 +94,15 @@ interface TemplateExportSpec {
 interface StreamedCommandResult extends CommandResult {
   readonly bytesWritten: number
   readonly rowCount: number
+  /** True when the stream budget stopped the export and a prefix was kept. */
+  readonly truncated: boolean
 }
 
 // PRB-097: the outcome of a single lazy schema export attempt, shared by
 // `exportSchema` (one explicit request, always fails closed on a budget
 // overrun) and `analyzeTrace` (per-analyzer required/optional schemas, where
-// an optional overrun is skipped instead of failing the whole analysis).
+// an optional overrun is skipped and a required overrun keeps a truncated
+// prefix so the full record→analyze loop still yields a summary).
 type SchemaExportOutcome =
   | {
       readonly kind: "exported"
@@ -97,6 +111,7 @@ type SchemaExportOutcome =
       readonly cacheHit: boolean
       readonly rowCount: number
       readonly bytesWritten: number
+      readonly truncated: boolean
     }
   | {
       readonly kind: "skipped-budget"
@@ -150,9 +165,11 @@ const templateSpecs: Record<PerfTemplate, AnalyzableTemplateSpec> = {
     exportSchemas: [{
       schema: "time-sample",
       required: true,
+      // Sized for a dense ~60s attach (observed ~9 MiB / ~30k rows on a live
+      // Metal breathing scene). Larger captures truncate to this prefix.
       budget: {
-        maxBytes: 4 * mib,
-        maxRows: 20_000,
+        maxBytes: 12 * mib,
+        maxRows: 50_000,
       },
     }],
     analyze: (tables) => analyzeTimeProfilerTable(tables["time-sample"]),
@@ -190,21 +207,38 @@ const templateSpecs: Record<PerfTemplate, AnalyzableTemplateSpec> = {
     exportSchemas: [{
       schema: "metal-gpu-intervals",
       required: true,
+      // Full 60s shader scenes export ~150 MiB / 160k+ rows — far past agent
+      // memory. Cap keeps a dense prefix; analyze diagnoses truncation.
+      budget: {
+        maxBytes: 16 * mib,
+        maxRows: 50_000,
+      },
+    }, {
+      schema: "metal-driver-event-intervals",
       budget: {
         maxBytes: 8 * mib,
         maxRows: 25_000,
       },
     }, {
-      schema: "metal-driver-event-intervals",
+      schema: "metal-application-encoders-list",
+      // Observed ~19 MiB on a 60s in-session Metal breathing capture.
       budget: {
-        maxBytes: 4 * mib,
-        maxRows: 12_000,
+        maxBytes: 24 * mib,
+        maxRows: 50_000,
       },
     }, {
-      schema: "metal-application-encoders-list",
+      // Present when recording with a counters-enabled custom template
+      // (e.g. Instruments "Ripple Scene Profiler.tracetemplate").
+      schema: "gpu-counter-value",
       budget: {
-        maxBytes: 4 * mib,
-        maxRows: 12_000,
+        maxBytes: 8 * mib,
+        maxRows: 50_000,
+      },
+    }, {
+      schema: "metal-gpu-counter-intervals",
+      budget: {
+        maxBytes: 8 * mib,
+        maxRows: 25_000,
       },
     }],
     maxRecordingTimeLimitMs: 120_000,
@@ -212,6 +246,7 @@ const templateSpecs: Record<PerfTemplate, AnalyzableTemplateSpec> = {
       gpuIntervalsTable: tables["metal-gpu-intervals"],
       driverEventTable: tables["metal-driver-event-intervals"],
       encoderListTable: tables["metal-application-encoders-list"],
+      gpuCounterTable: tables["gpu-counter-value"] ?? tables["metal-gpu-counter-intervals"],
     }),
   },
   hangs: {
@@ -594,6 +629,95 @@ const cleanupOutputFile = async (path: string): Promise<void> => {
   await rm(path, { force: true }).catch(() => undefined)
 }
 
+const countExportRowsInContent = (content: string): number => (content.match(/<row>/g) ?? []).length
+
+const countExportRowsInFile = async (path: string): Promise<number> => {
+  try {
+    const content = await readFile(path, "utf8")
+    return countExportRowsInContent(content)
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Clamp an xctrace table export to a byte budget by cutting after the last
+ * complete `</row>` that still fits. `parsePerfTableExport` only needs a
+ * leading `<schema>` block and complete row pairs — trailing close tags are
+ * optional — so this is enough to keep analysis honest under agent budgets.
+ */
+const clampExportFileToBudget = async (args: {
+  readonly outputPath: string
+  readonly maxBytes: number
+}): Promise<{ readonly bytesWritten: number; readonly rowCount: number; readonly truncated: boolean } | null> => {
+  try {
+    const stats = statSync(args.outputPath)
+    if (stats.size <= 0) {
+      return null
+    }
+
+    if (stats.size <= args.maxBytes) {
+      const rowCount = await countExportRowsInFile(args.outputPath)
+      if (rowCount <= 0) {
+        return null
+      }
+      return { bytesWritten: stats.size, rowCount, truncated: false }
+    }
+
+    // Read only the budget window — avoid loading a 100+ MiB export for clamp.
+    const handle = await openFile(args.outputPath, "r")
+    try {
+      const length = Math.min(stats.size, args.maxBytes)
+      const buffer = Buffer.alloc(length)
+      await handle.read(buffer, 0, length, 0)
+      const text = buffer.toString("utf8")
+      const lastRowEnd = text.lastIndexOf("</row>")
+      if (lastRowEnd < 0) {
+        return null
+      }
+      const clamped = text.slice(0, lastRowEnd + "</row>".length)
+      const rowCount = countExportRowsInContent(clamped)
+      if (rowCount <= 0) {
+        return null
+      }
+      await writeFile(args.outputPath, clamped, "utf8")
+      return {
+        bytesWritten: Buffer.byteLength(clamped, "utf8"),
+        rowCount,
+        truncated: true,
+      }
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+const tryKeepPartialExport = async (args: {
+  readonly outputPath: string
+  readonly budgetError: ExportBudgetExceededError
+  readonly stderr: string
+  readonly maxBytes: number
+}): Promise<StreamedCommandResult | null> => {
+  const clamped = await clampExportFileToBudget({
+    outputPath: args.outputPath,
+    maxBytes: args.maxBytes,
+  })
+  if (!clamped) {
+    return null
+  }
+
+  return {
+    stdout: "",
+    stderr: args.stderr,
+    exitCode: 0,
+    bytesWritten: clamped.bytesWritten,
+    rowCount: clamped.rowCount,
+    truncated: true,
+  }
+}
+
 export const runCommandToFile = (args: {
   readonly command: string
   readonly commandArgs: ReadonlyArray<string>
@@ -601,10 +725,17 @@ export const runCommandToFile = (args: {
   readonly gracePeriodMs?: number
   readonly outputPath: string
   readonly budget: ExportBudget
+  /**
+   * `fail` (default): delete partial output and throw ExportBudgetExceededError.
+   * `truncate`: keep a prefix of complete rows when the budget fires, so analyze
+   * can still produce a summary from dense long captures.
+   */
+  readonly budgetPolicy?: Exclude<ExportBudgetPolicy, "skip">
   /** Aborting kills the process group (TERM -> grace -> KILL), removes the partial output file, and rejects with a `command-cancelled` ChildProcessError. */
   readonly signal?: AbortSignal
 }): Promise<StreamedCommandResult> => {
   const outputGuard = new ExportBudgetTransform(args.budget)
+  const budgetPolicy = args.budgetPolicy ?? "fail"
 
   return runAppleProcess({
     command: args.command,
@@ -617,6 +748,18 @@ export const runCommandToFile = (args: {
   }).then(
     async (result) => {
       if (outputGuard.exceededError) {
+        if (budgetPolicy === "truncate") {
+          const partial = await tryKeepPartialExport({
+            outputPath: args.outputPath,
+            budgetError: outputGuard.exceededError,
+            stderr: result.stderr,
+            maxBytes: args.budget.maxBytes,
+          })
+          if (partial) {
+            return partial
+          }
+        }
+
         await cleanupOutputFile(args.outputPath)
         throw outputGuard.exceededError
       }
@@ -645,16 +788,41 @@ export const runCommandToFile = (args: {
         })
       }
 
-      const streamedResult = {
-        stdout: "",
-        stderr: result.stderr,
-        exitCode: result.exitCode,
-        bytesWritten: outputGuard.bytesWritten,
-        rowCount: outputGuard.rowCount,
-      } satisfies StreamedCommandResult
-
       if (result.exitCode === 0) {
-        return streamedResult
+        // Belt-and-suspenders: even if the stream guard missed (or the process
+        // flushed past SIGTERM), clamp the on-disk export to the declared budget
+        // so analyze never loads an unbounded XML into memory.
+        const clamped = await clampExportFileToBudget({
+          outputPath: args.outputPath,
+          maxBytes: args.budget.maxBytes,
+        })
+        if (clamped?.truncated) {
+          if (budgetPolicy === "fail") {
+            await cleanupOutputFile(args.outputPath)
+            throw new ExportBudgetExceededError({
+              kind: "bytes",
+              limit: args.budget.maxBytes,
+              observed: clamped.bytesWritten,
+            })
+          }
+          return {
+            stdout: "",
+            stderr: result.stderr,
+            exitCode: 0,
+            bytesWritten: clamped.bytesWritten,
+            rowCount: clamped.rowCount,
+            truncated: true,
+          } satisfies StreamedCommandResult
+        }
+
+        return {
+          stdout: "",
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          bytesWritten: clamped?.bytesWritten ?? outputGuard.bytesWritten,
+          rowCount: clamped?.rowCount ?? outputGuard.rowCount,
+          truncated: false,
+        } satisfies StreamedCommandResult
       }
 
       await cleanupOutputFile(args.outputPath)
@@ -668,10 +836,24 @@ export const runCommandToFile = (args: {
       })
     },
     async (error) => {
-      await cleanupOutputFile(args.outputPath)
       if (outputGuard.exceededError) {
+        if (budgetPolicy === "truncate") {
+          const partial = await tryKeepPartialExport({
+            outputPath: args.outputPath,
+            budgetError: outputGuard.exceededError,
+            stderr: "",
+            maxBytes: args.budget.maxBytes,
+          })
+          if (partial) {
+            return partial
+          }
+        }
+
+        await cleanupOutputFile(args.outputPath)
         throw outputGuard.exceededError
       }
+
+      await cleanupOutputFile(args.outputPath)
       return rethrowSupervisorError({ command: args.command, commandArgs: args.commandArgs, error })
     },
   )
@@ -968,6 +1150,7 @@ interface PerfCommandRunner {
     readonly gracePeriodMs?: number
     readonly outputPath: string
     readonly budget: ExportBudget
+    readonly budgetPolicy?: Exclude<ExportBudgetPolicy, "skip">
     readonly signal: AbortSignal
   }) => Promise<StreamedCommandResult>
   readonly startRecording?: (args: {
@@ -2247,7 +2430,7 @@ export const createPerfService = (dependencies: {
     budget,
     xctraceVersion,
     emitProgress,
-    failClosedOnBudget,
+    budgetPolicy,
   }: {
     readonly sessionId: string
     readonly artifactRoot: string
@@ -2258,16 +2441,18 @@ export const createPerfService = (dependencies: {
     readonly budget: ExportBudget
     readonly xctraceVersion: string
     readonly emitProgress: (stage: string, message: string) => void
-    readonly failClosedOnBudget: boolean
+    readonly budgetPolicy: ExportBudgetPolicy
   }): Effect.Effect<SchemaExportOutcome, EnvironmentError | ChildProcessError> =>
     Effect.gen(function* () {
       const getArtifact = dependencies.artifactStore.getArtifact!
       const resolvedXpath = xpath ?? buildSchemaExportXpath(runNumber, schema)
+      // Cache key includes budget policy so a failed fail-closed export cannot
+      // be reused as a truncated analyze result (and vice versa).
       const cacheKey = buildExportCacheKey({
         traceArtifactKey: traceArtifact.key,
         runNumber,
         schema,
-        xpath: resolvedXpath,
+        xpath: `${resolvedXpath}::budget=${budgetPolicy}:${budget.maxBytes}:${budget.maxRows}`,
         xctraceVersion,
       })
 
@@ -2296,6 +2481,8 @@ export const createPerfService = (dependencies: {
               }),
           })
 
+          const truncatedFromCache = cached.right.summary.includes("truncated prefix")
+
           return {
             kind: "exported",
             artifact: cached.right,
@@ -2303,6 +2490,7 @@ export const createPerfService = (dependencies: {
             cacheHit: true,
             rowCount: stats.rowCount,
             bytesWritten: stats.bytesWritten,
+            truncated: truncatedFromCache,
           } satisfies SchemaExportOutcome
         }
       }
@@ -2311,8 +2499,11 @@ export const createPerfService = (dependencies: {
       const exportPath = join(tracesDirectory, `${cacheKey}.xml`)
       emitProgress(
         "perf.export",
-        `Exporting ${schema} rows (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}).`,
+        `Exporting ${schema} rows (budget ${budget.maxRows} rows / ${formatBytes(budget.maxBytes)}, policy ${budgetPolicy}).`,
       )
+
+      const fileBudgetPolicy: Exclude<ExportBudgetPolicy, "skip"> =
+        budgetPolicy === "truncate" ? "truncate" : "fail"
 
       const exportOutcome = yield* Effect.tryPromise({
         try: async (signal) => {
@@ -2323,14 +2514,29 @@ export const createPerfService = (dependencies: {
               timeoutMs: defaultCommandOverheadMs,
               outputPath: exportPath,
               budget,
+              budgetPolicy: fileBudgetPolicy,
               signal,
             })
 
             return { kind: "exported" as const, result }
           } catch (error) {
-            if (error instanceof ExportBudgetExceededError && !failClosedOnBudget) {
-              await cleanupOutputFile(exportPath)
-              return { kind: "skipped-budget" as const, error }
+            if (error instanceof ExportBudgetExceededError) {
+              if (budgetPolicy === "skip") {
+                await cleanupOutputFile(exportPath)
+                return { kind: "skipped-budget" as const, error }
+              }
+
+              if (budgetPolicy === "truncate") {
+                const partial = await tryKeepPartialExport({
+                  outputPath: exportPath,
+                  budgetError: error,
+                  stderr: "",
+                  maxBytes: budget.maxBytes,
+                })
+                if (partial) {
+                  return { kind: "exported" as const, result: partial }
+                }
+              }
             }
 
             throw error
@@ -2357,27 +2563,74 @@ export const createPerfService = (dependencies: {
         return { kind: "skipped-budget", error: exportOutcome.error } satisfies SchemaExportOutcome
       }
 
-      const exportResult = exportOutcome.result
-      let maybeOversized: EnvironmentError | undefined
+      let exportResult = exportOutcome.result
 
+      // Final parse-size gate. Prefer clamping (for truncate/skip policies) over
+      // failing the whole analyze when a dense optional table blows past the
+      // agent memory ceiling — required tables already truncate above.
+      const parseBudgetBytes = Math.min(budget.maxBytes, maxExportFileSizeBytes)
       try {
         const stats = statSync(exportPath)
+        if (stats.size > parseBudgetBytes) {
+          if (budgetPolicy === "fail") {
+            yield* Effect.promise(() => cleanupOutputFile(exportPath))
+            return yield* Effect.fail(
+              new EnvironmentError({
+                code: "perf-export-file-too-large",
+                reason: `${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(parseBudgetBytes)} parse limit.`,
+                nextStep: "Reduce the requested window or inspect the saved .trace directly for full data.",
+                details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
+              }),
+            )
+          }
 
-        if (stats.size > maxExportFileSizeBytes) {
-          maybeOversized = new EnvironmentError({
-            code: "perf-export-file-too-large",
-            reason: `${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(maxExportFileSizeBytes)} parse limit.`,
-            nextStep: "Reduce the requested window or inspect the saved .trace directly for full data.",
-            details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
-          })
+          const clamped = yield* Effect.promise(() =>
+            clampExportFileToBudget({ outputPath: exportPath, maxBytes: parseBudgetBytes }),
+          )
+
+          if (!clamped) {
+            yield* Effect.promise(() => cleanupOutputFile(exportPath))
+            if (budgetPolicy === "skip") {
+              emitProgress(
+                "perf.export",
+                `Skipping optional ${schema} export after it exceeded the ${formatBytes(parseBudgetBytes)} parse limit with no salvageable rows.`,
+              )
+              return {
+                kind: "skipped-budget",
+                error: new ExportBudgetExceededError({
+                  kind: "bytes",
+                  limit: parseBudgetBytes,
+                  observed: stats.size,
+                }),
+              } satisfies SchemaExportOutcome
+            }
+
+            return yield* Effect.fail(
+              new EnvironmentError({
+                code: "perf-export-file-too-large",
+                reason: `${schema} export file (${formatBytes(stats.size)}) exceeds the ${formatBytes(parseBudgetBytes)} parse limit and could not be truncated to complete rows.`,
+                nextStep: "Reduce the requested window or inspect the saved .trace directly for full data.",
+                details: [`schema: ${schema}`, `file: ${exportPath}`, `size: ${stats.size}`],
+              }),
+            )
+          }
+
+          exportResult = {
+            ...exportResult,
+            bytesWritten: clamped.bytesWritten,
+            rowCount: clamped.rowCount,
+            truncated: true,
+          }
         }
       } catch {
         // File stat failed; let downstream readFile fail with a better error
       }
 
-      if (maybeOversized !== undefined) {
-        yield* Effect.promise(() => cleanupOutputFile(exportPath))
-        return yield* Effect.fail(maybeOversized)
+      if (exportResult.truncated) {
+        emitProgress(
+          "perf.export",
+          `Kept a truncated ${schema} prefix (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}) after hitting the export budget.`,
+        )
       }
 
       const artifact = yield* dependencies.artifactStore.registerArtifact(
@@ -2388,7 +2641,9 @@ export const createPerfService = (dependencies: {
           label: `${schema}-export`,
           kind: "xml",
           absolutePath: exportPath,
-          summary: `${schema} export (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
+          summary: exportResult.truncated
+            ? `${schema} export truncated prefix (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`
+            : `${schema} export (${exportResult.rowCount} rows, ${formatBytes(exportResult.bytesWritten)}).`,
         }),
       )
 
@@ -2399,6 +2654,7 @@ export const createPerfService = (dependencies: {
         cacheHit: false,
         rowCount: exportResult.rowCount,
         bytesWritten: exportResult.bytesWritten,
+        truncated: exportResult.truncated,
       } satisfies SchemaExportOutcome
     })
 
@@ -2427,8 +2683,8 @@ export const createPerfService = (dependencies: {
         })
       }
 
-      // `failClosedOnBudget: true` -- a caller who explicitly asked for this
-      // schema gets a typed budget failure, never a silent skip.
+      // Explicit `perf export` always fails closed on budget — never silent skip
+      // and never silent truncate (callers asked for the full schema).
       const outcome = yield* exportSchemaWithCache({
         sessionId,
         artifactRoot: context.artifactRoot,
@@ -2439,7 +2695,7 @@ export const createPerfService = (dependencies: {
         budget: resolveExportBudgetForSchema(schema),
         xctraceVersion: context.xctraceVersion,
         emitProgress,
-        failClosedOnBudget: true,
+        budgetPolicy: "fail",
       })
 
       if (outcome.kind === "skipped-budget") {
@@ -2483,6 +2739,7 @@ export const createPerfService = (dependencies: {
       const tocAdvertisesSchemas = context.availableSchemas.size > 0
       const parsedTables: Record<string, ParsedPerfTable> = {}
       const exportArtifacts: Array<ArtifactRecord> = []
+      const truncationDiagnoses: Array<PerfDiagnosis> = []
 
       for (const exportSpec of spec.exportSchemas) {
         if (tocAdvertisesSchemas && !context.availableSchemas.has(exportSpec.schema)) {
@@ -2498,6 +2755,10 @@ export const createPerfService = (dependencies: {
           continue
         }
 
+        // Required schemas always truncate under budget. Optional schemas also
+        // truncate when any complete rows were written — skip only if the export
+        // produced nothing salvageable (so encoder/driver heat is not lost on
+        // dense Metal scenes).
         const outcome = yield* exportSchemaWithCache({
           sessionId,
           artifactRoot: context.artifactRoot,
@@ -2507,14 +2768,32 @@ export const createPerfService = (dependencies: {
           budget: exportSpec.budget,
           xctraceVersion: context.xctraceVersion,
           emitProgress,
-          failClosedOnBudget: exportSpec.required === true,
+          budgetPolicy: "truncate",
         })
 
         if (outcome.kind === "skipped-budget") {
           continue
         }
 
+        if (exportSpec.required !== true && outcome.rowCount === 0) {
+          continue
+        }
+
         exportArtifacts.push(outcome.artifact)
+
+        if (outcome.truncated) {
+          truncationDiagnoses.push({
+            code: "perf-export-truncated",
+            severity: "warning",
+            summary: `Analysis used a budget-capped prefix of ${exportSpec.schema} (${outcome.rowCount} rows, ${formatBytes(outcome.bytesWritten)}).`,
+            details: [
+              `Budget: ${exportSpec.budget.maxRows} rows / ${formatBytes(exportSpec.budget.maxBytes)}.`,
+              "Metrics describe the exported prefix only, not necessarily the full recording window.",
+              "Re-record with a shorter --time-limit for full-window coverage under budget, or open the .trace in Instruments for the full capture.",
+            ],
+            wall: false,
+          })
+        }
 
         const exportXml = yield* Effect.tryPromise({
           try: () => readFile(outcome.artifact.absolutePath, "utf8"),
@@ -2548,6 +2827,16 @@ export const createPerfService = (dependencies: {
         })
       }
 
+      const requiredSchema = spec.exportSchemas.find((exportSpec) => exportSpec.required)?.schema
+      if (requiredSchema !== undefined && parsedTables[requiredSchema] === undefined) {
+        return yield* new EnvironmentError({
+          code: "perf-analyze-required-export-missing",
+          reason: `${spec.displayName} analysis needs ${requiredSchema} rows, but the export produced none under the current budget.`,
+          nextStep: "Re-record a shorter window, or inspect the raw .trace in Instruments.",
+          details: [],
+        })
+      }
+
       const analysis = yield* Effect.try({
         try: () => spec.analyze(parsedTables, context.targetProcessId ?? -1),
         catch: (error) =>
@@ -2566,7 +2855,7 @@ export const createPerfService = (dependencies: {
         analyzedAt: nowIso(),
         xctraceVersion: context.xctraceVersion,
         summary: analysis.summary,
-        diagnoses: analysis.diagnoses,
+        diagnoses: [...truncationDiagnoses, ...analysis.diagnoses],
         artifacts: {
           trace: context.traceArtifact,
           toc: context.tocArtifact,

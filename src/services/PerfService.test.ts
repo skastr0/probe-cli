@@ -584,6 +584,7 @@ const createCommandRunner = (options: {
         readonly timeoutMs: number
         readonly outputPath: string
         readonly budget: { readonly maxBytes: number; readonly maxRows: number }
+        readonly budgetPolicy?: "fail" | "truncate"
       }) => {
         stats.exportCalls += 1
 
@@ -605,7 +606,25 @@ const createCommandRunner = (options: {
         }
 
         await writeFile(args.outputPath, xml, "utf8")
-        await options.onExport?.({ outputPath: args.outputPath, schema, budget: args.budget })
+        try {
+          await options.onExport?.({ outputPath: args.outputPath, schema, budget: args.budget })
+        } catch (error) {
+          if (
+            error instanceof ExportBudgetExceededError
+            && args.budgetPolicy === "truncate"
+          ) {
+            return {
+              stdout: "",
+              stderr: "",
+              exitCode: 0,
+              bytesWritten: Buffer.byteLength(xml, "utf8"),
+              rowCount: (xml.match(/<row>/g) ?? []).length,
+              truncated: true,
+            }
+          }
+
+          throw error
+        }
 
         return {
           stdout: "",
@@ -613,6 +632,7 @@ const createCommandRunner = (options: {
           exitCode: 0,
           bytesWritten: Buffer.byteLength(xml, "utf8"),
           rowCount: (xml.match(/<row>/g) ?? []).length,
+          truncated: false,
         }
       },
       startRecording: async (args: {
@@ -1638,7 +1658,8 @@ describe("PerfService exportSchema", () => {
       const commandRunner = createCommandRunner({
         exports: { "time-sample": timeProfilerXml },
         onExport: async ({ outputPath, schema }) => {
-          const largeContent = "x".repeat(9 * 1024 * 1024)
+          // Above the 32 MiB parse limit (maxExportFileSizeBytes).
+          const largeContent = "x".repeat(33 * 1024 * 1024)
           await writeFile(outputPath, `<schema name="${schema}"></schema>${largeContent}`, "utf8")
         },
       })
@@ -1677,7 +1698,7 @@ describe("PerfService exportSchema", () => {
 // unchanged math. These replace the pre-PRB-097 record()-level assertions
 // for the same behavior -- record() no longer runs any of this eagerly.
 describe("PerfService analyzeTrace", () => {
-  test("system-trace skips an optional export that exceeds its budget but keeps the required one, using targeted budgets", async () => {
+  test("system-trace keeps a truncated optional export when it exceeds budget, using targeted budgets", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = createSessionRegistryMock(root)
@@ -1713,14 +1734,14 @@ describe("PerfService analyzeTrace", () => {
         { schema: "thread-state", maxBytes: 6 * mib, maxRows: 20_000 },
         { schema: "cpu-state", maxBytes: 12 * mib, maxRows: 50_000 },
       ])
-      expect(result.artifacts.exports).toHaveLength(1)
-      expect(result.artifacts.exports[0]?.label).toBe("thread-state-export")
+      // Optional cpu-state is truncated and kept (not dropped) so dense exports stay useful.
+      expect(result.artifacts.exports).toHaveLength(2)
+      expect(result.diagnoses.some((d) => d.code === "perf-export-truncated")).toBe(true)
       expect(result.summary.headline).toContain("1 target thread intervals")
-      expect(result.summary.metrics.find((metric) => metric.label === "Target CPU intervals")?.value).toBe("0")
     })
   })
 
-  test("system-trace fails the whole analysis when the required export exceeds its budget", async () => {
+  test("system-trace keeps a truncated prefix when the required export exceeds its budget", async () => {
     await withTempRoot(async (root) => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = createSessionRegistryMock(root)
@@ -1743,27 +1764,19 @@ describe("PerfService analyzeTrace", () => {
       })
 
       const result = await Effect.runPromise(
-        Effect.either(
-          perfService.analyzeTrace({
-            sessionId: "session-1",
-            artifactKey: traceArtifact.key,
-            analyzer: "system-trace",
-            emitProgress: () => undefined,
-          }),
-        ),
+        perfService.analyzeTrace({
+          sessionId: "session-1",
+          artifactKey: traceArtifact.key,
+          analyzer: "system-trace",
+          emitProgress: () => undefined,
+        }),
       )
 
-      expect(Either.isLeft(result)).toBe(true)
-      expect(commandRunner.stats.exportCalls).toBe(1)
-
-      if (Either.isLeft(result)) {
-        expect(result.left).toBeInstanceOf(EnvironmentError)
-
-        if (result.left instanceof EnvironmentError) {
-          expect(result.left.code).toBe("perf-export-row-budget")
-          expect(result.left.reason).toContain("thread-state")
-        }
-      }
+      // Required schema budget hit → prefix kept + optional still exported.
+      expect(commandRunner.stats.exportCalls).toBe(2)
+      expect(result.artifacts.exports.length).toBeGreaterThanOrEqual(1)
+      expect(result.diagnoses.some((d) => d.code === "perf-export-truncated")).toBe(true)
+      expect(result.summary.headline.length).toBeGreaterThan(0)
     })
   })
 
@@ -1810,11 +1823,22 @@ describe("PerfService analyzeTrace", () => {
       const artifactStore = createArtifactStore()
       const sessionRegistry = createSessionRegistryMock(root)
       const traceArtifact = await registerTraceFixture({ artifactStore, root, slug: "metal-system-trace" })
+      const emptyCounterXml = (schema: string) => `<?xml version="1.0"?>
+<trace-query-result>
+  <node>
+    <schema name="${schema}">
+      <col><mnemonic>value</mnemonic></col>
+      <col><mnemonic>counter-name</mnemonic></col>
+    </schema>
+  </node>
+</trace-query-result>`
       const commandRunner = createCommandRunner({
         exports: {
           "metal-gpu-intervals": loadPerfFixture("metal-system-trace.metal-gpu-intervals.xml"),
           "metal-driver-event-intervals": metalDriverIntervalsXml,
           "metal-application-encoders-list": metalEncoderListXml,
+          "gpu-counter-value": emptyCounterXml("gpu-counter-value"),
+          "metal-gpu-counter-intervals": emptyCounterXml("metal-gpu-counter-intervals"),
         },
       })
       const perfService = createPerfService({
@@ -1833,13 +1857,18 @@ describe("PerfService analyzeTrace", () => {
       )
 
       expect(commandRunner.stats.budgets).toEqual([
-        { schema: "metal-gpu-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
-        { schema: "metal-driver-event-intervals", maxBytes: 4 * mib, maxRows: 12_000 },
-        { schema: "metal-application-encoders-list", maxBytes: 4 * mib, maxRows: 12_000 },
+        { schema: "metal-gpu-intervals", maxBytes: 16 * mib, maxRows: 50_000 },
+        { schema: "metal-driver-event-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
+        { schema: "metal-application-encoders-list", maxBytes: 24 * mib, maxRows: 50_000 },
+        { schema: "gpu-counter-value", maxBytes: 8 * mib, maxRows: 50_000 },
+        { schema: "metal-gpu-counter-intervals", maxBytes: 8 * mib, maxRows: 25_000 },
       ])
+      // Empty counter tables are attempted (budgets recorded) but omitted from
+      // artifacts when they contribute zero rows.
       expect(result.artifacts.exports).toHaveLength(3)
       expect(result.summary.metrics.find((metric) => metric.label === "Estimated FPS")?.value).toContain("fps")
       expect(result.summary.metrics.find((metric) => metric.label === "Per-encoder summary")?.value).toContain("command buffer")
+      expect(result.summary.metrics.find((metric) => metric.label === "GPU counters")?.value).toBe("none exported")
     })
   })
 
