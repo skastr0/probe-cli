@@ -1,6 +1,6 @@
 # xctrace + Instruments sources
 
-Updated: 2026-04-10
+Updated: 2026-07-28
 
 ## Existing adjacent packs checked first
 
@@ -138,6 +138,40 @@ added in that pass:
   `WebFetch` and found **unsupported** — the thread contains zero thermal-related content.
   Treat WebSearch's own prose summaries as unverified until checked against the underlying
   page; this pack cites only what `WebFetch`/local commands actually returned.
+
+## GPU / Metal counters research (2026-07-28)
+
+See `knowledge/xctrace-instruments/gpu-metal-counters.md` for the full writeup.
+
+- Local TOC / empty-export evidence
+  - `knowledge/xctrace-instruments/fixture-metal-system-trace.toc.xml` — `Counter Set: (null)`, `Shader Timeline: Disabled`, schemas `gpu-counter-value`, `metal-gpu-counter-intervals`, `metal-shader-profiler-*`, `gpu-shader-profiler-*`
+  - `knowledge/ripple-qa-perf-2026-07-28/50-metal-analyze-60s.json` — counter schemas exported with 0 rows
+  - `templates/instruments/Ripple Scene Profiler.tracetemplate` + `templates/instruments/README.md`
+  - `src/services/PerfService.ts` metal-system-trace exportSchemas; `src/domain/perf.ts` counter summary
+- Apple
+  - https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app/ — Counter Set off by default; Recording Options → Performance Limiters
+  - https://developer.apple.com/videos/play/wwdc2020/10603/ — Performance Limiters first; enable Shader Timeline; limiters / occupancy / bandwidth themes
+  - https://developer.apple.com/videos/play/tech-talks/111374/ — occupancy counters on newer GPU families
+  - https://developer.apple.com/documentation/metal/gpu-counters-and-counter-sample-buffers — runtime MTLCounterSampleBuffer (separate from Instruments)
+
+## FPS / frame budget from export research (2026-07-28)
+
+See `knowledge/xctrace-instruments/fps-frame-budget-from-export.md` for the full writeup.
+
+- Local TOC / analyze evidence
+  - `fixture-metal-system-trace.toc.xml` — schemas `displayed-surfaces-per-second`, `displayed-surfaces-interval`, `display-vsyncs-interval`, `ca-client-present-request`, `ca-client-presented-handler`, `display-surface-swap`, `metal-command-buffer-frame-assignment`, `metal-gpu-intervals`
+  - `knowledge/ripple-qa-perf-2026-07-28/50-metal-analyze-60s.json` — FPS withheld; channels `0`/`Fragment`/`Vertex`; max frame span 3.74 s vs max GPU interval 8.56 ms
+  - `src/domain/perf.ts` — `buildMetalFrameEstimates`, app-render channel filter, reliability gate
+  - `src/domain/perf.metal-honesty.test.ts` — withhold vs well-behaved FPS tests
+  - `src/test-fixtures/perf/metal-system-trace.metal-gpu-intervals.xml` — WindowServer / missing frame-number rows
+- Apple (Display track + hitches + VRR)
+  - https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app/ — Display track; display instance duration + skipped vsyncs = stutter
+  - https://developer.apple.com/documentation/xcode/understanding-hitches-in-your-app — hitch rate ms/s bands
+  - https://developer.apple.com/videos/play/tech-talks/10855/ — hitch time ratio definition; 16.67 / 8.33 ms budgets
+  - https://developer.apple.com/videos/play/wwdc2021/10147/ — do not hardcode frame rate; CADisplayLink duration
+  - https://developer.apple.com/documentation/quartzcore/cadisplaylink — frame interval / duration APIs
+  - https://developer.apple.com/videos/play/wwdc2026/388/ — metalperftrace overview / `--json` (adjacent CLI; not yet integrated)
+- **Open before coding parsers:** column mnemonics for display/CA schemas not yet spiked from a live `xctrace export`
 
 ## Source quality notes
 

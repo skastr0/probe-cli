@@ -1,6 +1,6 @@
 # xctrace + Instruments open questions
 
-Updated: 2026-04-10
+Updated: 2026-07-28
 
 ## Open validation questions
 
@@ -45,6 +45,12 @@ Updated: 2026-04-10
    - The current Simulator spike showed HAR-related schema names in a failed Network trace, but it did not produce a usable HAR artifact because Network Connections are unsupported on Simulator.
    - Probe still needs a command-level contract for when to return XML-derived summaries, HAR artifacts, or only raw `.trace` references.
 
+8. **What are the exact XML mnemonics for display-side FPS schemas?** (2026-07-28)
+   - TOC confirms `displayed-surfaces-per-second`, `displayed-surfaces-interval`, `display-vsyncs-interval`, `ca-client-present-request` on Metal System Trace.
+   - Design for honest FPS precedence is in `fps-frame-budget-from-export.md`.
+   - **Still open:** one live `xctrace export` per schema to lock column mnemonics + sample rows before analyzer wiring.
+   - Fragment/Vertex channel filter is a span-cleaning heuristic only; reliability gate must stay.
+
 ## Immediate risks for later Probe items
 
 - Probe could accidentally record the host Mac instead of the intended iOS target if it omits `--device`.
@@ -53,3 +59,4 @@ Updated: 2026-04-10
 - Probe could misread older forum limitations as still-current behavior, or misread newer release-note features as available on older local Xcode builds.
 - Probe could treat local help/man wording as perfectly consistent even though the current toolchain already shows several documentation mismatches.
 - Probe could treat Simulator-only schema visibility as equivalent to end-to-end availability, especially for Network and other hardware- or target-dependent instruments.
+- Probe could treat GPU frame-span estimates as on-screen FPS (Display track is the present-rate source; see `fps-frame-budget-from-export.md`).
